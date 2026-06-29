@@ -1,0 +1,6 @@
+[target.i686-unknown-linux-gnu]
+linker = "gcc"
+rustflags = ["-C", "link-arg=-m32"]
+
+[env]
+STEAM_RUNTIME_RS_PROJECT = "steam-runtime-rs"
