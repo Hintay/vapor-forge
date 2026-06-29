@@ -17,6 +17,11 @@ static POST_TARGET_SNAPSHOT_ATTEMPTS: AtomicU8 = AtomicU8::new(0);
 const MAX_POST_TARGET_SNAPSHOT_ATTEMPTS: u8 = 3;
 
 #[cfg(target_os = "linux")]
+mod dlc_hooks;
+#[cfg(target_os = "linux")]
+mod hook_install;
+
+#[cfg(target_os = "linux")]
 mod linux_audit {
     use core::ffi::{c_char, c_uint, c_void};
     use std::sync::atomic::Ordering;
@@ -110,6 +115,12 @@ mod linux_audit {
                 ));
                 log_phase3_loader_target_event("la_objopen-target", kind.as_str());
                 maybe_log_post_target_snapshot("la_objopen-target");
+
+                if STEAM_MODULES.steamclient_seen()
+                    && LIFECYCLE.has_reached_ready_for_heavy_init()
+                {
+                    super::hook_install::try_install_hooks();
+                }
             } else {
                 maybe_log_post_target_snapshot("la_objopen-followup");
             }
@@ -125,6 +136,10 @@ mod linux_audit {
         LIFECYCLE.mark_ready_for_heavy_init();
         log_message("la_preinit: ready for deferred heavy init");
         maybe_log_post_target_snapshot("la_preinit-ready");
+
+        if STEAM_MODULES.steamclient_seen() {
+            super::hook_install::try_install_hooks();
+        }
     }
 
     #[no_mangle]
