@@ -7,7 +7,6 @@ use std::sync::Once;
 use steam_runtime_core::{Lifecycle, SteamModuleState};
 
 static LIFECYCLE: Lazy<Lifecycle> = Lazy::new(Lifecycle::new);
-static MODULE_PROBE: Once = Once::new();
 static STEAMCLIENT_ELF_METADATA_PROBE: Once = Once::new();
 static STEAMCLIENT_MAPPED_BYTE_SAMPLE_PROBE: Once = Once::new();
 static STEAM_MODULES: Lazy<SteamModuleState> = Lazy::new(SteamModuleState::new);
@@ -24,14 +23,13 @@ mod linux_audit {
 
     use steam_runtime_diagnostics::{log_cstr, log_message};
     use steam_runtime_memory::{
-        count_module_targets, current_process_context, enumerate_modules,
-        find_proc_self_maps_targets, is_steam_target_name, sample_mapped_target_module_bytes,
-        summarize_elf_file, summarize_proc_maps_targets, ElfMetadataLimits,
-        MappedByteSamplingLimits, MappedByteSamplingReport, ModuleInfo, ProcMapsEntry,
+        current_process_context, find_proc_self_maps_targets, is_steam_target_name,
+        sample_mapped_target_module_bytes, summarize_elf_file, summarize_proc_maps_targets,
+        ElfMetadataLimits, MappedByteSamplingLimits, MappedByteSamplingReport, ProcMapsEntry,
     };
 
     use super::{
-        LIFECYCLE, MAX_POST_TARGET_SNAPSHOT_ATTEMPTS, MODULE_PROBE, POST_TARGET_SNAPSHOT_ATTEMPTS,
+        LIFECYCLE, MAX_POST_TARGET_SNAPSHOT_ATTEMPTS, POST_TARGET_SNAPSHOT_ATTEMPTS,
         STEAMCLIENT_ELF_METADATA_PROBE, STEAMCLIENT_MAPPED_BYTE_SAMPLE_PROBE,
         STEAMUI_ELF_METADATA_PROBE, STEAMUI_MAPPED_BYTE_SAMPLE_PROBE, STEAM_MODULES,
     };
@@ -126,7 +124,6 @@ mod linux_audit {
     pub extern "C" fn la_preinit(_cookie: *mut usize) {
         LIFECYCLE.mark_ready_for_heavy_init();
         log_message("la_preinit: ready for deferred heavy init");
-        MODULE_PROBE.call_once(log_module_snapshot);
         maybe_log_post_target_snapshot("la_preinit-ready");
     }
 
@@ -135,29 +132,6 @@ mod linux_audit {
         LIFECYCLE.mark_closing();
         log_message("la_objclose: mark closing only");
         0
-    }
-
-    fn log_module_snapshot() {
-        match enumerate_modules() {
-            Ok(modules) => {
-                log_message("phase2a: libmem module snapshot begin");
-                log_phase3_correlation("la_preinit-module-snapshot", None, &modules);
-                for module in modules {
-                    if is_steam_target_name(&module.name) || is_steam_target_name(&module.path) {
-                        log_message(&format!(
-                            "phase2a: target module name={} base=0x{:x} end=0x{:x} size=0x{:x} path={}",
-                            module.name,
-                            module.range.base.0,
-                            module.range.end.0,
-                            module.range.size,
-                            module.path
-                        ));
-                    }
-                }
-                log_message("phase2a: libmem module snapshot end");
-            }
-            Err(error) => log_message(&format!("phase2a: module snapshot failed: {error}")),
-        }
     }
 
     fn maybe_log_post_target_snapshot(reason: &str) {
@@ -176,39 +150,43 @@ mod linux_audit {
             Err(_) => return,
         };
 
-        match enumerate_modules() {
-            Ok(modules) => {
+        match find_proc_self_maps_targets(MAX_PROC_MAPS_TARGET_ENTRIES) {
+            Ok(entries) => {
+                let context = current_process_context();
                 log_message(&format!(
-                    "phase2b: post-target module snapshot begin attempt={} reason={}",
-                    attempt, reason
+                    "phase2b: post-target snapshot begin attempt={} reason={} pid={} ppid={} arch={} exe={} proc_maps_target_count={}",
+                    attempt,
+                    reason,
+                    context.pid,
+                    format_optional_u32(context.ppid),
+                    context.arch,
+                    context.exe.as_deref().unwrap_or("<unknown>"),
+                    entries.len()
                 ));
-                log_phase3_correlation(reason, Some(attempt), &modules);
+                log_phase3_proc_maps_entries(reason, &entries);
                 log_phase4b_visible_elf_metadata(reason);
                 log_trackc_visible_mapped_byte_samples(reason);
-                let mut target_count = 0usize;
-                for module in modules {
-                    if is_steam_target_name(&module.name) || is_steam_target_name(&module.path) {
-                        target_count += 1;
-                        log_message(&format!(
-                            "phase2b: target module name={} base=0x{:x} end=0x{:x} size=0x{:x} path={}",
-                            module.name,
-                            module.range.base.0,
-                            module.range.end.0,
-                            module.range.size,
-                            module.path
-                        ));
-                    }
+                let target_count = entries.len();
+                for entry in &entries {
+                    log_message(&format!(
+                        "phase2b: target module base=0x{:x} end=0x{:x} size=0x{:x} perms={} path={}",
+                        entry.range.base.0,
+                        entry.range.end.0,
+                        entry.range.size,
+                        entry.permissions,
+                        entry.path
+                    ));
                 }
                 if target_count == 0 {
                     log_message("phase2b: no target modules in post-target snapshot");
                 }
                 log_message(&format!(
-                    "phase2b: post-target module snapshot end attempt={} targets={}",
+                    "phase2b: post-target snapshot end attempt={} targets={}",
                     attempt, target_count
                 ));
             }
             Err(error) => log_message(&format!(
-                "phase2b: post-target module snapshot failed attempt={attempt}: {error}"
+                "phase2b: post-target snapshot failed attempt={attempt}: {error}"
             )),
         }
     }
@@ -243,38 +221,6 @@ mod linux_audit {
             Err(error) => log_message(&format!(
                 "phase3: loader target proc maps failed reason={} target={} error={}",
                 reason, target_name, error
-            )),
-        }
-    }
-
-    fn log_phase3_correlation(reason: &str, attempt: Option<u8>, modules: &[ModuleInfo]) {
-        let context = current_process_context();
-        let libmem_target_count = count_module_targets(modules);
-        match find_proc_self_maps_targets(MAX_PROC_MAPS_TARGET_ENTRIES) {
-            Ok(entries) => {
-                log_message(&format!(
-                    "phase3: correlation reason={} attempt={} pid={} ppid={} arch={} exe={} libmem_target_count={} proc_maps_target_count={}",
-                    reason,
-                    format_optional_u8(attempt),
-                    context.pid,
-                    format_optional_u32(context.ppid),
-                    context.arch,
-                    context.exe.as_deref().unwrap_or("<unknown>"),
-                    libmem_target_count,
-                    entries.len()
-                ));
-                log_phase3_proc_maps_entries(reason, &entries);
-            }
-            Err(error) => log_message(&format!(
-                "phase3: correlation failed reason={} attempt={} pid={} ppid={} arch={} exe={} libmem_target_count={} proc_maps_error={}",
-                reason,
-                format_optional_u8(attempt),
-                context.pid,
-                format_optional_u32(context.ppid),
-                context.arch,
-                context.exe.as_deref().unwrap_or("<unknown>"),
-                libmem_target_count,
-                error
             )),
         }
     }
@@ -520,12 +466,6 @@ mod linux_audit {
                 reason, skip.module_name, skip.kind, skip.detail, skip.path
             ));
         }
-    }
-
-    fn format_optional_u8(value: Option<u8>) -> String {
-        value
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_owned())
     }
 
     fn format_optional_u32(value: Option<u32>) -> String {

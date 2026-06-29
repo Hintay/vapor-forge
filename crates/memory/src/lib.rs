@@ -19,8 +19,6 @@ const DEFAULT_MAX_SAMPLED_BYTES_PER_PROCESS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum MemoryError {
-    #[error("libmem failed to enumerate current-process modules")]
-    ModuleEnumerationFailed,
     #[error("failed to read /proc/self/maps: {0}")]
     ProcMapsReadFailed(#[from] std::io::Error),
     #[error("ELF metadata path is not a public Steam target module: {0}")]
@@ -43,13 +41,6 @@ pub struct ModuleRange {
     pub base: Address,
     pub end: Address,
     pub size: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModuleInfo {
-    pub name: String,
-    pub path: String,
-    pub range: ModuleRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,38 +152,6 @@ struct ProcMapsModuleInventoryBuilder {
     lowest_base: usize,
     highest_end: usize,
     permissions: BTreeSet<String>,
-}
-
-impl ModuleInfo {
-    pub fn is_named(&self, expected: &str) -> bool {
-        module_name_matches(&self.name, expected) || module_name_matches(&self.path, expected)
-    }
-}
-
-pub fn enumerate_modules() -> Result<Vec<ModuleInfo>> {
-    let modules = libmem::enum_modules().ok_or(MemoryError::ModuleEnumerationFailed)?;
-
-    Ok(modules
-        .into_iter()
-        .map(|module| ModuleInfo {
-            name: module.name,
-            path: module.path,
-            range: ModuleRange {
-                base: Address(module.base),
-                end: Address(module.end),
-                size: module.size,
-            },
-        })
-        .collect())
-}
-
-pub fn find_loaded_targets(targets: &[&str]) -> Result<Vec<ModuleInfo>> {
-    let modules = enumerate_modules()?;
-
-    Ok(modules
-        .into_iter()
-        .filter(|module| targets.iter().any(|target| module.is_named(target)))
-        .collect())
 }
 
 pub fn current_process_context() -> ProcessContext {
@@ -746,13 +705,6 @@ fn fnv1a64_digest(bytes: &[u8]) -> String {
         value = value.wrapping_mul(0x100000001b3);
     }
     format!("fnv1a64:{value:016x}")
-}
-
-pub fn count_module_targets(modules: &[ModuleInfo]) -> usize {
-    modules
-        .iter()
-        .filter(|module| is_steam_target_name(&module.name) || is_steam_target_name(&module.path))
-        .count()
 }
 
 pub fn is_steam_target_name(name_or_path: &str) -> bool {

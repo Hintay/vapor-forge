@@ -1,2 +1,5 @@
 /target/
 /.DS_Store
+experiments/**/*.so
+experiments/**/picfixture-caller
+experiments/**/target/
