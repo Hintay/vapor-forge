@@ -54,7 +54,7 @@ pub struct PicThunkRepairPlan {
 /// Scan a byte buffer for a `call rel32` whose target is a PIC thunk
 /// (`mov reg,[esp]; ret`), returning the first match.
 ///
-/// This is a pure analysis function — it does not modify any memory.
+/// This is a pure analysis function. It does not modify any memory.
 pub fn find_pic_thunk_call(
     buffer: &[u8],
     buffer_base_address: u32,

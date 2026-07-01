@@ -10,3 +10,18 @@ iced-x86.workspace = true
 libc.workspace = true
 steam-runtime-hook-boundary = { path = "../hook-boundary" }
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arc-swap.workspace = true
+inotify.workspace = true
+once_cell.workspace = true
+retour.workspace = true
+tracing.workspace = true
+steam-runtime-abi = { path = "../steam-abi" }
+steam-runtime-config = { path = "../config" }
+steam-runtime-diagnostics = { path = "../diagnostics" }
+steam-runtime-features = { path = "../features" }
+steam-runtime-memory = { path = "../memory" }
+steam-runtime-patterns = { path = "../patterns" }
+prost.workspace = true
+steam-runtime-scripting = { path = "../scripting" }

@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
+// Re-export newtypes so callers only need to depend on steam-runtime-config.
+pub use steam_runtime_core::{AppId, DepotId, ManifestId};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -23,12 +26,26 @@ pub struct RuntimeConfig {
     pub apps: AppsSection,
     #[serde(default)]
     pub scripting: ScriptingSection,
+    #[serde(default)]
+    pub ticket: TicketSection,
+    #[serde(default)]
+    pub manifest: ManifestSection,
+    #[serde(default)]
+    pub achievements: AchievementsSection,
+    #[serde(default)]
+    pub app_avatar: AppAvatarSection,
+    #[serde(default)]
+    pub library_inject: LibraryInjectSection,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RuntimeSection {
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    #[serde(default)]
+    pub diagnostics: bool,
+    #[serde(default)]
+    pub patterns_url: String,
 }
 
 /// Controlled apps.
@@ -48,9 +65,9 @@ pub struct AppsSection {
 /// An app to inject ownership for, with optional DLC list.
 #[derive(Clone, Debug, Deserialize)]
 pub struct InjectApp {
-    pub id: u32,
+    pub id: AppId,
     #[serde(default)]
-    pub dlc: Vec<u32>,
+    pub dlc: Vec<AppId>,
 }
 
 /// Family sharing concurrent-play bypass.
@@ -66,13 +83,13 @@ pub struct SharedSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
-    pub include: Vec<u32>,
+    pub include: Vec<AppId>,
     #[serde(default)]
-    pub exclude: Vec<u32>,
+    pub exclude: Vec<AppId>,
 }
 
 impl SharedSection {
-    pub fn allows(&self, app_id: u32) -> bool {
+    pub fn allows(&self, app_id: AppId) -> bool {
         if !self.enabled {
             return false;
         }
@@ -102,10 +119,176 @@ pub struct ScriptingSection {
     pub paths: Vec<String>,
 }
 
+/// Achievement/stats schema configuration.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AchievementsSection {
+    #[serde(default)]
+    pub offline_schema: bool,
+}
+
+/// AppAvatar: map a real AppId to another for networking.
+///
+/// Integer keys are static mappings. Use 0 as wildcard for all unowned apps.
+/// `rules` is an array of flag-driven rules evaluated at LaunchApp.
+///
+/// ```toml
+/// [app_avatar]
+/// 480 = 730
+/// 0 = 730
+///
+/// [[app_avatar.rules]]
+/// flag = "-onlinefix"
+/// avatar = 480
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct AppAvatarSection {
+    pub static_map: HashMap<AppId, AppId>,
+    pub rules: Vec<AppAvatarRule>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AppAvatarRule {
+    pub flag: String,
+    pub avatar: AppId,
+    #[serde(default)]
+    pub apps: Vec<AppId>,
+    #[serde(default)]
+    pub exclude: Vec<AppId>,
+}
+
+impl<'de> serde::Deserialize<'de> for AppAvatarSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, Visitor};
+        use std::fmt;
+
+        struct AppAvatarVisitor;
+
+        impl<'de> Visitor<'de> for AppAvatarVisitor {
+            type Value = AppAvatarSection;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("app_avatar table with integer keys and optional rules array")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut static_map = HashMap::new();
+                let mut rules = Vec::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "rules" {
+                        rules = map.next_value()?;
+                    } else if let Ok(app_id) = key.parse::<u32>() {
+                        let avatar: u32 = map.next_value()?;
+                        static_map.insert(AppId(app_id), AppId(avatar));
+                    } else {
+                        let _ = map.next_value::<toml::Value>();
+                    }
+                }
+
+                Ok(AppAvatarSection { static_map, rules })
+            }
+        }
+
+        deserializer.deserialize_map(AppAvatarVisitor)
+    }
+}
+
+/// Native .so injection via LD_PRELOAD, applied at BuildSpawnEnvBlock time.
+///
+/// Each entry lists a library path plus optional app/flag filters, mirroring
+/// the AppAvatar rule shape. Rules are evaluated at LaunchApp; matching paths
+/// are joined and written into the child process env block.
+///
+/// ```toml
+/// [[library_inject.libs]]
+/// path = "/home/deck/mylib.so"
+/// flag = "-onlinefix"
+/// apps = [480]
+/// ```
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LibraryInjectSection {
+    #[serde(default)]
+    pub libs: Vec<LibraryInjectEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LibraryInjectEntry {
+    pub path: String,
+    #[serde(default)]
+    pub flag: String,
+    #[serde(default)]
+    pub apps: Vec<AppId>,
+    #[serde(default)]
+    pub exclude: Vec<AppId>,
+}
+
+/// Ticket caching and forging configuration.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TicketSection {
+    #[serde(default)]
+    pub cache: TicketCacheMode,
+}
+
+/// Manifest request code fetch configuration.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ManifestSection {
+    #[serde(default = "default_providers")]
+    pub providers: Vec<String>,
+    #[serde(default = "default_timeout_connect_ms")]
+    pub timeout_connect_ms: u64,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for ManifestSection {
+    fn default() -> Self {
+        Self {
+            providers: default_providers(),
+            timeout_connect_ms: default_timeout_connect_ms(),
+            timeout_ms: default_timeout_ms(),
+        }
+    }
+}
+
+fn default_providers() -> Vec<String> {
+    vec![
+        "opensteamtool".to_owned(),
+        "wudrm".to_owned(),
+        "steamrun".to_owned(),
+    ]
+}
+
+fn default_timeout_connect_ms() -> u64 {
+    5000
+}
+
+fn default_timeout_ms() -> u64 {
+    15000
+}
+
+/// Where intercepted tickets are cached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketCacheMode {
+    /// In-memory only. Tickets are lost when Steam restarts.
+    #[default]
+    Session,
+    /// Persist tickets to disk so they survive restarts.
+    Disk,
+}
+
 impl Default for RuntimeSection {
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
+            diagnostics: false,
+            patterns_url: String::new(),
         }
     }
 }
@@ -121,7 +304,7 @@ fn default_true() -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppCategory {
     Inject,
-    InjectDlc { parent: u32 },
+    InjectDlc { parent: AppId },
 }
 
 impl RuntimeConfig {
@@ -130,7 +313,7 @@ impl RuntimeConfig {
         Ok(toml::from_str(&text)?)
     }
 
-    pub fn app_category(&self, app_id: u32) -> Option<AppCategory> {
+    pub fn app_category(&self, app_id: AppId) -> Option<AppCategory> {
         for app in &self.apps.inject {
             if app.id == app_id {
                 return Some(AppCategory::Inject);
@@ -142,11 +325,11 @@ impl RuntimeConfig {
         None
     }
 
-    pub fn should_bypass_sharing(&self, app_id: u32) -> bool {
+    pub fn should_bypass_sharing(&self, app_id: AppId) -> bool {
         self.apps.shared.allows(app_id)
     }
 
-    pub fn inject_app_ids(&self) -> HashSet<u32> {
+    pub fn inject_app_ids(&self) -> HashSet<AppId> {
         let mut ids = HashSet::new();
         for app in &self.apps.inject {
             ids.insert(app.id);
@@ -155,7 +338,7 @@ impl RuntimeConfig {
         ids
     }
 
-    pub fn inject_dlc_map(&self) -> HashMap<u32, Vec<u32>> {
+    pub fn inject_dlc_map(&self) -> HashMap<AppId, Vec<AppId>> {
         self.apps
             .inject
             .iter()
@@ -175,20 +358,20 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppCategory, RuntimeConfig};
+    use super::{AppCategory, AppId, RuntimeConfig, TicketCacheMode};
 
     #[test]
     fn parses_empty_config() {
         let config: RuntimeConfig = toml::from_str("").expect("empty config should parse");
         assert!(!config.has_any_inject_apps());
-        assert!(config.should_bypass_sharing(480));
+        assert!(config.should_bypass_sharing(AppId(480)));
     }
 
     #[test]
     fn shared_enabled_by_default() {
         let config: RuntimeConfig = toml::from_str("").expect("parse");
         assert!(config.apps.shared.enabled);
-        assert!(config.should_bypass_sharing(12345));
+        assert!(config.should_bypass_sharing(AppId(12345)));
     }
 
     #[test]
@@ -200,9 +383,9 @@ mod tests {
             "#,
         )
         .expect("parse");
-        assert!(config.should_bypass_sharing(570));
-        assert!(config.should_bypass_sharing(730));
-        assert!(!config.should_bypass_sharing(480));
+        assert!(config.should_bypass_sharing(AppId(570)));
+        assert!(config.should_bypass_sharing(AppId(730)));
+        assert!(!config.should_bypass_sharing(AppId(480)));
     }
 
     #[test]
@@ -214,8 +397,8 @@ mod tests {
             "#,
         )
         .expect("parse");
-        assert!(config.should_bypass_sharing(570));
-        assert!(!config.should_bypass_sharing(730));
+        assert!(config.should_bypass_sharing(AppId(570)));
+        assert!(!config.should_bypass_sharing(AppId(730)));
     }
 
     #[test]
@@ -227,7 +410,7 @@ mod tests {
             "#,
         )
         .expect("parse");
-        assert!(!config.should_bypass_sharing(480));
+        assert!(!config.should_bypass_sharing(AppId(480)));
     }
 
     #[test]
@@ -244,13 +427,13 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(config.app_category(480), Some(AppCategory::Inject));
-        assert_eq!(config.app_category(730), Some(AppCategory::Inject));
+        assert_eq!(config.app_category(AppId(480)), Some(AppCategory::Inject));
+        assert_eq!(config.app_category(AppId(730)), Some(AppCategory::Inject));
         assert_eq!(
-            config.app_category(505730),
-            Some(AppCategory::InjectDlc { parent: 480 })
+            config.app_category(AppId(505730)),
+            Some(AppCategory::InjectDlc { parent: AppId(480) })
         );
-        assert_eq!(config.app_category(999), None);
+        assert_eq!(config.app_category(AppId(999)), None);
 
         let all = config.inject_app_ids();
         assert_eq!(all.len(), 4);
@@ -260,5 +443,49 @@ mod tests {
     fn cloud_defaults_to_disabled() {
         let config: RuntimeConfig = toml::from_str("").expect("parse");
         assert!(!config.cloud_enabled_for_controlled_apps());
+    }
+
+    #[test]
+    fn ticket_defaults_to_session_cache() {
+        let config: RuntimeConfig = toml::from_str("").expect("parse");
+        assert_eq!(config.ticket.cache, TicketCacheMode::Session);
+    }
+
+    #[test]
+    fn ticket_disk_cache_parses() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+            [ticket]
+            cache = "disk"
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
+    }
+
+    #[test]
+    fn library_inject_defaults_to_empty() {
+        let config: RuntimeConfig = toml::from_str("").expect("parse");
+        assert!(config.library_inject.libs.is_empty());
+    }
+
+    #[test]
+    fn library_inject_parses_entries() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+            [[library_inject.libs]]
+            path = "/home/deck/mylib.so"
+            flag = "-onlinefix"
+            apps = [480]
+            exclude = [730]
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(config.library_inject.libs.len(), 1);
+        let entry = &config.library_inject.libs[0];
+        assert_eq!(entry.path, "/home/deck/mylib.so");
+        assert_eq!(entry.flag, "-onlinefix");
+        assert_eq!(entry.apps, vec![AppId(480)]);
+        assert_eq!(entry.exclude, vec![AppId(730)]);
     }
 }

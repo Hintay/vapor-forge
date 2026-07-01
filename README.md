@@ -1,24 +1,26 @@
 # steam-runtime-rs
 
-Rust-first Steam runtime instrumentation experiment.
+Rust-first Steam runtime instrumentation and hook-runtime experiment.
 
-This repository is currently limited to read-only observation through Phase 4B, Phase 5A release and supply-chain hardening, Phase 5B disk-only public symbol reporting, Track C option 2 bounded mapped-byte sampling, Track D-6 synthetic/no-write hook Go/No-Go readiness, and Track E planning-only real-hook prototype design:
+The repository has moved beyond the earlier read-only observation phases. The current workspace contains:
 
-- workspace and provenance skeleton;
-- minimal Linux `LD_AUDIT` `cdylib` entrypoints;
-- i686 build configuration hooks;
-- bounded lifecycle, module, `/proc/self/maps`, and disk ELF metadata diagnostics for public Steam target module names;
-- disk-only public dynamic symbol report for public Steam target module files;
-- bounded mapped-byte sampling for public target module mappings, emitting only digest/structural results;
-- synthetic-only hook boundary tests using local `extern "C"` function pointers, without real Steam hooks;
-- synthetic/no-write raw hook eligibility checks for module name, architecture, target address range, replacement address, and write-request rejection;
-- synthetic/no-write raw hook action gating that accepts validate-only decisions and rejects install requests;
-- synthetic/no-write patch-plan verification for relative-jump reachability and patch length;
-- synthetic byte-buffer patch simulation using test-owned memory only;
-- Track D-6 Go/No-Go decision documentation before any real hook prototype;
-- Track E planning-only real-hook prototype documentation, without implementation authorization;
-- pinned Rust toolchain and full read-only verification entrypoint;
-- no Steam entitlement, ticket, package, depot, or authorization-control behavior.
+- Linux `LD_AUDIT` `cdylib` entrypoints that wait for Steam loader lifecycle milestones before installing hooks;
+- i686 build configuration for Steam's 32-bit runtime path;
+- bounded lifecycle, module, `/proc/self/maps`, disk ELF metadata, and mapped-byte diagnostics for public Steam target module names;
+- hook boundary validation for module name, architecture, executable range, replacement address, and write-request rejection;
+- pattern registry support with embedded defaults and runtime TOML overrides;
+- hook installation for ownership, package, cloud, DLC, ticket, manifest, depot key, and network packet surfaces;
+- feature modules that keep most business decisions outside the unsafe hook callbacks;
+- Lua scripting and config hot-reload support for runtime state;
+- diagnostics CLI tools and smoke scripts for read-only and hook-boundary checks.
+
+The crate layout is intentionally layered:
+
+- `audit-loader` owns LD_AUDIT entrypoints and lifecycle handoff;
+- `hooks` owns unsafe hook installation, detour lifecycle, VMT swaps, and thin callback shells;
+- `features` owns testable business behavior for apps, DLC, cloud, tickets, manifests, achievements, and online pattern fetching;
+- `config`, `scripting`, `patterns`, `steam-abi`, `memory`, `diagnostics`, and `runtime-core` provide typed support code;
+- `hook-boundary` provides synthetic validation and patch-planning checks.
 
 The implementation policy is independent authorship. Do not copy or mechanically translate SLSsteam source, comments, file layout, or project-specific naming.
 

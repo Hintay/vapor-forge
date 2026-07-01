@@ -95,6 +95,53 @@ impl Pattern {
     }
 }
 
+/// Scan backward from `body_offset` to find a function prologue.
+///
+/// The prologue bytes follow the SLSsteam convention: they are stored in
+/// "scan order", i.e. `prologue[0]` is the byte **closest** to the body
+/// (highest address), and `prologue[N-1]` is the function entry byte
+/// (lowest address). The returned offset is the function entry point.
+///
+/// This mirrors the C++ logic:
+/// ```text
+/// for i in 0..max_scan:
+///     for j in 0..prologue.len():
+///         check haystack[body_offset - i - j] == prologue[j]
+///     if all match: return body_offset - i - prologue.len() + 1
+/// ```
+pub fn find_prologue_upwards(
+    haystack: &[u8],
+    body_offset: usize,
+    prologue: &[u8],
+    max_scan: usize,
+) -> Result<usize, PatternError> {
+    if prologue.is_empty() {
+        return Err(PatternError::Empty);
+    }
+
+    let limit = max_scan.min(body_offset);
+    for i in 0..=limit {
+        let anchor = body_offset - i;
+        let mut found = true;
+        for (j, &expected) in prologue.iter().enumerate() {
+            if anchor < j {
+                found = false;
+                break;
+            }
+            if haystack[anchor - j] != expected {
+                found = false;
+                break;
+            }
+        }
+        if found {
+            // Function entry is at the lowest-addressed prologue byte.
+            return Ok(anchor - prologue.len() + 1);
+        }
+    }
+
+    Err(PatternError::NoMatch)
+}
+
 /// Follows an `E8` (call) or `E9` (jmp) rel32 at `match_offset` to its target,
 /// returned as a byte offset relative to the start of `haystack`.
 pub fn follow_relative_call(haystack: &[u8], match_offset: usize) -> Result<i64, PatternError> {
@@ -116,9 +163,15 @@ pub fn follow_relative_call(haystack: &[u8], match_offset: usize) -> Result<i64,
     Ok(match_offset as i64 + REL32_INSTR_LEN as i64 + displacement as i64)
 }
 
+// ---------------------------------------------------------------------------
+// Pattern registry loaded from TOML file
+// ---------------------------------------------------------------------------
+
+pub mod registry;
+
 #[cfg(test)]
 mod tests {
-    use super::{follow_relative_call, Pattern, PatternError, PatternToken};
+    use super::{find_prologue_upwards, follow_relative_call, Pattern, PatternError, PatternToken};
 
     #[test]
     fn parses_bytes_and_wildcards() {
@@ -214,6 +267,69 @@ mod tests {
             follow_relative_call(&haystack, 0),
             Err(PatternError::FollowOutOfBounds)
         );
+    }
+
+    #[test]
+    fn finds_prologue_upwards_standard() {
+        // Memory layout:
+        //   offset 3: 55 89 E5  (push ebp; mov ebp, esp; function prologue)
+        //   offset 10: 83 EC 24 (sub esp, 0x24; body pattern match)
+        //
+        // SLSsteam convention: prologue bytes in scan order (closest to body first):
+        //   [0xE5, 0x89, 0x55]
+        // Scanning from body_offset=10 backward:
+        //   anchor=10: haystack[10]=0x83 != 0xE5
+        //   ...
+        //   anchor=5: haystack[5]=0xE5 == [0], haystack[4]=0x89 == [1], haystack[3]=0x55 == [2]
+        //   → function entry = 5 - 3 + 1 = 3
+        let mut buf = [0x90u8; 20];
+        buf[3] = 0x55;
+        buf[4] = 0x89;
+        buf[5] = 0xE5;
+        buf[10] = 0x83;
+        buf[11] = 0xEC;
+        buf[12] = 0x24;
+        let result = find_prologue_upwards(&buf, 10, &[0xE5, 0x89, 0x55], 100);
+        assert_eq!(result, Ok(3));
+    }
+
+    #[test]
+    fn finds_prologue_upwards_four_byte() {
+        // Simulate: prologue "53 56 57 55" (scan order = closest to body first)
+        // In memory (forward): 55 57 56 53 ... body
+        let mut buf = [0x90u8; 30];
+        buf[4] = 0x55;
+        buf[5] = 0x57;
+        buf[6] = 0x56;
+        buf[7] = 0x53;
+        // body at offset 15
+        buf[15] = 0x83;
+        buf[16] = 0xEC;
+        buf[17] = 0x0C;
+        // Scan from 15, prologue [0x53, 0x56, 0x57, 0x55]
+        // anchor=7: buf[7]=0x53, buf[6]=0x56, buf[5]=0x57, buf[4]=0x55 → match
+        // entry = 7 - 4 + 1 = 4
+        let result = find_prologue_upwards(&buf, 15, &[0x53, 0x56, 0x57, 0x55], 100);
+        assert_eq!(result, Ok(4));
+    }
+
+    #[test]
+    fn prologue_not_found_returns_no_match() {
+        let buf = [0x90u8; 20];
+        let result = find_prologue_upwards(&buf, 15, &[0x55, 0x89, 0xE5], 100);
+        assert_eq!(result, Err(PatternError::NoMatch));
+    }
+
+    #[test]
+    fn prologue_respects_max_scan() {
+        // Prologue exists but beyond max_scan distance
+        let mut buf = [0x90u8; 30];
+        buf[3] = 0x55;
+        buf[4] = 0x89;
+        buf[5] = 0xE5;
+        // body at offset 20
+        let result = find_prologue_upwards(&buf, 20, &[0xE5, 0x89, 0x55], 5);
+        assert_eq!(result, Err(PatternError::NoMatch));
     }
 
     #[test]

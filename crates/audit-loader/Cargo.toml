@@ -9,14 +9,10 @@ rust-version.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-iced-x86.workspace = true
 libc.workspace = true
 once_cell.workspace = true
-retour.workspace = true
-steam-runtime-abi = { path = "../steam-abi" }
-steam-runtime-config = { path = "../config" }
 steam-runtime-core = { path = "../runtime-core" }
 steam-runtime-diagnostics = { path = "../diagnostics" }
 steam-runtime-hooks = { path = "../hooks" }
 steam-runtime-memory = { path = "../memory" }
-steam-runtime-patterns = { path = "../patterns" }
+tracing.workspace = true
