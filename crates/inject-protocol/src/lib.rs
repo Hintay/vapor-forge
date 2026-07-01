@@ -5,6 +5,8 @@
 // len = size of msg_type + payload (does NOT include the 4-byte len field).
 // All multi-byte integers are little-endian.
 
+#![forbid(unsafe_code)]
+
 use std::io::{self, Read, Write};
 
 pub const TOKEN_LEN: usize = 32;
@@ -96,7 +98,10 @@ impl Message {
                 payload.extend_from_slice(&app_id.to_le_bytes());
                 payload.push(if *success { 1 } else { 0 });
             }
-            Message::PeSection { app_id, section_name } => {
+            Message::PeSection {
+                app_id,
+                section_name,
+            } => {
                 payload.push(MSG_PE_SECTION);
                 payload.extend_from_slice(&app_id.to_le_bytes());
                 let name_bytes = section_name.as_bytes();
@@ -222,7 +227,10 @@ fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
                 return Err(DecodeError::TooShort);
             }
             let section_name = String::from_utf8_lossy(&data[6..6 + name_len]).into_owned();
-            Ok(Message::PeSection { app_id, section_name })
+            Ok(Message::PeSection {
+                app_id,
+                section_name,
+            })
         }
         MSG_ACK => Ok(Message::Ack),
         MSG_SET_DELEGATE => {
@@ -401,6 +409,9 @@ mod tests {
     #[test]
     fn too_short_payload_returns_error() {
         let payload = [MSG_HELLO, 0x00]; // HELLO needs 40 bytes
-        assert!(matches!(decode_payload(&payload), Err(DecodeError::TooShort)));
+        assert!(matches!(
+            decode_payload(&payload),
+            Err(DecodeError::TooShort)
+        ));
     }
 }

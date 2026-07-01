@@ -14,7 +14,7 @@ use steam_runtime_abi::{
 use steam_runtime_features::achievements;
 use steam_runtime_features::request_code::{self, PendingQueue};
 use steam_runtime_features::rich_presence;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use steam_runtime_config::AppId;
 
@@ -25,6 +25,16 @@ use crate::install::config;
 // ---------------------------------------------------------------------------
 
 static PENDING: once_cell::sync::Lazy<PendingQueue> = once_cell::sync::Lazy::new(PendingQueue::new);
+
+#[cfg(target_pointer_width = "32")]
+const CNET_PACKET_DATA_OFFSET: usize = 4;
+#[cfg(target_pointer_width = "32")]
+const CNET_PACKET_SIZE_OFFSET: usize = 8;
+
+#[cfg(target_pointer_width = "64")]
+const CNET_PACKET_DATA_OFFSET: usize = 8;
+#[cfg(target_pointer_width = "64")]
+const CNET_PACKET_SIZE_OFFSET: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Outgoing frame handling called from BBuildAndAsyncSendFrame hook
@@ -38,16 +48,6 @@ pub enum SendFrameDecision {
 
 /// Inspect an outgoing frame and decide whether to pass, drop, or rewrite it.
 pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
-    match std::panic::catch_unwind(|| decide_send_frame_inner(data)) {
-        Ok(decision) => decision,
-        Err(_) => {
-            error!("netpacket: panic in decide_send_frame, passing through");
-            SendFrameDecision::Pass
-        }
-    }
-}
-
-fn decide_send_frame_inner(data: &[u8]) -> SendFrameDecision {
     let (emsg_raw, header_bytes, body_bytes) = match steam_runtime_abi::unpack_raw(data) {
         Some(v) => v,
         None => return SendFrameDecision::Pass,
@@ -276,21 +276,6 @@ pub unsafe fn try_inject<F>(
 ) where
     F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        try_inject_inner(this, packet, &call_original)
-    }));
-    if let Err(_) = result {
-        error!("netpacket: panic in try_inject");
-    }
-}
-
-unsafe fn try_inject_inner<F>(
-    this: *mut std::ffi::c_void,
-    packet: *mut std::ffi::c_void,
-    call_original: &F,
-) where
-    F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
-{
     let rp_inject_due = rich_presence::tracked_app().0 != 0 && rich_presence::has_inject_pending();
     if PENDING.is_empty() && !achievements::has_offline_responses() && !rp_inject_due {
         return;
@@ -358,8 +343,8 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     if packet.is_null() {
         return;
     }
-    let p_data = packet as *mut *mut u8;
-    let p_size = unsafe { (packet as *mut u8).add(4) } as *mut u32;
+    let p_data = unsafe { packet_data_slot(packet) };
+    let p_size = unsafe { packet_size_slot(packet) };
     let data = unsafe { *p_data };
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
@@ -465,12 +450,20 @@ unsafe fn replace_packet_data(packet: *mut std::ffi::c_void, data: Vec<u8>) {
     let len = boxed.len() as u32;
     let ptr = Box::into_raw(boxed) as *mut u8;
 
-    let p_data = packet as *mut *mut u8;
-    let p_size = unsafe { (packet as *mut u8).add(4) } as *mut u32;
+    let p_data = unsafe { packet_data_slot(packet) };
+    let p_size = unsafe { packet_size_slot(packet) };
     unsafe {
         *p_data = ptr;
         *p_size = len;
     }
+}
+
+unsafe fn packet_data_slot(packet: *mut std::ffi::c_void) -> *mut *mut u8 {
+    unsafe { (packet as *mut u8).add(CNET_PACKET_DATA_OFFSET) as *mut *mut u8 }
+}
+
+unsafe fn packet_size_slot(packet: *mut std::ffi::c_void) -> *mut u32 {
+    unsafe { (packet as *mut u8).add(CNET_PACKET_SIZE_OFFSET) as *mut u32 }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,10 +480,10 @@ struct PacketSwapGuard {
 
 impl PacketSwapGuard {
     /// # Safety
-    /// `packet` must be a valid CNetPacket pointer (i686 layout: +0 = *mut u8, +4 = u32).
+    /// `packet` must be a valid CNetPacket pointer.
     unsafe fn new(packet: *mut std::ffi::c_void, response: Vec<u8>) -> Self {
-        let p_data = packet as *mut *mut u8;
-        let p_size = unsafe { (packet as *mut u8).add(4) } as *mut u32;
+        let p_data = unsafe { packet_data_slot(packet) };
+        let p_size = unsafe { packet_size_slot(packet) };
         let orig_data = unsafe { *p_data };
         let orig_size = unsafe { *p_size };
 

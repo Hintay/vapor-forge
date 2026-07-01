@@ -166,8 +166,7 @@ fn flag_appears_in(haystack: &str, needle: &str) -> bool {
             let before = if abs > 0 { h[abs - 1] } else { b' ' };
             let after_pos = abs + n.len();
             let after = if after_pos < h.len() { h[after_pos] } else { 0 };
-            let sep =
-                |b: u8| matches!(b, b' ' | b'\t' | b'"' | b'\'' | 0);
+            let sep = |b: u8| matches!(b, b' ' | b'\t' | b'"' | b'\'' | 0);
             if sep(before) && sep(after) {
                 return true;
             }

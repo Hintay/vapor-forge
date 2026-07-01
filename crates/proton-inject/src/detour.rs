@@ -86,15 +86,11 @@ impl Detour {
 fn write_abs_jmp(addr: usize, target: usize) {
     let p = addr as *mut u8;
     unsafe {
-        *p = 0x48;            // REX.W
-        *p.add(1) = 0xB8;    // MOV RAX, imm64
-        ptr::copy_nonoverlapping(
-            &target as *const usize as *const u8,
-            p.add(2),
-            8,
-        );
-        *p.add(10) = 0xFF;   // JMP
-        *p.add(11) = 0xE0;   // RAX
+        *p = 0x48; // REX.W
+        *p.add(1) = 0xB8; // MOV RAX, imm64
+        ptr::copy_nonoverlapping(&target as *const usize as *const u8, p.add(2), 8);
+        *p.add(10) = 0xFF; // JMP
+        *p.add(11) = 0xE0; // RAX
     }
 }
 
@@ -107,7 +103,11 @@ fn prologue_steal_bytes(addr: usize) -> Option<usize> {
         let len = insn_length_x64(&bytes[pos..])?;
         pos += len;
     }
-    if pos >= MIN_STOLEN { Some(pos) } else { None }
+    if pos >= MIN_STOLEN {
+        Some(pos)
+    } else {
+        None
+    }
 }
 
 /// Minimal x86_64 instruction length decoder for common prologue patterns.
@@ -121,7 +121,12 @@ fn insn_length_x64(bytes: &[u8]) -> Option<usize> {
 
     // REX prefix (0x40-0x4F)
     let has_rex = bytes[i] >= 0x40 && bytes[i] <= 0x4F;
-    let rex = if has_rex { i += 1; bytes[i - 1] } else { 0 };
+    let rex = if has_rex {
+        i += 1;
+        bytes[i - 1]
+    } else {
+        0
+    };
     let rex_w = rex & 0x08 != 0;
 
     if i >= bytes.len() {
@@ -187,7 +192,9 @@ fn insn_length_x64(bytes: &[u8]) -> Option<usize> {
         }
         // Two-byte opcode (0F xx)
         0x0F => {
-            if i >= bytes.len() { return None; }
+            if i >= bytes.len() {
+                return None;
+            }
             let op2 = bytes[i];
             i += 1;
             match op2 {
@@ -292,14 +299,33 @@ fn contains_rip_relative(bytes: &[u8]) -> bool {
         // Instructions with ModR/M byte
         let has_modrm = matches!(
             op,
-            0x01 | 0x03 | 0x09 | 0x0B
-                | 0x21 | 0x23 | 0x29 | 0x2B
-                | 0x31 | 0x33 | 0x39 | 0x3B
-                | 0x63 | 0x69 | 0x6B
-                | 0x81 | 0x83 | 0x85 | 0x87
-                | 0x89 | 0x8B | 0x8D | 0x8F
-                | 0xC7 | 0xD1 | 0xD3
-                | 0xF7 | 0xFF
+            0x01 | 0x03
+                | 0x09
+                | 0x0B
+                | 0x21
+                | 0x23
+                | 0x29
+                | 0x2B
+                | 0x31
+                | 0x33
+                | 0x39
+                | 0x3B
+                | 0x63
+                | 0x69
+                | 0x6B
+                | 0x81
+                | 0x83
+                | 0x85
+                | 0x87
+                | 0x89
+                | 0x8B
+                | 0x8D
+                | 0x8F
+                | 0xC7
+                | 0xD1
+                | 0xD3
+                | 0xF7
+                | 0xFF
         );
 
         if has_modrm && pos < bytes.len() {

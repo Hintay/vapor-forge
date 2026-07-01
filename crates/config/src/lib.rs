@@ -322,7 +322,6 @@ fn default_timeout_ms() -> u64 {
     15000
 }
 
-
 impl Default for RuntimeSection {
     fn default() -> Self {
         Self {

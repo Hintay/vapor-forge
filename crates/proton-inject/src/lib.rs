@@ -2,6 +2,9 @@
 // 64-bit LD_AUDIT library loaded into Wine/Proton game processes.
 // Detours Wine's LdrLoadDll to inject a user DLL when steam_api64.dll loads.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 mod detour;
 mod ipc;
 mod loader;
@@ -22,7 +25,11 @@ const POLL_MAX_ATTEMPTS: u32 = 600; // 30 seconds
 
 #[no_mangle]
 pub extern "C" fn la_version(version: c_uint) -> c_uint {
-    if version == 0 { 0 } else { LAV_CURRENT.min(version) }
+    if version == 0 {
+        0
+    } else {
+        LAV_CURRENT.min(version)
+    }
 }
 
 #[no_mangle]

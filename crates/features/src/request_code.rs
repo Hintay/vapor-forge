@@ -144,6 +144,12 @@ impl PendingQueue {
     }
 }
 
+impl Default for PendingQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interception check
 // ---------------------------------------------------------------------------
@@ -356,7 +362,8 @@ mod tests {
                 inject: vec![steam_runtime_config::InjectApp {
                     id: AppId(480),
                     dlc: Vec::new(),
-                    ticket: Default::default(), purchase_time: 0,
+                    ticket: Default::default(),
+                    purchase_time: 0,
                 }],
                 ..Default::default()
             },

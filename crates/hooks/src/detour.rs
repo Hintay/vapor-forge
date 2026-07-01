@@ -1,8 +1,12 @@
 use retour::GenericDetour;
-use steam_runtime_patterns::{follow_relative_call, Pattern};
+use std::sync::Mutex;
+use steam_runtime_patterns::registry::{FollowMode, PatternLookup};
+use steam_runtime_patterns::{find_prologue_upwards, follow_relative_call, Pattern};
 use tracing::{debug, error, info, warn};
 
 use crate::pic_thunk;
+
+static TRAMPOLINE_PAGES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 pub struct CodeRegion {
     pub base: usize,
@@ -14,12 +18,32 @@ pub struct PendingDetour<F: retour::Function> {
     pub callee_addr: usize,
 }
 
-pub fn resolve_callee(
+pub fn resolve_pattern_entry(
     code: &CodeRegion,
     name: &str,
-    pattern_str: &str,
-    follow: bool,
+    entry: &PatternLookup<'_>,
 ) -> Option<usize> {
+    let addr = match entry.follow() {
+        FollowMode::None => resolve_callee(code, name, entry.pattern(), false)?,
+        FollowMode::Relative => resolve_callee(code, name, entry.pattern(), true)?,
+        FollowMode::Upward => {
+            let prologue = entry.prologue_bytes().or_else(|| {
+                error!(hook = name, "upward follow requires prologue bytes");
+                None
+            })?;
+            resolve_prologue_upwards(code, name, entry.pattern(), prologue)?
+        }
+        FollowMode::Call => resolve_follow_call(code, name, entry)?,
+    };
+
+    if entry.pic_entry() {
+        find_pic_entry(addr)
+    } else {
+        Some(addr)
+    }
+}
+
+fn resolve_callee(code: &CodeRegion, name: &str, pattern_str: &str, follow: bool) -> Option<usize> {
     let pattern = match Pattern::parse(pattern_str) {
         Ok(p) => p,
         Err(e) => {
@@ -71,9 +95,105 @@ pub fn resolve_callee(
     }
 }
 
+fn resolve_prologue_upwards(
+    code: &CodeRegion,
+    name: &str,
+    body_pattern_str: &str,
+    prologue_bytes: &[u8],
+) -> Option<usize> {
+    let body_pattern = match Pattern::parse(body_pattern_str) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(hook = name, error = %e, "body pattern parse failed");
+            return None;
+        }
+    };
+
+    let body_offset = match body_pattern.find_unique(code.bytes) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(hook = name, error = %e, "body pattern match failed");
+            return None;
+        }
+    };
+
+    match find_prologue_upwards(code.bytes, body_offset, prologue_bytes, 0x10000) {
+        Ok(entry_offset) => {
+            let addr = code.base + entry_offset;
+            debug!(
+                hook = name,
+                body = format_args!("0x{:x}", code.base + body_offset),
+                entry = format_args!("0x{:x}", addr),
+                "prologue resolved"
+            );
+            Some(addr)
+        }
+        Err(e) => {
+            warn!(hook = name, error = %e, "prologue scan failed");
+            None
+        }
+    }
+}
+
+fn resolve_follow_call(code: &CodeRegion, name: &str, entry: &PatternLookup<'_>) -> Option<usize> {
+    let pattern = match Pattern::parse(entry.pattern()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(hook = name, error = %e, "callsite pattern parse failed");
+            return None;
+        }
+    };
+    let callee_pattern = match entry.callee_pattern() {
+        Some(pattern) => match Pattern::parse(pattern) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                error!(hook = name, error = %e, "callee pattern parse failed");
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    let matches = pattern.find_all(code.bytes);
+    if matches.is_empty() {
+        warn!(hook = name, "callsite pattern match failed: no match");
+        return None;
+    }
+
+    for offset in matches.iter().copied() {
+        let Some(addr) = follow_last_call(code, offset, 256) else {
+            continue;
+        };
+        if let Some(callee_pattern) = callee_pattern.as_ref() {
+            let Some(callee_offset) = addr.checked_sub(code.base) else {
+                continue;
+            };
+            if !callee_pattern.matches_at(code.bytes, callee_offset) {
+                continue;
+            }
+        }
+        debug!(
+            hook = name,
+            match_addr = format_args!("0x{:x}", code.base + offset),
+            match_count = matches.len(),
+            addr = format_args!("0x{:x}", addr),
+            "call target resolved"
+        );
+        return Some(addr);
+    }
+
+    warn!(
+        hook = name,
+        match_count = matches.len(),
+        has_callee_pattern = callee_pattern.is_some(),
+        "no matching call target found"
+    );
+    None
+}
+
 /// Scan forward from `offset` for up to `max_scan` bytes, find the last
 /// E8 CALL before the next C3 (RET), and return its absolute target.
-pub fn follow_last_call(code: &CodeRegion, offset: usize, max_scan: usize) -> Option<usize> {
+fn follow_last_call(code: &CodeRegion, offset: usize, max_scan: usize) -> Option<usize> {
     let end = (offset + max_scan).min(code.bytes.len());
     let mut last_call_target: Option<usize> = None;
 
@@ -105,7 +225,7 @@ pub fn follow_last_call(code: &CodeRegion, offset: usize, max_scan: usize) -> Op
 /// PIC functions on i686 start with `E8 rel32` (CALL thunk) + `ADD reg, imm32`
 /// before the prologue. The ADD is 5 bytes (EAX, opcode 05) or 6 bytes (other
 /// registers, opcode 81 Cx), giving a total preamble of 10 or 11 bytes.
-pub fn find_pic_entry(prologue_addr: usize) -> Option<usize> {
+fn find_pic_entry(prologue_addr: usize) -> Option<usize> {
     for offset in [10usize, 11] {
         if prologue_addr < offset {
             continue;
@@ -146,6 +266,8 @@ pub unsafe fn create_detour<F: retour::Function>(
         return None;
     }
 
+    ensure_trampoline_pages_writable();
+
     // SAFETY: caller guarantees target is valid.
     // Note: GenericDetour::new() does NOT overwrite the original function.
     // that only happens on enable(). So the original prologue is still
@@ -165,6 +287,80 @@ pub unsafe fn create_detour<F: retour::Function>(
     }
 }
 
+/// Restore all trampoline pages touched by PIC repair to RX.
+///
+/// Called after a loader-consistent install pass. A future create_detour call
+/// will reopen these pages before asking retour to allocate again.
+pub fn restore_trampoline_pages_rx() {
+    set_trampoline_pages_protection(libc::PROT_READ | libc::PROT_EXEC, "RX");
+}
+
+/// Store a pending detour into its process-lifetime slot and finalize it.
+///
+/// Returns whether a detour was present and finalized.
+///
+/// # Safety
+/// `storage` must point to a valid `Option<GenericDetour<F>>` slot that lives
+/// for the process lifetime.
+pub unsafe fn store_and_finalize<F: retour::Function>(
+    name: &str,
+    storage: *mut Option<GenericDetour<F>>,
+    pending: Option<PendingDetour<F>>,
+) -> bool {
+    let Some(p) = pending else { return false };
+    let callee_addr = p.callee_addr;
+
+    // SAFETY: storing detour before enable so hook callbacks can access it.
+    unsafe { storage.write(Some(p.detour)) };
+
+    // SAFETY: storage points to the slot we just initialized.
+    unsafe {
+        let Some(detour) = (*storage).as_mut() else {
+            error!(hook = name, "stored detour missing after initialization");
+            return false;
+        };
+        finalize_detour(name, detour, callee_addr);
+    }
+    true
+}
+
+fn ensure_trampoline_pages_writable() {
+    set_trampoline_pages_protection(libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC, "RWX");
+}
+
+fn set_trampoline_pages_protection(protection: i32, label: &str) {
+    let Ok(pages) = TRAMPOLINE_PAGES.lock() else {
+        return;
+    };
+    if pages.is_empty() {
+        return;
+    }
+    let page_size = page_size();
+    let mut failures = 0usize;
+    for &page_start in pages.iter() {
+        // SAFETY: page_start values are page-aligned trampoline pages that
+        // were previously accepted by mprotect during PIC repair.
+        let rc = unsafe { libc::mprotect(page_start as *mut libc::c_void, page_size, protection) };
+        if rc != 0 {
+            failures += 1;
+        }
+    }
+    if failures == 0 {
+        debug!(
+            pages = pages.len(),
+            protection = label,
+            "trampoline pages protected"
+        );
+    } else {
+        warn!(
+            pages = pages.len(),
+            failures,
+            protection = label,
+            "trampoline page protection failed"
+        );
+    }
+}
+
 /// Apply PIC-thunk repair to a trampoline and enable the detour.
 ///
 /// # Safety
@@ -175,6 +371,7 @@ pub unsafe fn finalize_detour<F: retour::Function>(
     callee_addr: usize,
 ) {
     let tramp_addr = detour.trampoline() as *const _ as usize;
+    remember_trampoline_page(trampoline_page_start(tramp_addr));
 
     // Read the original prologue NOW, before enable() overwrites it.
     let mut prologue = [0u8; 16];
@@ -233,8 +430,8 @@ fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[
 
     // SAFETY: making the trampoline writable for PIC repair.
     unsafe {
-        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-        let page_start = tramp_addr & !(page_size - 1);
+        let page_size = page_size();
+        let page_start = trampoline_page_start(tramp_addr);
         if libc::mprotect(
             page_start as *mut libc::c_void,
             page_size,
@@ -248,18 +445,29 @@ fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[
         for (i, &byte) in plan.patch_bytes.iter().enumerate() {
             *patch_ptr.add(i) = byte;
         }
-        if libc::mprotect(
-            page_start as *mut libc::c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_EXEC,
-        ) != 0
-        {
-            warn!("PIC thunk repair: mprotect(RX) restore failed");
-        }
     }
     info!(
         register = format_args!("{:?}", register),
         offset = offset,
         "PIC thunk repaired"
     );
+}
+
+fn remember_trampoline_page(page_start: usize) {
+    let Ok(mut pages) = TRAMPOLINE_PAGES.lock() else {
+        return;
+    };
+    if !pages.contains(&page_start) {
+        pages.push(page_start);
+    }
+}
+
+fn trampoline_page_start(addr: usize) -> usize {
+    let page_size = page_size();
+    addr & !(page_size - 1)
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf is thread-safe and does not retain pointers.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }

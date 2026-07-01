@@ -26,6 +26,10 @@ impl<T> CUtlVector<T> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn capacity(&self) -> usize {
         self.m_n_allocation_count() as usize
     }
@@ -37,12 +41,14 @@ impl<T> CUtlVector<T> {
     /// # Safety
     /// Index must be < len().
     pub unsafe fn get(&self, index: usize) -> &T {
+        // SAFETY: caller guarantees index is in bounds for m_p_memory.
         unsafe { &*self.m_memory.m_p_memory.add(index) }
     }
 
     /// # Safety
     /// Index must be < len().
     pub unsafe fn get_mut(&mut self, index: usize) -> &mut T {
+        // SAFETY: caller guarantees index is in bounds for m_p_memory.
         unsafe { &mut *self.m_memory.m_p_memory.add(index) }
     }
 
@@ -104,6 +110,7 @@ pub mod package_info {
     /// # Safety
     /// pkg must point to a valid PackageInfo struct in Steam memory.
     pub unsafe fn status(pkg: *const u8) -> u32 {
+        // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { *(pkg.add(STATUS_OFF) as *const u32) }
     }
 
@@ -156,8 +163,62 @@ pub mod steamui {
         }
     }
 
+    #[repr(C)]
+    pub struct CSteamApp {
+        _prefix_00: [u32; 3],
+        app_id: u32,
+        _prefix_10: [u32; 2],
+        ownership_flags: u32,
+        app_state_flags: u32,
+        _prefix_20: [u32; 2],
+        purchased_time: u32,
+    }
+
+    impl CSteamApp {
+        pub const APP_ID_OFFSET: usize = core::mem::offset_of!(Self, app_id);
+        pub const OWNERSHIP_FLAGS_OFFSET: usize = core::mem::offset_of!(Self, ownership_flags);
+        pub const APP_STATE_FLAGS_OFFSET: usize = core::mem::offset_of!(Self, app_state_flags);
+        pub const PURCHASED_TIME_OFFSET: usize = core::mem::offset_of!(Self, purchased_time);
+
+        /// # Safety
+        /// app must point to a valid SteamUI CSteamApp object.
+        pub unsafe fn app_id(app: *const c_void) -> u32 {
+            let app = app.cast::<Self>();
+            // SAFETY: caller guarantees app points to the expected SteamUI object.
+            unsafe { core::ptr::addr_of!((*app).app_id).read() }
+        }
+
+        /// # Safety
+        /// app must point to a valid SteamUI CSteamApp object.
+        pub unsafe fn set_ownership_flags(app: *mut c_void, flags: u32) {
+            let app = app.cast::<Self>();
+            // SAFETY: caller guarantees app points to the expected SteamUI object.
+            unsafe { core::ptr::addr_of_mut!((*app).ownership_flags).write(flags) };
+        }
+
+        /// # Safety
+        /// app must point to a valid SteamUI CSteamApp object.
+        pub unsafe fn app_state_flags(app: *const c_void) -> u32 {
+            let app = app.cast::<Self>();
+            // SAFETY: caller guarantees app points to the expected SteamUI object.
+            unsafe { core::ptr::addr_of!((*app).app_state_flags).read() }
+        }
+
+        /// # Safety
+        /// app must point to a valid SteamUI CSteamApp object.
+        pub unsafe fn set_purchased_time(app: *mut c_void, time: u32) {
+            let app = app.cast::<Self>();
+            // SAFETY: caller guarantees app points to the expected SteamUI object.
+            unsafe { core::ptr::addr_of_mut!((*app).purchased_time).write(time) };
+        }
+    }
+
     const _: () = {
         assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x20);
+        assert!(CSteamApp::APP_ID_OFFSET == 0x0c);
+        assert!(CSteamApp::OWNERSHIP_FLAGS_OFFSET == 0x18);
+        assert!(CSteamApp::APP_STATE_FLAGS_OFFSET == 0x1c);
+        assert!(CSteamApp::PURCHASED_TIME_OFFSET == 0x28);
     };
 
     #[cfg(test)]
@@ -183,6 +244,14 @@ pub mod steamui {
         #[test]
         fn app_overview_change_removed_appid_offset() {
             assert_eq!(CAppOverviewChange::REMOVED_APPID_OFFSET, 0x20);
+        }
+
+        #[test]
+        fn steam_app_offsets() {
+            assert_eq!(CSteamApp::APP_ID_OFFSET, 0x0c);
+            assert_eq!(CSteamApp::OWNERSHIP_FLAGS_OFFSET, 0x18);
+            assert_eq!(CSteamApp::APP_STATE_FLAGS_OFFSET, 0x1c);
+            assert_eq!(CSteamApp::PURCHASED_TIME_OFFSET, 0x28);
         }
     }
 }

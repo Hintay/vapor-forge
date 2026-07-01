@@ -15,7 +15,7 @@ use tracing::{debug, info};
 
 /// Resolved injection for a single game launch.
 pub struct PendingInjection {
-    pub native_libs: Vec<String>,  // .so paths for LD_PRELOAD
+    pub native_libs: Vec<String>,   // .so paths for LD_PRELOAD
     pub proton_dll: Option<String>, // .dll path for Proton helper
 }
 
@@ -74,7 +74,13 @@ pub fn on_launch_app(app_id: AppId, libs: &[LibraryInjectEntry], launch_opts: &s
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
-            .insert(app_id, PendingInjection { native_libs, proton_dll });
+            .insert(
+                app_id,
+                PendingInjection {
+                    native_libs,
+                    proton_dll,
+                },
+            );
     }
 }
 

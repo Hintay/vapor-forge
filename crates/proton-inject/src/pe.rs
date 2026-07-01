@@ -50,8 +50,10 @@ pub fn find_export_rva(pe_bytes: &[u8], name: &str) -> Option<u32> {
     let functions_rva = read_u32(pe_bytes, dir + 28)?;
 
     let names_off = rva_to_offset(pe_bytes, sections_start, num_sections, names_rva)? as usize;
-    let ordinals_off = rva_to_offset(pe_bytes, sections_start, num_sections, ordinals_rva)? as usize;
-    let functions_off = rva_to_offset(pe_bytes, sections_start, num_sections, functions_rva)? as usize;
+    let ordinals_off =
+        rva_to_offset(pe_bytes, sections_start, num_sections, ordinals_rva)? as usize;
+    let functions_off =
+        rva_to_offset(pe_bytes, sections_start, num_sections, functions_rva)? as usize;
 
     for i in 0..num_names {
         let name_rva = read_u32(pe_bytes, names_off + i * 4)?;
@@ -67,7 +69,12 @@ pub fn find_export_rva(pe_bytes: &[u8], name: &str) -> Option<u32> {
     None
 }
 
-fn rva_to_offset(pe_bytes: &[u8], sections_start: usize, num_sections: usize, rva: u32) -> Option<u32> {
+fn rva_to_offset(
+    pe_bytes: &[u8],
+    sections_start: usize,
+    num_sections: usize,
+    rva: u32,
+) -> Option<u32> {
     for i in 0..num_sections {
         let sec = sections_start + i * 40;
         let virt_addr = read_u32(pe_bytes, sec + 12)?;
@@ -159,15 +166,6 @@ fn read_section_name(raw: &[u8]) -> String {
 
 /// Known PE section names associated with Denuvo/Themida DRM.
 pub const DENUVO_SECTIONS: &[&str] = &[".arch", ".srdata", ".themida"];
-
-/// Check if a PE file contains section names indicative of Denuvo DRM.
-pub fn has_denuvo_sections(pe_bytes: &[u8]) -> bool {
-    let names = section_names(pe_bytes);
-    names.iter().any(|n| {
-        let lower = n.to_ascii_lowercase();
-        DENUVO_SECTIONS.iter().any(|&ds| lower == ds)
-    })
-}
 
 /// Known DLL base names associated with Denuvo.
 const DENUVO_DLL_NAMES: &[&str] = &["denuvo"];

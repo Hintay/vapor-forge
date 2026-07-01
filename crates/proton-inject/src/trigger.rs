@@ -19,7 +19,9 @@ pub fn is_trigger_name(name: &[u16]) -> bool {
 pub fn trigger_already_loaded(maps: &[MapEntry]) -> bool {
     TRIGGER_DLLS.iter().any(|dll| {
         maps.iter().any(|e| {
-            e.path.rsplit('/').next()
+            e.path
+                .rsplit('/')
+                .next()
                 .map_or(false, |name| ascii_eq_ci(name, dll))
         })
     })
@@ -59,9 +61,9 @@ fn ascii_eq_ci(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).all(|(x, y)| {
-        x.to_ascii_lowercase() == y.to_ascii_lowercase()
-    })
+    a.bytes()
+        .zip(b.bytes())
+        .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
 }
 
 fn ascii_char_eq_ci(wide: u16, ascii: u8) -> bool {
@@ -80,7 +82,9 @@ mod tests {
         let name: Vec<u16> = "steam_api64.dll".encode_utf16().collect();
         assert!(is_trigger_name(&name));
 
-        let name: Vec<u16> = "C:\\windows\\system32\\Steam_API64.DLL".encode_utf16().collect();
+        let name: Vec<u16> = "C:\\windows\\system32\\Steam_API64.DLL"
+            .encode_utf16()
+            .collect();
         assert!(is_trigger_name(&name));
 
         let name: Vec<u16> = "kernel32.dll".encode_utf16().collect();
@@ -96,14 +100,18 @@ mod tests {
 
     #[test]
     fn trigger_in_maps() {
-        let maps = vec![
-            MapEntry { base: 0x1000, end: 0x2000, path: "/some/path/steam_api64.dll".into() },
-        ];
+        let maps = vec![MapEntry {
+            base: 0x1000,
+            end: 0x2000,
+            path: "/some/path/steam_api64.dll".into(),
+        }];
         assert!(trigger_already_loaded(&maps));
 
-        let maps = vec![
-            MapEntry { base: 0x1000, end: 0x2000, path: "/usr/lib/libc.so.6".into() },
-        ];
+        let maps = vec![MapEntry {
+            base: 0x1000,
+            end: 0x2000,
+            path: "/usr/lib/libc.so.6".into(),
+        }];
         assert!(!trigger_already_loaded(&maps));
     }
 }

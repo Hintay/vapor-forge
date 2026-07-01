@@ -1,6 +1,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+//! Read-only process/module visibility helpers.
+//!
+//! This crate is not a general memory editing API. Its unsafe surface is
+//! intentionally limited to bounded byte sampling from current-process mappings
+//! after `/proc/self/maps` containment checks.
+
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol};
 use std::collections::{BTreeMap, BTreeSet};
 use steam_runtime_core::Address;
@@ -448,7 +454,7 @@ fn sample_mapping_header(
 
     // SAFETY: The public caller accepted the raw-address contract. This helper also selected a
     // readable /proc/self/maps entry and checked that the requested range is fully contained in it.
-    let bytes = unsafe { copy_mapped_bytes(entry.range.base.0, len) };
+    let bytes = unsafe { copy_current_process_mapped_bytes(entry.range.base.0, len) };
     push_sample(
         report,
         &entry.path,
@@ -560,7 +566,7 @@ fn sample_public_dynamic_symbols(
 
         // SAFETY: The public caller accepted the raw-address contract. The symbol-derived address
         // was converted from disk ELF metadata and checked against one readable mapping entry.
-        let bytes = unsafe { copy_mapped_bytes(address, len) };
+        let bytes = unsafe { copy_current_process_mapped_bytes(address, len) };
         push_sample(
             report,
             &entry.path,
@@ -690,10 +696,10 @@ fn range_is_contained_in_entry(entry: &ProcMapsEntry, address: usize, len: usize
     end <= entry.range.end.0
 }
 
-unsafe fn copy_mapped_bytes(address: usize, len: usize) -> Vec<u8> {
+unsafe fn copy_current_process_mapped_bytes(address: usize, len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
-    // SAFETY: The caller guarantees that the source range is readable in the current process and
-    // that the destination buffer has at least `len` bytes.
+    // SAFETY: The caller guarantees that the source range is readable in the current process.
+    // The destination buffer has exactly `len` bytes.
     unsafe { core::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), len) };
     bytes
 }

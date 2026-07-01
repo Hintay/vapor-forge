@@ -65,19 +65,21 @@ impl IpcServer {
 
     /// Register a session token for an upcoming game launch.
     pub fn register_token(&self, token: [u8; proto::TOKEN_LEN], app_id: u32) {
-        self.tokens
-            .lock()
-            .unwrap()
-            .insert(token, TokenEntry { app_id });
+        let Ok(mut tokens) = self.tokens.lock() else {
+            warn!("ipc-server: token map lock poisoned");
+            return;
+        };
+        tokens.insert(token, TokenEntry { app_id });
         debug!(app_id, "ipc-server: token registered");
     }
 
     /// Remove a token when the game exits (called from CMsgClientGamesPlayed).
     pub fn revoke_app_tokens(&self, app_id: u32) {
-        self.tokens
-            .lock()
-            .unwrap()
-            .retain(|_, e| e.app_id != app_id);
+        let Ok(mut tokens) = self.tokens.lock() else {
+            warn!("ipc-server: token map lock poisoned");
+            return;
+        };
+        tokens.retain(|_, e| e.app_id != app_id);
     }
 
     pub fn socket_path(&self) -> &str {
@@ -126,16 +128,15 @@ fn handle_connection(
     };
 
     let (app_id, pid) = match hello {
-        Message::Hello {
-            token,
-            app_id,
-            pid,
-        } => {
+        Message::Hello { token, app_id, pid } => {
             // Validate the session token. Don't remove it: multiple Wine
             // child processes (launcher, game, overlay) share the same
             // env and may connect with the same token. Tokens are revoked
             // when the game exits via CMsgClientGamesPlayed.
-            let guard = tokens.lock().unwrap();
+            let Ok(guard) = tokens.lock() else {
+                warn!("ipc-server: token map lock poisoned");
+                return;
+            };
             match guard.get(&token) {
                 Some(e) if e.app_id == app_id => {
                     info!(app_id, pid, "ipc-server: client authenticated");
@@ -241,8 +242,5 @@ fn on_denuvo_detected(app_id: u32) {
     }
 
     steam_runtime_features::ticket::add_auto_delegate(aid);
-    info!(
-        app_id,
-        "ipc-server: Denuvo detected, auto-delegate enabled"
-    );
+    info!(app_id, "ipc-server: Denuvo detected, auto-delegate enabled");
 }

@@ -1,12 +1,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(target_os = "linux")]
 use once_cell::sync::Lazy;
+#[cfg(target_os = "linux")]
 use steam_runtime_core::{Lifecycle, SteamModuleState};
 
+#[cfg(target_os = "linux")]
 static LIFECYCLE: Lazy<Lifecycle> = Lazy::new(Lifecycle::new);
+#[cfg(target_os = "linux")]
 static STEAM_MODULES: Lazy<SteamModuleState> = Lazy::new(SteamModuleState::new);
-
 
 #[cfg(target_os = "linux")]
 mod linux_audit {
@@ -111,13 +114,28 @@ mod linux_audit {
         if flag != LA_ACT_CONSISTENT || !LIFECYCLE.has_reached_ready_for_heavy_init() {
             return;
         }
-        if STEAM_MODULES.steamclient_seen() {
-            steam_runtime_hooks::install::install_all();
+        let steamclient_seen = STEAM_MODULES.steamclient_seen();
+        let steamui_seen = STEAM_MODULES.steamui_seen();
+
+        use steam_runtime_hooks::install::{
+            ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
+        };
+
+        if steamclient_seen || steamui_seen {
+            ensure_runtime_initialized();
         }
-        // steamui.so may load in a later batch than steamclient.so.
-        // install_all (Once) already ran but steamui hooks were deferred.
-        if STEAM_MODULES.steamui_seen() {
-            steam_runtime_hooks::install::try_install_steamui();
+        if steamclient_seen {
+            install_hook_batch(HookBatch::SteamClient);
+        }
+        if steamui_seen {
+            install_hook_batch(HookBatch::SteamUi);
+        }
+
+        let steamclient_finished =
+            !steamclient_seen || is_hook_batch_finished(HookBatch::SteamClient);
+        let steamui_finished = !steamui_seen || is_hook_batch_finished(HookBatch::SteamUi);
+        if (steamclient_seen || steamui_seen) && steamclient_finished && steamui_finished {
+            steam_runtime_hooks::detour::restore_trampoline_pages_rx();
         }
     }
 

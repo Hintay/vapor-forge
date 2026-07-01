@@ -13,15 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use retour::GenericDetour;
-use steam_runtime_abi::steamui::CAppOverviewChange;
+use steam_runtime_abi::steamui::{CAppOverviewChange, CSteamApp};
 use steam_runtime_config::AppId;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-// CSteamApp field offsets (validated on Deck: specb-deck-runtime-verify memory)
-const CSAPP_APPID_OFFSET: usize = 0x0C;
-const CSAPP_OWNERSHIP_FLAGS_OFFSET: usize = 0x18;
-const CSAPP_APP_STATE_FLAGS_OFFSET: usize = 0x1C;
-const CSAPP_PURCHASED_TIME_OFFSET: usize = 0x28;
+use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
+use crate::original::detour_or_return;
 
 const EAPP_OWNERSHIP_FLAGS_NONE: u32 = 0;
 const EAPP_STATE_UNINSTALLED: u32 = 0;
@@ -63,12 +60,8 @@ extern "C" fn hk_run_frame(controller: *mut c_void) {
         drain_pending_removals(controller);
     }
     // SAFETY: detour set before hook enabled.
-    unsafe {
-        (*std::ptr::addr_of!(RUN_FRAME_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(controller)
-    }
+    let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR, ());
+    original.call(controller);
 }
 
 extern "C" fn hk_fill_in_app_overview(
@@ -77,7 +70,8 @@ extern "C" fn hk_fill_in_app_overview(
     app: *mut c_void,
 ) -> *mut c_void {
     if !app.is_null() {
-        let app_id_raw = unsafe { *((app as usize + CSAPP_APPID_OFFSET) as *const u32) };
+        // SAFETY: app is a CSteamApp* passed by SteamUI.
+        let app_id_raw = unsafe { CSteamApp::app_id(app) };
         let cfg = crate::install::config();
         if cfg.app_category(AppId(app_id_raw)).is_some() {
             // Use configured purchase time, or fall back to current time.
@@ -86,20 +80,17 @@ extern "C" fn hk_fill_in_app_overview(
                 t = unsafe { libc::time(std::ptr::null_mut()) } as u32;
             }
             // Stamp BEFORE the original copies the field into the overview.
-            // SAFETY: CSteamApp struct layout validated on Deck.
-            unsafe {
-                let time_ptr = (app as usize + CSAPP_PURCHASED_TIME_OFFSET) as *mut u32;
-                time_ptr.write(t);
-            }
+            // SAFETY: app is a CSteamApp* passed by SteamUI.
+            unsafe { CSteamApp::set_purchased_time(app, t) };
         }
     }
     // SAFETY: detour set before hook enabled.
-    unsafe {
-        (*std::ptr::addr_of!(FILL_IN_OVERVIEW_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, app_overview, app)
-    }
+    let original = detour_or_return!(
+        "CSteamUIAppController::FillInAppOverview",
+        FILL_IN_OVERVIEW_DETOUR,
+        std::ptr::null_mut()
+    );
+    original.call(this, app_overview, app)
 }
 
 extern "C" fn hk_build_complete_change(
@@ -109,17 +100,20 @@ extern "C" fn hk_build_complete_change(
 ) {
     // Call original first so the full snapshot is built.
     // SAFETY: detour set before hook enabled.
-    unsafe {
-        (*std::ptr::addr_of!(BUILD_COMPLETE_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(controller, change, callback_slot)
-    };
+    let original = detour_or_return!(
+        "CSteamUIAppController::BuildCompleteAppOverviewChange",
+        BUILD_COMPLETE_DETOUR,
+        ()
+    );
+    original.call(controller, change, callback_slot);
 
     if change.is_null() || !HAS_REMOVED.load(Ordering::Acquire) {
         return;
     }
-    let removed = REMOVED_APP_IDS.lock().unwrap();
+    let Ok(removed) = REMOVED_APP_IDS.lock() else {
+        error!("steamui: removed app set lock poisoned");
+        return;
+    };
     if removed.is_empty() {
         return;
     }
@@ -152,12 +146,12 @@ extern "C" fn hk_get_app_by_id(
         CONTROLLER.store(controller as usize, Ordering::Release);
     }
     // SAFETY: detour set before hook enabled.
-    unsafe {
-        (*std::ptr::addr_of!(GET_APP_BY_ID_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(controller, app_id, b_create)
-    }
+    let original = detour_or_return!(
+        "CSteamUIAppController::GetAppByID",
+        GET_APP_BY_ID_DETOUR,
+        std::ptr::null_mut()
+    );
+    original.call(controller, app_id, b_create)
 }
 
 extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
@@ -165,22 +159,16 @@ extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
         APP_CHANGE_SOURCE.store(source as usize, Ordering::Release);
     }
     // SAFETY: detour set before hook enabled.
-    unsafe {
-        (*std::ptr::addr_of!(MARK_APP_CHANGE_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(source, app_id, flags)
-    }
+    let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+    original.call(source, app_id, flags);
 }
 
-/// Install the two steamui.so capture hooks. Called from do_install after
-/// steamclient hooks are in place.
+/// Install the steamui.so hooks after the loader reaches a consistent state.
 pub fn install(
     steamui_code: &crate::detour::CodeRegion,
     registry: &steam_runtime_patterns::registry::PatternRegistry,
 ) -> bool {
     use crate::detour;
-    use steam_runtime_patterns::Pattern;
 
     let names = [
         "CSteamUIAppController::RunFrame",
@@ -188,10 +176,11 @@ pub fn install(
         "CSteamUIAppController::BuildCompleteAppOverviewChange",
         "CSteamUIAppController::GetAppByID",
         "CUpdateManager::MarkAppChange",
+        "google::protobuf::RepeatedField<uint32>::Add",
     ];
-    let mut addrs = [0usize; 5];
+    let mut addrs = [0usize; 6];
     let mut all_found = true;
-    for (i, name) in names.iter().enumerate() {
+    for (i, name) in names[..5].iter().enumerate() {
         let entry = match registry.get(name) {
             Some(e) => e,
             None => {
@@ -200,16 +189,8 @@ pub fn install(
                 continue;
             }
         };
-        let pat = match Pattern::parse(entry.pattern()) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(name, error = %e, "steamui: failed to parse pattern");
-                all_found = false;
-                continue;
-            }
-        };
         let short = name.rsplit("::").next().unwrap_or(name);
-        match detour::resolve_callee(steamui_code, short, &pat, false) {
+        match detour::resolve_pattern_entry(steamui_code, short, &entry) {
             Some(a) => addrs[i] = a,
             None => {
                 warn!(name, "steamui: pattern not found in steamui.so");
@@ -218,55 +199,122 @@ pub fn install(
         };
     }
 
-    // GetAppByID and MarkAppChange are required (capture hooks).
+    macro_rules! try_detour {
+        ($name:expr, $addr:expr, $fn:expr, $ty:ty, $slot:ident) => {{
+            let mut installed = false;
+            if $addr != 0 {
+                // SAFETY: $addr was resolved from steamui.so code for this function signature.
+                let target: $ty = unsafe { std::mem::transmute($addr) };
+                // SAFETY: target and replacement use the same function pointer type.
+                let pending = unsafe { detour::create_detour::<$ty>($name, target, $addr, $fn) };
+                // SAFETY: single-threaded init writes each detour slot once.
+                installed = unsafe {
+                    detour::store_and_finalize($name, std::ptr::addr_of_mut!($slot), pending)
+                };
+            }
+            installed
+        }};
+    }
+
+    let mut hook_results = vec![
+        HookResult {
+            name: names[0],
+            installed: false,
+            addr: addrs[0],
+        },
+        HookResult {
+            name: names[1],
+            installed: false,
+            addr: addrs[1],
+        },
+        HookResult {
+            name: names[2],
+            installed: false,
+            addr: addrs[2],
+        },
+        HookResult {
+            name: names[3],
+            installed: false,
+            addr: addrs[3],
+        },
+        HookResult {
+            name: names[4],
+            installed: false,
+            addr: addrs[4],
+        },
+        HookResult {
+            name: names[5],
+            installed: false,
+            addr: addrs[5],
+        },
+    ];
+
+    // GetAppByID and MarkAppChange are required capture hooks.
     if addrs[3] == 0 || addrs[4] == 0 {
         warn!("steamui: required capture hooks not found, aborting");
+        log_drift_summary("steamui.so", &hook_results);
+        if crate::install::config().runtime.diagnostics {
+            log_hook_details("steamui.so", &hook_results);
+        }
         return false;
     }
 
-    macro_rules! try_detour {
-        ($name:expr, $addr:expr, $fn:expr, $ty:ty, $slot:ident) => {
-            if $addr != 0 {
-                if let Some(d) = detour::create_detour::<$ty>($name, $addr, $fn) {
-                    unsafe { std::ptr::addr_of_mut!($slot).write(Some(d)) };
-                }
-            }
-        };
-    }
-
-    try_detour!("RunFrame", addrs[0], hk_run_frame as RunFrameFn, RunFrameFn, RUN_FRAME_DETOUR);
-    try_detour!("FillInAppOverview", addrs[1], hk_fill_in_app_overview as FillInAppOverviewFn, FillInAppOverviewFn, FILL_IN_OVERVIEW_DETOUR);
-    try_detour!("BuildComplete", addrs[2], hk_build_complete_change as BuildCompleteChangeFn, BuildCompleteChangeFn, BUILD_COMPLETE_DETOUR);
-    try_detour!("GetAppByID", addrs[3], hk_get_app_by_id as GetAppByIdFn, GetAppByIdFn, GET_APP_BY_ID_DETOUR);
-    try_detour!("MarkAppChange", addrs[4], hk_mark_app_change as MarkAppChangeFn, MarkAppChangeFn, MARK_APP_CHANGE_DETOUR);
-
-    // SAFETY: single-threaded init, never modified after.
-    unsafe {
-        for (name, slot_ptr) in [
-            ("RunFrame", std::ptr::addr_of!(RUN_FRAME_DETOUR)),
-            ("FillInAppOverview", std::ptr::addr_of!(FILL_IN_OVERVIEW_DETOUR)),
-            ("BuildComplete", std::ptr::addr_of!(BUILD_COMPLETE_DETOUR)),
-            ("GetAppByID", std::ptr::addr_of!(GET_APP_BY_ID_DETOUR)),
-            ("MarkAppChange", std::ptr::addr_of!(MARK_APP_CHANGE_DETOUR)),
-        ] {
-            if let Some(ref d) = *slot_ptr {
-                if let Err(e) = d.enable() {
-                    warn!(hook = name, error = %e, "steamui: failed to enable hook");
-                }
-            }
-        }
-    }
+    hook_results[0].installed = try_detour!(
+        "RunFrame",
+        addrs[0],
+        hk_run_frame as RunFrameFn,
+        RunFrameFn,
+        RUN_FRAME_DETOUR
+    );
+    hook_results[1].installed = try_detour!(
+        "FillInAppOverview",
+        addrs[1],
+        hk_fill_in_app_overview as FillInAppOverviewFn,
+        FillInAppOverviewFn,
+        FILL_IN_OVERVIEW_DETOUR
+    );
+    hook_results[2].installed = try_detour!(
+        "BuildComplete",
+        addrs[2],
+        hk_build_complete_change as BuildCompleteChangeFn,
+        BuildCompleteChangeFn,
+        BUILD_COMPLETE_DETOUR
+    );
+    hook_results[3].installed = try_detour!(
+        "GetAppByID",
+        addrs[3],
+        hk_get_app_by_id as GetAppByIdFn,
+        GetAppByIdFn,
+        GET_APP_BY_ID_DETOUR
+    );
+    hook_results[4].installed = try_detour!(
+        "MarkAppChange",
+        addrs[4],
+        hk_mark_app_change as MarkAppChangeFn,
+        MarkAppChangeFn,
+        MARK_APP_CHANGE_DETOUR
+    );
 
     // Resolve RepeatedField<uint32>::Add for BuildComplete protobuf mutation.
     // The body pattern matches both int32 and uint32 instantiations (isomorphic).
     // Take the second (higher-address) match which is the uint32 version.
-    resolve_repeated_field_add(steamui_code, registry);
+    if let Some(addr) = resolve_repeated_field_add(steamui_code, registry) {
+        addrs[5] = addr;
+        hook_results[5].addr = addr;
+        hook_results[5].installed = true;
+    }
 
     INSTALLED.store(true, Ordering::Release);
 
     if !all_found {
         warn!("steamui: some optional hooks missing, partial UI management");
     }
+    log_drift_summary("steamui.so", &hook_results);
+    if crate::install::config().runtime.diagnostics {
+        log_hook_details("steamui.so", &hook_results);
+    }
+
+    // SAFETY: single-threaded init reads the resolver slot after install attempt.
     let rfa = unsafe { (*std::ptr::addr_of!(REPEATED_FIELD_ADD)).is_some() };
     info!(
         run_frame = format_args!("{:#x}", addrs[0]),
@@ -286,89 +334,29 @@ pub fn install(
 fn resolve_repeated_field_add(
     steamui_code: &crate::detour::CodeRegion,
     registry: &steam_runtime_patterns::registry::PatternRegistry,
-) {
-    use steam_runtime_patterns::Pattern;
-    use steam_runtime_patterns::registry::FollowMode;
-
+) -> Option<usize> {
     let entry = match registry.get("google::protobuf::RepeatedField<uint32>::Add") {
         Some(e) => e,
-        None => return,
+        None => return None,
     };
-    let pat = match Pattern::parse(entry.pattern()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let callee_pat = match entry.callee_pattern() {
-        Some(pattern) => match Pattern::parse(pattern) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!(error = %e, "steamui: RepeatedField::Add callee pattern parse failed");
-                return;
-            }
-        },
-        None => None,
-    };
-
-    let addr = if entry.follow() == FollowMode::Call {
-        let matches = pat.find_all(steamui_code.bytes);
-        if matches.is_empty() {
-            warn!("steamui: RepeatedField::Add pattern match failed: no match");
-            return;
-        }
-
-        let mut resolved = None;
-        for offset in matches.iter().copied() {
-            if let Some(addr) = crate::detour::follow_last_call(steamui_code, offset, 256) {
-                if let Some(callee_pat) = callee_pat.as_ref() {
-                    let Some(callee_offset) = addr.checked_sub(steamui_code.base) else {
-                        continue;
-                    };
-                    if !callee_pat.matches_at(steamui_code.bytes, callee_offset) {
-                        continue;
-                    }
-                }
-                resolved = Some((offset, addr));
-                break;
-            }
-        }
-
-        match resolved {
-            Some((offset, addr)) => {
-                debug!(
-                    match_addr = format_args!("{:#x}", steamui_code.base + offset),
-                    match_count = matches.len(),
-                    addr = format_args!("{:#x}", addr),
-                    "steamui: RepeatedField::Add callsite resolved"
-                );
-                addr
-            }
-            None => {
-                warn!(
-                    match_count = matches.len(),
-                    has_callee_pattern = callee_pat.is_some(),
-                    "steamui: no matching RepeatedField::Add call target found"
-                );
-                return;
-            }
-        }
-    } else {
-        let offset = match pat.find_unique(steamui_code.bytes) {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, "steamui: RepeatedField::Add pattern match failed");
-                return;
-            }
-        };
-        steamui_code.base + offset
+    let addr = match crate::detour::resolve_pattern_entry(
+        steamui_code,
+        "google::protobuf::RepeatedField<uint32>::Add",
+        &entry,
+    ) {
+        Some(a) => a,
+        None => return None,
     };
 
     // SAFETY: addr is a validated function address in steamui.so .text.
     let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: single-threaded init writes the resolver slot once.
     unsafe { std::ptr::addr_of_mut!(REPEATED_FIELD_ADD).write(Some(f)) };
     info!(
         addr = format_args!("{:#x}", addr),
         "steamui: RepeatedField<uint32>::Add resolved"
     );
+    Some(addr)
 }
 
 /// Queue an app for removal from the library UI. The actual removal
@@ -377,15 +365,27 @@ pub fn queue_removal(app_id: AppId) {
     if !INSTALLED.load(Ordering::Acquire) {
         return;
     }
-    PENDING_REMOVALS.lock().unwrap().push(app_id);
+    let Ok(mut pending) = PENDING_REMOVALS.lock() else {
+        error!("steamui: pending removal lock poisoned");
+        return;
+    };
+    pending.push(app_id);
     HAS_PENDING.store(true, Ordering::Release);
     debug!(app = app_id.0, "steamui: removal queued");
 }
 
 /// Cancel a pending removal (e.g. when an app is re-added during hot-reload).
 pub fn cancel_removal(app_id: AppId) {
-    PENDING_REMOVALS.lock().unwrap().retain(|&id| id != app_id);
-    REMOVED_APP_IDS.lock().unwrap().retain(|&id| id != app_id.0);
+    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
+        pending.retain(|&id| id != app_id);
+    } else {
+        error!("steamui: pending removal lock poisoned");
+    }
+    if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
+        removed.retain(|&id| id != app_id.0);
+    } else {
+        error!("steamui: removed app set lock poisoned");
+    }
 }
 
 fn drain_pending_removals(controller: *mut c_void) {
@@ -395,7 +395,10 @@ fn drain_pending_removals(controller: *mut c_void) {
     }
 
     let draining: Vec<AppId> = {
-        let mut pending = PENDING_REMOVALS.lock().unwrap();
+        let Ok(mut pending) = PENDING_REMOVALS.lock() else {
+            error!("steamui: pending removal lock poisoned");
+            return;
+        };
         let v = std::mem::take(&mut *pending);
         if v.is_empty() {
             HAS_PENDING.store(false, Ordering::Release);
@@ -419,38 +422,37 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     }
 
     // SAFETY: calling through the trampoline with captured this pointers.
-    let app_ptr = unsafe {
-        (*std::ptr::addr_of!(GET_APP_BY_ID_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(controller, app_id.0, false)
-    };
+    let get_app_by_id = detour_or_return!(
+        "CSteamUIAppController::GetAppByID",
+        GET_APP_BY_ID_DETOUR,
+        ()
+    );
+    let app_ptr = get_app_by_id.call(controller, app_id.0, false);
     if app_ptr.is_null() {
         return;
     }
 
-    // SAFETY: CSteamApp struct layout validated on Deck.
+    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
     unsafe {
-        // Clear OwnershipFlags: [app+0x18] = 0
-        let flags_ptr = (app_ptr as usize + CSAPP_OWNERSHIP_FLAGS_OFFSET) as *mut u32;
-        flags_ptr.write(EAPP_OWNERSHIP_FLAGS_NONE);
+        CSteamApp::set_ownership_flags(app_ptr, EAPP_OWNERSHIP_FLAGS_NONE);
 
         // Only track in removed set if already uninstalled (matches OST).
-        let state = *((app_ptr as usize + CSAPP_APP_STATE_FLAGS_OFFSET) as *const u32);
+        let state = CSteamApp::app_state_flags(app_ptr);
         if state == EAPP_STATE_UNINSTALLED {
-            REMOVED_APP_IDS.lock().unwrap().push(app_id.0);
-            HAS_REMOVED.store(true, Ordering::Release);
+            if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
+                removed.push(app_id.0);
+                HAS_REMOVED.store(true, Ordering::Release);
+            } else {
+                error!("steamui: removed app set lock poisoned");
+            }
         }
     }
 
     // Notify UI
     // SAFETY: calling through the trampoline.
-    unsafe {
-        (*std::ptr::addr_of!(MARK_APP_CHANGE_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
-    }
+    let mark_app_change =
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     info!(app = app_id.0, "steamui: app removed from library");
 }
 
@@ -468,31 +470,24 @@ pub fn remove_app_and_send_change(app_id: AppId) {
     }
 
     // SAFETY: calling through the trampoline with captured this pointers.
-    let app_ptr = unsafe {
-        (*std::ptr::addr_of!(GET_APP_BY_ID_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(ctrl as *mut c_void, app_id.0, false)
-    };
+    let get_app_by_id = detour_or_return!(
+        "CSteamUIAppController::GetAppByID",
+        GET_APP_BY_ID_DETOUR,
+        ()
+    );
+    let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
     if app_ptr.is_null() {
         return;
     }
 
-    // Clear OwnershipFlags: [app+0x18] = 0
-    // SAFETY: CSteamApp struct layout validated on Deck.
-    unsafe {
-        let flags_ptr = (app_ptr as usize + CSAPP_OWNERSHIP_FLAGS_OFFSET) as *mut u32;
-        flags_ptr.write(0);
-    }
+    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
+    unsafe { CSteamApp::set_ownership_flags(app_ptr, EAPP_OWNERSHIP_FLAGS_NONE) };
 
     // Notify UI
     // SAFETY: calling through the trampoline.
-    unsafe {
-        (*std::ptr::addr_of!(MARK_APP_CHANGE_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
-    }
+    let mark_app_change =
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     info!(app = app_id.0, "steamui: app removed from library");
 }
 
@@ -508,31 +503,24 @@ pub fn stamp_purchase_time(app_id: AppId, time: u32) {
     }
 
     // SAFETY: calling through the trampoline.
-    let app_ptr = unsafe {
-        (*std::ptr::addr_of!(GET_APP_BY_ID_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(ctrl as *mut c_void, app_id.0, false)
-    };
+    let get_app_by_id = detour_or_return!(
+        "CSteamUIAppController::GetAppByID",
+        GET_APP_BY_ID_DETOUR,
+        ()
+    );
+    let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
     if app_ptr.is_null() {
         return;
     }
 
-    // Set PurchasedTime: [app+0x28] = time
-    // SAFETY: CSteamApp struct layout validated on Deck.
-    unsafe {
-        let time_ptr = (app_ptr as usize + CSAPP_PURCHASED_TIME_OFFSET) as *mut u32;
-        time_ptr.write(time);
-    }
+    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
+    unsafe { CSteamApp::set_purchased_time(app_ptr, time) };
 
     // Notify UI
     // SAFETY: calling through the trampoline.
-    unsafe {
-        (*std::ptr::addr_of!(MARK_APP_CHANGE_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
-    }
+    let mark_app_change =
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     debug!(app = app_id.0, time, "steamui: purchase time stamped");
 }
 
@@ -543,14 +531,11 @@ pub fn get_steamui_code() -> Option<crate::detour::CodeRegion> {
     let entries = find_proc_self_maps_targets(64).ok()?;
     let exec_entry = entries
         .iter()
-        .find(|e| e.perms.starts_with("r-xp") && e.path.ends_with("/steamui.so"))?;
+        .find(|e| e.permissions.starts_with("r-xp") && e.path.ends_with("/steamui.so"))?;
 
-    let base = exec_entry.base;
-    let size = exec_entry.size;
+    let base = exec_entry.range.base.0;
+    let size = exec_entry.range.size;
     // SAFETY: reading the executable mapping of steamui.so.
     let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    Some(crate::detour::CodeRegion {
-        base,
-        bytes,
-    })
+    Some(crate::detour::CodeRegion { base, bytes })
 }

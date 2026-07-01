@@ -22,13 +22,15 @@ pub fn parse_self_maps() -> Vec<MapEntry> {
 }
 
 pub fn find_module<'a>(entries: &'a [MapEntry], suffix: &str) -> Option<&'a MapEntry> {
-    entries.iter().find(|e| {
-        e.path.ends_with(suffix)
-            || e.path.rsplit('/').next() == Some(suffix)
-    })
+    entries
+        .iter()
+        .find(|e| e.path.ends_with(suffix) || e.path.rsplit('/').next() == Some(suffix))
 }
 
-pub fn find_module_with_path<'a>(entries: &'a [MapEntry], suffix: &str) -> Option<(usize, &'a str)> {
+pub fn find_module_with_path<'a>(
+    entries: &'a [MapEntry],
+    suffix: &str,
+) -> Option<(usize, &'a str)> {
     let entry = find_module(entries, suffix)?;
     Some((entry.base, &entry.path))
 }
@@ -80,8 +82,16 @@ mod tests {
     #[test]
     fn finds_module_by_suffix() {
         let entries = vec![
-            MapEntry { base: 0x1000, end: 0x2000, path: "/usr/lib/wine/x86_64-windows/ntdll.dll".into() },
-            MapEntry { base: 0x3000, end: 0x4000, path: "/usr/lib/libfoo.so".into() },
+            MapEntry {
+                base: 0x1000,
+                end: 0x2000,
+                path: "/usr/lib/wine/x86_64-windows/ntdll.dll".into(),
+            },
+            MapEntry {
+                base: 0x3000,
+                end: 0x4000,
+                path: "/usr/lib/libfoo.so".into(),
+            },
         ];
         assert!(find_module(&entries, "ntdll.dll").is_some());
         assert!(find_module(&entries, "bar.dll").is_none());

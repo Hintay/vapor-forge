@@ -165,7 +165,7 @@ pub fn drain_offline_responses() -> Vec<OfflineResponse> {
         Some(q) => q,
         None => return Vec::new(),
     };
-    let drained: Vec<OfflineResponse> = queue.drain(..).collect();
+    let drained = std::mem::take(queue);
     OFFLINE_QUEUE_COUNT.store(0, Ordering::Release);
     drained
 }

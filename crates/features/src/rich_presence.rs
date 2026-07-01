@@ -18,15 +18,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use steam_runtime_abi::{
-    ECLIENTPERSONASTATEFLAG_RICH_PRESENCE, EMSG_CLIENT_PERSONA_STATE, EPERSONASTATEFLAG_HAS_RICH_PRESENCE,
-    K_MSG_HDR_PROTO_FLAG,
+    ECLIENTPERSONASTATEFLAG_RICH_PRESENCE, EMSG_CLIENT_PERSONA_STATE,
+    EPERSONASTATEFLAG_HAS_RICH_PRESENCE, K_MSG_HDR_PROTO_FLAG,
 };
 use steam_runtime_config::AppId;
 use tracing::{debug, info};
 
+type RichPresenceKvs = HashMap<AppId, Vec<(String, String)>>;
+
 // Per-AppId rich presence KVs, extracted from the binary KV1 payload of
 // CMsgClientRichPresenceUpload.
-static RP_KVS: Mutex<Option<HashMap<AppId, Vec<(String, String)>>>> = Mutex::new(None);
+static RP_KVS: Mutex<Option<RichPresenceKvs>> = Mutex::new(None);
 
 // Cached self PersonaState template (raw header + body bytes) used as the
 // basis for manufactured inject packets.
@@ -89,8 +91,16 @@ pub fn on_rich_presence_upload(kv_data: &[u8]) {
     }
 
     let kvs = parse_binary_kv1(kv_data);
-    debug!(app = app.0, pairs = kvs.len(), "rich_presence: captured KVs");
-    RP_KVS.lock().unwrap().get_or_insert_with(HashMap::new).insert(app, kvs);
+    debug!(
+        app = app.0,
+        pairs = kvs.len(),
+        "rich_presence: captured KVs"
+    );
+    RP_KVS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(app, kvs);
     INJECT_PENDING.store(true, Ordering::Release);
 }
 
@@ -158,14 +168,21 @@ pub fn build_inject_packet(app_id: AppId) -> Option<Vec<u8>> {
     }
 
     let mut msg = steam_runtime_abi::ClientPersonaState::decode(cache.body.as_slice()).ok()?;
-    let entry = msg.friends.iter_mut().find(|f| f.friendid == Some(steamid))?;
+    let entry = msg
+        .friends
+        .iter_mut()
+        .find(|f| f.friendid == Some(steamid))?;
 
     apply_game_fields(entry, app_id);
     set_rich_presence_flag(&mut msg);
 
     let new_body = msg.encode_to_vec();
     let emsg_raw = EMSG_CLIENT_PERSONA_STATE | K_MSG_HDR_PROTO_FLAG;
-    Some(steam_runtime_abi::assemble_raw(emsg_raw, &cache.header, &new_body))
+    Some(steam_runtime_abi::assemble_raw(
+        emsg_raw,
+        &cache.header,
+        &new_body,
+    ))
 }
 
 /// Patch a live incoming PersonaState body if we are currently tracking an
@@ -182,7 +199,10 @@ pub fn patch_persona_state(body_bytes: &[u8]) -> Option<Vec<u8>> {
     }
 
     let mut msg = steam_runtime_abi::ClientPersonaState::decode(body_bytes).ok()?;
-    let entry = msg.friends.iter_mut().find(|f| f.friendid == Some(steamid))?;
+    let entry = msg
+        .friends
+        .iter_mut()
+        .find(|f| f.friendid == Some(steamid))?;
 
     apply_game_fields(entry, app);
     set_rich_presence_flag(&mut msg);
@@ -258,7 +278,9 @@ fn read_cstr(data: &[u8], pos: &mut usize) -> String {
     while *pos < data.len() && data[*pos] != 0 {
         *pos += 1;
     }
-    let s = std::str::from_utf8(&data[start..*pos]).unwrap_or("").to_owned();
+    let s = std::str::from_utf8(&data[start..*pos])
+        .unwrap_or("")
+        .to_owned();
     if *pos < data.len() {
         *pos += 1; // skip NUL terminator
     }
@@ -297,7 +319,10 @@ mod tests {
     fn apply_game_fields_sets_flag_and_kvs() {
         RP_KVS.lock().unwrap().replace({
             let mut m = HashMap::new();
-            m.insert(AppId(480), vec![("status".to_owned(), "Playing".to_owned())]);
+            m.insert(
+                AppId(480),
+                vec![("status".to_owned(), "Playing".to_owned())],
+            );
             m
         });
 

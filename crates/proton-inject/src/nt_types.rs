@@ -1,5 +1,4 @@
 // NT API type definitions for Wine's PE ntdll.
-// These are data types only; no unsafe code.
 
 pub const STATUS_SUCCESS: i32 = 0;
 

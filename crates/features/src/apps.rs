@@ -72,7 +72,8 @@ mod tests {
                     .map(|&id| InjectApp {
                         id: AppId(id),
                         dlc: Vec::new(),
-                        ticket: Default::default(), purchase_time: 0,
+                        ticket: Default::default(),
+                        purchase_time: 0,
                     })
                     .collect(),
                 ..Default::default()

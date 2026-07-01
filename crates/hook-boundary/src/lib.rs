@@ -1,5 +1,4 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(clippy::undocumented_unsafe_blocks)]
+#![forbid(unsafe_code)]
 
 use core::fmt;
 use thiserror::Error;

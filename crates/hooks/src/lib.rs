@@ -4,11 +4,15 @@
 #[cfg(target_os = "linux")]
 pub mod detour;
 #[cfg(target_os = "linux")]
+pub(crate) mod hook_report;
+#[cfg(target_os = "linux")]
 pub mod install;
 #[cfg(target_os = "linux")]
 pub mod ipc_server;
 #[cfg(target_os = "linux")]
 pub mod netpacket;
+#[cfg(target_os = "linux")]
+pub(crate) mod original;
 #[cfg(target_os = "linux")]
 pub mod package;
 pub mod pic_thunk;

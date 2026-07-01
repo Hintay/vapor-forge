@@ -55,7 +55,10 @@ impl TicketCache {
         lua_tickets: &HashMap<AppId, Vec<u8>>,
     ) -> Option<Vec<u8>> {
         if let Some(t) = lua_tickets.get(&app_id) {
-            debug!(app_id = app_id.0, "ticket: using Lua-provided encrypted ticket");
+            debug!(
+                app_id = app_id.0,
+                "ticket: using Lua-provided encrypted ticket"
+            );
             return Some(t.clone());
         }
         if let Some(t) = self.enc_tickets.lock().unwrap().get(&app_id) {
@@ -63,7 +66,10 @@ impl TicketCache {
             return Some(t.clone());
         }
         if let Some(t) = self.load_from_disk(app_id, "enc_ticket") {
-            debug!(app_id = app_id.0, "ticket: loaded encrypted ticket from disk");
+            debug!(
+                app_id = app_id.0,
+                "ticket: loaded encrypted ticket from disk"
+            );
             self.enc_tickets.lock().unwrap().insert(app_id, t.clone());
             return Some(t);
         }
@@ -73,7 +79,12 @@ impl TicketCache {
     /// Cache a ticket. `persist` = true writes to disk (for delegate tickets
     /// that must survive across account sessions).
     pub fn store_app_ticket(&self, app_id: AppId, data: Vec<u8>, persist: bool) {
-        info!(app_id = app_id.0, size = data.len(), persist, "ticket: caching app ticket");
+        info!(
+            app_id = app_id.0,
+            size = data.len(),
+            persist,
+            "ticket: caching app ticket"
+        );
         if persist {
             self.save_to_disk(app_id, "ticket", &data);
         }
@@ -82,7 +93,12 @@ impl TicketCache {
 
     /// Cache an encrypted ticket. `persist` = true writes to disk.
     pub fn store_enc_ticket(&self, app_id: AppId, data: Vec<u8>, persist: bool) {
-        info!(app_id = app_id.0, size = data.len(), persist, "ticket: caching encrypted ticket");
+        info!(
+            app_id = app_id.0,
+            size = data.len(),
+            persist,
+            "ticket: caching encrypted ticket"
+        );
         if persist {
             self.save_to_disk(app_id, "enc_ticket", &data);
         }
@@ -131,7 +147,7 @@ pub fn is_auto_delegate(app_id: AppId) -> bool {
         .lock()
         .unwrap()
         .as_ref()
-        .map_or(false, |s| s.contains(&app_id))
+        .is_some_and(|s| s.contains(&app_id))
 }
 
 /// Clear auto-delegate for an app (e.g. on game exit).

@@ -6,8 +6,7 @@ use retour::GenericDetour;
 use steam_runtime_abi::CAppOwnershipInfo;
 use steam_runtime_config::{AppId, DepotId, RuntimeConfig};
 use steam_runtime_memory::{find_proc_self_maps_targets, ProcMapsEntry};
-use steam_runtime_patterns::registry::{FollowMode, PatternRegistry};
-use steam_runtime_patterns::{find_prologue_upwards, Pattern};
+use steam_runtime_patterns::registry::PatternRegistry;
 use steam_runtime_scripting::ScriptState;
 use tracing::{debug, error, info, warn};
 
@@ -16,7 +15,9 @@ use steam_runtime_hook_boundary::{
 };
 
 use crate::detour::{self, CodeRegion, PendingDetour};
+use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
 use crate::netpacket::SendFrameDecision;
+use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
 // VMT slot indices resolved at runtime via VtableScan (no hardcoded values).
@@ -113,7 +114,10 @@ type SpawnProcessFn = extern "C" fn(
 // Static state
 // ---------------------------------------------------------------------------
 
-static HOOK_INSTALL: Once = Once::new();
+static STEAMCLIENT_BATCH_INSTALL_ONCE: Once = Once::new();
+static STEAMCLIENT_BATCH_FINISHED: AtomicBool = AtomicBool::new(false);
+static RUNTIME_INIT: Once = Once::new();
+static RUNTIME_HOOKS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static mut OWNERSHIP_DETOUR: Option<GenericDetour<CheckAppOwnershipFn>> = None;
 static mut SUBSCRIBED_DETOUR: Option<GenericDetour<GetSubscribedAppsFn>> = None;
@@ -141,7 +145,8 @@ static mut ORIG_LAUNCH_APP: Option<LaunchAppFn> = None;
 static mut SET_ENV_STRING_FN: Option<SetEnvStringFn> = None;
 static mut ORIG_GET_STEAMID: Option<GetSteamIDFn> = None;
 
-pub(crate) static IPC_SERVER: OnceLock<Option<std::sync::Arc<crate::ipc_server::IpcServer>>> = OnceLock::new();
+pub(crate) static IPC_SERVER: OnceLock<Option<std::sync::Arc<crate::ipc_server::IpcServer>>> =
+    OnceLock::new();
 
 static CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
@@ -177,9 +182,124 @@ static CODE_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Install all hooks. Safe to call multiple times; only the first call acts.
-pub fn install_all() {
-    HOOK_INSTALL.call_once(do_install);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookBatch {
+    SteamClient,
+    SteamUi,
+}
+
+/// Install one hook batch. Safe to call multiple times.
+pub fn install_hook_batch(batch: HookBatch) {
+    ensure_runtime_initialized();
+    match batch {
+        HookBatch::SteamClient => install_steamclient_hook_batch(),
+        HookBatch::SteamUi => install_steamui_hook_batch(),
+    }
+}
+
+pub fn is_hook_batch_finished(batch: HookBatch) -> bool {
+    match batch {
+        HookBatch::SteamClient => STEAMCLIENT_BATCH_FINISHED.load(Ordering::Acquire),
+        HookBatch::SteamUi => STEAMUI_BATCH_FINISHED.load(Ordering::Acquire),
+    }
+}
+
+fn install_steamclient_hook_batch() {
+    STEAMCLIENT_BATCH_INSTALL_ONCE.call_once(|| {
+        info!("hook-install: steamclient batch started");
+        do_install();
+        STEAMCLIENT_BATCH_FINISHED.store(true, Ordering::Release);
+        info!("hook-install: steamclient batch finished");
+    });
+}
+
+/// Initialize process-wide runtime state shared by every hook batch.
+///
+/// This sets up diagnostics, loads config and scripts, publishes the ArcSwap
+/// stores, primes feature state, and starts config watching. It is intentionally
+/// separate from steamclient detour installation so later modules can rely on
+/// the same runtime without depending on steamclient-specific setup.
+pub fn ensure_runtime_initialized() {
+    RUNTIME_INIT.call_once(|| {
+        // Early init so config loading errors can be logged.
+        steam_runtime_diagnostics::init("info");
+
+        let (config, config_path) = load_config();
+
+        steam_runtime_diagnostics::init(&config.runtime.log_level);
+
+        // Execute Lua scripts and merge addappid results into config.
+        let (config, script_state) = execute_and_merge_scripts(config);
+
+        let has_script_apps = !script_state.apps.is_empty();
+        let hooks_enabled =
+            config.has_any_inject_apps() || has_script_apps || config.apps.shared.enabled;
+
+        let inject_count = config.apps.inject.len();
+        let dlc_count: usize = config.apps.inject.iter().map(|a| a.dlc.len()).sum();
+        if hooks_enabled {
+            info!(
+                inject = inject_count,
+                dlc = dlc_count,
+                script_apps = script_state.apps.len(),
+                sharing = config.apps.shared.enabled,
+                "hook-install: config ready"
+            );
+        } else {
+            info!("hook-install: nothing to do, skipping");
+        }
+
+        if hooks_enabled {
+            // Load stat donor SteamIDs from Lua scripts.
+            steam_runtime_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
+
+            // Load AppAvatar mappings from config static_map and Lua setavatar.
+            steam_runtime_features::app_avatar::load_static_map(&config.app_avatar);
+            for (&app, &avatar) in &script_state.avatars {
+                steam_runtime_features::app_avatar::set_avatar(app, avatar);
+            }
+        }
+
+        CONFIG.store(std::sync::Arc::new(config));
+        SCRIPT_STATE.store(std::sync::Arc::new(script_state));
+        RUNTIME_HOOKS_ENABLED.store(hooks_enabled, Ordering::Release);
+
+        if !hooks_enabled {
+            return;
+        }
+
+        // Start the IPC server only when a feature that consumes IPC events
+        // is enabled and a proton helper is available.
+        {
+            let cfg = CONFIG.load();
+            let needs_ipc = hooks_enabled && cfg.ticket.auto_delegate;
+            let has_proton = needs_ipc
+                && (cfg
+                    .library_inject
+                    .libs
+                    .iter()
+                    .any(|l| l.path.ends_with(".dll"))
+                    || !cfg.library_inject.helper_path.is_empty());
+            let server = if has_proton {
+                crate::ipc_server::IpcServer::start()
+            } else {
+                if needs_ipc {
+                    warn!("hook-install: auto_delegate enabled but no proton helper configured");
+                }
+                None
+            };
+            let _ = IPC_SERVER.set(server);
+        }
+
+        // Force TICKET_CACHE lazy init while config is loaded.
+        let _ = &*TICKET_CACHE;
+
+        crate::watcher::start(&CONFIG, &SCRIPT_STATE, &PACKAGE_STATE, config_path);
+    });
+}
+
+fn runtime_hooks_enabled() -> bool {
+    RUNTIME_HOOKS_ENABLED.load(Ordering::Acquire)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +320,6 @@ fn load_pattern_registry() -> PatternRegistry {
 }
 
 /// Resolve a function address from the registry and create a pending detour.
-///
-/// Handles all three follow modes:
-/// - `None`:     pattern matches the prologue directly
-/// - `Relative`: pattern matches a call site; follow E8/E9 rel32
-/// - `Upward`:   pattern matches body; scan backward for prologue bytes
 fn resolve_from_registry<F: retour::Function>(
     registry: &PatternRegistry,
     code: &CodeRegion,
@@ -216,17 +331,7 @@ fn resolve_from_registry<F: retour::Function>(
         None
     })?;
 
-    let addr = match entry.follow() {
-        FollowMode::None => detour::resolve_callee(code, name, entry.pattern(), false)?,
-        FollowMode::Relative => detour::resolve_callee(code, name, entry.pattern(), true)?,
-        FollowMode::Upward => {
-            let prologue = entry.prologue_bytes().or_else(|| {
-                error!(hook = name, "upward follow requires prologue bytes");
-                None
-            })?;
-            resolve_prologue_upwards(code, name, entry.pattern(), prologue)?
-        }
-    };
+    let addr = detour::resolve_pattern_entry(code, name, &entry)?;
 
     // SAFETY: F is a function pointer type; its bit pattern is the address.
     let replacement_addr: usize = unsafe { std::mem::transmute_copy(&replacement) };
@@ -240,25 +345,6 @@ fn resolve_from_registry<F: retour::Function>(
     let target: F = unsafe { std::mem::transmute_copy(&addr) };
     // SAFETY: target is a valid function pointer.
     unsafe { detour::create_detour(name, target, addr, replacement) }
-}
-
-/// Store a pending detour into its static and finalize (PIC repair + enable).
-///
-/// # Safety
-/// `storage` must point to a valid `Option<GenericDetour<F>>` static.
-unsafe fn store_and_finalize<F: retour::Function>(
-    name: &str,
-    storage: *mut Option<GenericDetour<F>>,
-    pending: Option<PendingDetour<F>>,
-) {
-    let Some(p) = pending else { return };
-    let callee_addr = p.callee_addr;
-    // SAFETY: storing detour before enable so hook callback can access it.
-    unsafe { storage.write(Some(p.detour)) };
-    // SAFETY: PIC repair + enable on the stored detour.
-    unsafe {
-        detour::finalize_detour(name, (*storage).as_mut().unwrap(), callee_addr);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,62 +416,8 @@ fn validate_vmt_hook_eligibility(
 // ---------------------------------------------------------------------------
 
 fn do_install() {
-    // Early init so config loading errors can be logged
-    steam_runtime_diagnostics::init("info");
-
-    let (config, config_path) = load_config();
-
-    steam_runtime_diagnostics::init(&config.runtime.log_level);
-
-    // Execute Lua scripts and merge addappid results into config
-    let (config, script_state) = execute_and_merge_scripts(config);
-
-    let has_script_apps = !script_state.apps.is_empty();
-    if !config.has_any_inject_apps() && !has_script_apps && !config.apps.shared.enabled {
-        info!("hook-install: nothing to do, skipping");
+    if !runtime_hooks_enabled() {
         return;
-    }
-
-    let inject_count = config.apps.inject.len();
-    let dlc_count: usize = config.apps.inject.iter().map(|a| a.dlc.len()).sum();
-    info!(
-        inject = inject_count,
-        dlc = dlc_count,
-        script_apps = script_state.apps.len(),
-        sharing = config.apps.shared.enabled,
-        "hook-install: config ready"
-    );
-
-    // Load stat donor SteamIDs from Lua scripts
-    steam_runtime_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
-
-    // Load AppAvatar mappings (config static_map + lua setavatar)
-    steam_runtime_features::app_avatar::load_static_map(&config.app_avatar);
-    for (&app, &avatar) in &script_state.avatars {
-        steam_runtime_features::app_avatar::set_avatar(app, avatar);
-    }
-
-    CONFIG.store(std::sync::Arc::new(config));
-    SCRIPT_STATE.store(std::sync::Arc::new(script_state));
-
-    // Start the IPC server only when a feature that consumes IPC events
-    // is enabled AND a proton helper is available.
-    {
-        let cfg = CONFIG.load();
-        let needs_ipc = cfg.ticket.auto_delegate;
-        let has_proton = needs_ipc && (
-            cfg.library_inject.libs.iter().any(|l| l.path.ends_with(".dll"))
-            || !cfg.library_inject.helper_path.is_empty()
-        );
-        let server = if has_proton {
-            crate::ipc_server::IpcServer::start()
-        } else {
-            if needs_ipc {
-                warn!("hook-install: auto_delegate enabled but no proton helper configured");
-            }
-            None
-        };
-        let _ = IPC_SERVER.set(server);
     }
 
     let code = match get_steamclient_code() {
@@ -551,104 +583,92 @@ fn do_install() {
     // Phase 2: PIC-repair all trampolines, then enable.
     // SAFETY: each static is written exactly once during init.
     unsafe {
-        store_and_finalize(
+        detour::store_and_finalize(
             "CUser::CheckAppOwnership",
             std::ptr::addr_of_mut!(OWNERSHIP_DETOUR),
             d_ownership,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CUser::GetSubscribedApps",
             std::ptr::addr_of_mut!(SUBSCRIBED_DETOUR),
             d_subscribed,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientRemoteStorage::RunIPCFrame",
             std::ptr::addr_of_mut!(REMOTE_STORAGE_RUN_IPC_DETOUR),
             d_remote_storage_ipc,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientAppManager::RunIPCFrame",
             std::ptr::addr_of_mut!(APP_MANAGER_DETOUR),
             d_app_mgr_ipc,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientApps::RunIPCFrame",
             std::ptr::addr_of_mut!(CLIENT_APPS_DETOUR),
             d_client_apps_ipc,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CPackageInfo::GetPackageInfo",
             std::ptr::addr_of_mut!(GET_PKG_INFO_DETOUR),
             d_get_pkg_info,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientUser::GetAppOwnershipTicketExtendedData",
             std::ptr::addr_of_mut!(TICKET_EXT_DATA_DETOUR),
             d_ticket_ext,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientUser::BUpdateAppOwnershipTicket",
             std::ptr::addr_of_mut!(UPDATE_TICKET_DETOUR),
             d_update_ticket,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "IClientUser::IsUserSubscribedAppInTicket",
             std::ptr::addr_of_mut!(IS_SUBSCRIBED_IN_TICKET_DETOUR),
             d_is_sub_ticket,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "BuildDepotDependency",
             std::ptr::addr_of_mut!(BUILD_DEPOT_DETOUR),
             d_build_depot,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "LoadDepotDecryptionKey",
             std::ptr::addr_of_mut!(DEPOT_KEY_DETOUR),
             d_depot_key,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CWebSocketConnection::BBuildAndAsyncSendFrame",
             std::ptr::addr_of_mut!(SEND_FRAME_DETOUR),
             d_send_frame,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CCMConnection::RecvPkt",
             std::ptr::addr_of_mut!(RECV_PKT_DETOUR),
             d_recv_pkt,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CConfigStore::WriteVdfFile",
             std::ptr::addr_of_mut!(WRITE_VDF_DETOUR),
             d_write_vdf,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CUser::BuildSpawnEnvBlock",
             std::ptr::addr_of_mut!(BUILD_SPAWN_ENV_DETOUR),
             d_build_spawn_env,
         );
-        store_and_finalize(
+        detour::store_and_finalize(
             "CUser::SpawnProcess",
             std::ptr::addr_of_mut!(SPAWN_PROCESS_DETOUR),
             d_spawn_process,
         );
     }
 
-    // Force TICKET_CACHE lazy init while we have config loaded
-    let _ = &*TICKET_CACHE;
-
-    // Install steamui.so hooks for library UI management.
-    // steamui.so may not be loaded yet at this point (la_activity fires
-    // after steamclient.so, steamui.so loads later). Try now, retry in
-    // hk_get_pkg_info when pkg0 is captured (steamui.so is guaranteed
-    // loaded by then).
-    try_install_steamui_hooks(&registry);
-
-    crate::watcher::start(&CONFIG, &SCRIPT_STATE, &PACKAGE_STATE, config_path);
-
-    log_drift_summary(&hook_results);
+    log_drift_summary("steamclient.so", &hook_results);
 
     if CONFIG.load().runtime.diagnostics {
-        log_hook_details(&hook_results);
+        log_hook_details("steamclient.so", &hook_results);
     }
 
     // Background fetch of online pattern updates
@@ -661,56 +681,6 @@ fn do_install() {
     }
 }
 
-fn log_drift_summary(hook_results: &[HookResult]) {
-    let entries = match find_proc_self_maps_targets(16) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    if let Some(entry) = entries.iter().find(|e| e.path.ends_with("/steamclient.so")) {
-        let build_id = steam_runtime_memory::summarize_elf_file(
-            &entry.path,
-            steam_runtime_memory::ElfMetadataLimits::default(),
-        )
-        .ok()
-        .and_then(|m| m.build_id);
-        info!(
-            build_id = build_id.as_deref().unwrap_or("unknown"),
-            base = format_args!("0x{:x}", entry.range.base.0),
-            "Diagnostics: steamclient.so"
-        );
-    }
-
-    let found = hook_results.iter().filter(|r| r.installed).count();
-    let missing = hook_results.len() - found;
-    info!(
-        found = found,
-        missing = missing,
-        total = hook_results.len(),
-        "Diagnostics: pattern summary"
-    );
-
-    for r in hook_results.iter().filter(|r| !r.installed) {
-        info!(hook = r.name, "Diagnostics: pattern missing");
-    }
-}
-
-fn log_hook_details(hook_results: &[HookResult]) {
-    for r in hook_results {
-        debug!(
-            hook = r.name,
-            installed = r.installed,
-            addr = format_args!("0x{:x}", r.addr),
-            "Diagnostics: hook detail"
-        );
-    }
-}
-
-struct HookResult {
-    name: &'static str,
-    installed: bool,
-    addr: usize,
-}
-
 // ---------------------------------------------------------------------------
 // Config helper
 // ---------------------------------------------------------------------------
@@ -720,10 +690,7 @@ pub(crate) fn config() -> arc_swap::Guard<std::sync::Arc<RuntimeConfig>> {
 }
 
 /// Config ticket mode overlaid with runtime auto-delegate detections.
-fn effective_ticket_mode(
-    cfg: &RuntimeConfig,
-    app_id: AppId,
-) -> steam_runtime_config::TicketMode {
+fn effective_ticket_mode(cfg: &RuntimeConfig, app_id: AppId) -> steam_runtime_config::TicketMode {
     let mode = cfg.ticket_mode(app_id);
     if mode == steam_runtime_config::TicketMode::Forge
         && steam_runtime_features::ticket::is_auto_delegate(app_id)
@@ -732,8 +699,6 @@ fn effective_ticket_mode(
     }
     mode
 }
-
-
 
 pub(crate) fn script_state() -> arc_swap::Guard<std::sync::Arc<ScriptState>> {
     SCRIPT_STATE.load()
@@ -749,12 +714,8 @@ extern "C" fn hk_check_app_ownership(
     out: *mut CAppOwnershipInfo,
 ) -> u32 {
     // SAFETY: OWNERSHIP_DETOUR set before hook enabled, never modified after.
-    let result = unsafe {
-        (*std::ptr::addr_of!(OWNERSHIP_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, app_id, out)
-    };
+    let original = detour_or_return!("CheckAppOwnership", OWNERSHIP_DETOUR, 0);
+    let result = original.call(this, app_id, out);
 
     if out.is_null() {
         return result;
@@ -810,12 +771,8 @@ extern "C" fn hk_get_subscribed_apps(
     a3: u8,
 ) -> u32 {
     // SAFETY: SUBSCRIBED_DETOUR set before hook enabled, never modified after.
-    let count = unsafe {
-        (*std::ptr::addr_of!(SUBSCRIBED_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, app_list, size, a3)
-    };
+    let original = detour_or_return!("GetSubscribedApps", SUBSCRIBED_DETOUR, 0);
+    let count = original.call(this, app_list, size, a3);
 
     let cfg = config();
 
@@ -843,17 +800,17 @@ extern "C" fn hk_remote_storage_run_ipc_frame(
     }
 
     // SAFETY: REMOTE_STORAGE_RUN_IPC_DETOUR set before enabled.
-    unsafe {
-        (*std::ptr::addr_of!(REMOTE_STORAGE_RUN_IPC_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, a1, a2, a3);
-    }
+    let original = detour_or_return!(
+        "IClientRemoteStorage::RunIPCFrame",
+        REMOTE_STORAGE_RUN_IPC_DETOUR,
+        ()
+    );
+    original.call(this, a1, a2, a3);
 }
 
 extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> bool {
     // SAFETY: ORIGINAL_IS_CLOUD_ENABLED set before VMT swap.
-    let original = unsafe { (*std::ptr::addr_of!(ORIGINAL_IS_CLOUD_ENABLED)).unwrap() };
+    let original = vmt_or_return!("IsCloudEnabledForApp", ORIGINAL_IS_CLOUD_ENABLED, true);
     let result = original(this, app_id);
 
     let cfg = config();
@@ -925,17 +882,13 @@ extern "C" fn hk_app_manager_run_ipc_frame(
     }
 
     // SAFETY: APP_MANAGER_DETOUR set before enabled.
-    unsafe {
-        (*std::ptr::addr_of!(APP_MANAGER_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, a1, a2, a3);
-    }
+    let original = detour_or_return!("IClientAppManager::RunIPCFrame", APP_MANAGER_DETOUR, ());
+    original.call(this, a1, a2, a3);
 }
 
 extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u32) -> bool {
     // SAFETY: original function pointer set before VMT swap.
-    let original = unsafe { (*std::ptr::addr_of!(ORIG_IS_APP_DLC_INSTALLED)).unwrap() };
+    let original = vmt_or_return!("IsAppDlcInstalled", ORIG_IS_APP_DLC_INSTALLED, false);
     let result = original(this, app_id, dlc_id);
 
     let cfg = config();
@@ -949,7 +902,7 @@ extern "C" fn hk_b_is_dlc_enabled(
     unknown: *mut c_void,
 ) -> bool {
     // SAFETY: original function pointer set before VMT swap.
-    let original = unsafe { (*std::ptr::addr_of!(ORIG_B_IS_DLC_ENABLED)).unwrap() };
+    let original = vmt_or_return!("BIsDlcEnabled", ORIG_B_IS_DLC_ENABLED, false);
     let result = original(this, app_id, dlc_id, unknown);
 
     let cfg = config();
@@ -968,7 +921,8 @@ extern "C" fn hk_launch_app(
         debug!(app_id, "LaunchApp");
     }
     // Flag evaluation moved to SpawnProcess hook (has pCommandLine directly).
-    unsafe { (*std::ptr::addr_of!(ORIG_LAUNCH_APP)).unwrap()(this, p_app_id, a2, a3, a4) }
+    let original = vmt_or_return!("LaunchApp", ORIG_LAUNCH_APP, std::ptr::null_mut());
+    original(this, p_app_id, a2, a3, a4)
 }
 
 fn install_app_manager_vmt(this: *mut c_void) {
@@ -1042,12 +996,8 @@ extern "C" fn hk_client_apps_run_ipc_frame(
     }
 
     // SAFETY: CLIENT_APPS_DETOUR set before enabled.
-    unsafe {
-        (*std::ptr::addr_of!(CLIENT_APPS_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, a1, a2, a3);
-    }
+    let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR, ());
+    original.call(this, a1, a2, a3);
 }
 
 // DLC enumeration (GetDLCCount / BGetDLCDataByIndex) is NOT hooked.
@@ -1073,7 +1023,7 @@ fn install_client_apps_vmt(_this: *mut c_void) {
 /// matches the existing single-game-at-a-time launch model.
 extern "C" fn hk_get_steamid(this: *mut c_void) -> u64 {
     // SAFETY: ORIG_GET_STEAMID set before the VMT slot is swapped.
-    let original = unsafe { (*std::ptr::addr_of!(ORIG_GET_STEAMID)).unwrap() };
+    let original = vmt_or_return!("GetSteamID", ORIG_GET_STEAMID, 0);
     let real_steamid = original(this);
 
     let delegate = steam_runtime_features::ticket::delegate_steamid();
@@ -1139,22 +1089,14 @@ extern "C" fn hk_write_vdf_file(
                 "cloud: VDF write filtered"
             );
             // SAFETY: calling original with filtered buffer.
-            return unsafe {
-                (*std::ptr::addr_of!(WRITE_VDF_DETOUR))
-                    .as_ref()
-                    .unwrap()
-                    .call(a0, a1, a2, a3, filtered.as_ptr(), filtered.len() as u32)
-            };
+            let original = detour_or_return!("WriteVdfFile", WRITE_VDF_DETOUR, 0);
+            return original.call(a0, a1, a2, a3, filtered.as_ptr(), filtered.len() as u32);
         }
     }
 
     // SAFETY: pass through unmodified.
-    unsafe {
-        (*std::ptr::addr_of!(WRITE_VDF_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(a0, a1, a2, a3, buffer, size)
-    }
+    let original = detour_or_return!("WriteVdfFile", WRITE_VDF_DETOUR, 0);
+    original.call(a0, a1, a2, a3, buffer, size)
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,21 +1115,17 @@ extern "C" fn hk_build_spawn_env_block(
 ) -> i32 {
     // Call original first so Steam has already populated the env block.
     // SAFETY: BUILD_SPAWN_ENV_DETOUR set before hook enabled, never modified after.
-    let result = unsafe {
-        (*std::ptr::addr_of!(BUILD_SPAWN_ENV_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(
-                game_id,
-                exe_path,
-                working_dir,
-                launch_ctx,
-                flags,
-                something,
-                env_map,
-                context,
-            )
-    };
+    let original = detour_or_return!("BuildSpawnEnvBlock", BUILD_SPAWN_ENV_DETOUR, 0);
+    let result = original.call(
+        game_id,
+        exe_path,
+        working_dir,
+        launch_ctx,
+        flags,
+        something,
+        env_map,
+        context,
+    );
 
     if game_id.is_null() || env_map.is_null() {
         return result;
@@ -1225,7 +1163,10 @@ extern "C" fn hk_build_spawn_env_block(
         }
     }
 
-    let has_proton_dll = injection.as_ref().and_then(|i| i.proton_dll.as_ref()).is_some();
+    let has_proton_dll = injection
+        .as_ref()
+        .and_then(|i| i.proton_dll.as_ref())
+        .is_some();
 
     // IPC token injection: register a per-launch token whenever the IPC
     // server is running, regardless of whether this game has a DLL to
@@ -1241,8 +1182,11 @@ extern "C" fn hk_build_spawn_env_block(
                 set_env(env_map, key.as_ptr(), val.as_ptr());
             }
             if let Ok(sock_val) = std::ffi::CString::new(server.socket_path()) {
-                let key = std::ffi::CString::new(inject_protocol::ENV_IPC_SOCK).unwrap();
-                set_env(env_map, key.as_ptr(), sock_val.as_ptr());
+                set_env(
+                    env_map,
+                    b"STEAM_RUNTIME_IPC_SOCK\0".as_ptr() as *const i8,
+                    sock_val.as_ptr(),
+                );
             }
             debug!(app = app_id.0, "library_inject: IPC token injected");
         }
@@ -1344,24 +1288,20 @@ extern "C" fn hk_spawn_process(
         }
     }
 
-    unsafe {
-        (*std::ptr::addr_of!(SPAWN_PROCESS_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(
-                this,
-                exe_path,
-                command_line,
-                working_dir,
-                game_id,
-                extra,
-                flags1,
-                flags2,
-                launch_source,
-                flags3,
-                p_pid,
-            )
-    }
+    let original = detour_or_return!("SpawnProcess", SPAWN_PROCESS_DETOUR, -1);
+    original.call(
+        this,
+        exe_path,
+        command_line,
+        working_dir,
+        game_id,
+        extra,
+        flags1,
+        flags2,
+        launch_source,
+        flags3,
+        p_pid,
+    )
 }
 
 /// Bounded read of a C string into a Rust String.
@@ -1386,7 +1326,7 @@ fn resolve_set_cloud_fn(registry: &PatternRegistry, code: &CodeRegion) {
         Some(e) => e,
         None => return,
     };
-    let addr = match detour::resolve_callee(code, "SetCloudEnabledForApp", entry.pattern(), false) {
+    let addr = match detour::resolve_pattern_entry(code, "SetCloudEnabledForApp", &entry) {
         Some(a) => a,
         None => return,
     };
@@ -1455,17 +1395,9 @@ fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegion) {
         Some(e) => e,
         None => return,
     };
-    let addr = match detour::resolve_callee(code, "SetEnvString", entry.pattern(), false) {
+    let call_addr = match detour::resolve_pattern_entry(code, "SetEnvString", &entry) {
         Some(a) => a,
         None => return,
-    };
-    let call_addr = if entry.pic_entry() {
-        match detour::find_pic_entry(addr) {
-            Some(a) => a,
-            None => return,
-        }
-    } else {
-        addr
     };
     // SAFETY: call_addr is a validated code address.
     let f: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
@@ -1479,48 +1411,6 @@ fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegion) {
 // ---------------------------------------------------------------------------
 // Detour creation for special cases
 // ---------------------------------------------------------------------------
-
-/// Resolve a function address using PrologueUpwards: find body pattern, scan backward for prologue.
-fn resolve_prologue_upwards(
-    code: &CodeRegion,
-    name: &str,
-    body_pattern_str: &str,
-    prologue_bytes: &[u8],
-) -> Option<usize> {
-    let body_pattern = match Pattern::parse(body_pattern_str) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(hook = name, error = %e, "body pattern parse failed");
-            return None;
-        }
-    };
-
-    let body_offset = match body_pattern.find_unique(code.bytes) {
-        Ok(o) => o,
-        Err(e) => {
-            // Optional patterns log at warn level
-            warn!(hook = name, error = %e, "body pattern match failed");
-            return None;
-        }
-    };
-
-    match find_prologue_upwards(code.bytes, body_offset, prologue_bytes, 0x10000) {
-        Ok(entry_offset) => {
-            let addr = code.base + entry_offset;
-            debug!(
-                hook = name,
-                body = format_args!("0x{:x}", code.base + body_offset),
-                entry = format_args!("0x{:x}", addr),
-                "prologue resolved"
-            );
-            Some(addr)
-        }
-        Err(e) => {
-            warn!(hook = name, error = %e, "prologue scan failed");
-            None
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: GetAppOwnershipTicketExtendedData (ticket forge)
@@ -1537,21 +1427,21 @@ extern "C" fn hk_ticket_ext_data(
     pcb_signature: *mut u32,
 ) -> u32 {
     // SAFETY: TICKET_EXT_DATA_DETOUR set before hook enabled, never modified after.
-    let result = unsafe {
-        (*std::ptr::addr_of!(TICKET_EXT_DATA_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(
-                this,
-                app_id,
-                p_ticket,
-                ticket_buf_size,
-                pi_app_id,
-                pi_steam_id,
-                pi_signature,
-                pcb_signature,
-            )
-    };
+    let original = detour_or_return!(
+        "GetAppOwnershipTicketExtendedData",
+        TICKET_EXT_DATA_DETOUR,
+        0
+    );
+    let result = original.call(
+        this,
+        app_id,
+        p_ticket,
+        ticket_buf_size,
+        pi_app_id,
+        pi_steam_id,
+        pi_signature,
+        pcb_signature,
+    );
 
     // If Steam returned a valid ticket, cache it.
     // Persist decision:
@@ -1781,12 +1671,8 @@ extern "C" fn hk_update_ticket(this: *mut c_void, app_id: u32, force: bool) -> u
     }
 
     // SAFETY: UPDATE_TICKET_DETOUR set before hook enabled, never modified after.
-    unsafe {
-        (*std::ptr::addr_of!(UPDATE_TICKET_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, app_id, force)
-    }
+    let original = detour_or_return!("BUpdateAppOwnershipTicket", UPDATE_TICKET_DETOUR, 0);
+    original.call(this, app_id, force)
 }
 
 // ---------------------------------------------------------------------------
@@ -1807,12 +1693,12 @@ extern "C" fn hk_is_subscribed_in_ticket(
     }
 
     // SAFETY: IS_SUBSCRIBED_IN_TICKET_DETOUR set before hook enabled, never modified after.
-    unsafe {
-        (*std::ptr::addr_of!(IS_SUBSCRIBED_IN_TICKET_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, app_id, arg2, arg3, arg4)
-    }
+    let original = detour_or_return!(
+        "IsUserSubscribedAppInTicket",
+        IS_SUBSCRIBED_IN_TICKET_DETOUR,
+        0
+    );
+    original.call(this, app_id, arg2, arg3, arg4)
 }
 
 // ---------------------------------------------------------------------------
@@ -1825,12 +1711,8 @@ extern "C" fn hk_get_package_info(
     access_token: u64,
 ) -> *mut u8 {
     // SAFETY: GET_PKG_INFO_DETOUR set before enabled.
-    let result = unsafe {
-        (*std::ptr::addr_of!(GET_PKG_INFO_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, package_id, access_token)
-    };
+    let original = detour_or_return!("GetPackageInfo", GET_PKG_INFO_DETOUR, std::ptr::null_mut());
+    let result = original.call(this, package_id, access_token);
 
     // Capture CPackageInfo* on first call, then use it to get pkg0
     if !CPKG_INFO_CAPTURED.swap(true, Ordering::AcqRel) {
@@ -1839,19 +1721,13 @@ extern "C" fn hk_get_package_info(
         // Now call GetPackageInfo(this, 0, token) to get pkg0
         if !result.is_null() || package_id == 0 {
             // Try to get pkg0 using the captured CPackageInfo*
-            let pkg0 = unsafe {
-                (*std::ptr::addr_of!(GET_PKG_INFO_DETOUR))
-                    .as_ref()
-                    .unwrap()
-                    .call(this, 0, crate::package::PKG0_ACCESS_TOKEN)
-            };
+            let pkg0 = original.call(this, 0, crate::package::PKG0_ACCESS_TOKEN);
             if !pkg0.is_null() {
                 // SAFETY: pkg0 is a valid PackageInfo pointer.
                 let status = unsafe { steam_runtime_abi::package_info::status(pkg0) };
                 if status == 0 {
                     crate::package::PKG0_PTR.store(pkg0 as usize, Ordering::Release);
                     info!("package: captured pkg0 at 0x{:x}", pkg0 as usize);
-
                 } else {
                     warn!(status = status, "package: pkg0 status != Available");
                 }
@@ -1905,21 +1781,17 @@ extern "C" fn hk_build_depot_dependency(
     pb_beta_fallback: *mut bool,
 ) -> bool {
     // SAFETY: calling original.
-    let result = unsafe {
-        (*std::ptr::addr_of!(BUILD_DEPOT_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(
-                this,
-                app_id,
-                user_config,
-                p_depot_info,
-                p_shared_depot_info,
-                p_steam_app,
-                p_build_id,
-                pb_beta_fallback,
-            )
-    };
+    let original = detour_or_return!("BuildDepotDependency", BUILD_DEPOT_DETOUR, false);
+    let result = original.call(
+        this,
+        app_id,
+        user_config,
+        p_depot_info,
+        p_shared_depot_info,
+        p_steam_app,
+        p_build_id,
+        pb_beta_fallback,
+    );
 
     if !p_depot_info.is_null() {
         let ss = script_state();
@@ -1992,12 +1864,8 @@ extern "C" fn hk_load_depot_decryption_key(
     }
 
     // SAFETY: calling original.
-    unsafe {
-        (*std::ptr::addr_of!(DEPOT_KEY_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, foo, key_name, key_buf, key_size)
-    }
+    let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
+    original.call(this, foo, key_name, key_buf, key_size)
 }
 
 fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
@@ -2047,28 +1915,21 @@ extern "C" fn hk_send_frame(this: *mut c_void, opcode: i32, data: *mut u8, size:
             SendFrameDecision::Drop => return true,
             SendFrameDecision::Rewrite(rewritten) => {
                 // SAFETY: calling original with rewritten data.
-                return unsafe {
-                    (*std::ptr::addr_of!(SEND_FRAME_DETOUR))
-                        .as_ref()
-                        .unwrap()
-                        .call(
-                            this,
-                            opcode,
-                            rewritten.as_ptr() as *mut u8,
-                            rewritten.len() as u32,
-                        )
-                };
+                let original =
+                    detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
+                return original.call(
+                    this,
+                    opcode,
+                    rewritten.as_ptr() as *mut u8,
+                    rewritten.len() as u32,
+                );
             }
         }
     }
 
     // SAFETY: SEND_FRAME_DETOUR set before hook enabled, never modified after.
-    unsafe {
-        (*std::ptr::addr_of!(SEND_FRAME_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, opcode, data, size)
-    }
+    let original = detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
+    original.call(this, opcode, data, size)
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,23 +1940,16 @@ extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> *mut c_void
     // Try to inject fabricated responses from completed fetches.
     // SAFETY: this and packet are valid pointers from Steam's caller.
     // The closure calls the original RecvPkt.
+    let call_original =
+        |t, p| detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut()).call(t, p);
     unsafe {
-        crate::netpacket::try_inject(this, packet, |t, p| {
-            (*std::ptr::addr_of!(RECV_PKT_DETOUR))
-                .as_ref()
-                .unwrap()
-                .call(t, p)
-        });
+        crate::netpacket::try_inject(this, packet, call_original);
     }
 
     // Process the real packet normally
     // SAFETY: RECV_PKT_DETOUR set before hook enabled, never modified after.
-    let result = unsafe {
-        (*std::ptr::addr_of!(RECV_PKT_DETOUR))
-            .as_ref()
-            .unwrap()
-            .call(this, packet)
-    };
+    let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut());
+    let result = original.call(this, packet);
 
     // Post-process: strip achievement stats from incoming responses
     if !packet.is_null() {
@@ -2109,32 +1963,32 @@ extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> *mut c_void
 // Helpers
 // ---------------------------------------------------------------------------
 
-static STEAMUI_INSTALLED: AtomicBool = AtomicBool::new(false);
+static STEAMUI_BATCH_INSTALL_ONCE: Once = Once::new();
+static STEAMUI_BATCH_FINISHED: AtomicBool = AtomicBool::new(false);
 
-/// Called from la_activity when steamui.so becomes consistent.
+/// Called from la_activity after steamui.so reaches a consistent loader state.
 /// Safe to call multiple times; installs only once.
-pub fn try_install_steamui() {
-    if STEAMUI_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    let registry = load_pattern_registry();
-    try_install_steamui_hooks(&registry);
-}
-
-fn try_install_steamui_hooks(registry: &PatternRegistry) {
-    if STEAMUI_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    let ui_code = match crate::steamui::get_steamui_code() {
-        Some(c) => c,
-        None => {
-            debug!("hook-install: steamui.so not mapped yet, will retry later");
+fn install_steamui_hook_batch() {
+    STEAMUI_BATCH_INSTALL_ONCE.call_once(|| {
+        info!("hook-install: steamui batch started");
+        if !runtime_hooks_enabled() {
+            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
+            info!(installed = false, "hook-install: steamui batch finished");
             return;
         }
-    };
-    if crate::steamui::install(&ui_code, registry) {
-        STEAMUI_INSTALLED.store(true, Ordering::Release);
-    }
+        let Some(ui_code) = crate::steamui::get_steamui_code() else {
+            warn!(
+                "hook-install: steamui.so executable mapping unavailable, skipping steamui hooks"
+            );
+            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
+            info!(installed = false, "hook-install: steamui batch finished");
+            return;
+        };
+        let registry = load_pattern_registry();
+        let installed = crate::steamui::install(&ui_code, &registry);
+        STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
+        info!(installed, "hook-install: steamui batch finished");
+    });
 }
 
 fn get_steamclient_code() -> Option<CodeRegion> {
@@ -2239,7 +2093,8 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
             config.apps.inject.push(steam_runtime_config::InjectApp {
                 id: app_id,
                 dlc: Vec::new(),
-                ticket: Default::default(), purchase_time: 0,
+                ticket: Default::default(),
+                purchase_time: 0,
             });
         }
     }

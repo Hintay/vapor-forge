@@ -7,7 +7,7 @@ use steam_runtime_abi::{
 };
 use steam_runtime_config::AppId;
 use steam_runtime_features::package::ReloadDiff;
-use steam_runtime_patterns::registry::{FollowMode, PatternRegistry};
+use steam_runtime_patterns::registry::PatternRegistry;
 use tracing::{debug, error, info, warn};
 
 use crate::detour::CodeRegion;
@@ -91,29 +91,10 @@ fn resolve_from_registry_raw<F: Copy>(
         }
     };
 
-    let follow = match entry.follow() {
-        FollowMode::None => false,
-        FollowMode::Relative => true,
-        FollowMode::Upward => {
-            error!(
-                hook = name,
-                "upward follow not supported for raw fn resolve"
-            );
-            return;
-        }
-    };
-
-    let mut addr = match crate::detour::resolve_callee(code, name, entry.pattern(), follow) {
+    let addr = match crate::detour::resolve_pattern_entry(code, name, &entry) {
         Some(a) => a,
         None => return,
     };
-
-    if entry.pic_entry() {
-        addr = match crate::detour::find_pic_entry(addr) {
-            Some(a) => a,
-            None => return,
-        };
-    }
 
     // SAFETY: transmuting validated code address to typed fn pointer.
     unsafe {

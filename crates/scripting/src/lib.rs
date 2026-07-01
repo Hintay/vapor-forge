@@ -58,7 +58,7 @@ pub fn execute_scripts(dirs: &[String]) -> ScriptState {
         let mut entries: Vec<_> = match std::fs::read_dir(&expanded) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "lua"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "lua"))
                 .collect(),
             Err(e) => {
                 warn!(error = %e, dir = %expanded.display(), "scripting: read_dir failed");
@@ -115,7 +115,7 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
             "addappid",
             lua.create_function(move |_, args: LuaMultiValue| {
                 let id_raw = args
-                    .get(0)
+                    .front()
                     .and_then(|v| match v {
                         LuaValue::Integer(n) => Some(*n as u32),
                         _ => None,
@@ -194,7 +194,10 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
                 let bytes = parse_hex_key(&hex).ok_or_else(|| {
                     mlua::Error::RuntimeError("seteticket: invalid hex string".into())
                 })?;
-                enc_tickets_clone.lock().unwrap().insert(AppId(app_id_raw), bytes);
+                enc_tickets_clone
+                    .lock()
+                    .unwrap()
+                    .insert(AppId(app_id_raw), bytes);
                 debug!(app_id = app_id_raw, "lua: seteticket");
                 Ok(())
             })?,
@@ -233,7 +236,10 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
         globals.set(
             "setaccesstoken",
             lua.create_function(move |_, (app_id_raw, token): (u32, u64)| {
-                access_tokens_clone.lock().unwrap().insert(AppId(app_id_raw), token);
+                access_tokens_clone
+                    .lock()
+                    .unwrap()
+                    .insert(AppId(app_id_raw), token);
                 debug!(app_id = app_id_raw, token, "lua: setaccesstoken");
                 Ok(())
             })?,
@@ -263,7 +269,9 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
                     .map_err(|e| mlua::Error::RuntimeError(format!("http_post failed: {e}")))?
                     .body_mut()
                     .read_to_string()
-                    .map_err(|e| mlua::Error::RuntimeError(format!("http_post read failed: {e}")))?;
+                    .map_err(|e| {
+                        mlua::Error::RuntimeError(format!("http_post read failed: {e}"))
+                    })?;
                 Ok(resp)
             })?,
         )?;
@@ -290,12 +298,12 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
     state
         .avatars
         .extend(avatars.lock().unwrap().drain().collect::<Vec<_>>());
-    state.access_tokens.extend(
-        access_tokens.lock().unwrap().drain().collect::<Vec<_>>(),
-    );
-    state.enc_tickets.extend(
-        enc_tickets.lock().unwrap().drain().collect::<Vec<_>>(),
-    );
+    state
+        .access_tokens
+        .extend(access_tokens.lock().unwrap().drain().collect::<Vec<_>>());
+    state
+        .enc_tickets
+        .extend(enc_tickets.lock().unwrap().drain().collect::<Vec<_>>());
 
     Ok(())
 }

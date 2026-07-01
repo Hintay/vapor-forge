@@ -13,8 +13,8 @@ follow = "relative"
 pattern = "E8 ? ? ? ? 88 45 ? 83 C4 10 84 C0 0F 84 ? ? ? ? 8B 45 ? 80 7D ? 00"
 
 [steamclient."CUser::GetSubscribedApps"]
-follow = "relative"
-pattern = "E8 ? ? ? ? 89 C6 83 C4 10 85 C0 0F 84 ? ? ? ? 8B 9D ? ? ? ? 39 D8"
+follow = "none"
+pattern = "55 89 E5 57 ? ? ? ? ? ? ? ? ? ? ? ? 53 83 C4 80 0F B6 45 14 6A 00 6A 00"
 
 [steamclient."IClientRemoteStorage::RunIPCFrame"]
 follow = "none"
@@ -26,7 +26,7 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 80 07 00 00"
 
 [steamclient."IClientApps::RunIPCFrame"]
 follow = "none"
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 70 01 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 18 FF FF FF"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 70 01 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 ? ? FF FF 8B 45 10 89 8D ? ? FF FF 89 F3 89 85 ? ? FF FF 65 A1 14 00 00 00 89 45 E4 31 C0 8D 85 ? FF FF FF 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FF FF FF 83 C4 10 3D ? 9C 88 A6"
 
 [steamclient."LoadDepotDecryptionKey"]
 follow = "none"
@@ -56,8 +56,8 @@ prologue = "56 57 E5 89 55"
 pattern = "83 EC 0C 89 F3 8B 7D ? FF 30 E8 ? ? ? ? 83 C4 10 83 FF 01 77 ? 84 C0 75 ? 80 7D ? 00 74 ? 80 7D ? 00 0F 84 ? ? ? ? 8D 65"
 
 [steamclient."IClientUser::IsUserSubscribedAppInTicket"]
-follow = "relative"
-pattern = "E8 ? ? ? ? 89 C3 83 C4 20 8B ? ? ? ? ? 8B"
+follow = "none"
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 3C 8B 7C 24 50 8B 44 24 54 8B 54 24 58 8B 8F ? ? 00 00"
 
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"
@@ -94,12 +94,13 @@ optional = true
 
 [steamclient."CUser::BuildSpawnEnvBlock"]
 follow = "none"
-pattern = "55 89 E5 57 56 53 81 EC 3C 31 00 00"
+pattern = "55 89 E5 57 56 53 81 EC ? 31 00 00 8B 4D 24"
 optional = true
 
 [steamclient."SetEnvString"]
-follow = "none"
-pattern = "55 89 E5 57 56 53 83 EC 5C 89 45 CC 8B 45 0C 85 C0 0F 84"
+follow = "upward"
+prologue = "53 56 57 E5 89 55"
+pattern = "8B ? 78 85 ? 0F 84 ? ? ? ? 8B 5D CC 83 EC 0C FF 75 0C E8 ? ? ? ? 83 C4 10 6A 01 68 17 04 00 00 50 FF 75 0C E8"
 pic_entry = true
 optional = true
 

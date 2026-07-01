@@ -71,6 +71,11 @@ pub fn mark_pending() {
 /// Called from the LdrLoadDll hook. Checks if this DLL load is a trigger
 /// and reports PE analysis via IPC.
 pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
+    let dll_name = dll_name_to_string(name);
+    if !dll_name.is_empty() {
+        crate::ipc::send_dll_loaded(&dll_name);
+    }
+
     // Check for Denuvo DLL names in every loaded DLL.
     if pe::is_denuvo_dll_name(name) {
         log("Denuvo DLL name detected");
@@ -90,6 +95,12 @@ pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
         crate::ipc::try_connect();
         load_helper_now();
     }
+}
+
+fn dll_name_to_string(name: &[u16]) -> String {
+    String::from_utf16_lossy(name)
+        .trim_end_matches('\0')
+        .to_owned()
 }
 
 fn scan_loaded_pe(base: *mut core::ffi::c_void) {
@@ -173,18 +184,26 @@ unsafe extern "win64" fn hook_ldr_load_dll(
         return -1;
     }
 
-    let orig: LdrLoadDllFn = std::mem::transmute(tramp);
-    let status = orig(search_path, flags, dll_name, base_address);
+    // SAFETY: TRAMPOLINE is written by Detour::install with a valid
+    // LdrLoadDll-compatible trampoline address before this hook is active.
+    let orig: LdrLoadDllFn = unsafe { std::mem::transmute(tramp) };
+    // SAFETY: The hook receives LdrLoadDll's original arguments and forwards
+    // them unchanged to the original trampoline with the same ABI.
+    let status = unsafe { orig(search_path, flags, dll_name, base_address) };
 
     if status == STATUS_SUCCESS && !dll_name.is_null() {
         // Wrap in catch_unwind: a panic here would unwind through PE frames.
         let base = if base_address.is_null() {
             std::ptr::null_mut()
         } else {
-            *base_address
+            // SAFETY: On STATUS_SUCCESS, LdrLoadDll initialized base_address
+            // when the caller supplied a non-null out pointer.
+            unsafe { *base_address }
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let name = (*dll_name).as_slice();
+            // SAFETY: dll_name is checked for null above. Wine provides a
+            // valid UNICODE_STRING for the duration of the callback.
+            let name = unsafe { (*dll_name).as_slice() };
             on_ldr_load_dll(name, base);
         }));
     }
@@ -203,7 +222,11 @@ pub(crate) fn log(msg: &str) {
     const MAX_LOG_SIZE: libc::off_t = 512 * 1024;
 
     unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o644);
+        let fd = libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        );
         if fd < 0 {
             return;
         }
