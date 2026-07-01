@@ -16,6 +16,7 @@ const INTERESTING_IFACES: &[&str] = &[
     "IClientAppManager",
     "IClientApps",
     "IClientRemoteStorage",
+    "IClientUser",
     "IClientUtils",
 ];
 

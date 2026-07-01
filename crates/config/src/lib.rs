@@ -25,6 +25,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub apps: AppsSection,
     #[serde(default)]
+    pub cloud: CloudSection,
+    #[serde(default)]
     pub scripting: ScriptingSection,
     #[serde(default)]
     pub ticket: TicketSection,
@@ -58,8 +60,6 @@ pub struct AppsSection {
     pub inject: Vec<InjectApp>,
     #[serde(default)]
     pub shared: SharedSection,
-    #[serde(default)]
-    pub cloud_enabled: Option<bool>,
 }
 
 /// An app to inject ownership for, with optional DLC list.
@@ -68,6 +68,21 @@ pub struct InjectApp {
     pub id: AppId,
     #[serde(default)]
     pub dlc: Vec<AppId>,
+    #[serde(default)]
+    pub ticket: TicketMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketMode {
+    /// Default: forge tickets from appId 7 source with current user's SteamID.
+    #[default]
+    Forge,
+    /// Delegate to cached ticket from previous owner session. During the
+    /// first few ticket requests after launch, return the cached ticket
+    /// (with the original owner's SteamID). After the window closes,
+    /// switch to forge mode with the current user's SteamID.
+    Delegate,
 }
 
 /// Family sharing concurrent-play bypass.
@@ -111,6 +126,13 @@ impl Default for SharedSection {
             exclude: Vec::new(),
         }
     }
+}
+
+/// Cloud control for controlled apps.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CloudSection {
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -215,6 +237,8 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
 pub struct LibraryInjectSection {
     #[serde(default)]
     pub libs: Vec<LibraryInjectEntry>,
+    #[serde(default)]
+    pub helper_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -228,11 +252,33 @@ pub struct LibraryInjectEntry {
     pub exclude: Vec<AppId>,
 }
 
-/// Ticket caching and forging configuration.
+/// Ticket configuration.
+///
+/// - Forge source tickets (appId 7): always memory-only.
+/// - Delegate captured tickets: always persisted to disk.
+/// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TicketSection {
+    /// Persistence for non-delegate, non-forge tickets (Lua-provided or
+    /// intercepted real tickets). Default "session" = memory only.
     #[serde(default)]
     pub cache: TicketCacheMode,
+    /// Automatically detect Denuvo-protected games (via PE section scanning
+    /// in the proton-inject helper) and enable delegate ticket mode for them.
+    /// Requires library injection with a proton helper configured.
+    #[serde(default)]
+    pub auto_delegate: bool,
+}
+
+/// Persistence mode for non-delegate, non-forge tickets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketCacheMode {
+    /// In-memory only. Lost when Steam restarts.
+    Session,
+    /// Persist to disk. Survives restarts.
+    #[default]
+    Disk,
 }
 
 /// Manifest request code fetch configuration.
@@ -272,16 +318,6 @@ fn default_timeout_ms() -> u64 {
     15000
 }
 
-/// Where intercepted tickets are cached.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TicketCacheMode {
-    /// In-memory only. Tickets are lost when Steam restarts.
-    #[default]
-    Session,
-    /// Persist tickets to disk so they survive restarts.
-    Disk,
-}
 
 impl Default for RuntimeSection {
     fn default() -> Self {
@@ -325,6 +361,15 @@ impl RuntimeConfig {
         None
     }
 
+    pub fn ticket_mode(&self, app_id: AppId) -> TicketMode {
+        self.apps
+            .inject
+            .iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.ticket)
+            .unwrap_or(TicketMode::Forge)
+    }
+
     pub fn should_bypass_sharing(&self, app_id: AppId) -> bool {
         self.apps.shared.allows(app_id)
     }
@@ -352,7 +397,7 @@ impl RuntimeConfig {
     }
 
     pub fn cloud_enabled_for_controlled_apps(&self) -> bool {
-        self.apps.cloud_enabled.unwrap_or(false)
+        self.cloud.enabled.unwrap_or(false)
     }
 }
 
@@ -446,21 +491,34 @@ mod tests {
     }
 
     #[test]
-    fn ticket_defaults_to_session_cache() {
+    fn ticket_defaults() {
         let config: RuntimeConfig = toml::from_str("").expect("parse");
+        assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
+        assert!(!config.ticket.auto_delegate);
+    }
+
+    #[test]
+    fn ticket_session_cache_parses() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+            [ticket]
+            cache = "session"
+            "#,
+        )
+        .expect("parse");
         assert_eq!(config.ticket.cache, TicketCacheMode::Session);
     }
 
     #[test]
-    fn ticket_disk_cache_parses() {
+    fn ticket_auto_delegate_parses() {
         let config: RuntimeConfig = toml::from_str(
             r#"
             [ticket]
-            cache = "disk"
+            auto_delegate = true
             "#,
         )
         .expect("parse");
-        assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
+        assert!(config.ticket.auto_delegate);
     }
 
     #[test]

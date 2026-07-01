@@ -270,6 +270,68 @@ pub struct GetManifestRequestCodeResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Encrypted app ticket
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, prost::Message)]
+pub struct EncryptedAppTicket {
+    #[prost(uint32, optional, tag = "1")]
+    pub ticket_version_no: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub crc_encryptedticket: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub cb_encrypteduserdata: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub cb_encrypted_appownershipticket: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub encrypted_ticket: Option<Vec<u8>>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct EncryptedAppTicketResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(int32, optional, tag = "2")]
+    pub eresult: Option<i32>,
+    #[prost(message, optional, tag = "3")]
+    pub encrypted_app_ticket: Option<EncryptedAppTicket>,
+}
+
+// ---------------------------------------------------------------------------
+// PICS ProductInfo (access token injection)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, prost::Message)]
+pub struct PicsProductInfoRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub packages: Vec<PicsPackageInfo>,
+    #[prost(message, repeated, tag = "2")]
+    pub apps: Vec<PicsAppInfo>,
+    #[prost(bool, optional, tag = "3")]
+    pub meta_data_only: Option<bool>,
+    #[prost(uint32, optional, tag = "4")]
+    pub num_prev_failed: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PicsPackageInfo {
+    #[prost(uint32, optional, tag = "1")]
+    pub packageid: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub access_token: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PicsAppInfo {
+    #[prost(uint32, optional, tag = "1")]
+    pub appid: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub access_token: Option<u64>,
+    #[prost(bool, optional, tag = "3")]
+    pub only_public_obsolete: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // Achievement / stats messages
 // ---------------------------------------------------------------------------
 
@@ -357,6 +419,12 @@ pub struct AchievementBlock {
     pub unlock_time: Vec<u32>,
 }
 
+/// EMsg for CMsgClientPICSProductInfoRequest
+pub const EMSG_PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
+
+/// EMsg for CMsgClientRequestEncryptedAppTicketResponse
+pub const EMSG_ENCRYPTED_APPTICKET_RESPONSE: u32 = 5527;
+
 /// EMsg constants for stats
 pub const EMSG_REQUEST_USERSTATS: u32 = 818;
 pub const EMSG_REQUEST_USERSTATS_RESPONSE: u32 = 819;
@@ -407,6 +475,64 @@ pub struct GamePlayed {
 /// EResult constants
 pub const ERESULT_OK: i32 = 1;
 pub const ERESULT_NO_CONNECTION: i32 = 3;
+
+// ---------------------------------------------------------------------------
+// Rich Presence / PersonaState messages (AppAvatar spoofing)
+// ---------------------------------------------------------------------------
+
+/// EMsg for CMsgClientPersonaState.
+pub const EMSG_CLIENT_PERSONA_STATE: u32 = 766;
+/// EMsg for CMsgClientRichPresenceUpload.
+pub const EMSG_CLIENT_RICH_PRESENCE_UPLOAD: u32 = 7501;
+
+/// k_EClientPersonaStateFlagRichPresence: top-level status_flags bit meaning
+/// "this message carries rich presence field data".
+pub const ECLIENTPERSONASTATEFLAG_RICH_PRESENCE: u32 = 0x1000;
+/// k_EPersonaStateFlag_HasRichPresence: per-friend persona_state_flags bit
+/// meaning "this friend currently has rich presence set".
+pub const EPERSONASTATEFLAG_HAS_RICH_PRESENCE: u32 = 0x1;
+
+#[derive(Clone, prost::Message)]
+pub struct PersonaStateKV {
+    #[prost(string, optional, tag = "1")]
+    pub key: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub value: Option<String>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PersonaStateFriend {
+    #[prost(fixed64, optional, tag = "1")]
+    pub friendid: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub persona_state: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub game_played_app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub persona_state_flags: Option<u32>,
+    #[prost(string, optional, tag = "55")]
+    pub game_name: Option<String>,
+    #[prost(fixed64, optional, tag = "56")]
+    pub gameid: Option<u64>,
+    #[prost(message, repeated, tag = "71")]
+    pub rich_presence: Vec<PersonaStateKV>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct ClientPersonaState {
+    #[prost(uint32, optional, tag = "1")]
+    pub status_flags: Option<u32>,
+    #[prost(message, repeated, tag = "2")]
+    pub friends: Vec<PersonaStateFriend>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct ClientRichPresenceUpload {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    pub rich_presence_kv: Option<Vec<u8>>,
+    #[prost(fixed64, repeated, tag = "2")]
+    pub steamid_broadcast: Vec<u64>,
+}
 
 #[cfg(test)]
 mod tests {

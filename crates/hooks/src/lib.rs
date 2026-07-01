@@ -6,6 +6,8 @@ pub mod detour;
 #[cfg(target_os = "linux")]
 pub mod install;
 #[cfg(target_os = "linux")]
+pub mod ipc_server;
+#[cfg(target_os = "linux")]
 pub mod netpacket;
 #[cfg(target_os = "linux")]
 pub mod package;

@@ -25,3 +25,4 @@ steam-runtime-memory = { path = "../memory" }
 steam-runtime-patterns = { path = "../patterns" }
 prost.workspace = true
 steam-runtime-scripting = { path = "../scripting" }
+inject-protocol = { path = "../inject-protocol" }

@@ -231,6 +231,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inject-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "inotify"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -488,6 +492,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "proton-inject"
+version = "0.1.0"
+dependencies = [
+ "inject-protocol",
+ "libc",
 ]
 
 [[package]]
@@ -777,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "iced-x86",
+ "inject-protocol",
  "inotify",
  "libc",
  "once_cell",
@@ -822,6 +835,7 @@ dependencies = [
  "steam-runtime-diagnostics",
  "thiserror",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

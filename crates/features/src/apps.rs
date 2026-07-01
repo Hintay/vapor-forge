@@ -72,6 +72,7 @@ mod tests {
                     .map(|&id| InjectApp {
                         id: AppId(id),
                         dlc: Vec::new(),
+                        ticket: Default::default(),
                     })
                     .collect(),
                 ..Default::default()

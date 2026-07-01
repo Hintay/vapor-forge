@@ -25,6 +25,7 @@ pub struct ScriptState {
     pub enc_tickets: HashMap<AppId, Vec<u8>>,
     pub stat_steam_ids: HashMap<AppId, u64>,
     pub avatars: HashMap<AppId, AppId>,
+    pub access_tokens: HashMap<AppId, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,8 +101,10 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
         HashMap::<DepotId, ManifestOverride>::new(),
     ));
     let tickets = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, Vec<u8>>::new()));
+    let enc_tickets = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, Vec<u8>>::new()));
     let stat_ids = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, u64>::new()));
     let avatars = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, AppId>::new()));
+    let access_tokens = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, u64>::new()));
 
     {
         let globals = lua.globals();
@@ -184,6 +187,19 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
         )?;
 
         let stat_ids = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<AppId, u64>::new()));
+        let enc_tickets_clone = enc_tickets.clone();
+        globals.set(
+            "seteticket",
+            lua.create_function(move |_, (app_id_raw, hex): (u32, String)| {
+                let bytes = parse_hex_key(&hex).ok_or_else(|| {
+                    mlua::Error::RuntimeError("seteticket: invalid hex string".into())
+                })?;
+                enc_tickets_clone.lock().unwrap().insert(AppId(app_id_raw), bytes);
+                debug!(app_id = app_id_raw, "lua: seteticket");
+                Ok(())
+            })?,
+        )?;
+
         let stat_ids_clone = stat_ids.clone();
         globals.set(
             "setstat",
@@ -212,6 +228,45 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
                 Ok(())
             })?,
         )?;
+
+        let access_tokens_clone = access_tokens.clone();
+        globals.set(
+            "setaccesstoken",
+            lua.create_function(move |_, (app_id_raw, token): (u32, u64)| {
+                access_tokens_clone.lock().unwrap().insert(AppId(app_id_raw), token);
+                debug!(app_id = app_id_raw, token, "lua: setaccesstoken");
+                Ok(())
+            })?,
+        )?;
+
+        globals.set(
+            "http_get",
+            lua.create_function(|_, url: String| {
+                let body = ureq::Agent::new_with_defaults()
+                    .get(&url)
+                    .call()
+                    .map_err(|e| mlua::Error::RuntimeError(format!("http_get failed: {e}")))?
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| mlua::Error::RuntimeError(format!("http_get read failed: {e}")))?;
+                Ok(body)
+            })?,
+        )?;
+
+        globals.set(
+            "http_post",
+            lua.create_function(|_, (url, body): (String, String)| {
+                let resp = ureq::Agent::new_with_defaults()
+                    .post(&url)
+                    .content_type("application/x-www-form-urlencoded")
+                    .send(body.as_bytes())
+                    .map_err(|e| mlua::Error::RuntimeError(format!("http_post failed: {e}")))?
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| mlua::Error::RuntimeError(format!("http_post read failed: {e}")))?;
+                Ok(resp)
+            })?,
+        )?;
     }
 
     let filename = path.file_name().unwrap_or_default().to_string_lossy();
@@ -235,6 +290,12 @@ fn execute_file(path: &Path, state: &mut ScriptState) -> Result<(), ScriptError>
     state
         .avatars
         .extend(avatars.lock().unwrap().drain().collect::<Vec<_>>());
+    state.access_tokens.extend(
+        access_tokens.lock().unwrap().drain().collect::<Vec<_>>(),
+    );
+    state.enc_tickets.extend(
+        enc_tickets.lock().unwrap().drain().collect::<Vec<_>>(),
+    );
 
     Ok(())
 }

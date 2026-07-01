@@ -98,8 +98,20 @@ impl Default for PackageState {
 }
 
 /// Build the combined controlled-app-IDs list from config + script state.
+/// Includes both main app IDs and their DLC IDs (DLC goes into pkg0 so
+/// Steam downloads appinfo and handles DLC enumeration natively).
 pub fn controlled_app_ids(config: &RuntimeConfig, script_apps: &[AppId]) -> Vec<AppId> {
-    let mut ids: Vec<AppId> = config.apps.inject.iter().map(|a| a.id).collect();
+    let mut ids: Vec<AppId> = Vec::new();
+    for app in &config.apps.inject {
+        if !ids.contains(&app.id) {
+            ids.push(app.id);
+        }
+        for &dlc in &app.dlc {
+            if !ids.contains(&dlc) {
+                ids.push(dlc);
+            }
+        }
+    }
     for &id in script_apps {
         if !ids.contains(&id) {
             ids.push(id);
@@ -118,6 +130,7 @@ mod tests {
             .map(|&id| steam_runtime_config::InjectApp {
                 id: AppId(id),
                 dlc: Vec::new(),
+                ticket: Default::default(),
             })
             .collect();
         RuntimeConfig {

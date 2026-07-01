@@ -37,9 +37,6 @@ type RunIPCFrameFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c
 type IsCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32) -> bool;
 type IsAppDlcInstalledFn = extern "C" fn(*mut c_void, u32, u32) -> bool;
 type BIsDlcEnabledFn = extern "C" fn(*mut c_void, u32, u32, *mut c_void) -> bool;
-type GetDLCCountFn = extern "C" fn(*mut c_void, u32) -> u32;
-type BGetDLCDataByIndexFn =
-    extern "C" fn(*mut c_void, u32, i32, *mut u32, *mut bool, *mut u8, usize) -> bool;
 type GetPackageInfoHookFn = extern "C" fn(*mut c_void, u32, u64) -> *mut u8;
 
 // Network packet hook function types
@@ -59,6 +56,7 @@ type TicketExtDataFn = extern "C" fn(
 ) -> u32;
 type UpdateTicketFn = extern "C" fn(*mut c_void, u32, bool) -> u32;
 type IsSubscribedInTicketFn = extern "C" fn(*mut c_void, u32, u32, u32, u32) -> u8;
+type GetSteamIDFn = extern "C" fn(*mut c_void) -> u64;
 type LoadDepotDecryptionKeyFn = extern "C" fn(*mut c_void, u32, *const i8, *mut u8, u32) -> i32;
 type BuildDepotDependencyFn = extern "C" fn(
     *mut c_void,
@@ -76,7 +74,8 @@ type WriteVdfFileFn = extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u
 type SetCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32, bool);
 
 // AppAvatar LaunchApp VMT hook
-type LaunchAppFn = extern "C" fn(*mut c_void, *mut u32, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type LaunchAppFn =
+    extern "C" fn(*mut c_void, *mut u32, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 
 // Library injection: BuildSpawnEnvBlock builds the child process env block for
 // a game launch. CGameID is 8 bytes: low 24 bits = AppId, byte 3 = type (2 = app).
@@ -138,10 +137,11 @@ static mut ORIGINAL_IS_CLOUD_ENABLED: Option<IsCloudEnabledForAppFn> = None;
 static mut SET_CLOUD_FN: Option<SetCloudEnabledForAppFn> = None;
 static mut ORIG_IS_APP_DLC_INSTALLED: Option<IsAppDlcInstalledFn> = None;
 static mut ORIG_B_IS_DLC_ENABLED: Option<BIsDlcEnabledFn> = None;
-static mut ORIG_GET_DLC_COUNT: Option<GetDLCCountFn> = None;
-static mut ORIG_B_GET_DLC_DATA_BY_INDEX: Option<BGetDLCDataByIndexFn> = None;
 static mut ORIG_LAUNCH_APP: Option<LaunchAppFn> = None;
 static mut SET_ENV_STRING_FN: Option<SetEnvStringFn> = None;
+static mut ORIG_GET_STEAMID: Option<GetSteamIDFn> = None;
+
+pub(crate) static IPC_SERVER: OnceLock<Option<std::sync::Arc<crate::ipc_server::IpcServer>>> = OnceLock::new();
 
 static CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
@@ -153,12 +153,11 @@ pub(crate) static PACKAGE_STATE: once_cell::sync::Lazy<
     steam_runtime_features::package::PackageState,
 > = once_cell::sync::Lazy::new(steam_runtime_features::package::PackageState::new);
 
-static TICKET_CACHE: once_cell::sync::Lazy<steam_runtime_features::ticket::TicketCache> =
+pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<steam_runtime_features::ticket::TicketCache> =
     once_cell::sync::Lazy::new(|| {
-        let cfg = CONFIG.load();
         let cache_dir = std::env::var_os("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".config/steam-runtime-rs/cache"));
-        steam_runtime_features::ticket::TicketCache::new(cfg.ticket.cache, cache_dir)
+        steam_runtime_features::ticket::TicketCache::new(cache_dir)
     });
 
 /// Source ticket from appId 7, lazily acquired on first forge attempt.
@@ -170,6 +169,7 @@ static CPKG_INFO_CAPTURED: AtomicBool = AtomicBool::new(false);
 static CLOUD_VMT_DONE: AtomicBool = AtomicBool::new(false);
 static APP_MANAGER_VMT_DONE: AtomicBool = AtomicBool::new(false);
 static CLIENT_APPS_VMT_DONE: AtomicBool = AtomicBool::new(false);
+static STEAMID_VMT_DONE: AtomicBool = AtomicBool::new(false);
 
 static CODE_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 
@@ -367,6 +367,26 @@ fn do_install() {
 
     CONFIG.store(std::sync::Arc::new(config));
     SCRIPT_STATE.store(std::sync::Arc::new(script_state));
+
+    // Start the IPC server only when a feature that consumes IPC events
+    // is enabled AND a proton helper is available.
+    {
+        let cfg = CONFIG.load();
+        let needs_ipc = cfg.ticket.auto_delegate;
+        let has_proton = needs_ipc && (
+            cfg.library_inject.libs.iter().any(|l| l.path.ends_with(".dll"))
+            || !cfg.library_inject.helper_path.is_empty()
+        );
+        let server = if has_proton {
+            crate::ipc_server::IpcServer::start()
+        } else {
+            if needs_ipc {
+                warn!("hook-install: auto_delegate enabled but no proton helper configured");
+            }
+            None
+        };
+        let _ = IPC_SERVER.set(server);
+    }
 
     let code = match get_steamclient_code() {
         Some(c) => c,
@@ -692,7 +712,23 @@ pub(crate) fn config() -> arc_swap::Guard<std::sync::Arc<RuntimeConfig>> {
     CONFIG.load()
 }
 
-fn script_state() -> arc_swap::Guard<std::sync::Arc<ScriptState>> {
+/// Config ticket mode overlaid with runtime auto-delegate detections.
+fn effective_ticket_mode(
+    cfg: &RuntimeConfig,
+    app_id: AppId,
+) -> steam_runtime_config::TicketMode {
+    let mode = cfg.ticket_mode(app_id);
+    if mode == steam_runtime_config::TicketMode::Forge
+        && steam_runtime_features::ticket::is_auto_delegate(app_id)
+    {
+        return steam_runtime_config::TicketMode::Delegate;
+    }
+    mode
+}
+
+
+
+pub(crate) fn script_state() -> arc_swap::Guard<std::sync::Arc<ScriptState>> {
     SCRIPT_STATE.load()
 }
 
@@ -721,6 +757,12 @@ extern "C" fn hk_check_app_ownership(
     if crate::package::CUSER_PTR.load(Ordering::Acquire) == 0 {
         crate::package::CUSER_PTR.store(this as usize, Ordering::Release);
         debug!("package: captured CUser at 0x{:x}", this as usize);
+    }
+
+    // CUser also implements IClientUser; install the GetSteamID VMT hook once
+    // we have a live instance, so ticket-delegate mode can spoof it.
+    if !STEAMID_VMT_DONE.load(Ordering::Acquire) {
+        install_steamid_vmt(this);
     }
 
     // pkg0 injection: triggered after GetPackageInfo hook captures CPackageInfo* + pkg0
@@ -968,8 +1010,7 @@ fn install_app_manager_vmt(this: *mut c_void) {
             if validate_vmt_hook_eligibility("LaunchApp", addr, repl) {
                 // SAFETY: original stored before VMT slot is replaced.
                 unsafe {
-                    std::ptr::addr_of_mut!(ORIG_LAUNCH_APP)
-                        .write(Some(std::mem::transmute(addr)));
+                    std::ptr::addr_of_mut!(ORIG_LAUNCH_APP).write(Some(std::mem::transmute(addr)));
                     vmt::swap_vtable_slot("LaunchApp", this, slot, repl);
                 }
             }
@@ -977,7 +1018,6 @@ fn install_app_manager_vmt(this: *mut c_void) {
     } else {
         debug!("hook-install: LaunchApp slot not found (app-avatar flag rules inactive)");
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,123 +1043,70 @@ extern "C" fn hk_client_apps_run_ipc_frame(
     }
 }
 
-extern "C" fn hk_get_dlc_count(this: *mut c_void, app_id: u32) -> u32 {
-    // SAFETY: original function pointer set before VMT swap.
-    let original = unsafe { (*std::ptr::addr_of!(ORIG_GET_DLC_COUNT)).unwrap() };
-    let count = original(this, app_id);
+// DLC enumeration (GetDLCCount / BGetDLCDataByIndex) is NOT hooked.
+// DLC app IDs go into pkg0 alongside main app IDs, so Steam downloads
+// their appinfo and handles enumeration natively.
 
-    let cfg = config();
-    let extra = steam_runtime_features::dlc::dlc_count_adjustment(&*cfg, AppId(app_id));
-    if extra > 0 {
-        let total = count + extra;
-        info!(
-            app_id = app_id,
-            original = count,
-            injected = extra,
-            total = total,
-            "hook: DLC count adjusted"
-        );
-        return total;
-    }
-
-    count
-}
-
-extern "C" fn hk_b_get_dlc_data_by_index(
-    this: *mut c_void,
-    app_id: u32,
-    index: i32,
-    out_dlc_id: *mut u32,
-    out_available: *mut bool,
-    out_name: *mut u8,
-    name_len: usize,
-) -> bool {
-    // SAFETY: original function pointer set before VMT swap.
-    let original = unsafe { (*std::ptr::addr_of!(ORIG_B_GET_DLC_DATA_BY_INDEX)).unwrap() };
-    let result = original(
-        this,
-        app_id,
-        index,
-        out_dlc_id,
-        out_available,
-        out_name,
-        name_len,
-    );
-    if result {
-        return true;
-    }
-
-    let cfg = config();
-
-    // Get original count to compute the inject index.
-    let orig_count_fn = unsafe { (*std::ptr::addr_of!(ORIG_GET_DLC_COUNT)).unwrap() };
-    let orig_count = orig_count_fn(this, app_id) as i32;
-    let inject_idx = index - orig_count;
-    if inject_idx < 0 {
-        return false;
-    }
-
-    if let Some(injected) =
-        steam_runtime_features::dlc::get_injected_dlc_at(&*cfg, AppId(app_id), inject_idx as usize)
-    {
-        if !out_dlc_id.is_null() {
-            // SAFETY: out_dlc_id is a valid pointer from Steam's caller.
-            unsafe { *out_dlc_id = injected.dlc_id.0 };
-        }
-        if !out_available.is_null() {
-            // SAFETY: out_available is a valid pointer from Steam's caller.
-            unsafe { *out_available = true };
-        }
-        if !out_name.is_null() && name_len > 0 {
-            // SAFETY: out_name buffer provided by Steam.
-            let copy_len = injected.name.len().min(name_len - 1);
-            unsafe {
-                std::ptr::copy_nonoverlapping(injected.name.as_ptr(), out_name, copy_len);
-                *out_name.add(copy_len) = 0;
-            }
-        }
-        return true;
-    }
-
-    false
-}
-
-fn install_client_apps_vmt(this: *mut c_void) {
+fn install_client_apps_vmt(_this: *mut c_void) {
     if CLIENT_APPS_VMT_DONE.swap(true, Ordering::AcqRel) {
         return;
     }
+    // IClientApps VMT hooks removed. DLC handled via pkg0 injection.
+}
 
-    let slot_count = crate::vtable_scan::slot_of("IClientApps", "GetDLCCount");
-    let slot_data = crate::vtable_scan::slot_of("IClientApps", "BGetDLCDataByIndex");
+// ---------------------------------------------------------------------------
+// Hook replacement functions: IClientUser::GetSteamID (ticket-delegate spoof)
+// ---------------------------------------------------------------------------
 
-    if let Some(slot) = slot_count {
-        if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-            let repl = hk_get_dlc_count as *const () as usize;
-            if validate_vmt_hook_eligibility("GetDLCCount", addr, repl) {
-                unsafe {
-                    std::ptr::addr_of_mut!(ORIG_GET_DLC_COUNT)
-                        .write(Some(std::mem::transmute(addr)));
-                    vmt::swap_vtable_slot("GetDLCCount", this, slot, repl);
-                }
-            }
-        }
-    } else {
-        warn!("hook-install: GetDLCCount slot not found");
+/// Return the delegate (previous owner) SteamID while a delegate ticket
+/// window is active for the currently launched app, otherwise pass through.
+///
+/// This spoof is global rather than keyed to a specific app: the runtime
+/// only supports one delegate-ticket app being active at a time, which
+/// matches the existing single-game-at-a-time launch model.
+extern "C" fn hk_get_steamid(this: *mut c_void) -> u64 {
+    // SAFETY: ORIG_GET_STEAMID set before the VMT slot is swapped.
+    let original = unsafe { (*std::ptr::addr_of!(ORIG_GET_STEAMID)).unwrap() };
+    let real_steamid = original(this);
+
+    let delegate = steam_runtime_features::ticket::delegate_steamid();
+    if delegate != 0 {
+        debug!(
+            real = real_steamid,
+            delegate, "ticket: GetSteamID returning delegate SteamID"
+        );
+        return delegate;
     }
 
-    if let Some(slot) = slot_data {
-        if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-            let repl = hk_b_get_dlc_data_by_index as *const () as usize;
-            if validate_vmt_hook_eligibility("BGetDLCDataByIndex", addr, repl) {
-                unsafe {
-                    std::ptr::addr_of_mut!(ORIG_B_GET_DLC_DATA_BY_INDEX)
-                        .write(Some(std::mem::transmute(addr)));
-                    vmt::swap_vtable_slot("BGetDLCDataByIndex", this, slot, repl);
-                }
-            }
-        }
-    } else {
-        warn!("hook-install: BGetDLCDataByIndex slot not found");
+    real_steamid
+}
+
+fn install_steamid_vmt(this: *mut c_void) {
+    if STEAMID_VMT_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let Some(slot) = crate::vtable_scan::slot_of("IClientUser", "GetSteamID") else {
+        warn!("hook-install: GetSteamID slot not found in VtableScan");
+        return;
+    };
+
+    let Some(addr) = (unsafe { read_vtable_slot(this, slot) }) else {
+        return;
+    };
+    let repl = hk_get_steamid as *const () as usize;
+
+    if !validate_vmt_hook_eligibility("GetSteamID", addr, repl) {
+        return;
+    }
+
+    // SAFETY: transmuting a valid function address to a typed fn pointer.
+    let orig_fn: GetSteamIDFn = unsafe { std::mem::transmute(addr) };
+    unsafe { std::ptr::addr_of_mut!(ORIG_GET_STEAMID).write(Some(orig_fn)) };
+
+    // SAFETY: swap the vtable slot (original already stored).
+    unsafe {
+        vmt::swap_vtable_slot("GetSteamID", this, slot, repl);
     }
 }
 
@@ -1203,31 +1190,103 @@ extern "C" fn hk_build_spawn_env_block(
     let raw = unsafe { *(game_id as *const u32) };
     let app_id = AppId(raw & 0x00FF_FFFF);
 
-    let libs = steam_runtime_features::library_inject::take_pending(app_id);
-    if libs.is_empty() {
+    let injection = steam_runtime_features::library_inject::take_pending(app_id);
+    let ipc_server = IPC_SERVER.get().and_then(|s| s.as_ref());
+
+    if injection.is_none() && ipc_server.is_none() {
         return result;
     }
 
     // SAFETY: SET_ENV_STRING_FN resolved once at install time, never modified after.
     let Some(set_env) = (unsafe { *std::ptr::addr_of!(SET_ENV_STRING_FN) }) else {
-        warn!(
-            app = app_id.0,
-            "library_inject: SetEnvString unresolved, cannot set LD_PRELOAD"
-        );
+        warn!(app = app_id.0, "library_inject: SetEnvString unresolved");
         return result;
     };
 
-    let ld_preload = libs.join(":");
-    let Ok(value_cstr) = std::ffi::CString::new(ld_preload.as_str()) else {
-        warn!(app = app_id.0, "library_inject: LD_PRELOAD value has interior NUL");
-        return result;
-    };
-    const KEY: &[u8] = b"LD_PRELOAD\0";
+    // Native .so injection via LD_PRELOAD
+    if let Some(ref inj) = injection {
+        if !inj.native_libs.is_empty() {
+            let ld_preload = inj.native_libs.join(":");
+            if let Ok(value) = std::ffi::CString::new(ld_preload.as_str()) {
+                set_env(
+                    env_map,
+                    b"LD_PRELOAD\0".as_ptr() as *const i8,
+                    value.as_ptr(),
+                );
+                info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
+            }
+        }
+    }
 
-    // env_map is the valid pEnvMap from Steam's caller; key/value are
-    // NUL-terminated C strings owned for the duration of this call.
-    set_env(env_map, KEY.as_ptr() as *const i8, value_cstr.as_ptr());
-    info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
+    let has_proton_dll = injection.as_ref().and_then(|i| i.proton_dll.as_ref()).is_some();
+
+    // IPC token injection: register a per-launch token whenever the IPC
+    // server is running, regardless of whether this game has a DLL to
+    // inject. The helper may be loaded solely for PE scanning.
+    if let Some(server) = ipc_server {
+        if let Ok(token) = inject_protocol::generate_token() {
+            server.register_token(token, app_id.0);
+            let hex = inject_protocol::token_to_hex(&token);
+            if let (Ok(key), Ok(val)) = (
+                std::ffi::CString::new(inject_protocol::ENV_IPC_TOKEN),
+                std::ffi::CString::new(hex.as_str()),
+            ) {
+                set_env(env_map, key.as_ptr(), val.as_ptr());
+            }
+            if let Ok(sock_val) = std::ffi::CString::new(server.socket_path()) {
+                let key = std::ffi::CString::new(inject_protocol::ENV_IPC_SOCK).unwrap();
+                set_env(env_map, key.as_ptr(), sock_val.as_ptr());
+            }
+            debug!(app = app_id.0, "library_inject: IPC token injected");
+        }
+
+        // If no DLL injection is configured but IPC is needed, load the
+        // proton helper anyway so it can scan PEs and report back.
+        if !has_proton_dll {
+            let cfg = config();
+            if let Some(path) = resolve_helper_path(&cfg.library_inject.helper_path) {
+                if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
+                    set_env(
+                        env_map,
+                        b"LD_AUDIT\0".as_ptr() as *const i8,
+                        audit_val.as_ptr(),
+                    );
+                    debug!(app = app_id.0, helper = %path, "library_inject: helper loaded for IPC only");
+                }
+            }
+        }
+    }
+
+    // Proton .dll injection via LD_AUDIT helper
+    if let Some(ref inj) = injection {
+        if let Some(dll_path) = &inj.proton_dll {
+            let cfg = config();
+            let resolved = resolve_helper_path(&cfg.library_inject.helper_path);
+            match resolved {
+                Some(path) => {
+                    if let (Ok(audit_val), Ok(dll_val)) = (
+                        std::ffi::CString::new(path.as_str()),
+                        std::ffi::CString::new(dll_path.as_str()),
+                    ) {
+                        set_env(
+                            env_map,
+                            b"LD_AUDIT\0".as_ptr() as *const i8,
+                            audit_val.as_ptr(),
+                        );
+                        set_env(
+                            env_map,
+                            b"STEAM_RUNTIME_INJECT_DLL\0".as_ptr() as *const i8,
+                            dll_val.as_ptr(),
+                        );
+                        info!(app = app_id.0, dll = %dll_path, helper = %path, "library_inject: Proton DLL injection set");
+                    }
+                }
+                None => {
+                    warn!(app = app_id.0, "library_inject: proton helper not found");
+                }
+            }
+        }
+    }
 
     result
 }
@@ -1283,8 +1342,17 @@ extern "C" fn hk_spawn_process(
             .as_ref()
             .unwrap()
             .call(
-                this, exe_path, command_line, working_dir, game_id,
-                extra, flags1, flags2, launch_source, flags3, p_pid,
+                this,
+                exe_path,
+                command_line,
+                working_dir,
+                game_id,
+                extra,
+                flags1,
+                flags2,
+                launch_source,
+                flags3,
+                p_pid,
             )
     }
 }
@@ -1326,6 +1394,55 @@ fn resolve_set_cloud_fn(registry: &PatternRegistry, code: &CodeRegion) {
 
 /// Resolve SetEnvString as a raw fn pointer, not a detour. Called directly from
 /// hk_build_spawn_env_block to inject LD_PRELOAD into the child env map.
+const PROTON_HELPER_NAME: &str = "libproton_inject.so";
+
+/// Resolve the 64-bit proton inject helper path.
+/// Priority: config override > same dir as our .so > /usr/lib > /usr/lib64.
+fn resolve_helper_path(configured: &str) -> Option<String> {
+    if !configured.is_empty() {
+        let p = std::path::Path::new(configured);
+        if p.exists() {
+            return Some(configured.to_owned());
+        }
+        warn!(
+            path = configured,
+            "library_inject: configured helper_path not found"
+        );
+    }
+
+    // Same directory as our own .so
+    if let Some(dir) = own_library_dir() {
+        let candidate = std::path::Path::new(&dir).join(PROTON_HELPER_NAME);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    // Standard system paths (helper is 64-bit)
+    for dir in ["/usr/lib", "/usr/lib64"] {
+        let candidate = std::path::Path::new(dir).join(PROTON_HELPER_NAME);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    None
+}
+
+/// Get the directory containing our own .so via dladdr.
+fn own_library_dir() -> Option<String> {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    let self_addr = own_library_dir as *const () as *mut libc::c_void;
+    if unsafe { libc::dladdr(self_addr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    let path_str = path.to_str().ok()?;
+    std::path::Path::new(path_str)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegion) {
     let entry = match registry.get("SetEnvString") {
         Some(e) => e,
@@ -1429,12 +1546,22 @@ extern "C" fn hk_ticket_ext_data(
             )
     };
 
-    // If Steam returned a valid ticket, cache it for future use
+    // If Steam returned a valid ticket, cache it.
+    // Persist decision:
+    //   Controlled + delegate → always disk (cross-account)
+    //   Controlled + forge   → never disk (re-acquirable)
+    //   Uncontrolled (real)  → follows [ticket] cache setting
     if result > 0 && !p_ticket.is_null() {
         let size = result as usize;
         // SAFETY: p_ticket points to a buffer with at least `result` bytes written by Steam.
         let ticket_data = unsafe { std::slice::from_raw_parts(p_ticket, size) }.to_vec();
-        TICKET_CACHE.store_app_ticket(AppId(app_id), ticket_data);
+        let cfg = config();
+        let persist = if cfg.app_category(AppId(app_id)).is_some() {
+            effective_ticket_mode(&cfg, AppId(app_id)) == steam_runtime_config::TicketMode::Delegate
+        } else {
+            cfg.ticket.cache == steam_runtime_config::TicketCacheMode::Disk
+        };
+        TICKET_CACHE.store_app_ticket(AppId(app_id), ticket_data, persist);
         return result;
     }
 
@@ -1444,8 +1571,43 @@ extern "C" fn hk_ticket_ext_data(
         return result;
     }
 
-    // Try to provide a ticket from cache / Lua / forge
+    let ticket_mode = effective_ticket_mode(&cfg, AppId(app_id));
     let ss = script_state();
+
+    // Delegate mode: while inside the initial request window, prefer the
+    // cached ticket (from a previous owner session) over forging so the
+    // ticket's embedded SteamID matches an account that actually owns the
+    // app. Once the window closes, fall through to the normal forge path
+    // and stop spoofing GetSteamID.
+    if ticket_mode == steam_runtime_config::TicketMode::Delegate {
+        if steam_runtime_features::ticket::in_delegate_window(AppId(app_id)) {
+            if let Some(ticket) = TICKET_CACHE.get_app_ticket(AppId(app_id), &ss.app_tickets) {
+                if let Some(steamid) = extract_steamid_from_ticket(&ticket) {
+                    steam_runtime_features::ticket::set_delegate_steamid(steamid);
+                }
+                return copy_ticket_to_buffer(
+                    &ticket,
+                    p_ticket,
+                    ticket_buf_size,
+                    pi_app_id,
+                    pi_steam_id,
+                    pi_signature,
+                    pcb_signature,
+                    app_id,
+                    "delegate-cached",
+                );
+            }
+            // No cached ticket available yet, fall through to forge below.
+            debug!(
+                app_id,
+                "ticket: delegate window active but no cached ticket, forging"
+            );
+        } else {
+            steam_runtime_features::ticket::clear_delegate_steamid();
+        }
+    }
+
+    // Try to provide a ticket from cache / Lua / forge
     if let Some(ticket) = TICKET_CACHE.get_app_ticket(AppId(app_id), &ss.app_tickets) {
         return copy_ticket_to_buffer(
             &ticket,
@@ -1480,6 +1642,16 @@ extern "C" fn hk_ticket_ext_data(
         "ticket: no ticket available (no cache, no source for forge)"
     );
     result
+}
+
+/// Extract the SteamID embedded in a raw ownership ticket, using the
+/// standard `TICKET_STEAMID_OFFSET` (byte 8, little-endian u64). Returns
+/// `None` if the ticket is too small to contain a SteamID field.
+fn extract_steamid_from_ticket(ticket: &[u8]) -> Option<u64> {
+    const STEAMID_OFFSET: usize = 8;
+    let end = STEAMID_OFFSET.checked_add(8)?;
+    let bytes: [u8; 8] = ticket.get(STEAMID_OFFSET..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 /// Copy ticket data into the output buffer and populate offset pointers.
@@ -2031,6 +2203,7 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
             config.apps.inject.push(steam_runtime_config::InjectApp {
                 id: app_id,
                 dlc: Vec::new(),
+                ticket: Default::default(),
             });
         }
     }

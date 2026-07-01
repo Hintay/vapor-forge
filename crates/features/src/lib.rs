@@ -11,4 +11,5 @@ pub mod manifest;
 pub mod online_patterns;
 pub mod package;
 pub mod request_code;
+pub mod rich_presence;
 pub mod ticket;

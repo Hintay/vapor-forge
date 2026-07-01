@@ -12,3 +12,4 @@ steam-runtime-core = { path = "../runtime-core" }
 steam-runtime-diagnostics = { path = "../diagnostics" }
 thiserror.workspace = true
 tracing.workspace = true
+ureq.workspace = true

@@ -356,6 +356,7 @@ mod tests {
                 inject: vec![steam_runtime_config::InjectApp {
                     id: AppId(480),
                     dlc: Vec::new(),
+                    ticket: Default::default(),
                 }],
                 ..Default::default()
             },
