@@ -1,10 +1,12 @@
-# Pattern definitions for steamclient.so hook targets.
-# Loaded at runtime — update this file to adapt to Steam updates.
+# Pattern definitions for steamclient.so and steamui.so hook targets.
+# Loaded at runtime. Update this file to adapt to Steam updates.
 #
 # follow modes:
-#   "None"             — pattern matches the function prologue directly
-#   "Relative"         — pattern matches a call site; follow E8/E9 rel32 to callee
-#   "PrologueUpwards"  — pattern matches function body; scan upward for prologue bytes
+#   "none": pattern matches the function prologue directly
+#   "relative": pattern matches a call site; follow E8/E9 rel32 to callee
+#   "upward": pattern matches function body; scan upward for prologue bytes
+#   "call": pattern matches a context; scan forward to the last CALL before RET
+#           and optionally validate the callee with callee_pattern
 
 [steamclient."CUser::CheckAppOwnership"]
 follow = "relative"
@@ -99,4 +101,39 @@ optional = true
 follow = "none"
 pattern = "55 89 E5 57 56 53 83 EC 5C 89 45 CC 8B 45 0C 85 C0 0F 84"
 pic_entry = true
+optional = true
+
+# ---------------------------------------------------------------------------
+# steamui.so — library UI management
+# ---------------------------------------------------------------------------
+
+[steamui."CSteamUIAppController::RunFrame"]
+follow = "none"
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 7C E8 ? ? ? ? 8B 84 24 90 00 00 00 D9 5C 24 0C D9 44 24 0C D9 83 ? ? ? ? D8 80 58 06 00 00 D9 C9 DB F1 DD D9 0F 83 ? ? ? ? 8B 84 24 90 00 00 00 8B 80 70 0B 00 00 85 C0 7E 21"
+optional = true
+
+[steamui."CSteamUIAppController::FillInAppOverview"]
+follow = "none"
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 81 EC AC 00 00 00 8B 75 10 8B 5D 08 8B 7D 0C 89 45 94 8B 80 E0 09 00 00 89 75 98 89 5D 90 89 7D 9C 65 8B 35 14 00 00 00 89 75 E4"
+optional = true
+
+[steamui."CSteamUIAppController::BuildCompleteAppOverviewChange"]
+follow = "none"
+pattern = "55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 8C 00 00 00 8B 7D 08 89 5D A4 E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? C7 85 70 FF FF FF 00 00 00 00 66 0F EF C0"
+optional = true
+
+[steamui."google::protobuf::RepeatedField<uint32>::Add"]
+follow = "call"
+pattern = "0F B6 40 08 E8 ? ? ? ? 83 F8 03 74 ? 68 5D 01 00 00"
+callee_pattern = "55 89 E5 57 56 53 83 EC 1C 8B 5D 08 8B 55 0C 8B 33 3B 73 04 8D 7E 01 75 ? 8B 12 89 55 E4 50 50 57 53 E8 ? ? ? ? 89 1C 24 E8 ? ? ? ? 8B 55 E4 EB ? 89 55 0C 83 EC 0C 53 E8 ? ? ? ? 8B 55 0C 8B 12 89 14 B0"
+optional = true
+
+[steamui."CSteamUIAppController::GetAppByID"]
+follow = "none"
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 4C 8B 5D 10 8B 75 08 89 45 C8 8B 80 E0 09 00 00"
+optional = true
+
+[steamui."CUpdateManager::MarkAppChange"]
+follow = "none"
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C 8B 5D 10 8B 75 0C 89 45 D4 8B 80 E0 09 00 00 85 DB 0F 94 C1"
 optional = true

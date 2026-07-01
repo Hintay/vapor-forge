@@ -636,6 +636,13 @@ fn do_install() {
     // Force TICKET_CACHE lazy init while we have config loaded
     let _ = &*TICKET_CACHE;
 
+    // Install steamui.so hooks for library UI management.
+    // steamui.so may not be loaded yet at this point (la_activity fires
+    // after steamclient.so, steamui.so loads later). Try now, retry in
+    // hk_get_pkg_info when pkg0 is captured (steamui.so is guaranteed
+    // loaded by then).
+    try_install_steamui_hooks(&registry);
+
     crate::watcher::start(&CONFIG, &SCRIPT_STATE, &PACKAGE_STATE, config_path);
 
     log_drift_summary(&hook_results);
@@ -1844,6 +1851,7 @@ extern "C" fn hk_get_package_info(
                 if status == 0 {
                     crate::package::PKG0_PTR.store(pkg0 as usize, Ordering::Release);
                     info!("package: captured pkg0 at 0x{:x}", pkg0 as usize);
+
                 } else {
                     warn!(status = status, "package: pkg0 status != Available");
                 }
@@ -2101,6 +2109,34 @@ extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> *mut c_void
 // Helpers
 // ---------------------------------------------------------------------------
 
+static STEAMUI_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Called from la_activity when steamui.so becomes consistent.
+/// Safe to call multiple times; installs only once.
+pub fn try_install_steamui() {
+    if STEAMUI_INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    let registry = load_pattern_registry();
+    try_install_steamui_hooks(&registry);
+}
+
+fn try_install_steamui_hooks(registry: &PatternRegistry) {
+    if STEAMUI_INSTALLED.load(Ordering::Acquire) {
+        return;
+    }
+    let ui_code = match crate::steamui::get_steamui_code() {
+        Some(c) => c,
+        None => {
+            debug!("hook-install: steamui.so not mapped yet, will retry later");
+            return;
+        }
+    };
+    if crate::steamui::install(&ui_code, registry) {
+        STEAMUI_INSTALLED.store(true, Ordering::Release);
+    }
+}
+
 fn get_steamclient_code() -> Option<CodeRegion> {
     let entries = match find_proc_self_maps_targets(16) {
         Ok(e) => e,
@@ -2203,7 +2239,7 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
             config.apps.inject.push(steam_runtime_config::InjectApp {
                 id: app_id,
                 dlc: Vec::new(),
-                ticket: Default::default(),
+                ticket: Default::default(), purchase_time: 0,
             });
         }
     }

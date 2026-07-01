@@ -130,7 +130,7 @@ mod tests {
             .map(|&id| steam_runtime_config::InjectApp {
                 id: AppId(id),
                 dlc: Vec::new(),
-                ticket: Default::default(),
+                ticket: Default::default(), purchase_time: 0,
             })
             .collect();
         RuntimeConfig {

@@ -13,6 +13,8 @@ pub mod netpacket;
 pub mod package;
 pub mod pic_thunk;
 #[cfg(target_os = "linux")]
+pub mod steamui;
+#[cfg(target_os = "linux")]
 pub mod vmt;
 #[cfg(target_os = "linux")]
 pub mod vtable_scan;

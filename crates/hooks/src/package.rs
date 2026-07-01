@@ -265,11 +265,12 @@ pub unsafe fn apply_reload_diff(diff: &ReloadDiff) {
     let vec = unsafe { &mut *package_info::app_id_vec(pkg0 as *mut u8) };
     let mut changed = false;
 
-    // Removals: only remove apps that are no longer in the controlled set
+    // Removals: remove from pkg0 and queue UI removal for the UI thread.
     for &app_id in &diff.removals {
         let raw_id = app_id.0;
         if vec.find_and_fast_remove(&raw_id) {
             debug!(app_id = raw_id, "package: removed from pkg0");
+            crate::steamui::queue_removal(app_id);
             changed = true;
         }
     }

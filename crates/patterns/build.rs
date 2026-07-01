@@ -15,37 +15,46 @@ fn main() {
     let root: TomlRoot = toml::from_str(&toml_str)
         .unwrap_or_else(|e| panic!("failed to parse {}: {}", toml_path.display(), e));
 
-    let entries = root.steamclient.unwrap_or_default();
+    let mut all_entries: Vec<(String, &str, &TomlEntry)> = Vec::new();
+    for (name, entry) in root.steamclient.as_ref().into_iter().flatten() {
+        all_entries.push((name.clone(), "steamclient", entry));
+    }
+    for (name, entry) in root.steamui.as_ref().into_iter().flatten() {
+        all_entries.push((name.clone(), "steamui", entry));
+    }
+    all_entries.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(&b.0)));
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("patterns_generated.rs");
 
     let mut code = String::new();
-    code.push_str("// Auto-generated from res/patterns.toml — do not edit.\n\n");
+    code.push_str("// Auto-generated from res/patterns.toml. Do not edit.\n\n");
     code.push_str(&format!(
         "pub const EMBEDDED_PATTERNS: &[crate::registry::PatternDef; {}] = &[\n",
-        entries.len()
+        all_entries.len()
     ));
 
-    let mut sorted: Vec<_> = entries.iter().collect();
-    sorted.sort_by_key(|(name, _)| name.as_str());
-
-    for (name, entry) in &sorted {
+    for (name, module, entry) in &all_entries {
         let follow = match entry.follow.as_deref().unwrap_or("none") {
             "relative" => "Relative",
             "upward" => "Upward",
+            "call" => "Call",
             _ => "None",
         };
         let prologue = match &entry.prologue {
             Some(p) => format!("Some(&{:?})", parse_hex_bytes(p)),
             None => "None".to_owned(),
         };
+        let callee_pattern = match &entry.callee_pattern {
+            Some(p) => format!("Some({:?})", p),
+            None => "None".to_owned(),
+        };
         let optional = entry.optional.unwrap_or(false);
         let pic_entry = entry.pic_entry.unwrap_or(false);
 
         code.push_str(&format!(
-            "    crate::registry::PatternDef {{ name: {:?}, pattern: {:?}, follow: crate::registry::FollowMode::{}, prologue: {}, optional: {}, pic_entry: {} }},\n",
-            name, entry.pattern, follow, prologue, optional, pic_entry
+            "    crate::registry::PatternDef {{ name: {:?}, pattern: {:?}, follow: crate::registry::FollowMode::{}, prologue: {}, callee_pattern: {}, optional: {}, pic_entry: {}, module: {:?} }},\n",
+            name, entry.pattern, follow, prologue, callee_pattern, optional, pic_entry, module
         ));
     }
 
@@ -82,6 +91,7 @@ fn parse_hex_bytes(hex_str: &str) -> Vec<u8> {
 #[derive(serde::Deserialize)]
 struct TomlRoot {
     steamclient: Option<HashMap<String, TomlEntry>>,
+    steamui: Option<HashMap<String, TomlEntry>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,6 +99,7 @@ struct TomlEntry {
     pattern: String,
     follow: Option<String>,
     prologue: Option<String>,
+    callee_pattern: Option<String>,
     optional: Option<bool>,
     pic_entry: Option<bool>,
 }

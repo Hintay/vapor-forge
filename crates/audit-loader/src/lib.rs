@@ -108,11 +108,16 @@ mod linux_audit {
     #[no_mangle]
     pub extern "C" fn la_activity(_cookie: *mut usize, flag: c_uint) {
         const LA_ACT_CONSISTENT: c_uint = 1;
-        if flag == LA_ACT_CONSISTENT
-            && STEAM_MODULES.steamclient_seen()
-            && LIFECYCLE.has_reached_ready_for_heavy_init()
-        {
+        if flag != LA_ACT_CONSISTENT || !LIFECYCLE.has_reached_ready_for_heavy_init() {
+            return;
+        }
+        if STEAM_MODULES.steamclient_seen() {
             steam_runtime_hooks::install::install_all();
+        }
+        // steamui.so may load in a later batch than steamclient.so.
+        // install_all (Once) already ran but steamui hooks were deferred.
+        if STEAM_MODULES.steamui_seen() {
+            steam_runtime_hooks::install::try_install_steamui();
         }
     }
 

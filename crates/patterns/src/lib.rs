@@ -63,7 +63,7 @@ impl Pattern {
         self.tokens.is_empty()
     }
 
-    fn matches_at(&self, haystack: &[u8], offset: usize) -> bool {
+    pub fn matches_at(&self, haystack: &[u8], offset: usize) -> bool {
         let Some(window) = haystack.get(offset..offset + self.tokens.len()) else {
             return false;
         };

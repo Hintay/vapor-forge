@@ -115,6 +115,78 @@ pub mod package_info {
     }
 }
 
+pub mod steamui {
+    use core::ffi::c_void;
+    use core::marker::PhantomData;
+
+    #[repr(transparent)]
+    struct Ptr32<T> {
+        _addr: u32,
+        _marker: PhantomData<*mut T>,
+    }
+
+    #[repr(C)]
+    struct RepeatedPtrFieldOpaque {
+        _words: [u32; 4],
+    }
+
+    #[repr(C)]
+    struct RepeatedFieldU32Opaque {
+        _current_size: i32,
+        _total_size: i32,
+        _elements: Ptr32<u32>,
+    }
+
+    #[repr(C)]
+    pub struct CAppOverviewChange {
+        _prefix: [u32; 4],
+        _app_overview: RepeatedPtrFieldOpaque,
+        removed_appid: RepeatedFieldU32Opaque,
+    }
+
+    impl CAppOverviewChange {
+        pub const REMOVED_APPID_OFFSET: usize = core::mem::offset_of!(Self, removed_appid);
+
+        /// # Safety
+        /// change must point to a valid SteamUI CAppOverview_Change object.
+        pub unsafe fn mutable_removed_appid(change: *mut c_void) -> *mut c_void {
+            let change = change.cast::<Self>();
+            // SAFETY: caller guarantees change points to the expected SteamUI object.
+            unsafe { core::ptr::addr_of_mut!((*change).removed_appid).cast() }
+        }
+    }
+
+    const _: () = {
+        assert!(CAppOverviewChange::REMOVED_APPID_OFFSET == 0x20);
+    };
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use core::mem;
+
+        #[test]
+        fn repeated_ptr_field_size() {
+            assert_eq!(mem::size_of::<RepeatedPtrFieldOpaque>(), 0x10);
+        }
+
+        #[test]
+        fn repeated_field_u32_size() {
+            assert_eq!(mem::size_of::<RepeatedFieldU32Opaque>(), 0x0c);
+        }
+
+        #[test]
+        fn ptr32_size() {
+            assert_eq!(mem::size_of::<Ptr32<u32>>(), 0x04);
+        }
+
+        #[test]
+        fn app_overview_change_removed_appid_offset() {
+            assert_eq!(CAppOverviewChange::REMOVED_APPID_OFFSET, 0x20);
+        }
+    }
+}
+
 // Depot manifest entry (0x20 bytes) produced by BuildDepotDependency.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

@@ -71,6 +71,36 @@ pub fn resolve_callee(
     }
 }
 
+/// Scan forward from `offset` for up to `max_scan` bytes, find the last
+/// E8 CALL before the next C3 (RET), and return its absolute target.
+pub fn follow_last_call(code: &CodeRegion, offset: usize, max_scan: usize) -> Option<usize> {
+    let end = (offset + max_scan).min(code.bytes.len());
+    let mut last_call_target: Option<usize> = None;
+
+    let mut pos = offset;
+    while pos + 5 <= end {
+        let b = code.bytes[pos];
+        if b == 0xC3 {
+            break;
+        }
+        if b == 0xE8 {
+            let rel = i32::from_le_bytes([
+                code.bytes[pos + 1],
+                code.bytes[pos + 2],
+                code.bytes[pos + 3],
+                code.bytes[pos + 4],
+            ]);
+            let target = (code.base + pos + 5).wrapping_add(rel as usize);
+            last_call_target = Some(target);
+            pos += 5;
+        } else {
+            pos += 1;
+        }
+    }
+
+    last_call_target
+}
+
 /// Scan backward from a prologue address to find the PIC preamble entry point.
 /// PIC functions on i686 start with `E8 rel32` (CALL thunk) + `ADD reg, imm32`
 /// before the prologue. The ADD is 5 bytes (EAX, opcode 05) or 6 bytes (other

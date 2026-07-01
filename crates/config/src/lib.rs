@@ -70,6 +70,10 @@ pub struct InjectApp {
     pub dlc: Vec<AppId>,
     #[serde(default)]
     pub ticket: TicketMode,
+    /// Unix timestamp shown as purchase date in the Steam library UI.
+    /// 0 = auto (current time at first FillInAppOverview call).
+    #[serde(default)]
+    pub purchase_time: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -359,6 +363,15 @@ impl RuntimeConfig {
             }
         }
         None
+    }
+
+    pub fn purchase_time(&self, app_id: AppId) -> u32 {
+        self.apps
+            .inject
+            .iter()
+            .find(|a| a.id == app_id)
+            .map(|a| a.purchase_time)
+            .unwrap_or(0)
     }
 
     pub fn ticket_mode(&self, app_id: AppId) -> TicketMode {

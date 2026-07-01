@@ -92,7 +92,7 @@ mod tests {
                 inject: vec![InjectApp {
                     id: AppId(480),
                     dlc: vec![AppId(505730), AppId(505740)],
-                    ticket: Default::default(),
+                    ticket: Default::default(), purchase_time: 0,
                 }],
                 ..Default::default()
             },

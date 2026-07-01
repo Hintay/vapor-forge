@@ -110,7 +110,7 @@ fn reload_config(
                         .push(steam_runtime_config::InjectApp {
                             id: app_id,
                             dlc: Vec::new(),
-                            ticket: Default::default(),
+                            ticket: Default::default(), purchase_time: 0,
                         });
                 }
             }

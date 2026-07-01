@@ -12,6 +12,10 @@ pub enum FollowMode {
     Relative,
     /// Pattern matches function body; scan upward for prologue bytes.
     Upward,
+    /// Pattern identifies a code region; scan forward for the last E8 CALL
+    /// before a RET (C3) and follow it. Used when the target function is
+    /// called from a unique context but its own body is not unique.
+    Call,
 }
 
 /// A single pattern definition (compile-time or runtime).
@@ -21,8 +25,11 @@ pub struct PatternDef {
     pub pattern: &'static str,
     pub follow: FollowMode,
     pub prologue: Option<&'static [u8]>,
+    pub callee_pattern: Option<&'static str>,
     pub optional: bool,
     pub pic_entry: bool,
+    /// Which shared library this pattern targets ("steamclient" or "steamui").
+    pub module: &'static str,
 }
 
 // Generated at compile time from res/patterns.toml
@@ -34,8 +41,10 @@ pub struct RuntimePatternEntry {
     pub pattern: String,
     pub follow: FollowMode,
     pub prologue: Option<Vec<u8>>,
+    pub callee_pattern: Option<String>,
     pub optional: bool,
     pub pic_entry: bool,
+    pub module: String,
 }
 
 /// Pattern registry with embedded defaults + optional runtime overrides.
@@ -125,6 +134,13 @@ impl<'a> PatternLookup<'a> {
         }
     }
 
+    pub fn callee_pattern(&self) -> Option<&str> {
+        match self {
+            Self::Embedded(p) => p.callee_pattern,
+            Self::Runtime(p) => p.callee_pattern.as_deref(),
+        }
+    }
+
     pub fn optional(&self) -> bool {
         match self {
             Self::Embedded(p) => p.optional,
@@ -138,19 +154,53 @@ impl<'a> PatternLookup<'a> {
             Self::Runtime(p) => p.pic_entry,
         }
     }
+
+    pub fn module(&self) -> &str {
+        match self {
+            Self::Embedded(p) => p.module,
+            Self::Runtime(p) => &p.module,
+        }
+    }
 }
 
 /// Parse TOML overrides (same format as res/patterns.toml).
 fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntry>, String> {
     // Minimal manual TOML parsing to avoid serde at runtime.
-    // Format: [steamclient."FunctionName"]\nfollow = "..."\npattern = "..."
+    // Format: [steamclient."FunctionName"] or [steamui."FunctionName"]
     let mut result = HashMap::new();
     let mut current_name: Option<String> = None;
+    let mut current_module = String::new();
     let mut current_pattern: Option<String> = None;
     let mut current_follow = FollowMode::None;
     let mut current_prologue: Option<Vec<u8>> = None;
+    let mut current_callee_pattern: Option<String> = None;
     let mut current_optional = false;
     let mut current_pic_entry = false;
+
+    let flush = |result: &mut HashMap<String, RuntimePatternEntry>,
+                 name: Option<String>,
+                 module: &str,
+                 pattern: Option<String>,
+                 follow: FollowMode,
+                 prologue: Option<Vec<u8>>,
+                 callee_pattern: Option<String>,
+                 optional: bool,
+                 pic_entry: bool| {
+        if let (Some(name), Some(pattern)) = (name, pattern) {
+            result.insert(
+                name,
+                RuntimePatternEntry {
+                    pattern,
+                    follow,
+                    prologue,
+                    callee_pattern,
+                    optional,
+                    pic_entry,
+                    module: module.to_owned(),
+                },
+            );
+        }
+    };
 
     for line in text.lines() {
         let line = line.trim();
@@ -158,28 +208,36 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
             continue;
         }
 
-        if line.starts_with("[steamclient.") {
-            // Flush previous entry
-            if let (Some(name), Some(pattern)) = (current_name.take(), current_pattern.take()) {
-                result.insert(
-                    name,
-                    RuntimePatternEntry {
-                        pattern,
-                        follow: current_follow,
-                        prologue: current_prologue.take(),
-                        optional: current_optional,
-                        pic_entry: current_pic_entry,
-                    },
-                );
-            }
+        let section_module = if line.starts_with("[steamclient.") {
+            Some("steamclient")
+        } else if line.starts_with("[steamui.") {
+            Some("steamui")
+        } else {
+            None
+        };
+
+        if let Some(module) = section_module {
+            flush(
+                &mut result,
+                current_name.take(),
+                &current_module,
+                current_pattern.take(),
+                current_follow,
+                current_prologue.take(),
+                current_callee_pattern.take(),
+                current_optional,
+                current_pic_entry,
+            );
             current_follow = FollowMode::None;
             current_prologue = None;
+            current_callee_pattern = None;
             current_optional = false;
             current_pic_entry = false;
+            current_module = module.to_owned();
 
-            // Parse: [steamclient."FunctionName"]
+            let prefix = format!("[{module}.");
             let inner = line
-                .trim_start_matches("[steamclient.")
+                .trim_start_matches(&prefix)
                 .trim_end_matches(']')
                 .trim_matches('"');
             current_name = Some(inner.to_owned());
@@ -192,6 +250,7 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
                     current_follow = match value {
                         "relative" => FollowMode::Relative,
                         "upward" => FollowMode::Upward,
+                        "call" => FollowMode::Call,
                         _ => FollowMode::None,
                     };
                 }
@@ -203,6 +262,7 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
                             .collect(),
                     );
                 }
+                "callee_pattern" => current_callee_pattern = Some(value.to_owned()),
                 "optional" => current_optional = value == "true",
                 "pic_entry" => current_pic_entry = value == "true",
                 _ => {}
@@ -211,18 +271,17 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
     }
 
     // Flush last entry
-    if let (Some(name), Some(pattern)) = (current_name, current_pattern) {
-        result.insert(
-            name,
-            RuntimePatternEntry {
-                pattern,
-                follow: current_follow,
-                prologue: current_prologue,
-                optional: current_optional,
-                pic_entry: current_pic_entry,
-            },
-        );
-    }
+    flush(
+        &mut result,
+        current_name,
+        &current_module,
+        current_pattern,
+        current_follow,
+        current_prologue,
+        current_callee_pattern,
+        current_optional,
+        current_pic_entry,
+    );
 
     Ok(result)
 }
@@ -261,11 +320,13 @@ mod tests {
 [steamclient."CUser::CheckAppOwnership"]
 follow = "none"
 pattern = "AA BB CC"
+callee_pattern = "55 89 E5"
 "#;
         let overrides = parse_toml_overrides(toml).unwrap();
         let reg = PatternRegistry { overrides };
         let lookup = reg.get("CUser::CheckAppOwnership").expect("should find");
         assert_eq!(lookup.pattern(), "AA BB CC");
+        assert_eq!(lookup.callee_pattern(), Some("55 89 E5"));
         assert_eq!(lookup.follow(), FollowMode::None);
     }
 }
