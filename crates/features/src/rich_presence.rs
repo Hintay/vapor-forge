@@ -1,4 +1,4 @@
-//! Rich Presence spoofing for AppAvatar.
+//! Rich Presence rewriting for AppAvatar.
 //!
 //! When AppAvatar maps a real (unowned) AppId to another AppId for networking,
 //! Valve's server will not broadcast rich presence for the real AppId because
@@ -70,7 +70,7 @@ pub fn tracked_app() -> AppId {
 /// before AppAvatar rewriting); `is_avatared` reports whether AppAvatar has
 /// a mapping configured for a given AppId.
 pub fn on_games_played_update(app_ids: &[AppId], is_avatared: impl Fn(AppId) -> bool) {
-    let topmost = app_ids.last().copied().unwrap_or(AppId(0));
+    let topmost = app_ids.first().copied().unwrap_or(AppId(0));
     let new_tracked = if topmost.0 != 0 && is_avatared(topmost) {
         topmost.0
     } else {

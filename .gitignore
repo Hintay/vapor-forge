@@ -1,5 +1,9 @@
 /target/
 .DS_Store
+.env
+.env.*
+dist/
+bundle/
 experiments/**/*.so
 experiments/**/picfixture-caller
 experiments/**/target/

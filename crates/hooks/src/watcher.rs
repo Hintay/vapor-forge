@@ -93,8 +93,9 @@ fn reload_config(
     match RuntimeConfig::load(path) {
         Ok(mut new_config) => {
             // Re-execute Lua scripts
-            let new_script_state = if !new_config.scripting.paths.is_empty() {
-                vapor_forge_scripting::execute_scripts(&new_config.scripting.paths)
+            let script_dirs = crate::client::install::build_script_dirs(&new_config);
+            let new_script_state = if !script_dirs.is_empty() {
+                vapor_forge_scripting::execute_scripts(&script_dirs)
             } else {
                 ScriptState::default()
             };

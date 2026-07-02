@@ -73,7 +73,7 @@ pub struct DebugSection {
 /// Controlled apps.
 ///
 /// - `inject`: apps the user does NOT own. Full ownership + optional DLC.
-/// - `shared`: family sharing concurrent-play bypass.
+/// - `shared`: family sharing concurrent-play unlock.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AppsSection {
     #[serde(default)]
@@ -99,23 +99,23 @@ pub struct InjectApp {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TicketMode {
-    /// Default: forge tickets from appId 7 source with current user's SteamID.
+    /// Default: derive tickets from appId 7 source with current user's SteamID.
     #[default]
     Forge,
     /// Delegate to cached ticket from previous owner session. During the
     /// first few ticket requests after launch, return the cached ticket
     /// (with the original owner's SteamID). After the window closes,
-    /// switch to forge mode with the current user's SteamID.
+    /// switch to derived mode with the current user's SteamID.
     Delegate,
 }
 
-/// Family sharing concurrent-play bypass.
+/// Family sharing concurrent-play unlock.
 ///
 /// Enabled by default for ALL family-shared apps.
-/// - Set `include` to bypass ONLY listed apps (whitelist).
-/// - Set `exclude` to bypass all EXCEPT listed apps (blacklist).
+/// - Set `include` to unlock ONLY listed apps (whitelist).
+/// - Set `exclude` to unlock all EXCEPT listed apps (blacklist).
 /// - `include` and `exclude` are mutually exclusive; if both are set, `include` takes precedence.
-/// - Neither set = all family-shared apps are bypassed.
+/// - Neither set = all family-shared apps are unlocked.
 /// - `enabled = false` disables entirely.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SharedSection {
@@ -283,8 +283,8 @@ pub struct LibraryInjectEntry {
 /// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TicketSection {
-    /// Persistence for non-delegate, non-forge tickets (Lua-provided or
-    /// intercepted real tickets). Default "session" = memory only.
+    /// Persistence for non-delegate, non-derived tickets (Lua-provided or
+    /// intercepted real tickets). Default: disk.
     #[serde(default)]
     pub cache: TicketCacheMode,
     /// Automatically detect Denuvo-protected games (via PE section scanning
@@ -294,7 +294,7 @@ pub struct TicketSection {
     pub auto_delegate: bool,
 }
 
-/// Persistence mode for non-delegate, non-forge tickets.
+/// Persistence mode for non-delegate, non-derived tickets.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TicketCacheMode {

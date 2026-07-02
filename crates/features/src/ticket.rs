@@ -36,13 +36,13 @@ impl TicketCache {
             debug!(app_id = app_id.0, "ticket: using Lua-provided app ticket");
             return Some(t.clone());
         }
-        if let Some(t) = self.app_tickets.lock().unwrap().get(&app_id) {
+        if let Some(t) = self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).get(&app_id) {
             debug!(app_id = app_id.0, "ticket: using cached app ticket");
             return Some(t.clone());
         }
         if let Some(t) = self.load_from_disk(app_id, "ticket") {
             debug!(app_id = app_id.0, "ticket: loaded app ticket from disk");
-            self.app_tickets.lock().unwrap().insert(app_id, t.clone());
+            self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, t.clone());
             return Some(t);
         }
         None
@@ -61,7 +61,7 @@ impl TicketCache {
             );
             return Some(t.clone());
         }
-        if let Some(t) = self.enc_tickets.lock().unwrap().get(&app_id) {
+        if let Some(t) = self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).get(&app_id) {
             debug!(app_id = app_id.0, "ticket: using cached encrypted ticket");
             return Some(t.clone());
         }
@@ -70,7 +70,7 @@ impl TicketCache {
                 app_id = app_id.0,
                 "ticket: loaded encrypted ticket from disk"
             );
-            self.enc_tickets.lock().unwrap().insert(app_id, t.clone());
+            self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, t.clone());
             return Some(t);
         }
         None
@@ -88,7 +88,7 @@ impl TicketCache {
         if persist {
             self.save_to_disk(app_id, "ticket", &data);
         }
-        self.app_tickets.lock().unwrap().insert(app_id, data);
+        self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, data);
     }
 
     /// Cache an encrypted ticket. `persist` = true writes to disk.
@@ -102,7 +102,7 @@ impl TicketCache {
         if persist {
             self.save_to_disk(app_id, "enc_ticket", &data);
         }
-        self.enc_tickets.lock().unwrap().insert(app_id, data);
+        self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, data);
     }
 
     fn load_from_disk(&self, app_id: AppId, prefix: &str) -> Option<Vec<u8>> {
@@ -123,7 +123,7 @@ impl TicketCache {
 
 // ---------------------------------------------------------------------------
 // Delegate mode: serve a cached ticket (from a previous owner session) during
-// an initial request window, then switch to forge mode.
+// an initial request window, then switch to derived mode.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ static AUTO_DELEGATE_APPS: Mutex<Option<HashSet<AppId>>> = Mutex::new(None);
 /// Mark an app as auto-detected Denuvo. Subsequent `is_auto_delegate`
 /// checks will return true for this app. Does not modify config.
 pub fn add_auto_delegate(app_id: AppId) {
-    let mut guard = AUTO_DELEGATE_APPS.lock().unwrap();
+    let mut guard = AUTO_DELEGATE_APPS.lock().unwrap_or_else(|e| e.into_inner());
     guard.get_or_insert_with(HashSet::new).insert(app_id);
 }
 
@@ -152,7 +152,7 @@ pub fn is_auto_delegate(app_id: AppId) -> bool {
 
 /// Clear auto-delegate for an app (e.g. on game exit).
 pub fn remove_auto_delegate(app_id: AppId) {
-    if let Some(set) = AUTO_DELEGATE_APPS.lock().unwrap().as_mut() {
+    if let Some(set) = AUTO_DELEGATE_APPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         set.remove(&app_id);
     }
 }
@@ -168,22 +168,22 @@ const DELEGATE_WINDOW_SIZE: u32 = 2;
 /// Per-AppId count of ticket requests seen so far in delegate mode.
 static DELEGATE_COUNTS: Mutex<Option<HashMap<AppId, u32>>> = Mutex::new(None);
 
-/// SteamID to spoof for GetSteamID while a delegate window is active.
+/// SteamID to return from GetSteamID while a delegate window is active.
 /// Zero means no delegate window is active.
 static DELEGATE_STEAMID: AtomicU64 = AtomicU64::new(0);
 
 /// Check if we're still in the delegate window for this app.
 ///
 /// Each call counts as one request. Returns true (serve cached ticket) for
-/// the first `DELEGATE_WINDOW_SIZE` calls, then false (forge) afterwards.
+/// the first `DELEGATE_WINDOW_SIZE` calls, then false afterwards.
 pub fn in_delegate_window(app_id: AppId) -> bool {
-    let mut guard = DELEGATE_COUNTS.lock().unwrap();
+    let mut guard = DELEGATE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     let counts = guard.get_or_insert_with(HashMap::new);
     let count = counts.entry(app_id).or_insert(0);
     *count += 1;
     let in_window = *count <= DELEGATE_WINDOW_SIZE;
     if !in_window {
-        // Window just closed (or already closed): stop spoofing GetSteamID.
+        // Window just closed (or already closed): stop overriding GetSteamID.
         clear_delegate_steamid();
     }
     in_window
@@ -193,13 +193,13 @@ pub fn in_delegate_window(app_id: AppId) -> bool {
 /// (observed via CMsgClientGamesPlayed no longer listing the app), so a
 /// future relaunch gets a fresh delegate window.
 pub fn reset_delegate_window(app_id: AppId) {
-    if let Some(counts) = DELEGATE_COUNTS.lock().unwrap().as_mut() {
+    if let Some(counts) = DELEGATE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         counts.remove(&app_id);
     }
     clear_delegate_steamid();
 }
 
-/// Set the SteamID to spoof for GetSteamID while a delegate window is active.
+/// Set the SteamID to return from GetSteamID while a delegate window is active.
 pub fn set_delegate_steamid(steamid: u64) {
     DELEGATE_STEAMID.store(steamid, Ordering::Release);
 }
@@ -225,15 +225,15 @@ pub mod forge {
     /// Size of the RSA signature at the end of a ticket.
     const SIGNATURE_SIZE: usize = 128;
 
-    /// A ticket forged from a source ticket for a different appId.
+    /// A ticket derived from a source ticket for a different appId.
     pub struct ForgedTicket {
-        /// The complete forged ticket data.
+        /// The complete derived ticket data.
         pub data: Vec<u8>,
         /// Total ticket size (the data.len() value Steam should see).
         pub total_size: u32,
-        /// Byte offset of the appId field within the forged ticket.
+        /// Byte offset of the appId field within the derived ticket.
         pub app_id_offset: u32,
-        /// Byte offset of the SteamID field within the forged ticket.
+        /// Byte offset of the SteamID field within the derived ticket.
         pub steam_id_offset: u32,
         /// Byte offset where the signature begins.
         pub signature_offset: u32,
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn forge_from_source_produces_valid_ticket() {
-        // Create a fake source ticket: 200 bytes of body + 128 bytes of signature
+        // Create a test source ticket: 200 bytes of body + 128 bytes of signature
         let mut source = vec![0u8; 328];
         // Put some recognizable data
         for (i, b) in source.iter_mut().enumerate() {
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn forge_rejects_too_small_ticket() {
-        // Ticket smaller than signature size, cannot forge.
+        // Ticket smaller than signature size, cannot derive.
         let source = vec![0u8; 64];
         assert!(forge::forge_from_source(&source, 480).is_none());
     }

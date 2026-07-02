@@ -11,7 +11,7 @@ pub fn on_is_dlc_installed(
         info!(
             app_id = app_id.0,
             dlc_id = dlc_id.0,
-            "feat: DLC installed spoofed"
+            "feat: DLC installed"
         );
         return true;
     }
@@ -28,7 +28,7 @@ pub fn on_is_dlc_enabled(
         info!(
             app_id = app_id.0,
             dlc_id = dlc_id.0,
-            "feat: DLC enabled spoofed"
+            "feat: DLC enabled"
         );
         return true;
     }
@@ -54,7 +54,7 @@ pub fn get_injected_dlc_at(
         info!(
             app_id = app_id.0,
             dlc_id = dlc_id.0,
-            "feat: DLC data injected"
+            "feat: DLC data provided"
         );
         InjectedDlc {
             dlc_id,

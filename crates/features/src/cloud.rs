@@ -5,10 +5,11 @@ use tracing::info;
 use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool) -> bool {
-    let controlled = config.app_category(app_id).is_some();
+    let controlled =
+        config.app_category(app_id).is_some() && !crate::apps::is_actually_owned(app_id);
     if controlled && !config.cloud_enabled_for_controlled_apps() {
         if original {
-            info!(app_id = app_id.0, "feat: cloud disabled");
+            info!(app_id = app_id.0, "feat: cloud managed");
         }
         return false;
     }

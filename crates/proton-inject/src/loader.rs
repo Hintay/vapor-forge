@@ -104,12 +104,15 @@ fn dll_name_to_string(name: &[u16]) -> String {
 }
 
 fn scan_loaded_pe(base: *mut core::ffi::c_void) {
-    // Read PE section headers from the mapped image. The PE header is
-    // at the base of the mapping for any DLL loaded by Wine.
     const MAX_HEADER_READ: usize = 4096;
-    let ptr = base as *const u8;
-    // SAFETY: reading the PE header from a successfully loaded module.
-    let header = unsafe { std::slice::from_raw_parts(ptr, MAX_HEADER_READ) };
+    let addr = base as usize;
+    let readable = crate::maps::mapping_size_at(addr).unwrap_or(0);
+    if readable == 0 {
+        return;
+    }
+    let len = readable.min(MAX_HEADER_READ);
+    // SAFETY: reading within the verified mapping region of a loaded module.
+    let header = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
     let sections = pe::section_names(header);
     for name in &sections {
         if pe::DENUVO_SECTIONS

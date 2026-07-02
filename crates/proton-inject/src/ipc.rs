@@ -9,7 +9,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 
-use inject_protocol::{self as proto, Message};
+use vapor_forge_inject_protocol::{self as proto, Message};
 
 use crate::loader::log;
 

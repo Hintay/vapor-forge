@@ -51,7 +51,7 @@ pub extern "C" fn la_version(version: c_uint) -> c_uint {
 #[no_mangle]
 pub extern "C" fn la_preinit(_cookie: *mut usize) {
     let has_dll = std::env::var_os("VAPOR_FORGE_INJECT_DLL").is_some();
-    let has_ipc = std::env::var_os(inject_protocol::ENV_IPC_SOCK).is_some();
+    let has_ipc = std::env::var_os(vapor_forge_inject_protocol::ENV_IPC_SOCK).is_some();
 
     if !has_dll && !has_ipc {
         return;

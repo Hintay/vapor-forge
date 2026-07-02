@@ -618,7 +618,7 @@ pub const ERESULT_OK: i32 = 1;
 pub const ERESULT_NO_CONNECTION: i32 = 3;
 
 // ---------------------------------------------------------------------------
-// Rich Presence / PersonaState messages (AppAvatar spoofing)
+// Rich Presence / PersonaState messages (AppAvatar rewriting)
 // ---------------------------------------------------------------------------
 
 /// EMsg for CMsgClientPersonaState.

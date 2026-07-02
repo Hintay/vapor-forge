@@ -1,6 +1,20 @@
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use tracing::info;
 use vapor_forge_abi::CAppOwnershipInfo;
 use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
+
+static ACTUALLY_OWNED: Mutex<Option<HashSet<AppId>>> = Mutex::new(None);
+
+/// Returns true if a controlled app is actually owned by the user.
+pub fn is_actually_owned(app_id: AppId) -> bool {
+    ACTUALLY_OWNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&app_id))
+}
 
 pub fn on_check_ownership(
     config: &RuntimeConfig,
@@ -11,6 +25,13 @@ pub fn on_check_ownership(
     let category = config.app_category(app_id);
 
     if let Some(AppCategory::Inject | AppCategory::InjectDlc { .. }) = category {
+        if original_result != 0 {
+            ACTUALLY_OWNED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(HashSet::new)
+                .insert(app_id);
+        }
         if original_result == 0 {
             info.release_state = 2;
             info.owner = 1;
@@ -21,14 +42,14 @@ pub fn on_check_ownership(
             info.license_permanent = 1;
             info.free_license = 0;
             info.family_shared = 0;
-            info!(app_id = app_id.0, "feat: ownership injected");
+            info!(app_id = app_id.0, "feat: ownership granted");
             return 1;
         }
     }
 
     if config.should_bypass_sharing(app_id) && original_result != 0 && info.family_shared != 0 {
         info.family_shared = 0;
-        info!(app_id = app_id.0, "feat: sharing bypass");
+        info!(app_id = app_id.0, "feat: sharing unlocked");
     }
 
     original_result
@@ -46,8 +67,10 @@ pub fn on_get_subscribed_apps(
 
     let mut count = original_count as usize;
     for &app_id in &inject_ids {
+        if app_list[..count].contains(&app_id.0) {
+            continue;
+        }
         if count < app_list.len() {
-            // FFI buffer expects raw u32
             app_list[count] = app_id.0;
             count += 1;
         }

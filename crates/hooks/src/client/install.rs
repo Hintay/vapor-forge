@@ -163,7 +163,7 @@ pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<vapor_forge_features::tick
         vapor_forge_features::ticket::TicketCache::new(cache_dir)
     });
 
-/// Source ticket from appId 7, lazily acquired on first forge attempt.
+/// Source ticket from appId 7, lazily acquired on first derivation attempt.
 static SOURCE_TICKET_7: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
 static PKG0_INJECTED: AtomicBool = AtomicBool::new(false);
@@ -817,8 +817,9 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
     let result = original(this, app_id);
 
     let cfg = config();
-    let should_disable =
-        cfg.app_category(AppId(app_id)).is_some() && !cfg.cloud_enabled_for_controlled_apps();
+    let should_disable = cfg.app_category(AppId(app_id)).is_some()
+        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
+        && !cfg.cloud_enabled_for_controlled_apps();
 
     if should_disable {
         // Write cloudenabled=false into Steam's in-memory config store (once per app).
@@ -1175,11 +1176,11 @@ extern "C" fn hk_build_spawn_env_block(
     // server is running, regardless of whether this game has a DLL to
     // inject. The helper may be loaded solely for PE scanning.
     if let Some(server) = ipc_server {
-        if let Ok(token) = inject_protocol::generate_token() {
+        if let Ok(token) = vapor_forge_inject_protocol::generate_token() {
             server.register_token(token, app_id.0);
-            let hex = inject_protocol::token_to_hex(&token);
+            let hex = vapor_forge_inject_protocol::token_to_hex(&token);
             if let (Ok(key), Ok(val)) = (
-                std::ffi::CString::new(inject_protocol::ENV_IPC_TOKEN),
+                std::ffi::CString::new(vapor_forge_inject_protocol::ENV_IPC_TOKEN),
                 std::ffi::CString::new(hex.as_str()),
             ) {
                 set_env(env_map, key.as_ptr(), val.as_ptr());
@@ -1620,7 +1621,7 @@ fn try_forge_ticket(
     let source_data = source.as_ref()?;
     let forged = forge::forge_from_source(source_data, target_app_id);
     if forged.is_some() {
-        info!(target_app_id, "ticket: forged from appId 7 source");
+        info!(target_app_id, "ticket: derived from appId 7 source");
     }
     forged
 }
@@ -1666,10 +1667,12 @@ fn acquire_source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
 
 extern "C" fn hk_update_ticket(this: *mut c_void, app_id: u32, force: bool) -> u32 {
     let cfg = config();
-    if cfg.app_category(AppId(app_id)).is_some() {
+    if cfg.app_category(AppId(app_id)).is_some()
+        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
+    {
         // For controlled apps, report success without asking Steam to update
         // (the real update would fail for apps we don't own).
-        debug!(app_id, "ticket: BUpdateAppOwnershipTicket bypassed");
+        debug!(app_id, "ticket: BUpdateAppOwnershipTicket handled");
         return 1;
     }
 
@@ -1690,8 +1693,10 @@ extern "C" fn hk_is_subscribed_in_ticket(
     arg4: u32,
 ) -> u8 {
     let cfg = config();
-    if cfg.app_category(AppId(app_id)).is_some() {
-        debug!(app_id, "ticket: IsUserSubscribedAppInTicket spoofed");
+    if cfg.app_category(AppId(app_id)).is_some()
+        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
+    {
+        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
         return 1;
     }
 
@@ -2051,7 +2056,7 @@ fn find_steamclient_exec_mapping(entries: &[ProcMapsEntry]) -> Option<&ProcMapsE
 /// 1. {Steam}/config/lua/: Steam directory
 /// 2. ~/.config/vapor-forge/scripts/: user config directory
 /// 3. config.toml [scripting] paths: user-specified extra dirs (highest priority)
-fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
+pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
     let mut dirs = Vec::new();
 
     // 1. Steam root config/lua + config/scripts

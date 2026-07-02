@@ -231,10 +231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inject-protocol"
-version = "0.1.0"
-
-[[package]]
 name = "inotify"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -920,17 +916,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vapor-forge-diagnostics-cli"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "object",
- "thiserror",
- "vapor-forge-hooks",
- "vapor-forge-patterns",
-]
-
-[[package]]
 name = "vapor-forge-features"
 version = "0.1.0"
 dependencies = [
@@ -939,7 +924,6 @@ dependencies = [
  "ureq",
  "vapor-forge-abi",
  "vapor-forge-config",
- "vapor-forge-diagnostics",
  "vapor-forge-scripting",
 ]
 
@@ -956,7 +940,6 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "iced-x86",
- "inject-protocol",
  "inotify",
  "libc",
  "once_cell",
@@ -969,10 +952,15 @@ dependencies = [
  "vapor-forge-diagnostics",
  "vapor-forge-features",
  "vapor-forge-hook-boundary",
+ "vapor-forge-inject-protocol",
  "vapor-forge-memory",
  "vapor-forge-patterns",
  "vapor-forge-scripting",
 ]
+
+[[package]]
+name = "vapor-forge-inject-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "vapor-forge-memory"
@@ -996,8 +984,8 @@ dependencies = [
 name = "vapor-forge-proton-inject"
 version = "0.1.0"
 dependencies = [
- "inject-protocol",
  "libc",
+ "vapor-forge-inject-protocol",
 ]
 
 [[package]]
@@ -1008,9 +996,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "ureq",
- "vapor-forge-config",
  "vapor-forge-core",
- "vapor-forge-diagnostics",
 ]
 
 [[package]]

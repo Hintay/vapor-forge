@@ -1,9 +1,9 @@
 //! Achievement/stats schema interception.
 //!
-//! For injected (non-owned) apps, outgoing stats requests have their SteamID
-//! rewritten to a donor so the server returns a valid schema. Incoming responses
-//! have stat values cleared (schema is preserved) so Steam keeps metadata but
-//! falls back to local cache for actual stats.
+//! For controlled apps, outgoing stats requests have their SteamID rewritten
+//! to a reference account so the server returns a valid schema. Incoming
+//! responses have stat values cleared (schema is preserved) so Steam keeps
+//! metadata but falls back to local cache for actual stats.
 //!
 //! Two message paths are supported:
 //! - ServiceMethod (EMsg 151/147): Player.GetUserStats#1
@@ -19,7 +19,7 @@ use vapor_forge_abi::*;
 use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub const STATS_JOB_NAME: &str = "Player.GetUserStats#1";
-const DEFAULT_DONOR_STEAMID: u64 = 76561198028121353;
+const DEFAULT_REF_STEAMID: u64 = 76561198028121353;
 
 // ---------------------------------------------------------------------------
 // Donor SteamID registry
@@ -43,13 +43,13 @@ pub fn load_stat_steam_ids(ids: &HashMap<AppId, u64>) {
     map.extend(ids.iter().map(|(&k, &v)| (k, v)));
 }
 
-fn get_donor_steamid(app_id: AppId) -> u64 {
+fn get_ref_steamid(app_id: AppId) -> u64 {
     STAT_STEAM_IDS
         .lock()
         .unwrap()
         .as_ref()
         .and_then(|m| m.get(&app_id).copied())
-        .unwrap_or(DEFAULT_DONOR_STEAMID)
+        .unwrap_or(DEFAULT_REF_STEAMID)
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +176,7 @@ pub fn drain_offline_responses() -> Vec<OfflineResponse> {
 
 fn should_redirect(app_id: u32, config: &RuntimeConfig) -> bool {
     config.app_category(AppId(app_id)).is_some()
+        && !crate::apps::is_actually_owned(AppId(app_id))
 }
 
 /// Process an outgoing ServiceMethod (EMsg 151) Player.GetUserStats#1 request.
@@ -206,13 +207,13 @@ pub fn on_send_service_stats(
         req.sha_schema = None;
     }
 
-    let donor = get_donor_steamid(AppId(app_id));
-    req.steamid = Some(donor);
+    let ref_id = get_ref_steamid(AppId(app_id));
+    req.steamid = Some(ref_id);
 
     add_pending(job_id, AppId(app_id));
     info!(
         app_id,
-        donor,
+        ref_id,
         probe = is_probe,
         "achievements: redirected stats request"
     );
@@ -238,8 +239,8 @@ pub fn on_send_legacy_stats(body_bytes: &[u8], config: &RuntimeConfig) -> Option
         return Some(Vec::new()); // drop frame
     }
 
-    let donor = get_donor_steamid(AppId(app_id));
-    req.steam_id_for_user = Some(donor);
+    let ref_id = get_ref_steamid(AppId(app_id));
+    req.steam_id_for_user = Some(ref_id);
 
     add_legacy_pending(AppId(app_id));
     debug!(app_id, "achievements: redirected legacy stats request");
@@ -268,7 +269,7 @@ pub fn on_recv_service_stats(
 
     info!(
         app_id = app_id.0,
-        "achievements: cleared donor stats from response"
+        "achievements: cleared stats from response"
     );
     Some((new_hdr.encode_to_vec(), resp.encode_to_vec()))
 }

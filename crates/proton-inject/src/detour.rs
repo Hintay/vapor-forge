@@ -2,7 +2,7 @@
 
 use std::ptr;
 
-// `mov rax, imm64; jmp rax` = 12 bytes. We steal at least this many
+// `mov rax, imm64; jmp rax` = 12 bytes. We relocate at least this many
 // prologue bytes, rounded up to the next instruction boundary.
 const MIN_STOLEN: usize = 12;
 const MAX_PROLOGUE_SCAN: usize = 32;
@@ -94,7 +94,7 @@ fn write_abs_jmp(addr: usize, target: usize) {
     }
 }
 
-/// Determine how many bytes to steal from the prologue (>= MIN_STOLEN,
+/// Determine how many bytes to relocate from the prologue (>= MIN_STOLEN,
 /// on an instruction boundary). Returns None if we can't determine.
 fn prologue_steal_bytes(addr: usize) -> Option<usize> {
     let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, MAX_PROLOGUE_SCAN) };

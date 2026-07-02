@@ -35,6 +35,29 @@ pub fn find_module_with_path<'a>(
     Some((entry.base, &entry.path))
 }
 
+/// Return the size of the contiguous mapping containing `addr`.
+pub fn mapping_size_at(addr: usize) -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in text.lines() {
+        let Some((range, _)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((start_hex, end_hex)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(base), Ok(end)) = (
+            usize::from_str_radix(start_hex, 16),
+            usize::from_str_radix(end_hex, 16),
+        ) else {
+            continue;
+        };
+        if addr >= base && addr < end {
+            return Some(end - addr);
+        }
+    }
+    None
+}
+
 fn parse_line(line: &str) -> Option<MapEntry> {
     // Format: addr_start-addr_end perms offset dev inode path
     let mut parts = line.splitn(6, char::is_whitespace);

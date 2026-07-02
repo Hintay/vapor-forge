@@ -25,4 +25,4 @@ vapor-forge-memory = { path = "../memory" }
 vapor-forge-patterns = { path = "../patterns" }
 prost.workspace = true
 vapor-forge-scripting = { path = "../scripting" }
-inject-protocol = { path = "../inject-protocol" }
+vapor-forge-inject-protocol = { path = "../inject-protocol" }

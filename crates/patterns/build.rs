@@ -36,10 +36,11 @@ fn main() {
 
     for (name, module, entry) in &all_entries {
         let follow = match entry.follow.as_deref().unwrap_or("none") {
+            "none" => "None",
             "relative" => "Relative",
             "upward" => "Upward",
             "call" => "Call",
-            _ => "None",
+            other => panic!("unknown follow mode {:?} for pattern {:?}", other, name),
         };
         let prologue = match &entry.prologue {
             Some(p) => format!("Some(&{:?})", parse_hex_bytes(p)),

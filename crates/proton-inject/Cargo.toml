@@ -1,13 +1,14 @@
 [package]
 name = "vapor-forge-proton-inject"
 version = "0.1.0"
-edition = "2021"
-license = "AGPL-3.0-only"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "vapor_forge_proton_inject"
 crate-type = ["cdylib"]
 
 [target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dependencies]
-inject-protocol = { path = "../inject-protocol" }
-libc = "0.2"
+vapor-forge-inject-protocol = { path = "../inject-protocol" }
+libc.workspace = true

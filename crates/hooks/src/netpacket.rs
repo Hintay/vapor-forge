@@ -108,7 +108,7 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     }
 
     // Rewrite CMsgClientGamesPlayed to substitute avatar AppIds, and track
-    // which real AppId is being played for rich presence spoofing.
+    // which real AppId is being played for rich presence rewriting.
     if emsg == EMSG_GAMESPLAYED || emsg == EMSG_GAMESPLAYED_WITH_DATABLOB {
         capture_local_steamid(header_bytes);
         track_games_played(body_bytes);
