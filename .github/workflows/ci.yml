@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: file
+          targets: i686-unknown-linux-gnu, x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-${{ runner.os }}-
+
+      - name: Check lockfile
+        run: cargo check --workspace --locked
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build
+    needs: check
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install system packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eux
+          dpkg --add-architecture i386
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates git \
+            gcc g++ gcc-multilib g++-multilib \
+            libc6-dev-i386 make pkg-config
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: file
+          targets: i686-unknown-linux-gnu, x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: build-${{ runner.os }}-
+
+      - name: Compute version metadata
+        id: version
+        env:
+          HEAD_TIMESTAMP: ${{ github.event.head_commit.timestamp || '' }}
+          PR_UPDATED_AT: ${{ github.event.pull_request.updated_at || '' }}
+        run: |
+          set -eux
+          version_source="${HEAD_TIMESTAMP:-$PR_UPDATED_AT}"
+          if [ -n "$version_source" ]; then
+            version="$(date -u -d "$version_source" '+%Y%m%d%H%M%S')"
+          else
+            version="$(date -u '+%Y%m%d%H%M%S')"
+          fi
+          commit="${GITHUB_SHA:0:12}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+          else
+            tag_version=""
+          fi
+
+          {
+            echo "version=$version"
+            echo "commit=$commit"
+            echo "tag_version=$tag_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build release
+        run: |
+          set -eux
+          cargo build-main-release --locked
+          cargo build-inject-release --locked
+
+      - name: Stage artifacts
+        run: |
+          set -eux
+          mkdir -p dist
+          cp target/i686-unknown-linux-gnu/release/libvapor_forge.so dist/
+          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so dist/
+
+      - name: Compute artifact name
+        id: meta
+        run: echo "name=vapor-forge-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Package
+        run: |
+          set -eux
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p bundle
+          cp artifacts/libvapor_forge.so bundle/
+          cp artifacts/libvapor_forge_proton_inject.so bundle/
+          cp README.md bundle/
+          tar -C bundle -czf "vapor-forge-${VERSION}-linux.tar.gz" .
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Vapor Forge ${{ github.ref_name }}
+          files: vapor-forge-*-linux.tar.gz
+          generate_release_notes: true
+          draft: true
