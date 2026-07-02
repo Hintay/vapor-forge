@@ -924,7 +924,7 @@ dependencies = [
  "ureq",
  "vapor-forge-abi",
  "vapor-forge-config",
- "vapor-forge-scripting",
+ "vapor-forge-core",
 ]
 
 [[package]]

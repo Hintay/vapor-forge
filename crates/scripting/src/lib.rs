@@ -6,6 +6,7 @@ use std::path::Path;
 use mlua::prelude::*;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+pub use vapor_forge_core::{ManifestOverride, ScriptState};
 use vapor_forge_core::{AppId, DepotId, ManifestId};
 
 #[derive(Debug, Error)]
@@ -14,25 +15,6 @@ pub enum ScriptError {
     Lua(#[from] mlua::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ScriptState {
-    pub apps: Vec<AppId>,
-    pub depot_keys: HashMap<DepotId, Vec<u8>>,
-    pub manifests: HashMap<DepotId, ManifestOverride>,
-    pub app_tickets: HashMap<AppId, Vec<u8>>,
-    pub enc_tickets: HashMap<AppId, Vec<u8>>,
-    pub stat_steam_ids: HashMap<AppId, u64>,
-    pub avatars: HashMap<AppId, AppId>,
-    pub access_tokens: HashMap<AppId, u64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManifestOverride {
-    pub depot_id: DepotId,
-    pub gid: ManifestId,
-    pub size: Option<u64>,
 }
 
 pub fn execute_scripts(dirs: &[String]) -> ScriptState {

@@ -1,5 +1,5 @@
 use vapor_forge_config::{DepotId, ManifestId};
-use vapor_forge_scripting::ScriptState;
+use vapor_forge_core::ScriptState;
 
 pub struct ManifestPatch {
     pub depot_id: DepotId,

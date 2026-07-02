@@ -9,6 +9,6 @@ rust-version.workspace = true
 prost.workspace = true
 vapor-forge-abi = { path = "../steam-abi" }
 vapor-forge-config = { path = "../config" }
-vapor-forge-scripting = { path = "../scripting" }
+vapor-forge-core = { path = "../runtime-core" }
 tracing.workspace = true
 ureq.workspace = true

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +131,25 @@ impl std::fmt::Display for ManifestId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Address(pub usize);
+
+#[derive(Clone, Debug, Default)]
+pub struct ScriptState {
+    pub apps: Vec<AppId>,
+    pub depot_keys: HashMap<DepotId, Vec<u8>>,
+    pub manifests: HashMap<DepotId, ManifestOverride>,
+    pub app_tickets: HashMap<AppId, Vec<u8>>,
+    pub enc_tickets: HashMap<AppId, Vec<u8>>,
+    pub stat_steam_ids: HashMap<AppId, u64>,
+    pub avatars: HashMap<AppId, AppId>,
+    pub access_tokens: HashMap<AppId, u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManifestOverride {
+    pub depot_id: DepotId,
+    pub gid: ManifestId,
+    pub size: Option<u64>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SteamModuleKind {
