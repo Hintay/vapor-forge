@@ -52,35 +52,9 @@ Lua scripts are also loaded from `{Steam}/config/lua/` if the directory exists.
 
 ## Configuration
 
-All configuration lives in `~/.config/vapor-forge/config.toml`. The file is optional. Defaults are applied for every missing field. Changes are picked up automatically through hot-reload.
+All configuration lives in `~/.config/vapor-forge/config.toml`. The file is optional. If no config exists, Vapor Forge creates a starter file from `res/config.default.toml` with recommended defaults and commented examples. On later launches, missing recommended fields and commented examples are synced from that template without overwriting existing values. If a commented example is uncommented, it becomes normal user config and is preserved on future syncs. Defaults are applied for every missing field. Changes are picked up automatically through hot-reload.
 
-### Minimal example
-
-```toml
-[runtime]
-log_level = "info"          # trace, debug, info, warn, error
-
-[cloud]
-enabled = true
-
-[toast]
-enabled = true
-
-[scripting]
-paths = ["/home/deck/my-scripts"]
-```
-
-### Sections
-
-| Section | Purpose |
-| --- | --- |
-| `[runtime]` | Log level, diagnostics toggle, online pattern URL |
-| `[toast]` | Enable/disable in-game toast notifications |
-| `[cloud]` | Cloud save control |
-| `[achievements]` | Offline schema toggle |
-| `[app_avatar]` | App ID remapping for online presence |
-| `[library_inject]` | Native `.so`/`.dll` injection rules per game |
-| `[scripting]` | Extra Lua script directory paths |
+See `res/config.default.toml` for the full generated template and commented examples.
 
 ### Lua scripting
 

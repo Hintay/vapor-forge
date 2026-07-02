@@ -1,0 +1,78 @@
+# Vapor Forge configuration.
+# Fields without a leading "#" are recommended defaults and match runtime
+# defaults. Vapor Forge keeps these fields present and sorted.
+# Lines starting with "#" are examples. Uncomment them only when needed.
+
+# Runtime logging, diagnostics, and pattern override source.
+[runtime]
+log_level = "info"          # trace, debug, info, warn, error
+diagnostics = false         # write extra hook/module diagnostics to logs
+# patterns_url = "https://example.invalid/patterns.toml" # remote pattern overrides
+
+# SteamUI toast notifications.
+[toast]
+enabled = true
+init = true                 # show a startup toast after SteamUI bridge is ready
+
+# Family sharing concurrent-play unlock.
+[apps.shared]
+enabled = true
+# include = [480, 730]      # only unlock these family-shared apps
+# exclude = [730]           # unlock all family-shared apps except these
+
+# Cloud sync control for apps controlled by Vapor Forge.
+[cloud]
+enabled = false             # false strips CloudEnabled for controlled apps
+
+# Ticket generation and ticket cache behavior.
+[ticket]
+cache = "disk"              # disk or session
+auto_delegate = false       # enable delegate mode when the helper detects it
+
+# Manifest request-code provider settings.
+[manifest]
+timeout_connect_ms = 5000   # connection timeout per provider
+timeout_ms = 15000          # total request timeout per provider
+# providers = ["provider-name"] # override provider order/list
+
+# Offline achievement schema support.
+[achievements]
+offline_schema = false
+
+# Native library injection into launched games.
+[library_inject]
+helper_path = ""            # 64-bit Proton helper .so path
+
+# Lua script search paths. Steam's config/lua directory is also scanned.
+[scripting]
+paths = []
+
+# Development API socket for local testing and manual toast/debug commands.
+# [debug]
+# control_api = false
+
+# Apps the current account does not own but Vapor Forge should present as owned.
+# [[apps.inject]]
+# id = 480
+# dlc = [12345, 67890]
+# ticket = "forge"          # forge or delegate
+# purchase_time = 0         # 0 = auto
+
+# Map an app to another app id for networking/rich presence compatibility.
+# [app_avatar]
+# 480 = 730
+# 0 = 730                   # wildcard for all unowned apps
+
+# Apply avatar mappings only when launch options contain a flag.
+# [[app_avatar.rules]]
+# flag = "-onlinefix"
+# avatar = 480
+# apps = [480]
+# exclude = [730]
+
+# Inject a native library into matching launched games through LD_PRELOAD.
+# [[library_inject.libs]]
+# path = "/home/user/mylib.so"
+# flag = "-onlinefix"
+# apps = [480]
+# exclude = [730]

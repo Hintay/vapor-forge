@@ -910,6 +910,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "toml_edit",
  "vapor-forge-core",
 ]
 

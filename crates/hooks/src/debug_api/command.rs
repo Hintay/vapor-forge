@@ -297,7 +297,12 @@ fn config_response(json_mode: bool) -> String {
     let _ = writeln!(out, "    log_level:      {}", cfg.runtime.log_level);
     let _ = writeln!(out, "    diagnostics:    {}", cfg.runtime.diagnostics);
     let _ = writeln!(out, "  [apps]");
-    let _ = writeln!(out, "    inject:         {} apps {:?}", cfg.apps.inject.len(), inject_ids);
+    let _ = writeln!(
+        out,
+        "    inject:         {} apps {:?}",
+        cfg.apps.inject.len(),
+        inject_ids
+    );
     let _ = writeln!(out, "    shared:         {}", cfg.apps.shared.enabled);
     let _ = writeln!(out, "  [cloud]");
     let _ = writeln!(out, "    enabled:        {cloud_str}");

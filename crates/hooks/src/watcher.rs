@@ -92,6 +92,8 @@ fn reload_config(
 ) {
     match RuntimeConfig::load(path) {
         Ok(mut new_config) => {
+            crate::client::install::sync_config_template(path);
+
             // Re-execute Lua scripts
             let script_dirs = crate::client::install::build_script_dirs(&new_config);
             let new_script_state = if !script_dirs.is_empty() {

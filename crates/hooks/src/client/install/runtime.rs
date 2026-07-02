@@ -206,21 +206,28 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
 
 fn config_search_paths() -> Vec<std::path::PathBuf> {
     let mut paths = vec![std::path::PathBuf::from(CONFIG_FILENAME)];
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(
-            std::path::Path::new(&home)
-                .join(".config/vapor-forge")
-                .join(CONFIG_FILENAME),
-        );
+    if let Some(path) = user_config_path() {
+        paths.push(path);
     }
     paths
 }
 
+fn user_config_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(|home| {
+        std::path::Path::new(&home)
+            .join(".config/vapor-forge")
+            .join(CONFIG_FILENAME)
+    })
+}
+
 fn load_config() -> (RuntimeConfig, Option<std::path::PathBuf>) {
+    let mut saw_config_file = false;
     for p in config_search_paths() {
         if p.exists() {
+            saw_config_file = true;
             match RuntimeConfig::load(&p) {
                 Ok(config) => {
+                    sync_config_template(&p);
                     info!(path = %p.display(), "hook-install: config loaded");
                     return (config, Some(p));
                 }
@@ -230,6 +237,45 @@ fn load_config() -> (RuntimeConfig, Option<std::path::PathBuf>) {
             }
         }
     }
+    if !saw_config_file {
+        if let Some(path) = user_config_path() {
+            match RuntimeConfig::write_default_template(&path) {
+                Ok(()) => match RuntimeConfig::load(&path) {
+                    Ok(config) => {
+                        info!(path = %path.display(), "hook-install: config template created");
+                        return (config, Some(path));
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "hook-install: generated config template failed to load"
+                        );
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "hook-install: config template create failed"
+                    );
+                }
+            }
+        }
+    }
     info!("hook-install: no config, using defaults");
     (RuntimeConfig::default(), None)
+}
+
+pub(crate) fn sync_config_template(path: &std::path::Path) {
+    match RuntimeConfig::sync_default_template(path) {
+        Ok(true) => info!(path = %path.display(), "hook-install: config template synced"),
+        Ok(false) => {}
+        Err(e) => warn!(
+            path = %path.display(),
+            error = %e,
+            "hook-install: config template sync failed"
+        ),
+    }
 }
