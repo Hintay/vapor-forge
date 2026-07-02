@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use steam_runtime_config::{AppId, RuntimeConfig};
 use tracing::debug;
+use vapor_forge_config::{AppId, RuntimeConfig};
 
 /// Safe business logic for pkg0 injection.
 ///
@@ -127,7 +127,7 @@ mod tests {
     fn make_config(ids: &[u32]) -> RuntimeConfig {
         let inject = ids
             .iter()
-            .map(|&id| steam_runtime_config::InjectApp {
+            .map(|&id| vapor_forge_config::InjectApp {
                 id: AppId(id),
                 dlc: Vec::new(),
                 ticket: Default::default(),
@@ -135,7 +135,7 @@ mod tests {
             })
             .collect();
         RuntimeConfig {
-            apps: steam_runtime_config::AppsSection {
+            apps: vapor_forge_config::AppsSection {
                 inject,
                 ..Default::default()
             },

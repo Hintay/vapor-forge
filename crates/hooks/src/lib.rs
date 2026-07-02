@@ -2,22 +2,28 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(target_os = "linux")]
+pub mod client;
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub mod debug_api;
+#[cfg(target_os = "linux")]
 pub mod detour;
 #[cfg(target_os = "linux")]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]
-pub mod install;
+pub use client::install;
+#[cfg(target_os = "linux")]
+pub use client::package;
 #[cfg(target_os = "linux")]
 pub mod ipc_server;
 #[cfg(target_os = "linux")]
 pub mod netpacket;
 #[cfg(target_os = "linux")]
 pub(crate) mod original;
-#[cfg(target_os = "linux")]
-pub mod package;
 pub mod pic_thunk;
 #[cfg(target_os = "linux")]
-pub mod steamui;
+pub mod ui;
+#[cfg(target_os = "linux")]
+pub use ui::steamui;
 #[cfg(target_os = "linux")]
 pub mod vmt;
 #[cfg(target_os = "linux")]

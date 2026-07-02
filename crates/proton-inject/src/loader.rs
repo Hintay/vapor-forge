@@ -128,10 +128,10 @@ fn load_helper_now() {
         return; // already loading/loaded
     }
 
-    let dll_path = match std::env::var("STEAM_RUNTIME_INJECT_DLL") {
+    let dll_path = match std::env::var("VAPOR_FORGE_INJECT_DLL") {
         Ok(p) if !p.is_empty() => p,
         _ => {
-            log("STEAM_RUNTIME_INJECT_DLL not set");
+            log("VAPOR_FORGE_INJECT_DLL not set");
             HELPER_LOADING.store(false, Ordering::Release);
             return;
         }
@@ -215,8 +215,10 @@ pub(crate) fn log(msg: &str) {
     static PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
     let path = PATH.get_or_init(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        std::ffi::CString::new(format!("{home}/.config/steam-runtime-rs/proton-inject.log"))
-            .unwrap_or_else(|_| std::ffi::CString::new("/tmp/proton-inject.log").unwrap())
+        std::ffi::CString::new(format!(
+            "{home}/.config/vapor-forge/vapor-forge-proton-inject.log"
+        ))
+        .unwrap_or_else(|_| std::ffi::CString::new("/tmp/vapor-forge-proton-inject.log").unwrap())
     });
 
     const MAX_LOG_SIZE: libc::off_t = 512 * 1024;
@@ -238,7 +240,7 @@ pub(crate) fn log(msg: &str) {
         let pid = libc::getpid();
         let mut header = [0u8; 48];
         let header_len = {
-            let s = format!("[proton-inject][{pid}] ");
+            let s = format!("[vapor-forge-proton-inject][{pid}] ");
             let len = s.len().min(header.len());
             header[..len].copy_from_slice(&s.as_bytes()[..len]);
             len

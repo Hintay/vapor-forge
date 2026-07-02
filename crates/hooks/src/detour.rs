@@ -1,8 +1,8 @@
 use retour::GenericDetour;
 use std::sync::Mutex;
-use steam_runtime_patterns::registry::{FollowMode, PatternLookup};
-use steam_runtime_patterns::{find_prologue_upwards, follow_relative_call, Pattern};
 use tracing::{debug, error, info, warn};
+use vapor_forge_patterns::registry::{FollowMode, PatternLookup};
+use vapor_forge_patterns::{find_prologue_upwards, follow_relative_call, Pattern};
 
 use crate::pic_thunk;
 

@@ -5,24 +5,39 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+compile_error!("vapor-forge-proton-inject only supports 64-bit Linux targets");
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod detour;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod ipc;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod loader;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod maps;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod nt_types;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod pe;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod trigger;
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 use core::ffi::{c_uint, c_void};
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const LAV_CURRENT: c_uint = 2;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const POLL_INTERVAL_MS: u64 = 50;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const POLL_MAX_ATTEMPTS: u32 = 600; // 30 seconds
 
 // ---------------------------------------------------------------------------
 // LD_AUDIT interface
 // ---------------------------------------------------------------------------
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
 pub extern "C" fn la_version(version: c_uint) -> c_uint {
     if version == 0 {
@@ -32,9 +47,10 @@ pub extern "C" fn la_version(version: c_uint) -> c_uint {
     }
 }
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
 pub extern "C" fn la_preinit(_cookie: *mut usize) {
-    let has_dll = std::env::var_os("STEAM_RUNTIME_INJECT_DLL").is_some();
+    let has_dll = std::env::var_os("VAPOR_FORGE_INJECT_DLL").is_some();
     let has_ipc = std::env::var_os(inject_protocol::ENV_IPC_SOCK).is_some();
 
     if !has_dll && !has_ipc {
@@ -43,9 +59,9 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
 
     // Do NOT connect IPC here. Wine spawns multiple child processes
     // (wineboot, wineserver, services.exe) that all inherit the same
-    // env vars. Connecting here would consume the one-time token from
-    // a non-game process. IPC connects later when the trigger fires
-    // (steam_api64.dll loaded), ensuring only the game process connects.
+    // env vars. Connecting here would authenticate a non-game process
+    // before the trigger path is active. IPC connects later when the
+    // trigger fires, ensuring only the game process reports events.
 
     if loader::install_trigger() {
         return;
@@ -53,6 +69,7 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
     spawn_poll_thread();
 }
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
 pub unsafe extern "C" fn la_objopen(
     _map: *mut c_void,
@@ -62,6 +79,7 @@ pub unsafe extern "C" fn la_objopen(
     0
 }
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
 pub unsafe extern "C" fn la_objclose(_cookie: *mut usize) -> c_uint {
     0
@@ -71,9 +89,10 @@ pub unsafe extern "C" fn la_objclose(_cookie: *mut usize) -> c_uint {
 // Poll thread
 // ---------------------------------------------------------------------------
 
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 fn spawn_poll_thread() {
     std::thread::Builder::new()
-        .name("proton-inject-poll".into())
+        .name("vapor-forge-proton-inject-poll".into())
         .spawn(|| {
             for _ in 0..POLL_MAX_ATTEMPTS {
                 if loader::install_trigger() {

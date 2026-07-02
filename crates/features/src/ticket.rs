@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use steam_runtime_config::AppId;
 use tracing::{debug, info, warn};
+use vapor_forge_config::AppId;
 
 /// Thread-safe ticket cache.
 ///
@@ -245,8 +245,7 @@ pub mod forge {
     ///
     /// Layout: `[signed_data] [target_app_id le32] [signature]`
     ///
-    /// The target appId is inserted between the signed body and the signature,
-    /// matching the SLSsteam forging strategy.
+    /// The target appId is inserted between the signed body and the signature.
     pub fn forge_from_source(source_ticket: &[u8], target_app_id: u32) -> Option<ForgedTicket> {
         if source_ticket.len() <= SIGNATURE_SIZE {
             return None;

@@ -99,7 +99,7 @@ fn do_fetch(url: &str) -> Result<String, String> {
 
 fn pattern_cache_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(std::path::Path::new(&home).join(".config/steam-runtime-rs/patterns.toml"))
+    Some(std::path::Path::new(&home).join(".config/vapor-forge/patterns.toml"))
 }
 
 fn fnv1a_64(data: &[u8]) -> u64 {

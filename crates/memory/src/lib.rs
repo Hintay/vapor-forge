@@ -9,8 +9,8 @@
 
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol};
 use std::collections::{BTreeMap, BTreeSet};
-use steam_runtime_core::Address;
 use thiserror::Error;
+use vapor_forge_core::Address;
 
 const MAX_PROC_MAPS_LINE_LEN: usize = 4096;
 const MAX_PROC_MAPS_PATH_LEN: usize = 1024;
@@ -976,7 +976,7 @@ f7d85000-f7d90000 r--p 00000000 08:01 44 /tmp/steamclient.so\n";
     fn summarizes_target_named_elf_file_from_disk() {
         let source = std::env::current_exe().expect("test executable path should be available");
         let work_dir =
-            std::env::temp_dir().join(format!("steam-runtime-rs-elf-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("vapor-forge-elf-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&work_dir);
         std::fs::create_dir_all(&work_dir).expect("test directory should be created");
         let target = work_dir.join("steamui.so");
@@ -1014,10 +1014,7 @@ f7d85000-f7d90000 r--p 00000000 08:01 44 /tmp/steamclient.so\n";
             segment_count: 4,
             section_count: 32,
             dynamic_symbol_count: 2,
-            dynamic_symbol_names: vec![
-                "steam_runtime_plain_symbol".to_owned(),
-                "_Z3foov".to_owned(),
-            ],
+            dynamic_symbol_names: vec!["vapor_forge_plain_symbol".to_owned(), "_Z3foov".to_owned()],
             dynamic_symbol_names_truncated: false,
             build_id: Some("001122".to_owned()),
             gnu_hash_present: true,

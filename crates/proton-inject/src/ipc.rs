@@ -1,4 +1,4 @@
-// IPC client for communicating with the main steam-runtime-rs process.
+// IPC client for communicating with the main vapor-forge process.
 // Connects to a Unix domain socket, authenticates with a per-launch token,
 // then sends PE analysis results and DLL injection status.
 //

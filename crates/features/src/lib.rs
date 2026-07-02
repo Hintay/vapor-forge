@@ -13,3 +13,4 @@ pub mod package;
 pub mod request_code;
 pub mod rich_presence;
 pub mod ticket;
+pub mod toast;

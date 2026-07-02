@@ -1,22 +1,25 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(target_os = "linux")]
-use once_cell::sync::Lazy;
-#[cfg(target_os = "linux")]
-use steam_runtime_core::{Lifecycle, SteamModuleState};
+#[cfg(all(target_os = "linux", not(target_pointer_width = "32")))]
+compile_error!("vapor-forge-audit-loader only supports 32-bit Linux targets");
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+use once_cell::sync::Lazy;
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+use vapor_forge_core::{Lifecycle, SteamModuleState};
+
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
 static LIFECYCLE: Lazy<Lifecycle> = Lazy::new(Lifecycle::new);
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
 static STEAM_MODULES: Lazy<SteamModuleState> = Lazy::new(SteamModuleState::new);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
 mod linux_audit {
     use core::ffi::{c_char, c_uint, c_void};
 
-    use steam_runtime_diagnostics::{log_cstr, log_early};
-    use steam_runtime_memory::is_steam_target_name;
+    use vapor_forge_diagnostics::{log_cstr, log_early};
+    use vapor_forge_memory::is_steam_target_name;
 
     use super::{LIFECYCLE, STEAM_MODULES};
 
@@ -117,7 +120,7 @@ mod linux_audit {
         let steamclient_seen = STEAM_MODULES.steamclient_seen();
         let steamui_seen = STEAM_MODULES.steamui_seen();
 
-        use steam_runtime_hooks::install::{
+        use vapor_forge_hooks::install::{
             ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
         };
 
@@ -135,7 +138,7 @@ mod linux_audit {
             !steamclient_seen || is_hook_batch_finished(HookBatch::SteamClient);
         let steamui_finished = !steamui_seen || is_hook_batch_finished(HookBatch::SteamUi);
         if (steamclient_seen || steamui_seen) && steamclient_finished && steamui_finished {
-            steam_runtime_hooks::detour::restore_trampoline_pages_rx();
+            vapor_forge_hooks::detour::restore_trampoline_pages_rx();
         }
     }
 

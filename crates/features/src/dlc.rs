@@ -1,5 +1,5 @@
-use steam_runtime_config::{AppId, RuntimeConfig};
 use tracing::info;
+use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub fn on_is_dlc_installed(
     config: &RuntimeConfig,
@@ -84,11 +84,11 @@ fn controlled_dlcs_for(config: &RuntimeConfig, app_id: AppId) -> Vec<AppId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use steam_runtime_config::InjectApp;
+    use vapor_forge_config::InjectApp;
 
     fn config_with_dlc() -> RuntimeConfig {
         RuntimeConfig {
-            apps: steam_runtime_config::AppsSection {
+            apps: vapor_forge_config::AppsSection {
                 inject: vec![InjectApp {
                     id: AppId(480),
                     dlc: vec![AppId(505730), AppId(505740)],

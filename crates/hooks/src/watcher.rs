@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use inotify::{Inotify, WatchMask};
-use steam_runtime_config::{AppId, RuntimeConfig};
-use steam_runtime_features::package::PackageState;
-use steam_runtime_scripting::ScriptState;
 use tracing::{debug, info, warn};
+use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_features::package::PackageState;
+use vapor_forge_scripting::ScriptState;
 
 pub fn start(
     config_store: &'static ArcSwap<RuntimeConfig>,
@@ -94,7 +94,7 @@ fn reload_config(
         Ok(mut new_config) => {
             // Re-execute Lua scripts
             let new_script_state = if !new_config.scripting.paths.is_empty() {
-                steam_runtime_scripting::execute_scripts(&new_config.scripting.paths)
+                vapor_forge_scripting::execute_scripts(&new_config.scripting.paths)
             } else {
                 ScriptState::default()
             };
@@ -104,15 +104,12 @@ fn reload_config(
                 new_config.apps.inject.iter().map(|a| a.id).collect();
             for &app_id in &new_script_state.apps {
                 if !existing_ids.contains(&app_id) {
-                    new_config
-                        .apps
-                        .inject
-                        .push(steam_runtime_config::InjectApp {
-                            id: app_id,
-                            dlc: Vec::new(),
-                            ticket: Default::default(),
-                            purchase_time: 0,
-                        });
+                    new_config.apps.inject.push(vapor_forge_config::InjectApp {
+                        id: app_id,
+                        dlc: Vec::new(),
+                        ticket: Default::default(),
+                        purchase_time: 0,
+                    });
                 }
             }
 
@@ -120,16 +117,16 @@ fn reload_config(
             let dlc_count: usize = new_config.apps.inject.iter().map(|a| a.dlc.len()).sum();
 
             // Compute pkg0 diff BEFORE updating stores
-            let controlled = steam_runtime_features::package::controlled_app_ids(
+            let controlled = vapor_forge_features::package::controlled_app_ids(
                 &new_config,
                 &new_script_state.apps,
             );
             let diff = package_state.compute_hot_reload_diff(&controlled);
 
             // Reload AppAvatar static map (config + lua).
-            steam_runtime_features::app_avatar::load_static_map(&new_config.app_avatar);
+            vapor_forge_features::app_avatar::load_static_map(&new_config.app_avatar);
             for (&app, &avatar) in &new_script_state.avatars {
-                steam_runtime_features::app_avatar::set_avatar(app, avatar);
+                vapor_forge_features::app_avatar::set_avatar(app, avatar);
             }
 
             // Update stores
@@ -142,7 +139,7 @@ fn reload_config(
             {
                 // SAFETY: pkg0 and cuser are captured when package_state is active,
                 // and all function pointers are resolved.
-                unsafe { crate::package::apply_reload_diff(&diff) };
+                unsafe { crate::client::package::apply_reload_diff(&diff) };
                 package_state.apply_diff(&diff);
                 info!(
                     additions = diff.additions.len(),

@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use steam_runtime_config::{AppAvatarRule, AppAvatarSection, AppId};
 use tracing::{debug, info};
+use vapor_forge_config::{AppAvatarRule, AppAvatarSection, AppId};
 
 // Static + Lua mappings (replaced on config reload).
 static STATIC_MAP: Mutex<Option<HashMap<AppId, AppId>>> = Mutex::new(None);
@@ -64,7 +64,7 @@ pub fn get_avatar(app_id: AppId) -> Option<AppId> {
 /// Returns Some(new_body) if any game_id was changed, None otherwise.
 pub fn rewrite_games_played(body_bytes: &[u8]) -> Option<Vec<u8>> {
     use prost::Message;
-    let mut msg = steam_runtime_abi::CMsgClientGamesPlayed::decode(body_bytes).ok()?;
+    let mut msg = vapor_forge_abi::CMsgClientGamesPlayed::decode(body_bytes).ok()?;
     let mut changed = false;
     for game in &mut msg.games_played {
         if let Some(gid) = game.game_id {

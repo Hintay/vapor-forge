@@ -1,5 +1,5 @@
-// IPC protocol between proton-inject (64-bit Wine child) and the main
-// steam-runtime-rs process (32-bit Linux Steam).
+// IPC protocol between the 64-bit Wine child helper and the main 32-bit Steam
+// process.
 //
 // Wire format: [u32 len][u8 msg_type][payload...]
 // len = size of msg_type + payload (does NOT include the 4-byte len field).
@@ -14,13 +14,13 @@ pub const MAX_MSG_SIZE: usize = 4096;
 pub const MAX_NAME_LEN: usize = 260;
 
 // Socket path environment variable name.
-pub const ENV_IPC_SOCK: &str = "STEAM_RUNTIME_IPC_SOCK";
+pub const ENV_IPC_SOCK: &str = "VAPOR_FORGE_IPC_SOCK";
 
 // Per-launch authentication token environment variable name.
-pub const ENV_IPC_TOKEN: &str = "STEAM_RUNTIME_IPC_TOKEN";
+pub const ENV_IPC_TOKEN: &str = "VAPOR_FORGE_IPC_TOKEN";
 
 // Default socket directory under XDG_RUNTIME_DIR.
-pub const SOCK_DIR_NAME: &str = "steam-runtime-rs";
+pub const SOCK_DIR_NAME: &str = "vapor-forge";
 pub const SOCK_FILE_NAME: &str = "ipc.sock";
 
 // -----------------------------------------------------------------------
@@ -286,7 +286,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Compute the default socket path: $XDG_RUNTIME_DIR/steam-runtime-rs/ipc.sock
+/// Compute the default socket path: $XDG_RUNTIME_DIR/vapor-forge/ipc.sock
 pub fn default_socket_path() -> Option<String> {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
     Some(format!("{runtime_dir}/{SOCK_DIR_NAME}/{SOCK_FILE_NAME}"))

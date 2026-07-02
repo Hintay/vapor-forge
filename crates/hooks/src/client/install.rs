@@ -3,16 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Once, OnceLock};
 
 use retour::GenericDetour;
-use steam_runtime_abi::CAppOwnershipInfo;
-use steam_runtime_config::{AppId, DepotId, RuntimeConfig};
-use steam_runtime_memory::{find_proc_self_maps_targets, ProcMapsEntry};
-use steam_runtime_patterns::registry::PatternRegistry;
-use steam_runtime_scripting::ScriptState;
 use tracing::{debug, error, info, warn};
+use vapor_forge_abi::CAppOwnershipInfo;
+use vapor_forge_config::{AppId, DepotId, RuntimeConfig};
+use vapor_forge_memory::{find_proc_self_maps_targets, ProcMapsEntry};
+use vapor_forge_patterns::registry::PatternRegistry;
+use vapor_forge_scripting::ScriptState;
 
-use steam_runtime_hook_boundary::{
-    validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput,
-};
+use vapor_forge_hook_boundary::{validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput};
 
 use crate::detour::{self, CodeRegion, PendingDetour};
 use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
@@ -155,14 +153,14 @@ pub(crate) static SCRIPT_STATE: once_cell::sync::Lazy<arc_swap::ArcSwap<ScriptSt
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(ScriptState::default()));
 
 pub(crate) static PACKAGE_STATE: once_cell::sync::Lazy<
-    steam_runtime_features::package::PackageState,
-> = once_cell::sync::Lazy::new(steam_runtime_features::package::PackageState::new);
+    vapor_forge_features::package::PackageState,
+> = once_cell::sync::Lazy::new(vapor_forge_features::package::PackageState::new);
 
-pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<steam_runtime_features::ticket::TicketCache> =
+pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<vapor_forge_features::ticket::TicketCache> =
     once_cell::sync::Lazy::new(|| {
         let cache_dir = std::env::var_os("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".config/steam-runtime-rs/cache"));
-        steam_runtime_features::ticket::TicketCache::new(cache_dir)
+            .map(|h| std::path::PathBuf::from(h).join(".config/vapor-forge/cache"));
+        vapor_forge_features::ticket::TicketCache::new(cache_dir)
     });
 
 /// Source ticket from appId 7, lazily acquired on first forge attempt.
@@ -222,11 +220,11 @@ fn install_steamclient_hook_batch() {
 pub fn ensure_runtime_initialized() {
     RUNTIME_INIT.call_once(|| {
         // Early init so config loading errors can be logged.
-        steam_runtime_diagnostics::init("info");
+        vapor_forge_diagnostics::init("info");
 
         let (config, config_path) = load_config();
 
-        steam_runtime_diagnostics::init(&config.runtime.log_level);
+        vapor_forge_diagnostics::init(&config.runtime.log_level);
 
         // Execute Lua scripts and merge addappid results into config.
         let (config, script_state) = execute_and_merge_scripts(config);
@@ -251,18 +249,23 @@ pub fn ensure_runtime_initialized() {
 
         if hooks_enabled {
             // Load stat donor SteamIDs from Lua scripts.
-            steam_runtime_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
+            vapor_forge_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
 
             // Load AppAvatar mappings from config static_map and Lua setavatar.
-            steam_runtime_features::app_avatar::load_static_map(&config.app_avatar);
+            vapor_forge_features::app_avatar::load_static_map(&config.app_avatar);
             for (&app, &avatar) in &script_state.avatars {
-                steam_runtime_features::app_avatar::set_avatar(app, avatar);
+                vapor_forge_features::app_avatar::set_avatar(app, avatar);
             }
         }
 
         CONFIG.store(std::sync::Arc::new(config));
         SCRIPT_STATE.store(std::sync::Arc::new(script_state));
         RUNTIME_HOOKS_ENABLED.store(hooks_enabled, Ordering::Release);
+
+        #[cfg(debug_assertions)]
+        if CONFIG.load().debug.control_api {
+            crate::debug_api::start();
+        }
 
         if !hooks_enabled {
             return;
@@ -309,7 +312,7 @@ fn runtime_hooks_enabled() -> bool {
 /// Load patterns: try external override file, fall back to embedded.
 fn load_pattern_registry() -> PatternRegistry {
     if let Ok(home) = std::env::var("HOME") {
-        let path = std::path::Path::new(&home).join(".config/steam-runtime-rs/patterns.toml");
+        let path = std::path::Path::new(&home).join(".config/vapor-forge/patterns.toml");
         if path.exists() {
             let reg = PatternRegistry::with_overrides(&path);
             info!(path = %path.display(), "patterns: loaded external overrides");
@@ -356,7 +359,7 @@ fn validate_hook_eligibility(
     target_addr: usize,
     replacement_addr: usize,
     code: &CodeRegion,
-) -> steam_runtime_hook_boundary::Result<()> {
+) -> vapor_forge_hook_boundary::Result<()> {
     validate_raw_hook_plan(RawHookEligibilityInput {
         module_name: "steamclient.so",
         expected_module_name: "steamclient.so",
@@ -433,9 +436,9 @@ fn do_install() {
     crate::vtable_scan::warmup();
 
     // Resolve pkg0 injection function addresses. These are not hooks and are called directly.
-    crate::package::resolve_functions(&code, &registry);
+    super::package::resolve_functions(&code, &registry);
 
-    if crate::package::all_functions_resolved() {
+    if super::package::all_functions_resolved() {
         info!("hook-install: pkg0 functions resolved (4/4)");
     } else {
         warn!("hook-install: some pkg0 functions not resolved, injection may be limited");
@@ -560,7 +563,7 @@ fn do_install() {
         HookResult {
             name: "CPackageInfo::GetPackageInfo",
             installed: d_get_pkg_info.is_some(),
-            addr: crate::package::get_package_info_addr().unwrap_or(0),
+            addr: super::package::get_package_info_addr().unwrap_or(0),
         },
         hr!(
             "IClientUser::GetAppOwnershipTicketExtendedData",
@@ -674,9 +677,9 @@ fn do_install() {
     // Background fetch of online pattern updates
     let cfg = CONFIG.load();
     if !cfg.runtime.patterns_url.is_empty() {
-        steam_runtime_features::online_patterns::spawn_fetch(
+        vapor_forge_features::online_patterns::spawn_fetch(
             cfg.runtime.patterns_url.clone(),
-            steam_runtime_patterns::registry::EMBEDDED_PATTERNS_HASH,
+            vapor_forge_patterns::registry::EMBEDDED_PATTERNS_HASH,
         );
     }
 }
@@ -690,12 +693,12 @@ pub(crate) fn config() -> arc_swap::Guard<std::sync::Arc<RuntimeConfig>> {
 }
 
 /// Config ticket mode overlaid with runtime auto-delegate detections.
-fn effective_ticket_mode(cfg: &RuntimeConfig, app_id: AppId) -> steam_runtime_config::TicketMode {
+fn effective_ticket_mode(cfg: &RuntimeConfig, app_id: AppId) -> vapor_forge_config::TicketMode {
     let mode = cfg.ticket_mode(app_id);
-    if mode == steam_runtime_config::TicketMode::Forge
-        && steam_runtime_features::ticket::is_auto_delegate(app_id)
+    if mode == vapor_forge_config::TicketMode::Forge
+        && vapor_forge_features::ticket::is_auto_delegate(app_id)
     {
-        return steam_runtime_config::TicketMode::Delegate;
+        return vapor_forge_config::TicketMode::Delegate;
     }
     mode
 }
@@ -722,8 +725,8 @@ extern "C" fn hk_check_app_ownership(
     }
 
     // Store CUser pointer for MarkLicenseAsChanged / ProcessPendingLicenseUpdates
-    if crate::package::CUSER_PTR.load(Ordering::Acquire) == 0 {
-        crate::package::CUSER_PTR.store(this as usize, Ordering::Release);
+    if super::package::CUSER_PTR.load(Ordering::Acquire) == 0 {
+        super::package::CUSER_PTR.store(this as usize, Ordering::Release);
         debug!("package: captured CUser at 0x{:x}", this as usize);
     }
 
@@ -734,22 +737,22 @@ extern "C" fn hk_check_app_ownership(
     }
 
     // pkg0 injection: triggered after GetPackageInfo hook captures CPackageInfo* + pkg0
-    if crate::package::PKG0_PTR.load(Ordering::Acquire) != 0
+    if super::package::PKG0_PTR.load(Ordering::Acquire) != 0
         && !PKG0_INJECTED.swap(true, Ordering::AcqRel)
     {
         let cfg = config();
         let ss = script_state();
-        let controlled = steam_runtime_features::package::controlled_app_ids(&*cfg, &ss.apps);
+        let controlled = vapor_forge_features::package::controlled_app_ids(&*cfg, &ss.apps);
         let plan = PACKAGE_STATE.compute_injection(&controlled);
 
         // SAFETY: pkg0 and cuser captured, function pointers resolved.
-        unsafe { crate::package::try_inject_once(&plan.app_ids) };
+        unsafe { super::package::try_inject_once(&plan.app_ids) };
         PACKAGE_STATE.record_injected(&plan.app_ids);
         PACKAGE_STATE.set_active();
     }
 
     // Pump pending markAndProcess from watcher thread (runs on this Steam thread).
-    crate::package::pump_mark_and_process();
+    super::package::pump_mark_and_process();
 
     let cfg = config();
     // SAFETY: out is a valid pointer provided by Steam's caller, filled by original.
@@ -757,7 +760,7 @@ extern "C" fn hk_check_app_ownership(
 
     // If pkg0 injection is active, Steam's original already sees ownership
     // from pkg0. Still run the spoof as fallback for edge cases.
-    steam_runtime_features::apps::on_check_ownership(&*cfg, AppId(app_id), result, info)
+    vapor_forge_features::apps::on_check_ownership(&*cfg, AppId(app_id), result, info)
 }
 
 // ---------------------------------------------------------------------------
@@ -777,12 +780,12 @@ extern "C" fn hk_get_subscribed_apps(
     let cfg = config();
 
     if app_list.is_null() || size == 0 {
-        return count + steam_runtime_features::apps::get_subscribed_count_adjustment(&*cfg);
+        return count + vapor_forge_features::apps::get_subscribed_count_adjustment(&*cfg);
     }
 
     // SAFETY: app_list buffer has `size` u32 slots, provided by Steam's caller.
     let slice = unsafe { std::slice::from_raw_parts_mut(app_list, size as usize) };
-    steam_runtime_features::apps::on_get_subscribed_apps(&*cfg, slice, count)
+    vapor_forge_features::apps::on_get_subscribed_apps(&*cfg, slice, count)
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +824,7 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
         // Write cloudenabled=false into Steam's in-memory config store (once per app).
         // This prevents the "out of date" cloud badge after hot-reload.
         // The VDF write filter strips it before disk flush.
-        if steam_runtime_features::cloud::mark_cloud_wrote(AppId(app_id)) {
+        if vapor_forge_features::cloud::mark_cloud_wrote(AppId(app_id)) {
             if let Some(set_fn) = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) } {
                 set_fn(this, app_id, false);
                 info!(
@@ -832,7 +835,7 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
         }
     }
 
-    steam_runtime_features::cloud::on_is_cloud_enabled(&*cfg, AppId(app_id), result)
+    vapor_forge_features::cloud::on_is_cloud_enabled(&*cfg, AppId(app_id), result)
 }
 
 fn install_cloud_vmt(this: *mut c_void) {
@@ -892,7 +895,7 @@ extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u3
     let result = original(this, app_id, dlc_id);
 
     let cfg = config();
-    steam_runtime_features::dlc::on_is_dlc_installed(&*cfg, AppId(app_id), AppId(dlc_id), result)
+    vapor_forge_features::dlc::on_is_dlc_installed(&*cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
 extern "C" fn hk_b_is_dlc_enabled(
@@ -906,7 +909,7 @@ extern "C" fn hk_b_is_dlc_enabled(
     let result = original(this, app_id, dlc_id, unknown);
 
     let cfg = config();
-    steam_runtime_features::dlc::on_is_dlc_enabled(&*cfg, AppId(app_id), AppId(dlc_id), result)
+    vapor_forge_features::dlc::on_is_dlc_enabled(&*cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
 extern "C" fn hk_launch_app(
@@ -1026,7 +1029,7 @@ extern "C" fn hk_get_steamid(this: *mut c_void) -> u64 {
     let original = vmt_or_return!("GetSteamID", ORIG_GET_STEAMID, 0);
     let real_steamid = original(this);
 
-    let delegate = steam_runtime_features::ticket::delegate_steamid();
+    let delegate = vapor_forge_features::ticket::delegate_steamid();
     if delegate != 0 {
         debug!(
             real = real_steamid,
@@ -1082,7 +1085,7 @@ extern "C" fn hk_write_vdf_file(
     if !buffer.is_null() && size > 0 {
         // SAFETY: buffer/size from Steam's serialized VDF.
         let data = unsafe { std::slice::from_raw_parts(buffer, size as usize) };
-        if let Some(filtered) = steam_runtime_features::cloud::strip_cloud_from_vdf(data) {
+        if let Some(filtered) = vapor_forge_features::cloud::strip_cloud_from_vdf(data) {
             debug!(
                 original = size,
                 filtered = filtered.len(),
@@ -1135,7 +1138,7 @@ extern "C" fn hk_build_spawn_env_block(
     let raw = unsafe { *(game_id as *const u32) };
     let app_id = AppId(raw & 0x00FF_FFFF);
 
-    let injection = steam_runtime_features::library_inject::take_pending(app_id);
+    let injection = vapor_forge_features::library_inject::take_pending(app_id);
     let ipc_server = IPC_SERVER.get().and_then(|s| s.as_ref());
 
     if injection.is_none() && ipc_server.is_none() {
@@ -1184,7 +1187,7 @@ extern "C" fn hk_build_spawn_env_block(
             if let Ok(sock_val) = std::ffi::CString::new(server.socket_path()) {
                 set_env(
                     env_map,
-                    b"STEAM_RUNTIME_IPC_SOCK\0".as_ptr() as *const i8,
+                    b"VAPOR_FORGE_IPC_SOCK\0".as_ptr() as *const i8,
                     sock_val.as_ptr(),
                 );
             }
@@ -1226,7 +1229,7 @@ extern "C" fn hk_build_spawn_env_block(
                         );
                         set_env(
                             env_map,
-                            b"STEAM_RUNTIME_INJECT_DLL\0".as_ptr() as *const i8,
+                            b"VAPOR_FORGE_INJECT_DLL\0".as_ptr() as *const i8,
                             dll_val.as_ptr(),
                         );
                         info!(app = app_id.0, dll = %dll_path, helper = %path, "library_inject: Proton DLL injection set");
@@ -1273,14 +1276,14 @@ extern "C" fn hk_spawn_process(
 
         let cfg = config();
         if !cfg.app_avatar.rules.is_empty() {
-            steam_runtime_features::app_avatar::on_launch_app(
+            vapor_forge_features::app_avatar::on_launch_app(
                 app_id,
                 &cfg.app_avatar.rules,
                 &launch_opts,
             );
         }
         if !cfg.library_inject.libs.is_empty() {
-            steam_runtime_features::library_inject::on_launch_app(
+            vapor_forge_features::library_inject::on_launch_app(
                 app_id,
                 &cfg.library_inject.libs,
                 &launch_opts,
@@ -1341,7 +1344,7 @@ fn resolve_set_cloud_fn(registry: &PatternRegistry, code: &CodeRegion) {
 
 /// Resolve SetEnvString as a raw fn pointer, not a detour. Called directly from
 /// hk_build_spawn_env_block to inject LD_PRELOAD into the child env map.
-const PROTON_HELPER_NAME: &str = "libproton_inject.so";
+const PROTON_HELPER_NAME: &str = "libvapor_forge_proton_inject.so";
 
 /// Resolve the 64-bit proton inject helper path.
 /// Priority: config override > same dir as our .so > /usr/lib > /usr/lib64.
@@ -1454,9 +1457,9 @@ extern "C" fn hk_ticket_ext_data(
         let ticket_data = unsafe { std::slice::from_raw_parts(p_ticket, size) }.to_vec();
         let cfg = config();
         let persist = if cfg.app_category(AppId(app_id)).is_some() {
-            effective_ticket_mode(&cfg, AppId(app_id)) == steam_runtime_config::TicketMode::Delegate
+            effective_ticket_mode(&cfg, AppId(app_id)) == vapor_forge_config::TicketMode::Delegate
         } else {
-            cfg.ticket.cache == steam_runtime_config::TicketCacheMode::Disk
+            cfg.ticket.cache == vapor_forge_config::TicketCacheMode::Disk
         };
         TICKET_CACHE.store_app_ticket(AppId(app_id), ticket_data, persist);
         return result;
@@ -1476,11 +1479,11 @@ extern "C" fn hk_ticket_ext_data(
     // ticket's embedded SteamID matches an account that actually owns the
     // app. Once the window closes, fall through to the normal forge path
     // and stop spoofing GetSteamID.
-    if ticket_mode == steam_runtime_config::TicketMode::Delegate {
-        if steam_runtime_features::ticket::in_delegate_window(AppId(app_id)) {
+    if ticket_mode == vapor_forge_config::TicketMode::Delegate {
+        if vapor_forge_features::ticket::in_delegate_window(AppId(app_id)) {
             if let Some(ticket) = TICKET_CACHE.get_app_ticket(AppId(app_id), &ss.app_tickets) {
                 if let Some(steamid) = extract_steamid_from_ticket(&ticket) {
-                    steam_runtime_features::ticket::set_delegate_steamid(steamid);
+                    vapor_forge_features::ticket::set_delegate_steamid(steamid);
                 }
                 return copy_ticket_to_buffer(
                     &ticket,
@@ -1500,7 +1503,7 @@ extern "C" fn hk_ticket_ext_data(
                 "ticket: delegate window active but no cached ticket, forging"
             );
         } else {
-            steam_runtime_features::ticket::clear_delegate_steamid();
+            vapor_forge_features::ticket::clear_delegate_steamid();
         }
     }
 
@@ -1609,8 +1612,8 @@ fn copy_ticket_to_buffer(
 fn try_forge_ticket(
     this: *mut c_void,
     target_app_id: u32,
-) -> Option<steam_runtime_features::ticket::forge::ForgedTicket> {
-    use steam_runtime_features::ticket::forge;
+) -> Option<vapor_forge_features::ticket::forge::ForgedTicket> {
+    use vapor_forge_features::ticket::forge;
 
     let source = SOURCE_TICKET_7.get_or_init(|| acquire_source_ticket(this));
 
@@ -1637,7 +1640,7 @@ fn acquire_source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
             .as_ref()?
             .call(
                 this,
-                steam_runtime_features::ticket::forge::SOURCE_APP_ID,
+                vapor_forge_features::ticket::forge::SOURCE_APP_ID,
                 buf.as_mut_ptr(),
                 BUF_SIZE,
                 &mut app_id_off,
@@ -1721,12 +1724,12 @@ extern "C" fn hk_get_package_info(
         // Now call GetPackageInfo(this, 0, token) to get pkg0
         if !result.is_null() || package_id == 0 {
             // Try to get pkg0 using the captured CPackageInfo*
-            let pkg0 = original.call(this, 0, crate::package::PKG0_ACCESS_TOKEN);
+            let pkg0 = original.call(this, 0, super::package::PKG0_ACCESS_TOKEN);
             if !pkg0.is_null() {
                 // SAFETY: pkg0 is a valid PackageInfo pointer.
-                let status = unsafe { steam_runtime_abi::package_info::status(pkg0) };
+                let status = unsafe { vapor_forge_abi::package_info::status(pkg0) };
                 if status == 0 {
-                    crate::package::PKG0_PTR.store(pkg0 as usize, Ordering::Release);
+                    super::package::PKG0_PTR.store(pkg0 as usize, Ordering::Release);
                     info!("package: captured pkg0 at 0x{:x}", pkg0 as usize);
                 } else {
                     warn!(status = status, "package: pkg0 status != Available");
@@ -1742,7 +1745,7 @@ extern "C" fn hk_get_package_info(
 }
 
 fn create_get_package_info_detour() -> Option<PendingDetour<GetPackageInfoHookFn>> {
-    let addr = crate::package::get_package_info_addr()?;
+    let addr = super::package::get_package_info_addr()?;
 
     let replacement_addr = hk_get_package_info as *const () as usize;
     if let Some(&(base, end)) = CODE_RANGE.get() {
@@ -1797,8 +1800,7 @@ extern "C" fn hk_build_depot_dependency(
         let ss = script_state();
         if !ss.manifests.is_empty() {
             // SAFETY: p_depot_info is a CUtlVector<DepotEntry>* filled by Steam.
-            let vec =
-                p_depot_info as *mut steam_runtime_abi::CUtlVector<steam_runtime_abi::DepotEntry>;
+            let vec = p_depot_info as *mut vapor_forge_abi::CUtlVector<vapor_forge_abi::DepotEntry>;
             // SAFETY: vec is valid after BuildDepotDependency returned.
             let size = unsafe { (*vec).len() };
             if size > 0 && size <= unsafe { (*vec).capacity() } {
@@ -1808,7 +1810,7 @@ extern "C" fn hk_build_depot_dependency(
                     // SAFETY: i < size.
                     depot_ids.push(DepotId(unsafe { (*vec).get(i) }.depot_id));
                 }
-                let patches = steam_runtime_features::manifest::find_patches(&depot_ids, &*ss);
+                let patches = vapor_forge_features::manifest::find_patches(&depot_ids, &*ss);
                 for patch in &patches {
                     for i in 0..size {
                         // SAFETY: i < size.
@@ -1850,10 +1852,9 @@ extern "C" fn hk_load_depot_decryption_key(
     if !key_name.is_null() && key_size >= 32 && !key_buf.is_null() {
         if let Some(depot_id_raw) = extract_depot_id_from_raw(key_name) {
             let ss = script_state();
-            if let Some(key) = steam_runtime_features::depot_key::provide_key(
-                DepotId(depot_id_raw),
-                &ss.depot_keys,
-            ) {
+            if let Some(key) =
+                vapor_forge_features::depot_key::provide_key(DepotId(depot_id_raw), &ss.depot_keys)
+            {
                 // SAFETY: key_buf has key_size capacity >= 32, we write 32 bytes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(key.as_ptr(), key_buf, 32);
@@ -1976,7 +1977,7 @@ fn install_steamui_hook_batch() {
             info!(installed = false, "hook-install: steamui batch finished");
             return;
         }
-        let Some(ui_code) = crate::steamui::get_steamui_code() else {
+        let Some(ui_code) = crate::ui::steamui::get_steamui_code() else {
             warn!(
                 "hook-install: steamui.so executable mapping unavailable, skipping steamui hooks"
             );
@@ -1985,7 +1986,7 @@ fn install_steamui_hook_batch() {
             return;
         };
         let registry = load_pattern_registry();
-        let installed = crate::steamui::install(&ui_code, &registry);
+        let installed = crate::ui::steamui::install(&ui_code, &registry);
         STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
         info!(installed, "hook-install: steamui batch finished");
     });
@@ -2047,8 +2048,8 @@ fn find_steamclient_exec_mapping(entries: &[ProcMapsEntry]) -> Option<&ProcMapsE
 }
 
 /// Build the ordered list of Lua script directories:
-/// 1. {Steam}/config/lua/: Steam directory (compatible with OST)
-/// 2. ~/.config/steam-runtime-rs/scripts/: user config directory
+/// 1. {Steam}/config/lua/: Steam directory
+/// 2. ~/.config/vapor-forge/scripts/: user config directory
 /// 3. config.toml [scripting] paths: user-specified extra dirs (highest priority)
 fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
     let mut dirs = Vec::new();
@@ -2061,7 +2062,7 @@ fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
 
     // 2. User config directory
     if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{}/.config/steam-runtime-rs/scripts", home));
+        dirs.push(format!("{}/.config/vapor-forge/scripts", home));
     }
 
     // 3. Extra dirs from config. Highest priority; later dirs override earlier.
@@ -2082,7 +2083,7 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
         return (config, ScriptState::default());
     }
 
-    let state = steam_runtime_scripting::execute_scripts(&dirs);
+    let state = vapor_forge_scripting::execute_scripts(&dirs);
 
     // Merge script-added app IDs into config.apps.inject (dedup)
     let existing_ids: std::collections::HashSet<AppId> =
@@ -2090,7 +2091,7 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
 
     for &app_id in &state.apps {
         if !existing_ids.contains(&app_id) {
-            config.apps.inject.push(steam_runtime_config::InjectApp {
+            config.apps.inject.push(vapor_forge_config::InjectApp {
                 id: app_id,
                 dlc: Vec::new(),
                 ticket: Default::default(),
@@ -2107,7 +2108,7 @@ fn config_search_paths() -> Vec<std::path::PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         paths.push(
             std::path::Path::new(&home)
-                .join(".config/steam-runtime-rs")
+                .join(".config/vapor-forge")
                 .join(CONFIG_FILENAME),
         );
     }

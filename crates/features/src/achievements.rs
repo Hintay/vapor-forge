@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use prost::Message;
-use steam_runtime_abi::*;
-use steam_runtime_config::{AppId, RuntimeConfig};
 use tracing::{debug, info};
+use vapor_forge_abi::*;
+use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub const STATS_JOB_NAME: &str = "Player.GetUserStats#1";
 const DEFAULT_DONOR_STEAMID: u64 = 76561198028121353;

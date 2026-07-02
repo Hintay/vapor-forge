@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use steam_runtime_abi::{
+use tracing::{debug, info};
+use vapor_forge_abi::{
     ECLIENTPERSONASTATEFLAG_RICH_PRESENCE, EMSG_CLIENT_PERSONA_STATE,
     EPERSONASTATEFLAG_HAS_RICH_PRESENCE, K_MSG_HDR_PROTO_FLAG,
 };
-use steam_runtime_config::AppId;
-use tracing::{debug, info};
+use vapor_forge_config::AppId;
 
 type RichPresenceKvs = HashMap<AppId, Vec<(String, String)>>;
 
@@ -113,7 +113,7 @@ pub fn cache_self_persona(header: &[u8], body: &[u8]) {
     use prost::Message;
     let steamid = local_steamid();
     if steamid != 0 {
-        let has_self = steam_runtime_abi::ClientPersonaState::decode(body)
+        let has_self = vapor_forge_abi::ClientPersonaState::decode(body)
             .map(|msg| msg.friends.iter().any(|f| f.friendid == Some(steamid)))
             .unwrap_or(false);
         if !has_self {
@@ -167,7 +167,7 @@ pub fn build_inject_packet(app_id: AppId) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut msg = steam_runtime_abi::ClientPersonaState::decode(cache.body.as_slice()).ok()?;
+    let mut msg = vapor_forge_abi::ClientPersonaState::decode(cache.body.as_slice()).ok()?;
     let entry = msg
         .friends
         .iter_mut()
@@ -178,7 +178,7 @@ pub fn build_inject_packet(app_id: AppId) -> Option<Vec<u8>> {
 
     let new_body = msg.encode_to_vec();
     let emsg_raw = EMSG_CLIENT_PERSONA_STATE | K_MSG_HDR_PROTO_FLAG;
-    Some(steam_runtime_abi::assemble_raw(
+    Some(vapor_forge_abi::assemble_raw(
         emsg_raw,
         &cache.header,
         &new_body,
@@ -198,7 +198,7 @@ pub fn patch_persona_state(body_bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut msg = steam_runtime_abi::ClientPersonaState::decode(body_bytes).ok()?;
+    let mut msg = vapor_forge_abi::ClientPersonaState::decode(body_bytes).ok()?;
     let entry = msg
         .friends
         .iter_mut()
@@ -211,14 +211,14 @@ pub fn patch_persona_state(body_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(msg.encode_to_vec())
 }
 
-fn apply_game_fields(entry: &mut steam_runtime_abi::PersonaStateFriend, app_id: AppId) {
+fn apply_game_fields(entry: &mut vapor_forge_abi::PersonaStateFriend, app_id: AppId) {
     entry.game_played_app_id = Some(app_id.0);
     entry.gameid = Some(app_id.0 as u64);
     entry.rich_presence.clear();
     let kvs = get_kvs(app_id);
     let has_kvs = !kvs.is_empty();
     for (k, v) in kvs {
-        entry.rich_presence.push(steam_runtime_abi::PersonaStateKV {
+        entry.rich_presence.push(vapor_forge_abi::PersonaStateKV {
             key: Some(k),
             value: Some(v),
         });
@@ -233,7 +233,7 @@ fn apply_game_fields(entry: &mut steam_runtime_abi::PersonaStateFriend, app_id: 
 }
 
 /// Mark the top-level status_flags as carrying rich presence field data.
-fn set_rich_presence_flag(msg: &mut steam_runtime_abi::ClientPersonaState) {
+fn set_rich_presence_flag(msg: &mut vapor_forge_abi::ClientPersonaState) {
     let flags = msg.status_flags.unwrap_or(0);
     msg.status_flags = Some(flags | ECLIENTPERSONASTATEFLAG_RICH_PRESENCE);
 }
@@ -326,7 +326,7 @@ mod tests {
             m
         });
 
-        let mut entry = steam_runtime_abi::PersonaStateFriend::default();
+        let mut entry = vapor_forge_abi::PersonaStateFriend::default();
         apply_game_fields(&mut entry, AppId(480));
 
         assert_eq!(entry.game_played_app_id, Some(480));

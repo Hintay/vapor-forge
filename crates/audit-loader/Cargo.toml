@@ -1,18 +1,19 @@
 [package]
-name = "steam-runtime-audit-loader"
+name = "vapor-forge-audit-loader"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [lib]
+name = "vapor_forge"
 crate-type = ["cdylib"]
 
-[dependencies]
+[target.'cfg(all(target_os = "linux", target_pointer_width = "32"))'.dependencies]
 libc.workspace = true
 once_cell.workspace = true
-steam-runtime-core = { path = "../runtime-core" }
-steam-runtime-diagnostics = { path = "../diagnostics" }
-steam-runtime-hooks = { path = "../hooks" }
-steam-runtime-memory = { path = "../memory" }
+vapor-forge-core = { path = "../runtime-core" }
+vapor-forge-diagnostics = { path = "../diagnostics" }
+vapor-forge-hooks = { path = "../hooks" }
+vapor-forge-memory = { path = "../memory" }
 tracing.workspace = true

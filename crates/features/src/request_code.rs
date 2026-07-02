@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
-use steam_runtime_abi::{
+use tracing::{debug, error, info, warn};
+use vapor_forge_abi::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
     K_MSG_HDR_PROTO_FLAG,
 };
-use steam_runtime_config::{AppId, RuntimeConfig};
-use tracing::{debug, error, info, warn};
+use vapor_forge_config::{AppId, RuntimeConfig};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -196,7 +196,7 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
     let body_bytes = resp_body.encode_to_vec();
     let emsg_raw = EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG;
 
-    steam_runtime_abi::assemble_raw(emsg_raw, &hdr_bytes, &body_bytes)
+    vapor_forge_abi::assemble_raw(emsg_raw, &hdr_bytes, &body_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +331,7 @@ mod tests {
     fn build_response_routes_to_caller() {
         let req_hdr = make_req_header(42, TARGET_JOB_NAME);
         let packet = build_response_packet(&req_hdr, 42, 123, 99999);
-        let (emsg, hdr_bytes, body_bytes) = steam_runtime_abi::unpack_raw(&packet).unwrap();
+        let (emsg, hdr_bytes, body_bytes) = vapor_forge_abi::unpack_raw(&packet).unwrap();
         assert_eq!(emsg, EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG);
 
         let resp_hdr = CMsgProtoBufHeader::decode(hdr_bytes).unwrap();
@@ -346,7 +346,7 @@ mod tests {
     fn build_response_failure_returns_access_denied() {
         let req_hdr = make_req_header(7, TARGET_JOB_NAME);
         let packet = build_response_packet(&req_hdr, 7, 123, 0);
-        let (_, hdr_bytes, body_bytes) = steam_runtime_abi::unpack_raw(&packet).unwrap();
+        let (_, hdr_bytes, body_bytes) = vapor_forge_abi::unpack_raw(&packet).unwrap();
 
         let resp_hdr = CMsgProtoBufHeader::decode(hdr_bytes).unwrap();
         assert_eq!(resp_hdr.eresult, Some(15));
@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn should_intercept_controlled_app() {
         let config = RuntimeConfig {
-            apps: steam_runtime_config::AppsSection {
-                inject: vec![steam_runtime_config::InjectApp {
+            apps: vapor_forge_config::AppsSection {
+                inject: vec![vapor_forge_config::InjectApp {
                     id: AppId(480),
                     dlc: Vec::new(),
                     ticket: Default::default(),

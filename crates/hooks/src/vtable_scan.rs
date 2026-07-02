@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Once;
 
-use steam_runtime_memory::find_proc_self_maps_targets;
 use tracing::{debug, info, warn};
+use vapor_forge_memory::find_proc_self_maps_targets;
 
 static SCAN_ONCE: Once = Once::new();
 static mut SCAN_RESULT: Option<ScanResult> = None;

@@ -3,15 +3,15 @@
 //!
 //! Two injection modes:
 //!   - Native .so: written as LD_PRELOAD
-//!   - Proton .dll: written as LD_AUDIT (64-bit helper) + STEAM_RUNTIME_INJECT_DLL
+//!   - Proton .dll: written as LD_AUDIT (64-bit helper) + VAPOR_FORGE_INJECT_DLL
 //!
 //! The unsafe SetEnvString call lives in the hooks crate, not here.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use steam_runtime_config::{AppId, LibraryInjectEntry};
 use tracing::{debug, info};
+use vapor_forge_config::{AppId, LibraryInjectEntry};
 
 /// Resolved injection for a single game launch.
 pub struct PendingInjection {

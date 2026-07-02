@@ -1,14 +1,14 @@
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use steam_runtime_abi::{
+use tracing::{debug, error, info, warn};
+use vapor_forge_abi::{
     package_info, CUtlMemoryGrowFn, GetPackageInfoFn, MarkLicenseAsChangedFn,
     ProcessPendingLicenseUpdatesFn,
 };
-use steam_runtime_config::AppId;
-use steam_runtime_features::package::ReloadDiff;
-use steam_runtime_patterns::registry::PatternRegistry;
-use tracing::{debug, error, info, warn};
+use vapor_forge_config::AppId;
+use vapor_forge_features::package::ReloadDiff;
+use vapor_forge_patterns::registry::PatternRegistry;
 
 use crate::detour::CodeRegion;
 
@@ -16,7 +16,7 @@ use crate::detour::CodeRegion;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Access token for pkg0 (from OST).
+/// Access token for pkg0.
 pub const PKG0_ACCESS_TOKEN: u64 = 10660652434190618804;
 
 /// Batch grow size for CUtlMemory reallocation.
@@ -173,7 +173,7 @@ pub unsafe fn try_capture_pkg0(cuser: *mut c_void) {
 
 /// Inject app IDs into pkg0 and trigger license re-evaluation.
 ///
-/// Dedup: findAndFastRemove(id) then appendGrowing(id), same as SLSsteam.
+/// Dedup: remove an existing app id before appending it to the injected package.
 ///
 /// # Safety
 /// Must only be called after pkg0 and cuser are captured, and all function
@@ -251,7 +251,7 @@ pub unsafe fn apply_reload_diff(diff: &ReloadDiff) {
         let raw_id = app_id.0;
         if vec.find_and_fast_remove(&raw_id) {
             debug!(app_id = raw_id, "package: removed from pkg0");
-            crate::steamui::queue_removal(app_id);
+            crate::ui::steamui::queue_removal(app_id);
             changed = true;
         }
     }
@@ -303,7 +303,7 @@ pub fn pump_mark_and_process() {
 // ---------------------------------------------------------------------------
 
 /// Append a value to a CUtlVector<u32>, growing the backing CUtlMemory if needed.
-fn append_growing(vec: &mut steam_runtime_abi::CUtlVector<u32>, value: u32) -> bool {
+fn append_growing(vec: &mut vapor_forge_abi::CUtlVector<u32>, value: u32) -> bool {
     if vec.try_append(value) {
         return true;
     }
@@ -320,7 +320,7 @@ fn append_growing(vec: &mut steam_runtime_abi::CUtlVector<u32>, value: u32) -> b
 
     // SAFETY: growing Steam's CUtlMemory via its own internal function.
     grow_fn(
-        &mut vec.m_memory as *mut steam_runtime_abi::CUtlMemory<u32> as *mut c_void,
+        &mut vec.m_memory as *mut vapor_forge_abi::CUtlMemory<u32> as *mut c_void,
         GROW_BATCH,
     );
 

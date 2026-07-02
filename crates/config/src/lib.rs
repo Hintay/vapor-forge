@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
-// Re-export newtypes so callers only need to depend on steam-runtime-config.
-pub use steam_runtime_core::{AppId, DepotId, ManifestId};
+// Re-export newtypes so callers only need to depend on vapor-forge-config.
+pub use vapor_forge_core::{AppId, DepotId, ManifestId};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -22,6 +22,10 @@ pub enum ConfigError {
 pub struct RuntimeConfig {
     #[serde(default)]
     pub runtime: RuntimeSection,
+    #[serde(default)]
+    pub toast: ToastSection,
+    #[serde(default)]
+    pub debug: DebugSection,
     #[serde(default)]
     pub apps: AppsSection,
     #[serde(default)]
@@ -48,6 +52,22 @@ pub struct RuntimeSection {
     pub diagnostics: bool,
     #[serde(default)]
     pub patterns_url: String,
+}
+
+/// Steam internal toast notifications shown through SteamUI WebUI.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ToastSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub init: bool,
+}
+
+/// Development-only local control API.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DebugSection {
+    #[serde(default = "default_debug_control_api")]
+    pub control_api: bool,
 }
 
 /// Controlled apps.
@@ -268,7 +288,7 @@ pub struct TicketSection {
     #[serde(default)]
     pub cache: TicketCacheMode,
     /// Automatically detect Denuvo-protected games (via PE section scanning
-    /// in the proton-inject helper) and enable delegate ticket mode for them.
+    /// in the vapor-forge-proton-inject helper) and enable delegate ticket mode for them.
     /// Requires library injection with a proton helper configured.
     #[serde(default)]
     pub auto_delegate: bool,
@@ -332,12 +352,33 @@ impl Default for RuntimeSection {
     }
 }
 
+impl Default for ToastSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            init: true,
+        }
+    }
+}
+
+impl Default for DebugSection {
+    fn default() -> Self {
+        Self {
+            control_api: default_debug_control_api(),
+        }
+    }
+}
+
 fn default_log_level() -> String {
     "info".to_owned()
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_debug_control_api() -> bool {
+    cfg!(debug_assertions)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +463,37 @@ mod tests {
         let config: RuntimeConfig = toml::from_str("").expect("empty config should parse");
         assert!(!config.has_any_inject_apps());
         assert!(config.should_bypass_sharing(AppId(480)));
+        assert!(config.toast.enabled);
+        assert!(config.toast.init);
+        assert_eq!(config.debug.control_api, cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn steam_toasts_can_be_disabled() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+            [toast]
+            enabled = false
+            init = false
+            "#,
+        )
+        .expect("parse");
+
+        assert!(!config.toast.enabled);
+        assert!(!config.toast.init);
+    }
+
+    #[test]
+    fn debug_control_api_can_be_disabled() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+            [debug]
+            control_api = false
+            "#,
+        )
+        .expect("parse");
+
+        assert!(!config.debug.control_api);
     }
 
     #[test]

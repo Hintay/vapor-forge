@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use steam_runtime_config::DepotId;
 use tracing::info;
+use vapor_forge_config::DepotId;
 
 const DEPOT_KEY_SIZE: usize = 32;
 

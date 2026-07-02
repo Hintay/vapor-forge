@@ -6,7 +6,7 @@ use core::ffi::c_char;
 use tracing::span;
 use tracing::{Event, Metadata, Subscriber};
 
-const PREFIX: &[u8] = b"[steam-runtime-rs] ";
+const PREFIX: &[u8] = b"[vapor-forge] ";
 const NEWLINE: &[u8] = b"\n";
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ impl Subscriber for StderrSubscriber {
     fn event(&self, event: &Event<'_>) {
         use std::fmt::Write;
         let mut buf = String::with_capacity(256);
-        let _ = write!(buf, "[steam-runtime-rs][{}] ", event.metadata().level());
+        let _ = write!(buf, "[vapor-forge][{}] ", event.metadata().level());
 
         // Visit the event fields to extract the message
         struct Visitor<'a>(&'a mut String);

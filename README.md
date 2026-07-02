@@ -1,49 +1,103 @@
-# steam-runtime-rs
+# Vapor Forge
 
-Rust-first Steam runtime instrumentation and hook-runtime experiment.
+Yet another mod for the Linux Steam client, built with Rust.
 
-The repository has moved beyond the earlier read-only observation phases. The current workspace contains:
+## Features
 
-- Linux `LD_AUDIT` `cdylib` entrypoints that wait for Steam loader lifecycle milestones before installing hooks;
-- i686 build configuration for Steam's 32-bit runtime path;
-- bounded lifecycle, module, `/proc/self/maps`, disk ELF metadata, and mapped-byte diagnostics for public Steam target module names;
-- hook boundary validation for module name, architecture, executable range, replacement address, and write-request rejection;
-- pattern registry support with embedded defaults and runtime TOML overrides;
-- hook installation for ownership, package, cloud, DLC, ticket, manifest, depot key, and network packet surfaces;
-- feature modules that keep most business decisions outside the unsafe hook callbacks;
-- Lua scripting and config hot-reload support for runtime state;
-- diagnostics CLI tools and smoke scripts for read-only and hook-boundary checks.
+- SteamUI library management, purchase time stamps, and app removal
+- Cloud save redirection and sync control
+- Rich presence spoofing and app avatar override
+- Achievement unlock and progress modification
+- In-game toast notifications through CEF injection
+- Proton/Wine per-game native library injection
+- Lua scripting and config hot-reload
 
-The crate layout is intentionally layered:
+## Prerequisites
 
-- `audit-loader` owns LD_AUDIT entrypoints and lifecycle handoff;
-- `hooks` owns unsafe hook installation, detour lifecycle, VMT swaps, and thin callback shells;
-- `features` owns testable business behavior for apps, DLC, cloud, tickets, manifests, achievements, and online pattern fetching;
-- `config`, `scripting`, `patterns`, `steam-abi`, `memory`, `diagnostics`, and `runtime-core` provide typed support code;
-- `hook-boundary` provides synthetic validation and patch-planning checks.
+- **Rust** 1.80+ (MSRV), toolchain **1.96.0** pinned in `rust-toolchain.toml`
+- **Targets:** `i686-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`
+- **i686 linker:** `gcc` with 32-bit libc headers (`-m32`)
 
-The implementation policy is independent authorship. Do not copy or mechanically translate SLSsteam source, comments, file layout, or project-specific naming.
+`rustup` will install the pinned toolchain and targets automatically on first build.
 
-## Initial checks
-
-The pinned Rust toolchain is declared in `rust-toolchain.toml` and currently uses Rust `1.96.0` with `rustfmt`, `clippy`, and the `i686-unknown-linux-gnu` target.
-
-Fast workspace checks:
+## Build
 
 ```sh
-./scripts/check.sh
+cargo build-main            # 32-bit main library  (libvapor_forge.so)
+cargo build-inject          # 64-bit Proton helper (libvapor_forge_proton_inject.so)
+
+cargo build-main-release    # release variants
+cargo build-inject-release
 ```
 
-Linux/i686 audit-loader check:
+## Install
+
+Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment:
 
 ```sh
-./scripts/check-i686.sh
+LD_AUDIT=/path/to/libvapor_forge.so
 ```
 
-Full read-only validation, including native/i686 release builds and Phase 4A/4B/5B plus Track C and Track D synthetic smoke tests:
+### File layout
+
+```
+~/.config/vapor-forge/
+  config.toml               # main configuration
+  patterns.toml             # optional pattern overrides
+  scripts/                  # user Lua scripts
+  cache/                    # ticket and session cache
+```
+
+Lua scripts are also loaded from `{Steam}/config/lua/` if the directory exists.
+
+## Configuration
+
+All configuration lives in `~/.config/vapor-forge/config.toml`. The file is optional. Defaults are applied for every missing field. Changes are picked up automatically through hot-reload.
+
+### Minimal example
+
+```toml
+[runtime]
+log_level = "info"          # trace, debug, info, warn, error
+
+[cloud]
+enabled = true
+
+[toast]
+enabled = true
+
+[scripting]
+paths = ["/home/deck/my-scripts"]
+```
+
+### Sections
+
+| Section | Purpose |
+| --- | --- |
+| `[runtime]` | Log level, diagnostics toggle, online pattern URL |
+| `[toast]` | Enable/disable in-game toast notifications |
+| `[cloud]` | Cloud save control |
+| `[achievements]` | Offline schema toggle |
+| `[app_avatar]` | App ID remapping for online presence |
+| `[library_inject]` | Native `.so`/`.dll` injection rules per game |
+| `[scripting]` | Extra Lua script directory paths |
+
+### Lua scripting
+
+Lua scripts can register apps, set avatars, provide stat donors, and more. Scripts are loaded from (in priority order):
+
+1. `{Steam}/config/lua/`
+2. `~/.config/vapor-forge/scripts/`
+3. Paths listed in `[scripting].paths`
+
+## Check
 
 ```sh
-sh ./scripts/verify-readonly.sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-The full validation script does not run real Steam. Real Steam validation remains an explicit manual/remote validation step because it interacts with the desktop Steam session.
+## License
+
+AGPL-3.0-only

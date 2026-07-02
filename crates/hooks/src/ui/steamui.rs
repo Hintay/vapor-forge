@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use retour::GenericDetour;
-use steam_runtime_abi::steamui::{CAppOverviewChange, CSteamApp};
-use steam_runtime_config::AppId;
 use tracing::{debug, error, info, warn};
+use vapor_forge_abi::steamui::{CAppOverviewChange, CSteamApp};
+use vapor_forge_config::AppId;
 
 use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
 use crate::original::detour_or_return;
@@ -41,6 +41,7 @@ static mut MARK_APP_CHANGE_DETOUR: Option<GenericDetour<MarkAppChangeFn>> = None
 static CONTROLLER: AtomicUsize = AtomicUsize::new(0);
 static APP_CHANGE_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+static INIT_TOAST_QUEUED: AtomicBool = AtomicBool::new(false);
 
 // Pending removals queued from the FileWatcher thread, drained on the
 // UI thread inside hk_run_frame.
@@ -59,9 +60,12 @@ extern "C" fn hk_run_frame(controller: *mut c_void) {
     if HAS_PENDING.load(Ordering::Acquire) {
         drain_pending_removals(controller);
     }
+    crate::ui::toast_bridge::bootstrap();
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR, ());
     original.call(controller);
+    maybe_show_init_toast();
+    crate::ui::toast_bridge::pump();
 }
 
 extern "C" fn hk_fill_in_app_overview(
@@ -72,7 +76,7 @@ extern "C" fn hk_fill_in_app_overview(
     if !app.is_null() {
         // SAFETY: app is a CSteamApp* passed by SteamUI.
         let app_id_raw = unsafe { CSteamApp::app_id(app) };
-        let cfg = crate::install::config();
+        let cfg = crate::client::install::config();
         if cfg.app_category(AppId(app_id_raw)).is_some() {
             // Use configured purchase time, or fall back to current time.
             let mut t = cfg.purchase_time(AppId(app_id_raw));
@@ -151,7 +155,9 @@ extern "C" fn hk_get_app_by_id(
         GET_APP_BY_ID_DETOUR,
         std::ptr::null_mut()
     );
-    original.call(controller, app_id, b_create)
+    let app = original.call(controller, app_id, b_create);
+    crate::ui::toast_bridge::pump();
+    app
 }
 
 extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
@@ -161,12 +167,13 @@ extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
     original.call(source, app_id, flags);
+    crate::ui::toast_bridge::pump();
 }
 
 /// Install the steamui.so hooks after the loader reaches a consistent state.
 pub fn install(
     steamui_code: &crate::detour::CodeRegion,
-    registry: &steam_runtime_patterns::registry::PatternRegistry,
+    registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> bool {
     use crate::detour;
 
@@ -253,7 +260,7 @@ pub fn install(
     if addrs[3] == 0 || addrs[4] == 0 {
         warn!("steamui: required capture hooks not found, aborting");
         log_drift_summary("steamui.so", &hook_results);
-        if crate::install::config().runtime.diagnostics {
+        if crate::client::install::config().runtime.diagnostics {
             log_hook_details("steamui.so", &hook_results);
         }
         return false;
@@ -310,7 +317,7 @@ pub fn install(
         warn!("steamui: some optional hooks missing, partial UI management");
     }
     log_drift_summary("steamui.so", &hook_results);
-    if crate::install::config().runtime.diagnostics {
+    if crate::client::install::config().runtime.diagnostics {
         log_hook_details("steamui.so", &hook_results);
     }
 
@@ -328,12 +335,28 @@ pub fn install(
     true
 }
 
+fn maybe_show_init_toast() {
+    if INIT_TOAST_QUEUED.load(Ordering::Acquire) {
+        return;
+    }
+
+    if INIT_TOAST_QUEUED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let cfg = crate::client::install::config();
+    vapor_forge_features::toast::show_init_toast(&cfg);
+}
+
 /// Resolve RepeatedField<uint32>::Add from steamui.so.
 /// Uses follow=call: pattern matches one or more callsites, scan forward
 /// for the last E8 CALL before RET to reach the target function.
 fn resolve_repeated_field_add(
     steamui_code: &crate::detour::CodeRegion,
-    registry: &steam_runtime_patterns::registry::PatternRegistry,
+    registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let entry = match registry.get("google::protobuf::RepeatedField<uint32>::Add") {
         Some(e) => e,
@@ -415,7 +438,7 @@ fn drain_pending_removals(controller: *mut c_void) {
 
 fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     // Skip if the app was re-added to config (hot-reload: unload then load).
-    let cfg = crate::install::config();
+    let cfg = crate::client::install::config();
     if cfg.app_category(app_id).is_some() {
         debug!(app = app_id.0, "steamui: app re-owned, skipping removal");
         return;
@@ -436,7 +459,7 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     unsafe {
         CSteamApp::set_ownership_flags(app_ptr, EAPP_OWNERSHIP_FLAGS_NONE);
 
-        // Only track in removed set if already uninstalled (matches OST).
+        // Only track in removed set if already uninstalled.
         let state = CSteamApp::app_state_flags(app_ptr);
         if state == EAPP_STATE_UNINSTALLED {
             if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
@@ -526,7 +549,7 @@ pub fn stamp_purchase_time(app_id: AppId, time: u32) {
 
 /// Resolve steamui.so code region from /proc/self/maps.
 pub fn get_steamui_code() -> Option<crate::detour::CodeRegion> {
-    use steam_runtime_memory::find_proc_self_maps_targets;
+    use vapor_forge_memory::find_proc_self_maps_targets;
 
     let entries = find_proc_self_maps_targets(64).ok()?;
     let exec_entry = entries

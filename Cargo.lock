@@ -495,14 +495,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proton-inject"
-version = "0.1.0"
-dependencies = [
- "inject-protocol",
- "libc",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -708,137 +700,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "steam-runtime-abi"
-version = "0.1.0"
-dependencies = [
- "prost",
-]
-
-[[package]]
-name = "steam-runtime-audit-loader"
-version = "0.1.0"
-dependencies = [
- "libc",
- "once_cell",
- "steam-runtime-core",
- "steam-runtime-diagnostics",
- "steam-runtime-hooks",
- "steam-runtime-memory",
- "tracing",
-]
-
-[[package]]
-name = "steam-runtime-config"
-version = "0.1.0"
-dependencies = [
- "serde",
- "steam-runtime-core",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "steam-runtime-core"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "steam-runtime-diagnostics"
-version = "0.1.0"
-dependencies = [
- "libc",
- "tracing",
-]
-
-[[package]]
-name = "steam-runtime-diagnostics-cli"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "object",
- "steam-runtime-hooks",
- "steam-runtime-patterns",
- "thiserror",
-]
-
-[[package]]
-name = "steam-runtime-features"
-version = "0.1.0"
-dependencies = [
- "prost",
- "steam-runtime-abi",
- "steam-runtime-config",
- "steam-runtime-diagnostics",
- "steam-runtime-scripting",
- "tracing",
- "ureq",
-]
-
-[[package]]
-name = "steam-runtime-hook-boundary"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "steam-runtime-hooks"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "iced-x86",
- "inject-protocol",
- "inotify",
- "libc",
- "once_cell",
- "prost",
- "retour",
- "steam-runtime-abi",
- "steam-runtime-config",
- "steam-runtime-diagnostics",
- "steam-runtime-features",
- "steam-runtime-hook-boundary",
- "steam-runtime-memory",
- "steam-runtime-patterns",
- "steam-runtime-scripting",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "steam-runtime-memory"
-version = "0.1.0"
-dependencies = [
- "object",
- "steam-runtime-core",
- "thiserror",
-]
-
-[[package]]
-name = "steam-runtime-patterns"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "steam-runtime-scripting"
-version = "0.1.0"
-dependencies = [
- "mlua",
- "steam-runtime-config",
- "steam-runtime-core",
- "steam-runtime-diagnostics",
- "thiserror",
- "tracing",
- "ureq",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,6 +873,145 @@ name = "utf8-zero"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
+
+[[package]]
+name = "vapor-forge-abi"
+version = "0.1.0"
+dependencies = [
+ "prost",
+]
+
+[[package]]
+name = "vapor-forge-audit-loader"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "once_cell",
+ "tracing",
+ "vapor-forge-core",
+ "vapor-forge-diagnostics",
+ "vapor-forge-hooks",
+ "vapor-forge-memory",
+]
+
+[[package]]
+name = "vapor-forge-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+ "vapor-forge-core",
+]
+
+[[package]]
+name = "vapor-forge-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "vapor-forge-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
+name = "vapor-forge-diagnostics-cli"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "object",
+ "thiserror",
+ "vapor-forge-hooks",
+ "vapor-forge-patterns",
+]
+
+[[package]]
+name = "vapor-forge-features"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tracing",
+ "ureq",
+ "vapor-forge-abi",
+ "vapor-forge-config",
+ "vapor-forge-diagnostics",
+ "vapor-forge-scripting",
+]
+
+[[package]]
+name = "vapor-forge-hook-boundary"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "vapor-forge-hooks"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "iced-x86",
+ "inject-protocol",
+ "inotify",
+ "libc",
+ "once_cell",
+ "prost",
+ "retour",
+ "thiserror",
+ "tracing",
+ "vapor-forge-abi",
+ "vapor-forge-config",
+ "vapor-forge-diagnostics",
+ "vapor-forge-features",
+ "vapor-forge-hook-boundary",
+ "vapor-forge-memory",
+ "vapor-forge-patterns",
+ "vapor-forge-scripting",
+]
+
+[[package]]
+name = "vapor-forge-memory"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+ "vapor-forge-core",
+]
+
+[[package]]
+name = "vapor-forge-patterns"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "vapor-forge-proton-inject"
+version = "0.1.0"
+dependencies = [
+ "inject-protocol",
+ "libc",
+]
+
+[[package]]
+name = "vapor-forge-scripting"
+version = "0.1.0"
+dependencies = [
+ "mlua",
+ "thiserror",
+ "tracing",
+ "ureq",
+ "vapor-forge-config",
+ "vapor-forge-core",
+ "vapor-forge-diagnostics",
+]
 
 [[package]]
 name = "version_check"

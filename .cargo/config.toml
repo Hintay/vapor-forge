@@ -2,5 +2,11 @@
 linker = "gcc"
 rustflags = ["-C", "link-arg=-m32"]
 
+[alias]
+build-main = "build -p vapor-forge-audit-loader --target i686-unknown-linux-gnu"
+build-inject = "build -p vapor-forge-proton-inject --target x86_64-unknown-linux-gnu"
+build-main-release = "build --release -p vapor-forge-audit-loader --target i686-unknown-linux-gnu"
+build-inject-release = "build --release -p vapor-forge-proton-inject --target x86_64-unknown-linux-gnu"
+
 [env]
-STEAM_RUNTIME_RS_PROJECT = "steam-runtime-rs"
+VAPOR_FORGE_PROJECT = "vapor-forge"

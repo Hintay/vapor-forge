@@ -29,6 +29,7 @@ default-members = [
     "crates/runtime-core",
     "crates/scripting",
     "crates/steam-abi",
+    "crates/proton-inject",
 ]
 resolver = "2"
 

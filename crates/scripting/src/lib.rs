@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mlua::prelude::*;
-use steam_runtime_core::{AppId, DepotId, ManifestId};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use vapor_forge_core::{AppId, DepotId, ManifestId};
 
 #[derive(Debug, Error)]
 pub enum ScriptError {

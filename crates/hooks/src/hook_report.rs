@@ -7,7 +7,7 @@ pub(crate) struct HookResult {
 }
 
 pub(crate) fn log_drift_summary(module_name: &str, hook_results: &[HookResult]) {
-    let entries = match steam_runtime_memory::find_proc_self_maps_targets(16) {
+    let entries = match vapor_forge_memory::find_proc_self_maps_targets(16) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -15,9 +15,9 @@ pub(crate) fn log_drift_summary(module_name: &str, hook_results: &[HookResult]) 
         .iter()
         .find(|e| e.path.ends_with(&format!("/{module_name}")))
     {
-        let build_id = steam_runtime_memory::summarize_elf_file(
+        let build_id = vapor_forge_memory::summarize_elf_file(
             &entry.path,
-            steam_runtime_memory::ElfMetadataLimits::default(),
+            vapor_forge_memory::ElfMetadataLimits::default(),
         )
         .ok()
         .and_then(|m| m.build_id);

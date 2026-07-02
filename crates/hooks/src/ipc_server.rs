@@ -1,4 +1,4 @@
-// IPC server: accepts connections from proton-inject helper processes
+// IPC server: accepts connections from vapor-forge-proton-inject helper processes
 // running inside Wine/Proton game instances. Validates per-launch tokens
 // and dispatches messages (Denuvo detection, DLL load events).
 
@@ -224,9 +224,9 @@ fn handle_connection(
     }
 }
 
-/// Called when a proton-inject helper detects Denuvo in a game process.
+/// Called when a vapor-forge-proton-inject helper detects Denuvo in a game process.
 fn on_denuvo_detected(app_id: u32) {
-    let cfg = crate::install::config();
+    let cfg = crate::client::install::config();
     if !cfg.ticket.auto_delegate {
         info!(
             app_id,
@@ -235,12 +235,12 @@ fn on_denuvo_detected(app_id: u32) {
         return;
     }
 
-    let aid = steam_runtime_config::AppId(app_id);
-    if cfg.ticket_mode(aid) == steam_runtime_config::TicketMode::Delegate {
+    let aid = vapor_forge_config::AppId(app_id);
+    if cfg.ticket_mode(aid) == vapor_forge_config::TicketMode::Delegate {
         debug!(app_id, "ipc-server: app already in delegate mode");
         return;
     }
 
-    steam_runtime_features::ticket::add_auto_delegate(aid);
+    vapor_forge_features::ticket::add_auto_delegate(aid);
     info!(app_id, "ipc-server: Denuvo detected, auto-delegate enabled");
 }

@@ -97,7 +97,7 @@ impl Pattern {
 
 /// Scan backward from `body_offset` to find a function prologue.
 ///
-/// The prologue bytes follow the SLSsteam convention: they are stored in
+/// The prologue bytes are stored in reverse order:
 /// "scan order", i.e. `prologue[0]` is the byte **closest** to the body
 /// (highest address), and `prologue[N-1]` is the function entry byte
 /// (lowest address). The returned offset is the function entry point.
@@ -275,7 +275,7 @@ mod tests {
         //   offset 3: 55 89 E5  (push ebp; mov ebp, esp; function prologue)
         //   offset 10: 83 EC 24 (sub esp, 0x24; body pattern match)
         //
-        // SLSsteam convention: prologue bytes in scan order (closest to body first):
+        // Prologue bytes in scan order (closest to body first):
         //   [0xE5, 0x89, 0x55]
         // Scanning from body_offset=10 backward:
         //   anchor=10: haystack[10]=0x83 != 0xE5

@@ -67,12 +67,12 @@ impl PatternRegistry {
             Ok(text) => match parse_toml_overrides(&text) {
                 Ok(overrides) => Self { overrides },
                 Err(e) => {
-                    eprintln!("[steam-runtime-rs] WARNING: pattern override parse error in {}: {}, falling back to embedded", path.display(), e);
+                    eprintln!("[vapor-forge] WARNING: pattern override parse error in {}: {}, falling back to embedded", path.display(), e);
                     Self::embedded()
                 }
             },
             Err(e) => {
-                eprintln!("[steam-runtime-rs] WARNING: failed to read pattern overrides {}: {}, falling back to embedded", path.display(), e);
+                eprintln!("[vapor-forge] WARNING: failed to read pattern overrides {}: {}, falling back to embedded", path.display(), e);
                 Self::embedded()
             }
         }

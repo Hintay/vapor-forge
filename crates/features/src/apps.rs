@@ -1,6 +1,6 @@
-use steam_runtime_abi::CAppOwnershipInfo;
-use steam_runtime_config::{AppCategory, AppId, RuntimeConfig};
 use tracing::info;
+use vapor_forge_abi::CAppOwnershipInfo;
+use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
 pub fn on_check_ownership(
     config: &RuntimeConfig,
@@ -62,11 +62,11 @@ pub fn get_subscribed_count_adjustment(config: &RuntimeConfig) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use steam_runtime_config::InjectApp;
+    use vapor_forge_config::InjectApp;
 
     fn config_with_inject(ids: &[u32]) -> RuntimeConfig {
         RuntimeConfig {
-            apps: steam_runtime_config::AppsSection {
+            apps: vapor_forge_config::AppsSection {
                 inject: ids
                     .iter()
                     .map(|&id| InjectApp {

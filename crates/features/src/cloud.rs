@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use steam_runtime_config::{AppId, RuntimeConfig};
 use tracing::info;
+use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool) -> bool {
     let controlled = config.app_category(app_id).is_some();

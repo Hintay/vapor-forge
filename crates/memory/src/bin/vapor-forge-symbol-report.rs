@@ -1,10 +1,10 @@
-use steam_runtime_memory::{
+use vapor_forge_memory::{
     analyze_public_dynamic_symbol_questions, summarize_elf_file, ElfMetadataLimits,
 };
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("steam-runtime-symbol-report: {error}");
+        eprintln!("vapor-forge-symbol-report: {error}");
         std::process::exit(1);
     }
 }
@@ -13,7 +13,7 @@ fn run() -> Result<(), String> {
     let mut paths = std::env::args().skip(1).collect::<Vec<_>>();
     if paths.is_empty() {
         return Err(
-            "usage: steam-runtime-symbol-report <steamui.so|steamclient.so> [...]".to_owned(),
+            "usage: vapor-forge-symbol-report <steamui.so|steamclient.so> [...]".to_owned(),
         );
     }
 
