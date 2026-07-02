@@ -9,8 +9,7 @@ use crate::original::detour_or_return;
 // Function type aliases
 // ---------------------------------------------------------------------------
 
-pub(crate) type BBuildAndAsyncSendFrameFn =
-    extern "C" fn(*mut c_void, i32, *mut u8, u32) -> bool;
+pub(crate) type BBuildAndAsyncSendFrameFn = extern "C" fn(*mut c_void, i32, *mut u8, u32) -> bool;
 pub(crate) type RecvPktFn = extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 
 // ---------------------------------------------------------------------------

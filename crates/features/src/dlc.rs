@@ -8,11 +8,7 @@ pub fn on_is_dlc_installed(
     original: bool,
 ) -> bool {
     if !original && is_controlled_dlc(config, app_id, dlc_id) {
-        info!(
-            app_id = app_id.0,
-            dlc_id = dlc_id.0,
-            "feat: DLC installed"
-        );
+        info!(app_id = app_id.0, dlc_id = dlc_id.0, "feat: DLC installed");
         return true;
     }
     original
@@ -25,11 +21,7 @@ pub fn on_is_dlc_enabled(
     original: bool,
 ) -> bool {
     if !original && is_controlled_dlc(config, app_id, dlc_id) {
-        info!(
-            app_id = app_id.0,
-            dlc_id = dlc_id.0,
-            "feat: DLC enabled"
-        );
+        info!(app_id = app_id.0, dlc_id = dlc_id.0, "feat: DLC enabled");
         return true;
     }
     original

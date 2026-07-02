@@ -2,19 +2,20 @@ use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 use retour::GenericDetour;
-use tracing::{debug, info};
+use tracing::debug;
 use vapor_forge_abi::CAppOwnershipInfo;
 use vapor_forge_config::AppId;
 
 use crate::original::detour_or_return;
 
-use super::install::{config, script_state, PACKAGE_STATE, PKG0_INJECTED};
+use super::install::{config, package_state, script_state, PKG0_INJECTED};
 
 // ---------------------------------------------------------------------------
 // Function type alias
 // ---------------------------------------------------------------------------
 
-pub(crate) type CheckAppOwnershipFn = extern "C" fn(*mut c_void, u32, *mut CAppOwnershipInfo) -> u32;
+pub(crate) type CheckAppOwnershipFn =
+    extern "C" fn(*mut c_void, u32, *mut CAppOwnershipInfo) -> u32;
 pub(crate) type GetSubscribedAppsFn = extern "C" fn(*mut c_void, *mut u32, u32, u8) -> u32;
 
 // ---------------------------------------------------------------------------
@@ -60,12 +61,13 @@ pub(crate) extern "C" fn hk_check_app_ownership(
         let cfg = config();
         let ss = script_state();
         let controlled = vapor_forge_features::package::controlled_app_ids(&*cfg, &ss.apps);
-        let plan = PACKAGE_STATE.compute_injection(&controlled);
+        let pkg_state = package_state();
+        let plan = pkg_state.compute_injection(&controlled);
 
         // SAFETY: pkg0 and cuser captured, function pointers resolved.
         unsafe { super::package::try_inject_once(&plan.app_ids) };
-        PACKAGE_STATE.record_injected(&plan.app_ids);
-        PACKAGE_STATE.set_active();
+        pkg_state.record_injected(&plan.app_ids);
+        pkg_state.set_active();
     }
 
     // Pump pending markAndProcess from watcher thread (runs on this Steam thread).

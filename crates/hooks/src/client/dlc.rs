@@ -8,7 +8,7 @@ use vapor_forge_config::AppId;
 use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
-use super::install::{config, validate_vmt_hook_eligibility, read_vtable_slot};
+use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 
 // ---------------------------------------------------------------------------
 // Function type aliases

@@ -10,7 +10,7 @@ use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
 use super::install::{
-    config, effective_ticket_mode, script_state, validate_vmt_hook_eligibility, read_vtable_slot,
+    config, effective_ticket_mode, read_vtable_slot, script_state, validate_vmt_hook_eligibility,
     TICKET_CACHE,
 };
 
@@ -38,8 +38,9 @@ pub(crate) type GetSteamIDFn = extern "C" fn(*mut c_void) -> u64;
 
 pub(crate) static mut TICKET_EXT_DATA_DETOUR: Option<GenericDetour<TicketExtDataFn>> = None;
 pub(crate) static mut UPDATE_TICKET_DETOUR: Option<GenericDetour<UpdateTicketFn>> = None;
-pub(crate) static mut IS_SUBSCRIBED_IN_TICKET_DETOUR: Option<GenericDetour<IsSubscribedInTicketFn>> =
-    None;
+pub(crate) static mut IS_SUBSCRIBED_IN_TICKET_DETOUR: Option<
+    GenericDetour<IsSubscribedInTicketFn>,
+> = None;
 pub(crate) static mut ORIG_GET_STEAMID: Option<GetSteamIDFn> = None;
 pub(crate) static STEAMID_VMT_DONE: AtomicBool = AtomicBool::new(false);
 

@@ -8,8 +8,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vapor_forge_inject_protocol::{self as proto, Message};
 use tracing::{debug, info, warn};
+use vapor_forge_inject_protocol::{self as proto, Message};
 
 struct TokenEntry {
     app_id: u32,

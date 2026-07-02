@@ -36,13 +36,21 @@ impl TicketCache {
             debug!(app_id = app_id.0, "ticket: using Lua-provided app ticket");
             return Some(t.clone());
         }
-        if let Some(t) = self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).get(&app_id) {
+        if let Some(t) = self
+            .app_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&app_id)
+        {
             debug!(app_id = app_id.0, "ticket: using cached app ticket");
             return Some(t.clone());
         }
         if let Some(t) = self.load_from_disk(app_id, "ticket") {
             debug!(app_id = app_id.0, "ticket: loaded app ticket from disk");
-            self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, t.clone());
+            self.app_tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(app_id, t.clone());
             return Some(t);
         }
         None
@@ -61,7 +69,12 @@ impl TicketCache {
             );
             return Some(t.clone());
         }
-        if let Some(t) = self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).get(&app_id) {
+        if let Some(t) = self
+            .enc_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&app_id)
+        {
             debug!(app_id = app_id.0, "ticket: using cached encrypted ticket");
             return Some(t.clone());
         }
@@ -70,7 +83,10 @@ impl TicketCache {
                 app_id = app_id.0,
                 "ticket: loaded encrypted ticket from disk"
             );
-            self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, t.clone());
+            self.enc_tickets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(app_id, t.clone());
             return Some(t);
         }
         None
@@ -88,7 +104,10 @@ impl TicketCache {
         if persist {
             self.save_to_disk(app_id, "ticket", &data);
         }
-        self.app_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, data);
+        self.app_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_id, data);
     }
 
     /// Cache an encrypted ticket. `persist` = true writes to disk.
@@ -102,7 +121,10 @@ impl TicketCache {
         if persist {
             self.save_to_disk(app_id, "enc_ticket", &data);
         }
-        self.enc_tickets.lock().unwrap_or_else(|e| e.into_inner()).insert(app_id, data);
+        self.enc_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_id, data);
     }
 
     fn load_from_disk(&self, app_id: AppId, prefix: &str) -> Option<Vec<u8>> {
@@ -152,7 +174,11 @@ pub fn is_auto_delegate(app_id: AppId) -> bool {
 
 /// Clear auto-delegate for an app (e.g. on game exit).
 pub fn remove_auto_delegate(app_id: AppId) {
-    if let Some(set) = AUTO_DELEGATE_APPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(set) = AUTO_DELEGATE_APPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         set.remove(&app_id);
     }
 }
@@ -193,7 +219,11 @@ pub fn in_delegate_window(app_id: AppId) -> bool {
 /// (observed via CMsgClientGamesPlayed no longer listing the app), so a
 /// future relaunch gets a fresh delegate window.
 pub fn reset_delegate_window(app_id: AppId) {
-    if let Some(counts) = DELEGATE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(counts) = DELEGATE_COUNTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         counts.remove(&app_id);
     }
     clear_delegate_steamid();

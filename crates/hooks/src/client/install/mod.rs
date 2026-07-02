@@ -1,66 +1,34 @@
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Once, OnceLock};
+use std::sync::OnceLock;
 
-use retour::GenericDetour;
 use tracing::{debug, error, info, warn};
-use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_memory::{find_proc_self_maps_targets, ProcMapsEntry};
 use vapor_forge_patterns::registry::PatternRegistry;
-use vapor_forge_scripting::ScriptState;
 
 use vapor_forge_hook_boundary::{validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput};
 
 use crate::detour::{self, CodeRegion, PendingDetour};
 use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
 
-// ---------------------------------------------------------------------------
-// Config paths
-// ---------------------------------------------------------------------------
+mod package_info;
+mod runtime;
+mod steamclient;
+mod steamui;
 
-const CONFIG_FILENAME: &str = "config.toml";
-
-// ---------------------------------------------------------------------------
-// GetPackageInfo hook type (used only here for the special-case detour)
-// ---------------------------------------------------------------------------
-
-type GetPackageInfoHookFn = extern "C" fn(*mut c_void, u32, u64) -> *mut u8;
+pub use runtime::ensure_runtime_initialized;
+use runtime::runtime_hooks_enabled;
+pub(crate) use runtime::{
+    build_script_dirs, config, effective_ticket_mode, script_state, IPC_SERVER, TICKET_CACHE,
+};
 
 // ---------------------------------------------------------------------------
 // Static state
 // ---------------------------------------------------------------------------
 
-static STEAMCLIENT_BATCH_INSTALL_ONCE: Once = Once::new();
-static STEAMCLIENT_BATCH_FINISHED: AtomicBool = AtomicBool::new(false);
-static RUNTIME_INIT: Once = Once::new();
-static RUNTIME_HOOKS_ENABLED: AtomicBool = AtomicBool::new(false);
-
-static mut GET_PKG_INFO_DETOUR: Option<GenericDetour<GetPackageInfoHookFn>> = None;
-
 pub(crate) static PKG0_INJECTED: AtomicBool = AtomicBool::new(false);
-static CPKG_INFO_CAPTURED: AtomicBool = AtomicBool::new(false);
 
 static CODE_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
-
-pub(crate) static IPC_SERVER: OnceLock<Option<std::sync::Arc<crate::ipc_server::IpcServer>>> =
-    OnceLock::new();
-
-static CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
-    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
-
-pub(crate) static SCRIPT_STATE: once_cell::sync::Lazy<arc_swap::ArcSwap<ScriptState>> =
-    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(ScriptState::default()));
-
-pub(crate) static PACKAGE_STATE: once_cell::sync::Lazy<
-    vapor_forge_features::package::PackageState,
-> = once_cell::sync::Lazy::new(vapor_forge_features::package::PackageState::new);
-
-pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<vapor_forge_features::ticket::TicketCache> =
-    once_cell::sync::Lazy::new(|| {
-        let cache_dir = std::env::var_os("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".config/vapor-forge/cache"));
-        vapor_forge_features::ticket::TicketCache::new(cache_dir)
-    });
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -76,119 +44,16 @@ pub enum HookBatch {
 pub fn install_hook_batch(batch: HookBatch) {
     ensure_runtime_initialized();
     match batch {
-        HookBatch::SteamClient => install_steamclient_hook_batch(),
-        HookBatch::SteamUi => install_steamui_hook_batch(),
+        HookBatch::SteamClient => steamclient::install_hook_batch(),
+        HookBatch::SteamUi => steamui::install_hook_batch(),
     }
 }
 
 pub fn is_hook_batch_finished(batch: HookBatch) -> bool {
     match batch {
-        HookBatch::SteamClient => STEAMCLIENT_BATCH_FINISHED.load(Ordering::Acquire),
-        HookBatch::SteamUi => STEAMUI_BATCH_FINISHED.load(Ordering::Acquire),
+        HookBatch::SteamClient => steamclient::STEAMCLIENT_BATCH_FINISHED.load(Ordering::Acquire),
+        HookBatch::SteamUi => steamui::STEAMUI_BATCH_FINISHED.load(Ordering::Acquire),
     }
-}
-
-fn install_steamclient_hook_batch() {
-    STEAMCLIENT_BATCH_INSTALL_ONCE.call_once(|| {
-        info!("hook-install: steamclient batch started");
-        do_install();
-        STEAMCLIENT_BATCH_FINISHED.store(true, Ordering::Release);
-        info!("hook-install: steamclient batch finished");
-    });
-}
-
-/// Initialize process-wide runtime state shared by every hook batch.
-///
-/// This sets up diagnostics, loads config and scripts, publishes the ArcSwap
-/// stores, primes feature state, and starts config watching. It is intentionally
-/// separate from steamclient detour installation so later modules can rely on
-/// the same runtime without depending on steamclient-specific setup.
-pub fn ensure_runtime_initialized() {
-    RUNTIME_INIT.call_once(|| {
-        // Early init so config loading errors can be logged.
-        vapor_forge_diagnostics::init("info");
-
-        let (config, config_path) = load_config();
-
-        vapor_forge_diagnostics::init(&config.runtime.log_level);
-
-        // Execute Lua scripts and merge addappid results into config.
-        let (config, script_state) = execute_and_merge_scripts(config);
-
-        let has_script_apps = !script_state.apps.is_empty();
-        let hooks_enabled =
-            config.has_any_inject_apps() || has_script_apps || config.apps.shared.enabled;
-
-        let inject_count = config.apps.inject.len();
-        let dlc_count: usize = config.apps.inject.iter().map(|a| a.dlc.len()).sum();
-        if hooks_enabled {
-            info!(
-                inject = inject_count,
-                dlc = dlc_count,
-                script_apps = script_state.apps.len(),
-                sharing = config.apps.shared.enabled,
-                "hook-install: config ready"
-            );
-        } else {
-            info!("hook-install: nothing to do, skipping");
-        }
-
-        if hooks_enabled {
-            // Load stat donor SteamIDs from Lua scripts.
-            vapor_forge_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
-
-            // Load AppAvatar mappings from config static_map and Lua setavatar.
-            vapor_forge_features::app_avatar::load_static_map(&config.app_avatar);
-            for (&app, &avatar) in &script_state.avatars {
-                vapor_forge_features::app_avatar::set_avatar(app, avatar);
-            }
-        }
-
-        CONFIG.store(std::sync::Arc::new(config));
-        SCRIPT_STATE.store(std::sync::Arc::new(script_state));
-        RUNTIME_HOOKS_ENABLED.store(hooks_enabled, Ordering::Release);
-
-        #[cfg(debug_assertions)]
-        if CONFIG.load().debug.control_api {
-            crate::debug_api::start();
-        }
-
-        if !hooks_enabled {
-            return;
-        }
-
-        // Start the IPC server only when a feature that consumes IPC events
-        // is enabled and a proton helper is available.
-        {
-            let cfg = CONFIG.load();
-            let needs_ipc = hooks_enabled && cfg.ticket.auto_delegate;
-            let has_proton = needs_ipc
-                && (cfg
-                    .library_inject
-                    .libs
-                    .iter()
-                    .any(|l| l.path.ends_with(".dll"))
-                    || !cfg.library_inject.helper_path.is_empty());
-            let server = if has_proton {
-                crate::ipc_server::IpcServer::start()
-            } else {
-                if needs_ipc {
-                    warn!("hook-install: auto_delegate enabled but no proton helper configured");
-                }
-                None
-            };
-            let _ = IPC_SERVER.set(server);
-        }
-
-        // Force TICKET_CACHE lazy init while config is loaded.
-        let _ = &*TICKET_CACHE;
-
-        crate::watcher::start(&CONFIG, &SCRIPT_STATE, &PACKAGE_STATE, config_path);
-    });
-}
-
-pub(crate) fn runtime_hooks_enabled() -> bool {
-    RUNTIME_HOOKS_ENABLED.load(Ordering::Acquire)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +228,7 @@ fn do_install() {
         "IClientApps::RunIPCFrame",
         super::dlc::hk_client_apps_run_ipc_frame as super::cloud::RunIPCFrameFn,
     );
-    let d_get_pkg_info = create_get_package_info_detour();
+    let d_get_pkg_info = package_info::create_detour();
     let d_ticket_ext = resolve_from_registry(
         &registry,
         &code,
@@ -499,7 +364,7 @@ fn do_install() {
         );
         detour::store_and_finalize(
             "CPackageInfo::GetPackageInfo",
-            std::ptr::addr_of_mut!(GET_PKG_INFO_DETOUR),
+            std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
             d_get_pkg_info,
         );
         detour::store_and_finalize(
@@ -556,145 +421,18 @@ fn do_install() {
 
     log_drift_summary("steamclient.so", &hook_results);
 
-    if CONFIG.load().runtime.diagnostics {
+    if config().runtime.diagnostics {
         log_hook_details("steamclient.so", &hook_results);
     }
 
     // Background fetch of online pattern updates
-    let cfg = CONFIG.load();
+    let cfg = config();
     if !cfg.runtime.patterns_url.is_empty() {
         vapor_forge_features::online_patterns::spawn_fetch(
             cfg.runtime.patterns_url.clone(),
             vapor_forge_patterns::registry::EMBEDDED_PATTERNS_HASH,
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Config helper
-// ---------------------------------------------------------------------------
-
-pub(crate) fn config() -> arc_swap::Guard<std::sync::Arc<RuntimeConfig>> {
-    CONFIG.load()
-}
-
-/// Config ticket mode overlaid with runtime auto-delegate detections.
-pub(crate) fn effective_ticket_mode(
-    cfg: &RuntimeConfig,
-    app_id: AppId,
-) -> vapor_forge_config::TicketMode {
-    let mode = cfg.ticket_mode(app_id);
-    if mode == vapor_forge_config::TicketMode::Forge
-        && vapor_forge_features::ticket::is_auto_delegate(app_id)
-    {
-        return vapor_forge_config::TicketMode::Delegate;
-    }
-    mode
-}
-
-pub(crate) fn script_state() -> arc_swap::Guard<std::sync::Arc<ScriptState>> {
-    SCRIPT_STATE.load()
-}
-
-// ---------------------------------------------------------------------------
-// GetPackageInfo hook captures CPackageInfo* for pkg0 injection
-// ---------------------------------------------------------------------------
-
-extern "C" fn hk_get_package_info(
-    this: *mut c_void,
-    package_id: u32,
-    access_token: u64,
-) -> *mut u8 {
-    // SAFETY: GET_PKG_INFO_DETOUR set before enabled.
-    let original = crate::original::detour_or_return!(
-        "GetPackageInfo",
-        GET_PKG_INFO_DETOUR,
-        std::ptr::null_mut()
-    );
-    let result = original.call(this, package_id, access_token);
-
-    // Capture CPackageInfo* on first call, then use it to get pkg0
-    if !CPKG_INFO_CAPTURED.swap(true, Ordering::AcqRel) {
-        info!("package: captured CPackageInfo at 0x{:x}", this as usize);
-
-        // Now call GetPackageInfo(this, 0, token) to get pkg0
-        if !result.is_null() || package_id == 0 {
-            // Try to get pkg0 using the captured CPackageInfo*
-            let pkg0 = original.call(this, 0, super::package::PKG0_ACCESS_TOKEN);
-            if !pkg0.is_null() {
-                // SAFETY: pkg0 is a valid PackageInfo pointer.
-                let status = unsafe { vapor_forge_abi::package_info::status(pkg0) };
-                if status == 0 {
-                    super::package::PKG0_PTR.store(pkg0 as usize, Ordering::Release);
-                    info!("package: captured pkg0 at 0x{:x}", pkg0 as usize);
-                } else {
-                    warn!(status = status, "package: pkg0 status != Available");
-                }
-            } else {
-                debug!("package: GetPackageInfo(0) returned null, will retry");
-                CPKG_INFO_CAPTURED.store(false, Ordering::Release);
-            }
-        }
-    }
-
-    result
-}
-
-fn create_get_package_info_detour() -> Option<PendingDetour<GetPackageInfoHookFn>> {
-    let addr = super::package::get_package_info_addr()?;
-
-    let replacement_addr = hk_get_package_info as *const () as usize;
-    if let Some(&(base, end)) = CODE_RANGE.get() {
-        if let Err(e) = validate_hook_eligibility(
-            "CPackageInfo::GetPackageInfo",
-            addr,
-            replacement_addr,
-            &CodeRegion {
-                base,
-                bytes: unsafe { std::slice::from_raw_parts(base as *const u8, end - base) },
-            },
-        ) {
-            error!(hook = "CPackageInfo::GetPackageInfo", error = %e, "hook boundary validation failed");
-            return None;
-        }
-    }
-
-    // SAFETY: addr is a validated code address.
-    let target: GetPackageInfoHookFn = unsafe { std::mem::transmute(addr) };
-    // SAFETY: target is valid.
-    unsafe { detour::create_detour("GetPackageInfo", target, addr, hk_get_package_info) }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-static STEAMUI_BATCH_INSTALL_ONCE: Once = Once::new();
-static STEAMUI_BATCH_FINISHED: AtomicBool = AtomicBool::new(false);
-
-/// Called from la_activity after steamui.so reaches a consistent loader state.
-/// Safe to call multiple times; installs only once.
-fn install_steamui_hook_batch() {
-    STEAMUI_BATCH_INSTALL_ONCE.call_once(|| {
-        info!("hook-install: steamui batch started");
-        if !runtime_hooks_enabled() {
-            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
-            info!(installed = false, "hook-install: steamui batch finished");
-            return;
-        }
-        let Some(ui_code) = crate::ui::install::get_steamui_code() else {
-            warn!(
-                "hook-install: steamui.so executable mapping unavailable, skipping steamui hooks"
-            );
-            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
-            info!(installed = false, "hook-install: steamui batch finished");
-            return;
-        };
-        let registry = load_pattern_registry();
-        let installed = crate::ui::install::install(&ui_code, &registry);
-        STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
-        info!(installed, "hook-install: steamui batch finished");
-    });
 }
 
 fn get_steamclient_code() -> Option<CodeRegion> {
@@ -727,6 +465,10 @@ fn get_steamclient_code() -> Option<CodeRegion> {
     Some(CodeRegion { base, bytes })
 }
 
+fn steamclient_code_range() -> Option<(usize, usize)> {
+    CODE_RANGE.get().copied()
+}
+
 /// Read a vtable slot value without modifying it.
 ///
 /// # Safety
@@ -750,90 +492,4 @@ fn find_steamclient_exec_mapping(entries: &[ProcMapsEntry]) -> Option<&ProcMapsE
         e.permissions.contains('x')
             && (e.path.ends_with("/steamclient.so") || e.path == "steamclient.so")
     })
-}
-
-/// Build the ordered list of Lua script directories:
-/// 1. {Steam}/config/lua/: Steam directory
-/// 2. ~/.config/vapor-forge/scripts/: user config directory
-/// 3. config.toml [scripting] paths: user-specified extra dirs (highest priority)
-pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
-    let mut dirs = Vec::new();
-
-    // 1. Steam root config/lua + config/scripts
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{}/.local/share/Steam/config/lua", home));
-        dirs.push(format!("{}/.local/share/Steam/config/scripts", home));
-    }
-
-    // 2. User config directory
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{}/.config/vapor-forge/scripts", home));
-    }
-
-    // 3. Extra dirs from config. Highest priority; later dirs override earlier.
-    for path in &config.scripting.paths {
-        if !dirs.contains(path) {
-            dirs.push(path.clone());
-        }
-    }
-
-    dirs
-}
-
-/// Execute Lua scripts from default + config directories and merge addappid
-/// results into the config's inject list.
-fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, ScriptState) {
-    let dirs = build_script_dirs(&config);
-    if dirs.is_empty() {
-        return (config, ScriptState::default());
-    }
-
-    let state = vapor_forge_scripting::execute_scripts(&dirs);
-
-    // Merge script-added app IDs into config.apps.inject (dedup)
-    let existing_ids: std::collections::HashSet<AppId> =
-        config.apps.inject.iter().map(|a| a.id).collect();
-
-    for &app_id in &state.apps {
-        if !existing_ids.contains(&app_id) {
-            config.apps.inject.push(vapor_forge_config::InjectApp {
-                id: app_id,
-                dlc: Vec::new(),
-                ticket: Default::default(),
-                purchase_time: 0,
-            });
-        }
-    }
-
-    (config, state)
-}
-
-fn config_search_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = vec![std::path::PathBuf::from(CONFIG_FILENAME)];
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(
-            std::path::Path::new(&home)
-                .join(".config/vapor-forge")
-                .join(CONFIG_FILENAME),
-        );
-    }
-    paths
-}
-
-fn load_config() -> (RuntimeConfig, Option<std::path::PathBuf>) {
-    for p in config_search_paths() {
-        if p.exists() {
-            match RuntimeConfig::load(&p) {
-                Ok(config) => {
-                    info!(path = %p.display(), "hook-install: config loaded");
-                    return (config, Some(p));
-                }
-                Err(e) => {
-                    warn!(path = %p.display(), error = %e, "hook-install: config error");
-                }
-            }
-        }
-    }
-    info!("hook-install: no config, using defaults");
-    (RuntimeConfig::default(), None)
 }

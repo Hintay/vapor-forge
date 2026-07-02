@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

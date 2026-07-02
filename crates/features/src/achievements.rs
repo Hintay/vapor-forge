@@ -175,8 +175,7 @@ pub fn drain_offline_responses() -> Vec<OfflineResponse> {
 // ---------------------------------------------------------------------------
 
 fn should_redirect(app_id: u32, config: &RuntimeConfig) -> bool {
-    config.app_category(AppId(app_id)).is_some()
-        && !crate::apps::is_actually_owned(AppId(app_id))
+    config.app_category(AppId(app_id)).is_some() && !crate::apps::is_actually_owned(AppId(app_id))
 }
 
 /// Process an outgoing ServiceMethod (EMsg 151) Player.GetUserStats#1 request.

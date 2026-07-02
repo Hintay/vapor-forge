@@ -10,7 +10,7 @@ use crate::detour::{self, CodeRegion};
 use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
-use super::install::{config, validate_vmt_hook_eligibility, read_vtable_slot};
+use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -19,7 +19,8 @@ use super::install::{config, validate_vmt_hook_eligibility, read_vtable_slot};
 pub(crate) type RunIPCFrameFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
 pub(crate) type IsCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32) -> bool;
 pub(crate) type SetCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32, bool);
-pub(crate) type WriteVdfFileFn = extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u8, u32) -> u32;
+pub(crate) type WriteVdfFileFn =
+    extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u8, u32) -> u32;
 
 // ---------------------------------------------------------------------------
 // Static state
