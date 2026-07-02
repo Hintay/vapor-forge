@@ -4,8 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autobins = false
+
+[features]
+default = []
+tools = []
+
+[[bin]]
+name = "vapor-forge-pattern-scan"
+path = "src/bin/vapor-forge-pattern-scan.rs"
+required-features = ["tools"]
 
 [dependencies]
+memchr.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]

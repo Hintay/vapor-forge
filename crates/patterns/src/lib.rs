@@ -22,6 +22,8 @@ pub enum PatternError {
     FollowOutOfBounds,
     #[error("relative follow requires a call/jmp rel32 opcode at the match offset")]
     FollowUnsupportedOpcode,
+    #[error("no call target found before RET")]
+    NoCallTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,9 +82,36 @@ impl Pattern {
         if haystack.len() < self.tokens.len() {
             return Vec::new();
         }
-        (0..=haystack.len() - self.tokens.len())
-            .filter(|&offset| self.matches_at(haystack, offset))
-            .collect()
+        let limit = haystack.len() - self.tokens.len();
+        let Some((anchor_index, anchor_byte)) =
+            self.tokens
+                .iter()
+                .enumerate()
+                .find_map(|(index, token)| match token {
+                    PatternToken::Byte(byte) => Some((index, *byte)),
+                    PatternToken::Wildcard => None,
+                })
+        else {
+            return (0..=limit).collect();
+        };
+
+        let mut matches = Vec::new();
+        let mut search_from = anchor_index;
+        while search_from < haystack.len() {
+            let Some(relative) = memchr::memchr(anchor_byte, &haystack[search_from..]) else {
+                break;
+            };
+            let anchor_offset = search_from + relative;
+            if anchor_offset >= anchor_index {
+                let candidate = anchor_offset - anchor_index;
+                if candidate <= limit && self.matches_at(haystack, candidate) {
+                    matches.push(candidate);
+                }
+            }
+            search_from = anchor_offset + 1;
+        }
+
+        matches
     }
 
     pub fn find_unique(&self, haystack: &[u8]) -> Result<usize, PatternError> {
@@ -163,6 +192,43 @@ pub fn follow_relative_call(haystack: &[u8], match_offset: usize) -> Result<i64,
     Ok(match_offset as i64 + REL32_INSTR_LEN as i64 + displacement as i64)
 }
 
+/// Scan forward from `offset` for up to `max_scan` bytes, find the last
+/// `E8 rel32` CALL before the next `C3` RET, and return its target offset
+/// relative to the start of `haystack`.
+pub fn follow_last_call_before_ret(
+    haystack: &[u8],
+    offset: usize,
+    max_scan: usize,
+) -> Result<usize, PatternError> {
+    let end = offset.saturating_add(max_scan).min(haystack.len());
+    let mut last_call_target = None;
+
+    let mut pos = offset;
+    while pos + 5 <= end {
+        let byte = haystack[pos];
+        if byte == 0xC3 {
+            break;
+        }
+        if byte == 0xE8 {
+            let rel = i32::from_le_bytes([
+                haystack[pos + 1],
+                haystack[pos + 2],
+                haystack[pos + 3],
+                haystack[pos + 4],
+            ]);
+            let target = pos as i64 + 5 + rel as i64;
+            if target >= 0 && (target as usize) < haystack.len() {
+                last_call_target = Some(target as usize);
+            }
+            pos += 5;
+        } else {
+            pos += 1;
+        }
+    }
+
+    last_call_target.ok_or(PatternError::NoCallTarget)
+}
+
 // ---------------------------------------------------------------------------
 // Pattern registry loaded from TOML file
 // ---------------------------------------------------------------------------
@@ -171,7 +237,10 @@ pub mod registry;
 
 #[cfg(test)]
 mod tests {
-    use super::{find_prologue_upwards, follow_relative_call, Pattern, PatternError, PatternToken};
+    use super::{
+        find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
+        PatternError, PatternToken,
+    };
 
     #[test]
     fn parses_bytes_and_wildcards() {
@@ -206,6 +275,13 @@ mod tests {
         let haystack = [0x00, 0x83, 0xC4, 0x90, 0x83, 0x10];
         let pattern = Pattern::parse("83 ?").expect("pattern should parse");
         assert_eq!(pattern.find_all(&haystack), vec![1, 4]);
+    }
+
+    #[test]
+    fn finds_matches_with_leading_wildcard() {
+        let haystack = [0x00, 0x83, 0xC4, 0x90, 0x83, 0x10];
+        let pattern = Pattern::parse("? 83").expect("pattern should parse");
+        assert_eq!(pattern.find_all(&haystack), vec![0, 3]);
     }
 
     #[test]
@@ -351,5 +427,36 @@ mod tests {
 
         let callee = follow_relative_call(&haystack, site).expect("callee resolves");
         assert_eq!(callee, 19);
+    }
+
+    #[test]
+    fn follows_last_call_before_ret() {
+        let mut haystack = [0x90u8; 40];
+        haystack[4] = 0xE8;
+        haystack[5] = 0x05;
+        haystack[6] = 0x00;
+        haystack[7] = 0x00;
+        haystack[8] = 0x00;
+        haystack[12] = 0xE8;
+        haystack[13] = 0x09;
+        haystack[14] = 0x00;
+        haystack[15] = 0x00;
+        haystack[16] = 0x00;
+        haystack[20] = 0xC3;
+
+        assert_eq!(follow_last_call_before_ret(&haystack, 0, 32), Ok(26));
+    }
+
+    #[test]
+    fn last_call_stops_at_ret() {
+        let mut haystack = [0x90u8; 32];
+        haystack[3] = 0xC3;
+        haystack[4] = 0xE8;
+        haystack[5] = 0x01;
+
+        assert_eq!(
+            follow_last_call_before_ret(&haystack, 0, 16),
+            Err(PatternError::NoCallTarget)
+        );
     }
 }

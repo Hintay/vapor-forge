@@ -2,7 +2,9 @@ use retour::GenericDetour;
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use vapor_forge_patterns::registry::{FollowMode, PatternLookup};
-use vapor_forge_patterns::{find_prologue_upwards, follow_relative_call, Pattern};
+use vapor_forge_patterns::{
+    find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
+};
 
 use crate::pic_thunk;
 
@@ -161,13 +163,11 @@ fn resolve_follow_call(code: &CodeRegion, name: &str, entry: &PatternLookup<'_>)
     }
 
     for offset in matches.iter().copied() {
-        let Some(addr) = follow_last_call(code, offset, 256) else {
+        let Ok(callee_offset) = follow_last_call_before_ret(code.bytes, offset, 256) else {
             continue;
         };
+        let addr = code.base + callee_offset;
         if let Some(callee_pattern) = callee_pattern.as_ref() {
-            let Some(callee_offset) = addr.checked_sub(code.base) else {
-                continue;
-            };
             if !callee_pattern.matches_at(code.bytes, callee_offset) {
                 continue;
             }
@@ -189,36 +189,6 @@ fn resolve_follow_call(code: &CodeRegion, name: &str, entry: &PatternLookup<'_>)
         "no matching call target found"
     );
     None
-}
-
-/// Scan forward from `offset` for up to `max_scan` bytes, find the last
-/// E8 CALL before the next C3 (RET), and return its absolute target.
-fn follow_last_call(code: &CodeRegion, offset: usize, max_scan: usize) -> Option<usize> {
-    let end = (offset + max_scan).min(code.bytes.len());
-    let mut last_call_target: Option<usize> = None;
-
-    let mut pos = offset;
-    while pos + 5 <= end {
-        let b = code.bytes[pos];
-        if b == 0xC3 {
-            break;
-        }
-        if b == 0xE8 {
-            let rel = i32::from_le_bytes([
-                code.bytes[pos + 1],
-                code.bytes[pos + 2],
-                code.bytes[pos + 3],
-                code.bytes[pos + 4],
-            ]);
-            let target = (code.base + pos + 5).wrapping_add(rel as usize);
-            last_call_target = Some(target);
-            pos += 5;
-        } else {
-            pos += 1;
-        }
-    }
-
-    last_call_target
 }
 
 /// Scan backward from a prologue address to find the PIC preamble entry point.
