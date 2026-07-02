@@ -23,7 +23,7 @@ pub mod pic_thunk;
 #[cfg(target_os = "linux")]
 pub mod ui;
 #[cfg(target_os = "linux")]
-pub use ui::steamui;
+pub use ui::install as steamui;
 #[cfg(target_os = "linux")]
 pub mod vmt;
 #[cfg(target_os = "linux")]

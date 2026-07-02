@@ -251,7 +251,7 @@ pub unsafe fn apply_reload_diff(diff: &ReloadDiff) {
         let raw_id = app_id.0;
         if vec.find_and_fast_remove(&raw_id) {
             debug!(app_id = raw_id, "package: removed from pkg0");
-            crate::ui::steamui::queue_removal(app_id);
+            crate::ui::install::queue_removal(app_id);
             changed = true;
         }
     }
