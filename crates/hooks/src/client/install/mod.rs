@@ -9,7 +9,7 @@ use vapor_forge_patterns::registry::PatternRegistry;
 use vapor_forge_hook_boundary::{validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput};
 
 use crate::detour::{self, CodeRegion, PendingDetour};
-use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
+use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
 
 mod package_info;
 mod runtime;
@@ -19,7 +19,8 @@ mod steamui;
 pub use runtime::ensure_runtime_initialized;
 use runtime::runtime_hooks_enabled;
 pub(crate) use runtime::{
-    build_script_dirs, config, effective_ticket_mode, script_state, IPC_SERVER, TICKET_CACHE,
+    build_script_dirs, config, effective_ticket_mode, package_state, script_state, IPC_SERVER,
+    TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
@@ -420,6 +421,7 @@ fn do_install() {
     }
 
     log_drift_summary("steamclient.so", &hook_results);
+    store_results("steamclient.so", &hook_results);
 
     if config().runtime.diagnostics {
         log_hook_details("steamclient.so", &hook_results);

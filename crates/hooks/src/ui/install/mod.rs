@@ -12,11 +12,11 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use retour::GenericDetour;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use vapor_forge_abi::steamui::CSteamApp;
 use vapor_forge_config::AppId;
 
-use crate::hook_report::{log_drift_summary, log_hook_details, HookResult};
+use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
 use crate::original::detour_or_return;
 
 pub use super::library::{
@@ -225,6 +225,7 @@ pub fn install(
     if addrs[3] == 0 || addrs[4] == 0 {
         warn!("steamui: required capture hooks not found, aborting");
         log_drift_summary("steamui.so", &hook_results);
+        store_results("steamui.so", &hook_results);
         if crate::client::install::config().runtime.diagnostics {
             log_hook_details("steamui.so", &hook_results);
         }
@@ -282,6 +283,7 @@ pub fn install(
         warn!("steamui: some optional hooks missing, partial UI management");
     }
     log_drift_summary("steamui.so", &hook_results);
+    store_results("steamui.so", &hook_results);
     if crate::client::install::config().runtime.diagnostics {
         log_hook_details("steamui.so", &hook_results);
     }

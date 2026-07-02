@@ -3,11 +3,14 @@
 
 #[cfg(target_os = "linux")]
 pub mod client;
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(any(
+    all(target_os = "linux", debug_assertions),
+    all(test, target_family = "unix")
+))]
 pub mod debug_api;
 #[cfg(target_os = "linux")]
 pub mod detour;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]
 pub use client::install;

@@ -1,3 +1,6 @@
+use std::sync::Mutex;
+
+#[cfg(target_os = "linux")]
 use tracing::{debug, info};
 
 pub(crate) struct HookResult {
@@ -6,6 +9,63 @@ pub(crate) struct HookResult {
     pub(crate) addr: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Stored results for cross-module queries (e.g. debug API)
+// ---------------------------------------------------------------------------
+
+/// Lightweight copy of HookResult for cross-module queries.
+pub(crate) struct StoredHook {
+    pub(crate) name: &'static str,
+    pub(crate) installed: bool,
+    pub(crate) addr: usize,
+}
+
+/// Per-module storage entry.
+pub(crate) struct ModuleResults {
+    pub(crate) module: &'static str,
+    pub(crate) hooks: Vec<StoredHook>,
+}
+
+static STORED_RESULTS: Mutex<Vec<ModuleResults>> = Mutex::new(Vec::new());
+
+/// Persist hook results for a module so they can be queried later
+/// (e.g. by the debug API). Safe to call for multiple modules.
+pub(crate) fn store_results(module: &'static str, results: &[HookResult]) {
+    let entry = ModuleResults {
+        module,
+        hooks: results
+            .iter()
+            .map(|r| StoredHook {
+                name: r.name,
+                installed: r.installed,
+                addr: r.addr,
+            })
+            .collect(),
+    };
+    if let Ok(mut guard) = STORED_RESULTS.lock() {
+        guard.push(entry);
+    }
+}
+
+/// Access stored results. The callback receives a slice of all module results.
+pub(crate) fn with_stored_results<R>(f: impl FnOnce(&[ModuleResults]) -> R) -> R {
+    let guard = STORED_RESULTS.lock().unwrap_or_else(|e| e.into_inner());
+    f(&guard)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_stored_results() {
+    STORED_RESULTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+// ---------------------------------------------------------------------------
+// Logging helpers
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
 pub(crate) fn log_drift_summary(module_name: &str, hook_results: &[HookResult]) {
     let entries = match vapor_forge_memory::find_proc_self_maps_targets(16) {
         Ok(e) => e,
@@ -48,6 +108,7 @@ pub(crate) fn log_drift_summary(module_name: &str, hook_results: &[HookResult]) 
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn log_hook_details(module_name: &str, hook_results: &[HookResult]) {
     for r in hook_results {
         debug!(

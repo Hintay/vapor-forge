@@ -144,6 +144,10 @@ pub(crate) fn script_state() -> arc_swap::Guard<Arc<ScriptState>> {
     SCRIPT_STATE.load()
 }
 
+pub(crate) fn package_state() -> &'static vapor_forge_features::package::PackageState {
+    &PACKAGE_STATE
+}
+
 /// Build the ordered list of Lua script directories:
 /// 1. {Steam}/config/lua/: Steam directory
 /// 2. ~/.config/vapor-forge/scripts/: user config directory

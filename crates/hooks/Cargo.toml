@@ -11,6 +11,13 @@ libc.workspace = true
 vapor-forge-hook-boundary = { path = "../hook-boundary" }
 thiserror.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+tracing.workspace = true
+vapor-forge-config = { path = "../config" }
+vapor-forge-diagnostics = { path = "../diagnostics" }
+vapor-forge-features = { path = "../features" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 arc-swap.workspace = true
 inotify.workspace = true
@@ -24,5 +31,6 @@ vapor-forge-features = { path = "../features" }
 vapor-forge-memory = { path = "../memory" }
 vapor-forge-patterns = { path = "../patterns" }
 prost.workspace = true
+serde_json.workspace = true
 vapor-forge-scripting = { path = "../scripting" }
 vapor-forge-inject-protocol = { path = "../inject-protocol" }

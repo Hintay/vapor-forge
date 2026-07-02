@@ -15,7 +15,7 @@ fn help_is_default_for_empty_command() {
 #[test]
 fn dump_returns_jsonish_response() {
     let _guard = TEST_LOCK.lock().unwrap();
-    let response = dispatch("dump");
+    let response = dispatch("dump --json");
     assert!(response.starts_with("ok {"));
     assert!(response.contains("\"toast\""));
     assert!(response.contains("\"target\":\"steamclient\""));
@@ -24,7 +24,7 @@ fn dump_returns_jsonish_response() {
 #[test]
 fn target_dump_selects_namespace() {
     let _guard = TEST_LOCK.lock().unwrap();
-    let response = dispatch("steamui dump");
+    let response = dispatch("steamui dump --json");
     assert!(response.contains("\"target\":\"steamui\""));
 }
 
@@ -38,7 +38,7 @@ fn ping_is_lightweight_probe() {
 #[test]
 fn status_aliases_dump() {
     let _guard = TEST_LOCK.lock().unwrap();
-    let response = dispatch("steamui status");
+    let response = dispatch("steamui status --json");
     assert!(response.starts_with("ok {"));
     assert!(response.contains("\"target\":\"steamui\""));
 }
@@ -198,6 +198,14 @@ fn command_parser_normalizes_known_commands() {
     let _guard = TEST_LOCK.lock().unwrap();
     assert_eq!(parse_command(" help "), DebugCommand::Help);
     assert_eq!(parse_command("status"), DebugCommand::Dump);
+    assert_eq!(parse_command("config"), DebugCommand::Config);
+    assert_eq!(parse_command("hooks"), DebugCommand::Hooks);
+    assert_eq!(parse_command("apps"), DebugCommand::Apps);
+    assert_eq!(parse_command("pkg0"), DebugCommand::Pkg0);
+    assert_eq!(parse_command("patterns"), DebugCommand::Patterns);
+    assert_eq!(parse_command("version"), DebugCommand::Version);
+    assert_eq!(parse_command("log debug"), DebugCommand::Log("debug"));
+    assert_eq!(parse_command("log"), DebugCommand::Log(""));
     assert_eq!(
         parse_command("toast hello"),
         DebugCommand::Toast(ToastArgs::Fields("hello"))
@@ -270,4 +278,172 @@ fn target_prefixes_are_stripped() {
     );
     assert_eq!(strip_target("steamui", "steamui"), None);
     assert_eq!(strip_target("steamuis toast", "steamui"), None);
+}
+
+// ---------------------------------------------------------------------------
+// New command tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_returns_json_with_runtime_section() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("config --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"runtime\":{"));
+    assert!(response.contains("\"log_level\":"));
+    assert!(response.contains("\"apps\":{"));
+    assert!(response.contains("\"toast\":{"));
+    assert!(response.contains("\"ticket\":{"));
+    assert!(response.contains("\"cloud\":{"));
+    assert!(response.contains("\"scripting\":{"));
+    assert!(response.contains("\"debug\":{"));
+}
+
+#[test]
+fn hooks_returns_json() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    crate::hook_report::clear_stored_results();
+
+    let response = dispatch("hooks --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"installed\":false"));
+}
+
+#[test]
+fn hooks_with_stored_results() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    crate::hook_report::clear_stored_results();
+
+    crate::hook_report::store_results(
+        "test.so",
+        &[
+            crate::hook_report::HookResult {
+                name: "TestHook::Alpha",
+                installed: true,
+                addr: 0xdead,
+            },
+            crate::hook_report::HookResult {
+                name: "TestHook::Beta",
+                installed: false,
+                addr: 0,
+            },
+        ],
+    );
+
+    let response = dispatch("hooks --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"test.so\":["));
+    assert!(response.contains("\"TestHook::Alpha\""));
+    assert!(response.contains("\"installed\":true"));
+    assert!(response.contains("\"TestHook::Beta\""));
+    assert!(response.contains("\"installed\":false"));
+}
+
+#[test]
+fn apps_returns_controlled_list() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("apps --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"controlled\":["));
+}
+
+#[test]
+fn pkg0_returns_capture_status() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("pkg0 --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"pkg0_captured\":"));
+    assert!(response.contains("\"cuser_captured\":"));
+    assert!(response.contains("\"inject_count\":"));
+    assert!(response.contains("\"active\":"));
+}
+
+#[test]
+fn patterns_returns_json() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    crate::hook_report::clear_stored_results();
+
+    let response = dispatch("patterns --json");
+    assert!(response.starts_with("ok {"));
+}
+
+#[test]
+fn patterns_shows_stored_results() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    crate::hook_report::clear_stored_results();
+
+    crate::hook_report::store_results(
+        "test.so",
+        &[
+            crate::hook_report::HookResult {
+                name: "TestHook::Alpha",
+                installed: true,
+                addr: 0xdead,
+            },
+            crate::hook_report::HookResult {
+                name: "TestHook::Beta",
+                installed: false,
+                addr: 0,
+            },
+        ],
+    );
+
+    let response = dispatch("patterns --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"test.so\":["));
+    assert!(response.contains("\"TestHook::Alpha\""));
+    assert!(response.contains("\"addr\":\"0xdead\""));
+    assert!(response.contains("\"TestHook::Beta\""));
+    assert!(response.contains("\"addr\":null"));
+}
+
+#[test]
+fn version_returns_json() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("version --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"version\":"));
+    assert!(response.contains("\"commit\":"));
+}
+
+#[test]
+fn log_without_args_returns_current_level() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("log --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"level\":"));
+}
+
+#[test]
+fn log_sets_level() {
+    let _guard = TEST_LOCK.lock().unwrap();
+
+    let response = dispatch("log debug --json");
+    assert_eq!(response, "ok {\"level\":\"debug\"}");
+
+    let response = dispatch("log --json");
+    assert!(response.contains("\"level\":\"debug\""));
+
+    let response = dispatch("log info --json");
+    assert_eq!(response, "ok {\"level\":\"info\"}");
+}
+
+#[test]
+fn log_rejects_invalid_level() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("log banana");
+    assert!(response.starts_with("err unknown log level:"));
+}
+
+#[test]
+fn help_lists_new_commands() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let response = dispatch("help");
+    assert!(response.contains("config"));
+    assert!(response.contains("hooks"));
+    assert!(response.contains("apps"));
+    assert!(response.contains("pkg0"));
+    assert!(response.contains("patterns"));
+    assert!(response.contains("version"));
+    assert!(response.contains("log"));
 }
