@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use retour::GenericDetour;
 
 pub(crate) const EAPP_OWNERSHIP_FLAGS_NONE: u32 = 0;
-pub(crate) const EAPP_STATE_UNINSTALLED: u32 = 0;
+pub(crate) const EAPP_STATE_UNINSTALLED: u32 = 1;
 pub(crate) const EAPPCHANGE_ADDED_OR_CREATED: u32 = 1;
 
 pub(crate) type GetAppByIdFn = extern "C" fn(*mut c_void, u32, bool) -> *mut c_void;

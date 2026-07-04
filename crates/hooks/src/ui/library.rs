@@ -24,10 +24,14 @@ pub(crate) static HAS_PENDING: AtomicBool = AtomicBool::new(false);
 static REMOVED_APP_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static HAS_REMOVED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: RepeatedFieldAddFn) {
+pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<RepeatedFieldAddFn>) {
     if change.is_null() || !HAS_REMOVED.load(Ordering::Acquire) {
         return;
     }
+    let Some(add_fn) = add_fn else {
+        error!("steamui: RepeatedField<uint32>::Add unavailable");
+        return;
+    };
     let Ok(removed) = REMOVED_APP_IDS.lock() else {
         error!("steamui: removed app set lock poisoned");
         return;
@@ -124,10 +128,11 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
 
     // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
     unsafe {
-        CSteamApp::set_ownership_flags(app_ptr, EAPP_OWNERSHIP_FLAGS_NONE);
+        let app = app_ptr.cast::<CSteamApp>();
+        (*app).ownership_flags = EAPP_OWNERSHIP_FLAGS_NONE;
 
         // Only track in removed set if already uninstalled.
-        let state = CSteamApp::app_state_flags(app_ptr);
+        let state = (*app).app_state_flags;
         if state == EAPP_STATE_UNINSTALLED {
             if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
                 removed.push(app_id.0);
@@ -171,7 +176,9 @@ pub fn remove_app_and_send_change(app_id: AppId) {
     }
 
     // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
-    unsafe { CSteamApp::set_ownership_flags(app_ptr, EAPP_OWNERSHIP_FLAGS_NONE) };
+    unsafe {
+        (*app_ptr.cast::<CSteamApp>()).ownership_flags = EAPP_OWNERSHIP_FLAGS_NONE;
+    }
 
     // Notify UI.
     // SAFETY: calling through the trampoline.
@@ -204,7 +211,9 @@ pub fn stamp_purchase_time(app_id: AppId, time: u32) {
     }
 
     // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
-    unsafe { CSteamApp::set_purchased_time(app_ptr, time) };
+    unsafe {
+        (*app_ptr.cast::<CSteamApp>()).purchased_time = time;
+    }
 
     // Notify UI.
     // SAFETY: calling through the trampoline.

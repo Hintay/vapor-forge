@@ -59,7 +59,9 @@ extern "C" fn hk_fill_in_app_overview(
 ) -> *mut c_void {
     if !app.is_null() {
         // SAFETY: app is a CSteamApp* passed by SteamUI.
-        let app_id_raw = unsafe { CSteamApp::app_id(app) };
+        let steam_app = app.cast::<CSteamApp>();
+        // SAFETY: steam_app points to the CSteamApp passed by SteamUI; this is a by-value read.
+        let app_id_raw = unsafe { (*steam_app).app_id };
         let cfg = crate::client::install::config();
         if cfg.app_category(AppId(app_id_raw)).is_some()
             && !vapor_forge_features::apps::is_actually_owned(AppId(app_id_raw))
@@ -70,8 +72,8 @@ extern "C" fn hk_fill_in_app_overview(
                 t = unsafe { libc::time(std::ptr::null_mut()) } as u32;
             }
             // Stamp BEFORE the original copies the field into the overview.
-            // SAFETY: app is a CSteamApp* passed by SteamUI.
-            unsafe { CSteamApp::set_purchased_time(app, t) };
+            // SAFETY: steam_app points to the CSteamApp passed by SteamUI.
+            unsafe { (*steam_app).purchased_time = t };
         }
     }
     // SAFETY: detour set before hook enabled.
@@ -98,11 +100,7 @@ extern "C" fn hk_build_complete_change(
     original.call(controller, change, callback_slot);
 
     // SAFETY: REPEATED_FIELD_ADD resolved once at install time.
-    let add_fn = match unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) } {
-        Some(f) => f,
-        None => return,
-    };
-
+    let add_fn = unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) };
     super::library::append_removed_appids(change, add_fn);
 }
 
@@ -269,8 +267,6 @@ pub fn install(
     );
 
     // Resolve RepeatedField<uint32>::Add for BuildComplete protobuf mutation.
-    // The body pattern matches both int32 and uint32 instantiations (isomorphic).
-    // Take the second (higher-address) match which is the uint32 version.
     if let Some(addr) = resolve_repeated_field_add(steamui_code, registry) {
         addrs[5] = addr;
         hook_results[5].addr = addr;
@@ -319,8 +315,6 @@ fn maybe_show_init_toast() {
 }
 
 /// Resolve RepeatedField<uint32>::Add from steamui.so.
-/// Uses follow=call: pattern matches one or more callsites, scan forward
-/// for the last E8 CALL before RET to reach the target function.
 fn resolve_repeated_field_add(
     steamui_code: &crate::detour::CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
@@ -338,6 +332,15 @@ fn resolve_repeated_field_add(
         None => return None,
     };
 
+    #[cfg(target_pointer_width = "64")]
+    if !is_repeated_field_u32_add_abi(steamui_code, addr) {
+        error!(
+            addr = format_args!("{:#x}", addr),
+            "steamui: rejected RepeatedField<uint32>::Add candidate"
+        );
+        return None;
+    }
+
     // SAFETY: addr is a validated function address in steamui.so .text.
     let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };
     // SAFETY: single-threaded init writes the resolver slot once.
@@ -347,6 +350,19 @@ fn resolve_repeated_field_add(
         "steamui: RepeatedField<uint32>::Add resolved"
     );
     Some(addr)
+}
+
+#[cfg(target_pointer_width = "64")]
+fn is_repeated_field_u32_add_abi(code: &crate::detour::CodeRegion, addr: usize) -> bool {
+    let Some(offset) = addr.checked_sub(code.base) else {
+        return false;
+    };
+    let Some(bytes) = code.bytes.get(offset..offset.saturating_add(0x90)) else {
+        return false;
+    };
+
+    bytes.windows(4).any(|w| w == [0x8b, 0x13, 0x41, 0x89])
+        && bytes.windows(4).any(|w| w == [0x41, 0x89, 0x14, 0x80])
 }
 
 /// Resolve steamui.so code region from /proc/self/maps.

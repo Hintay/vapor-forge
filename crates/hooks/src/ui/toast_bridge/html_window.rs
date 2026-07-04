@@ -8,7 +8,6 @@ type ExecuteJavaScriptFn = extern "C" fn(*mut c_void, *const c_char);
 
 const CHTML_WINDOW_RTTI_NAME: &[u8] = b"11CHTMLWindow\0";
 const CHTML_WINDOW_MIN_SIZE: usize = 0x3c;
-const CHTML_WINDOW_CHROMEHTML_DATA_OFF: usize = 0x38;
 const MAX_HTML_WINDOWS: usize = 64;
 const BOOTSTRAP_RETRY_NS: u64 = 1_000_000_000;
 const BOOTSTRAP_SCAN_BUDGET: usize = 32 * 1024 * 1024;
@@ -130,15 +129,16 @@ fn find_typeinfo_for_name(name_addr: usize, maps: &[MapsEntry]) -> Option<usize>
 }
 
 fn find_primary_vtable(typeinfo: usize, maps: &[MapsEntry]) -> Option<usize> {
+    let word = std::mem::size_of::<usize>();
     for typeinfo_slot in find_readable_ptrs(typeinfo, maps) {
-        if typeinfo_slot < 4 {
+        if typeinfo_slot < word {
             continue;
         }
-        let offset_to_top_addr = typeinfo_slot - 4;
-        let offset_to_top = read_i32(offset_to_top_addr, maps)?;
-        let method0 = typeinfo_slot + 4;
+        let offset_to_top_addr = typeinfo_slot - word;
+        let offset_to_top = read_isize(offset_to_top_addr, maps)?;
+        let method0 = typeinfo_slot + word;
         if offset_to_top == 0
-            && is_readable_range(method0, 4, maps)
+            && is_readable_range(method0, word, maps)
             && read_usize(method0, maps).is_some_and(|addr| is_executable_addr(addr, maps))
         {
             return Some(method0);
@@ -282,11 +282,21 @@ fn is_html_window_candidate(window: usize, vtable: usize, maps: &[MapsEntry]) ->
         return false;
     }
 
-    read_usize(
-        window.saturating_add(CHTML_WINDOW_CHROMEHTML_DATA_OFF),
-        maps,
-    )
-    .is_some_and(|addr| is_readable_addr(addr, maps))
+    object_has_readable_member_pointer(window, CHTML_WINDOW_MIN_SIZE, maps)
+}
+
+fn object_has_readable_member_pointer(object: usize, scan_size: usize, maps: &[MapsEntry]) -> bool {
+    let word = std::mem::size_of::<usize>();
+    let mut offset = word;
+    while offset.saturating_add(word) <= scan_size {
+        if read_usize(object.saturating_add(offset), maps)
+            .is_some_and(|addr| is_readable_addr(addr, maps))
+        {
+            return true;
+        }
+        offset = offset.saturating_add(word);
+    }
+    false
 }
 
 fn log_bootstrap_hit(entry: &MapsEntry, window: usize, accepted: bool) {
@@ -380,15 +390,15 @@ fn read_usize(addr: usize, maps: &[MapsEntry]) -> Option<usize> {
     Some(read_usize_from_bytes(&bytes))
 }
 
-fn read_i32(addr: usize, maps: &[MapsEntry]) -> Option<i32> {
-    if !is_readable_range(addr, std::mem::size_of::<i32>(), maps) {
+fn read_isize(addr: usize, maps: &[MapsEntry]) -> Option<isize> {
+    if !is_readable_range(addr, std::mem::size_of::<isize>(), maps) {
         return None;
     }
-    let mut bytes = [0u8; std::mem::size_of::<i32>()];
+    let mut bytes = [0u8; std::mem::size_of::<isize>()];
     if !read_process_bytes(addr, &mut bytes) {
         return None;
     }
-    Some(i32::from_ne_bytes(bytes))
+    Some(isize::from_ne_bytes(bytes))
 }
 
 fn read_usize_from_bytes(bytes: &[u8]) -> usize {
@@ -523,5 +533,63 @@ mod tests {
             path: "/memfd/steam-object-arena".to_owned(),
         };
         assert!(!is_bootstrap_scan_entry(&entry));
+    }
+
+    #[test]
+    fn primary_vtable_uses_pointer_sized_itanium_slots() {
+        let typeinfo = 0x1234_5000usize;
+        let executable = primary_vtable_uses_pointer_sized_itanium_slots as *const () as usize;
+        let mut vtable_prefix = Box::new([0usize, typeinfo, executable]);
+        let base = vtable_prefix.as_mut_ptr() as usize;
+        let end = base + std::mem::size_of_val(&*vtable_prefix);
+
+        let maps = vec![
+            MapsEntry {
+                start: base,
+                end,
+                perms: "r--p".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
+            },
+            MapsEntry {
+                start: executable.saturating_sub(0x10),
+                end: executable.saturating_add(0x10),
+                perms: "r-xp".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            find_primary_vtable(typeinfo, &maps),
+            Some(base + std::mem::size_of::<usize>() * 2)
+        );
+    }
+
+    #[test]
+    fn window_candidate_validation_scans_pointer_sized_members() {
+        let mut target = Box::new(42usize);
+        let mut object = Box::new([0usize, target.as_mut() as *mut usize as usize]);
+        let object_base = object.as_mut_ptr() as usize;
+        let target_addr = target.as_mut() as *mut usize as usize;
+
+        let maps = vec![
+            MapsEntry {
+                start: object_base,
+                end: object_base + std::mem::size_of_val(&*object),
+                perms: "rw-p".to_owned(),
+                path: "[heap]".to_owned(),
+            },
+            MapsEntry {
+                start: target_addr,
+                end: target_addr + std::mem::size_of::<usize>(),
+                perms: "rw-p".to_owned(),
+                path: "[heap]".to_owned(),
+            },
+        ];
+
+        assert!(object_has_readable_member_pointer(
+            object_base,
+            std::mem::size_of_val(&*object),
+            &maps
+        ));
     }
 }

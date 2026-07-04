@@ -29,8 +29,13 @@ pub(crate) type TicketExtDataFn = extern "C" fn(
     *mut u32,    // pcb_signature (out)
 ) -> u32;
 pub(crate) type UpdateTicketFn = extern "C" fn(*mut c_void, u32, bool) -> u32;
+#[cfg(target_pointer_width = "32")]
 pub(crate) type IsSubscribedInTicketFn = extern "C" fn(*mut c_void, u32, u32, u32, u32) -> u8;
+#[cfg(target_pointer_width = "64")]
+pub(crate) type IsSubscribedInTicketFn = extern "C" fn(*mut c_void, u64, *const u64, u32) -> u8;
 pub(crate) type GetSteamIDFn = extern "C" fn(*mut c_void) -> u64;
+
+const USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE: u8 = 0;
 
 // ---------------------------------------------------------------------------
 // Static state
@@ -316,19 +321,17 @@ pub(crate) extern "C" fn hk_update_ticket(this: *mut c_void, app_id: u32, force:
 // Hook replacement functions: IsUserSubscribedAppInTicket
 // ---------------------------------------------------------------------------
 
+#[cfg(target_pointer_width = "32")]
 pub(crate) extern "C" fn hk_is_subscribed_in_ticket(
     this: *mut c_void,
+    steam_id_low: u32,
+    steam_id_high: u32,
+    game_id_ptr: u32,
     app_id: u32,
-    arg2: u32,
-    arg3: u32,
-    arg4: u32,
 ) -> u8 {
-    let cfg = config();
-    if cfg.app_category(AppId(app_id)).is_some()
-        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
-    {
+    if is_controlled_unowned_ticket_app(app_id) {
         debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
-        return 1;
+        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
     }
 
     // SAFETY: IS_SUBSCRIBED_IN_TICKET_DETOUR set before hook enabled, never modified after.
@@ -337,7 +340,34 @@ pub(crate) extern "C" fn hk_is_subscribed_in_ticket(
         IS_SUBSCRIBED_IN_TICKET_DETOUR,
         0
     );
-    original.call(this, app_id, arg2, arg3, arg4)
+    original.call(this, steam_id_low, steam_id_high, game_id_ptr, app_id)
+}
+
+#[cfg(target_pointer_width = "64")]
+pub(crate) extern "C" fn hk_is_subscribed_in_ticket(
+    this: *mut c_void,
+    steam_id: u64,
+    game_id_ptr: *const u64,
+    app_id: u32,
+) -> u8 {
+    if is_controlled_unowned_ticket_app(app_id) {
+        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
+        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
+    }
+
+    // SAFETY: IS_SUBSCRIBED_IN_TICKET_DETOUR set before hook enabled, never modified after.
+    let original = detour_or_return!(
+        "IsUserSubscribedAppInTicket",
+        IS_SUBSCRIBED_IN_TICKET_DETOUR,
+        0
+    );
+    original.call(this, steam_id, game_id_ptr, app_id)
+}
+
+fn is_controlled_unowned_ticket_app(app_id: u32) -> bool {
+    let cfg = config();
+    cfg.app_category(AppId(app_id)).is_some()
+        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
 }
 
 // ---------------------------------------------------------------------------

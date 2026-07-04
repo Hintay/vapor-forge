@@ -9,7 +9,7 @@ rust-version.workspace = true
 name = "vapor_forge"
 crate-type = ["cdylib"]
 
-[target.'cfg(all(target_os = "linux", target_pointer_width = "32"))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 once_cell.workspace = true
 vapor-forge-core = { path = "../runtime-core" }

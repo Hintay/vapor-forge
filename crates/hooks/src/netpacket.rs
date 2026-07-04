@@ -6,7 +6,7 @@
 use prost::Message;
 use tracing::{debug, info, warn};
 use vapor_forge_abi::{
-    CMsgProtoBufHeader, GetManifestRequestCodeRequest, EMSG_CLIENT_PERSONA_STATE,
+    cnet_packet, CMsgProtoBufHeader, GetManifestRequestCodeRequest, EMSG_CLIENT_PERSONA_STATE,
     EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
     EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
     EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
@@ -25,16 +25,6 @@ use crate::client::install::config;
 // ---------------------------------------------------------------------------
 
 static PENDING: once_cell::sync::Lazy<PendingQueue> = once_cell::sync::Lazy::new(PendingQueue::new);
-
-#[cfg(target_pointer_width = "32")]
-const CNET_PACKET_DATA_OFFSET: usize = 4;
-#[cfg(target_pointer_width = "32")]
-const CNET_PACKET_SIZE_OFFSET: usize = 8;
-
-#[cfg(target_pointer_width = "64")]
-const CNET_PACKET_DATA_OFFSET: usize = 8;
-#[cfg(target_pointer_width = "64")]
-const CNET_PACKET_SIZE_OFFSET: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Outgoing frame handling called from BBuildAndAsyncSendFrame hook
@@ -342,8 +332,8 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     if packet.is_null() {
         return;
     }
-    let p_data = unsafe { packet_data_slot(packet) };
-    let p_size = unsafe { packet_size_slot(packet) };
+    let p_data = unsafe { cnet_packet::data_slot(packet) };
+    let p_size = unsafe { cnet_packet::size_slot(packet) };
     let data = unsafe { *p_data };
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
@@ -449,20 +439,7 @@ unsafe fn replace_packet_data(packet: *mut std::ffi::c_void, data: Vec<u8>) {
     let len = boxed.len() as u32;
     let ptr = Box::into_raw(boxed) as *mut u8;
 
-    let p_data = unsafe { packet_data_slot(packet) };
-    let p_size = unsafe { packet_size_slot(packet) };
-    unsafe {
-        *p_data = ptr;
-        *p_size = len;
-    }
-}
-
-unsafe fn packet_data_slot(packet: *mut std::ffi::c_void) -> *mut *mut u8 {
-    unsafe { (packet as *mut u8).add(CNET_PACKET_DATA_OFFSET) as *mut *mut u8 }
-}
-
-unsafe fn packet_size_slot(packet: *mut std::ffi::c_void) -> *mut u32 {
-    unsafe { (packet as *mut u8).add(CNET_PACKET_SIZE_OFFSET) as *mut u32 }
+    unsafe { cnet_packet::set_data(packet, ptr, len) };
 }
 
 // ---------------------------------------------------------------------------
@@ -481,8 +458,8 @@ impl PacketSwapGuard {
     /// # Safety
     /// `packet` must be a valid CNetPacket pointer.
     unsafe fn new(packet: *mut std::ffi::c_void, response: Vec<u8>) -> Self {
-        let p_data = unsafe { packet_data_slot(packet) };
-        let p_size = unsafe { packet_size_slot(packet) };
+        let p_data = unsafe { cnet_packet::data_slot(packet) };
+        let p_size = unsafe { cnet_packet::size_slot(packet) };
         let orig_data = unsafe { *p_data };
         let orig_size = unsafe { *p_size };
 

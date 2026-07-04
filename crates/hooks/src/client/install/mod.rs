@@ -44,6 +44,15 @@ pub enum HookBatch {
 /// Install one hook batch. Safe to call multiple times.
 pub fn install_hook_batch(batch: HookBatch) {
     ensure_runtime_initialized();
+    if !steam_hook_batch_supported(batch) {
+        warn!(
+            batch = ?batch,
+            arch = current_hook_architecture(),
+            "hook-install: Steam hook batch skipped on unsupported process architecture"
+        );
+        mark_hook_batch_finished(batch);
+        return;
+    }
     match batch {
         HookBatch::SteamClient => steamclient::install_hook_batch(),
         HookBatch::SteamUi => steamui::install_hook_batch(),
@@ -54,6 +63,48 @@ pub fn is_hook_batch_finished(batch: HookBatch) -> bool {
     match batch {
         HookBatch::SteamClient => steamclient::STEAMCLIENT_BATCH_FINISHED.load(Ordering::Acquire),
         HookBatch::SteamUi => steamui::STEAMUI_BATCH_FINISHED.load(Ordering::Acquire),
+    }
+}
+
+fn mark_hook_batch_finished(batch: HookBatch) {
+    match batch {
+        HookBatch::SteamClient => {
+            steamclient::STEAMCLIENT_BATCH_FINISHED.store(true, Ordering::Release)
+        }
+        HookBatch::SteamUi => steamui::STEAMUI_BATCH_FINISHED.store(true, Ordering::Release),
+    }
+}
+
+fn steam_hook_batch_supported(batch: HookBatch) -> bool {
+    match batch {
+        HookBatch::SteamClient => cfg!(target_os = "linux"),
+        HookBatch::SteamUi => steamui_hooks_supported(),
+    }
+}
+
+fn package_injection_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn vmt_scanner_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn env_hooks_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn steamui_hooks_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn current_hook_architecture() -> &'static str {
+    if cfg!(target_pointer_width = "64") {
+        "x86_64"
+    } else if cfg!(target_pointer_width = "32") {
+        "x86"
+    } else {
+        "unknown"
     }
 }
 
@@ -115,8 +166,8 @@ fn validate_hook_eligibility(
     validate_raw_hook_plan(RawHookEligibilityInput {
         module_name: "steamclient.so",
         expected_module_name: "steamclient.so",
-        actual_architecture: "x86",
-        expected_architecture: "x86",
+        actual_architecture: current_hook_architecture(),
+        expected_architecture: current_hook_architecture(),
         target_address: target_addr,
         replacement_address: replacement_addr,
         executable_range: RawAddressRange {
@@ -146,8 +197,8 @@ pub(crate) fn validate_vmt_hook_eligibility(
     let result = validate_raw_hook_plan(RawHookEligibilityInput {
         module_name: "steamclient.so",
         expected_module_name: "steamclient.so",
-        actual_architecture: "x86",
-        expected_architecture: "x86",
+        actual_architecture: current_hook_architecture(),
+        expected_architecture: current_hook_architecture(),
         target_address: original_addr,
         replacement_address: replacement_addr,
         executable_range: RawAddressRange { start: base, end },
@@ -185,15 +236,29 @@ fn do_install() {
     let registry = load_pattern_registry();
     info!(patterns = registry.len(), "patterns loaded");
 
-    crate::vtable_scan::warmup();
+    if vmt_scanner_supported() {
+        crate::vtable_scan::warmup();
+    } else {
+        info!(
+            arch = current_hook_architecture(),
+            "hook-install: VMT scanner hooks disabled on this architecture"
+        );
+    }
 
     // Resolve pkg0 injection function addresses. These are not hooks and are called directly.
-    super::package::resolve_functions(&code, &registry);
+    if package_injection_supported() {
+        super::package::resolve_functions(&code, &registry);
 
-    if super::package::all_functions_resolved() {
-        info!("hook-install: pkg0 functions resolved (4/4)");
+        if super::package::all_functions_resolved() {
+            info!("hook-install: pkg0 functions resolved (4/4)");
+        } else {
+            warn!("hook-install: some pkg0 functions not resolved, injection may be limited");
+        }
     } else {
-        warn!("hook-install: some pkg0 functions not resolved, injection may be limited");
+        info!(
+            arch = current_hook_architecture(),
+            "hook-install: pkg0 injection disabled on this architecture"
+        );
     }
 
     // Phase 1: create all detours (retour allocates trampolines on a shared pool page).
@@ -211,25 +276,41 @@ fn do_install() {
         "CUser::GetSubscribedApps",
         super::ownership::hk_get_subscribed_apps as super::ownership::GetSubscribedAppsFn,
     );
-    let d_remote_storage_ipc = resolve_from_registry(
-        &registry,
-        &code,
-        "IClientRemoteStorage::RunIPCFrame",
-        super::cloud::hk_remote_storage_run_ipc_frame as super::cloud::RunIPCFrameFn,
-    );
-    let d_app_mgr_ipc = resolve_from_registry(
-        &registry,
-        &code,
-        "IClientAppManager::RunIPCFrame",
-        super::dlc::hk_app_manager_run_ipc_frame as super::cloud::RunIPCFrameFn,
-    );
-    let d_client_apps_ipc = resolve_from_registry(
-        &registry,
-        &code,
-        "IClientApps::RunIPCFrame",
-        super::dlc::hk_client_apps_run_ipc_frame as super::cloud::RunIPCFrameFn,
-    );
-    let d_get_pkg_info = package_info::create_detour();
+    let d_remote_storage_ipc = if vmt_scanner_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "IClientRemoteStorage::RunIPCFrame",
+            super::cloud::hk_remote_storage_run_ipc_frame as super::cloud::RunIPCFrameFn,
+        )
+    } else {
+        None
+    };
+    let d_app_mgr_ipc = if vmt_scanner_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "IClientAppManager::RunIPCFrame",
+            super::dlc::hk_app_manager_run_ipc_frame as super::cloud::RunIPCFrameFn,
+        )
+    } else {
+        None
+    };
+    let d_client_apps_ipc = if vmt_scanner_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "IClientApps::RunIPCFrame",
+            super::dlc::hk_client_apps_run_ipc_frame as super::cloud::RunIPCFrameFn,
+        )
+    } else {
+        None
+    };
+    let d_get_pkg_info = if package_injection_supported() {
+        package_info::create_detour()
+    } else {
+        None
+    };
     let d_ticket_ext = resolve_from_registry(
         &registry,
         &code,
@@ -272,30 +353,41 @@ fn do_install() {
         "CCMConnection::RecvPkt",
         super::network::hk_recv_pkt as super::network::RecvPktFn,
     );
-    let d_write_vdf = resolve_from_registry(
-        &registry,
-        &code,
-        "CConfigStore::WriteVdfFile",
-        super::cloud::hk_write_vdf_file as super::cloud::WriteVdfFileFn,
-    );
-    let d_build_spawn_env = resolve_from_registry(
-        &registry,
-        &code,
-        "CUser::BuildSpawnEnvBlock",
-        super::env::hk_build_spawn_env_block as super::env::BuildSpawnEnvBlockFn,
-    );
-    let d_spawn_process = resolve_from_registry(
-        &registry,
-        &code,
-        "CUser::SpawnProcess",
-        super::env::hk_spawn_process as super::env::SpawnProcessFn,
-    );
-
-    // Resolve SetCloudEnabledForApp vtable slot address for later VMT call
-    super::cloud::resolve_set_cloud_fn(&registry, &code);
+    let d_write_vdf = if vmt_scanner_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "CConfigStore::WriteVdfFile",
+            super::cloud::hk_write_vdf_file as super::cloud::WriteVdfFileFn,
+        )
+    } else {
+        None
+    };
+    let d_build_spawn_env = if env_hooks_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "CUser::BuildSpawnEnvBlock",
+            super::env::hk_build_spawn_env_block as super::env::BuildSpawnEnvBlockFn,
+        )
+    } else {
+        None
+    };
+    let d_spawn_process = if env_hooks_supported() {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "CUser::SpawnProcess",
+            super::env::hk_spawn_process as super::env::SpawnProcessFn,
+        )
+    } else {
+        None
+    };
 
     // Resolve SetEnvString as a raw fn pointer for library injection.
-    super::env::resolve_set_env_string(&registry, &code);
+    if env_hooks_supported() {
+        super::env::resolve_set_env_string(&registry, &code);
+    }
 
     macro_rules! hr {
         ($name:expr, $d:expr) => {
@@ -313,7 +405,7 @@ fn do_install() {
         hr!("IClientAppManager::RunIPCFrame", d_app_mgr_ipc),
         hr!("IClientApps::RunIPCFrame", d_client_apps_ipc),
         HookResult {
-            name: "CPackageInfo::GetPackageInfo",
+            name: package_info::hook_name(),
             installed: d_get_pkg_info.is_some(),
             addr: super::package::get_package_info_addr().unwrap_or(0),
         },
@@ -364,7 +456,7 @@ fn do_install() {
             d_client_apps_ipc,
         );
         detour::store_and_finalize(
-            "CPackageInfo::GetPackageInfo",
+            package_info::hook_name(),
             std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
             d_get_pkg_info,
         );

@@ -238,36 +238,54 @@ fn set_rich_presence_flag(msg: &mut vapor_forge_abi::ClientPersonaState) {
     msg.status_flags = Some(flags | ECLIENTPERSONASTATEFLAG_RICH_PRESENCE);
 }
 
-/// Parse Steam's binary KV1 format. Type 0x00 = struct start, 0x01 = string
-/// pair, 0x08 = struct end. Only top-level string pairs are collected; nested
-/// structs are skipped over by depth tracking rather than being recursed into,
-/// since rich presence KVs are always a flat list under one root struct.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinaryKv1Type {
+    Section = 0x00,
+    String = 0x01,
+    End = 0x08,
+}
+
+impl BinaryKv1Type {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x00 => Some(Self::Section),
+            0x01 => Some(Self::String),
+            0x08 => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// Parse Steam's binary KV1 format. Only top-level string pairs are collected;
+/// nested structs are skipped over by depth tracking rather than being recursed
+/// into, since rich presence KVs are always a flat list under one root struct.
 fn parse_binary_kv1(data: &[u8]) -> Vec<(String, String)> {
     let mut result = Vec::new();
     let mut pos = 0;
     let mut depth = 0;
 
     while pos < data.len() {
-        let typ = data[pos];
+        let typ = BinaryKv1Type::from_byte(data[pos]);
         pos += 1;
         match typ {
-            0x08 => {
+            Some(BinaryKv1Type::End) => {
                 if depth > 0 {
                     depth -= 1;
                 } else {
                     break;
                 }
             }
-            0x00 => {
+            Some(BinaryKv1Type::Section) => {
                 let _ = read_cstr(data, &mut pos);
                 depth += 1;
             }
-            0x01 => {
+            Some(BinaryKv1Type::String) => {
                 let key = read_cstr(data, &mut pos);
                 let value = read_cstr(data, &mut pos);
                 result.push((key, value));
             }
-            _ => break,
+            None => break,
         }
     }
     result
@@ -294,16 +312,16 @@ mod tests {
     #[test]
     fn parse_kv1_flat_pairs() {
         // struct root, two string pairs, end.
-        let mut data = vec![0x00];
+        let mut data = vec![BinaryKv1Type::Section as u8];
         data.extend_from_slice(b"root\0");
-        data.push(0x01);
+        data.push(BinaryKv1Type::String as u8);
         data.extend_from_slice(b"status\0");
         data.extend_from_slice(b"In Menu\0");
-        data.push(0x01);
+        data.push(BinaryKv1Type::String as u8);
         data.extend_from_slice(b"steam_display\0");
         data.extend_from_slice(b"#Status\0");
-        data.push(0x08); // end root
-        data.push(0x08); // outer end marker
+        data.push(BinaryKv1Type::End as u8);
+        data.push(BinaryKv1Type::End as u8);
 
         let kvs = parse_binary_kv1(&data);
         assert_eq!(

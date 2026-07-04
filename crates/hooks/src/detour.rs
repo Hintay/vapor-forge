@@ -1,7 +1,7 @@
 use retour::GenericDetour;
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use vapor_forge_patterns::registry::{FollowMode, PatternLookup};
+use vapor_forge_patterns::registry::{FollowMode, PatternLookup, PatternVariantLookup};
 use vapor_forge_patterns::{
     find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
 };
@@ -25,12 +25,30 @@ pub fn resolve_pattern_entry(
     name: &str,
     entry: &PatternLookup<'_>,
 ) -> Option<usize> {
+    for (variant_index, variant) in entry.variants().enumerate() {
+        if let Some(addr) = resolve_pattern_variant(code, name, variant_index, variant) {
+            return Some(addr);
+        }
+    }
+    None
+}
+
+fn resolve_pattern_variant(
+    code: &CodeRegion,
+    name: &str,
+    variant_index: usize,
+    entry: PatternVariantLookup<'_>,
+) -> Option<usize> {
     let addr = match entry.follow() {
         FollowMode::None => resolve_callee(code, name, entry.pattern(), false)?,
         FollowMode::Relative => resolve_callee(code, name, entry.pattern(), true)?,
         FollowMode::Upward => {
             let prologue = entry.prologue_bytes().or_else(|| {
-                error!(hook = name, "upward follow requires prologue bytes");
+                error!(
+                    hook = name,
+                    variant = variant_index,
+                    "upward follow requires prologue bytes"
+                );
                 None
             })?;
             resolve_prologue_upwards(code, name, entry.pattern(), prologue)?
@@ -137,7 +155,11 @@ fn resolve_prologue_upwards(
     }
 }
 
-fn resolve_follow_call(code: &CodeRegion, name: &str, entry: &PatternLookup<'_>) -> Option<usize> {
+fn resolve_follow_call(
+    code: &CodeRegion,
+    name: &str,
+    entry: PatternVariantLookup<'_>,
+) -> Option<usize> {
     let pattern = match Pattern::parse(entry.pattern()) {
         Ok(p) => p,
         Err(e) => {
@@ -196,6 +218,10 @@ fn resolve_follow_call(code: &CodeRegion, name: &str, entry: &PatternLookup<'_>)
 /// before the prologue. The ADD is 5 bytes (EAX, opcode 05) or 6 bytes (other
 /// registers, opcode 81 Cx), giving a total preamble of 10 or 11 bytes.
 fn find_pic_entry(prologue_addr: usize) -> Option<usize> {
+    if !cfg!(target_pointer_width = "32") {
+        return Some(prologue_addr);
+    }
+
     for offset in [10usize, 11] {
         if prologue_addr < offset {
             continue;
@@ -369,6 +395,10 @@ pub unsafe fn finalize_detour<F: retour::Function>(
 /// saved original prologue to find call-to-thunk patterns, then verify the
 /// trampoline has an E8 (call) at the same offset before patching.
 fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[u8; 16]) {
+    if !cfg!(target_pointer_width = "32") {
+        return;
+    }
+
     // SAFETY: reading trampoline bytes.
     let tramp_bytes = unsafe { std::slice::from_raw_parts(tramp_addr as *const u8, 64) };
 

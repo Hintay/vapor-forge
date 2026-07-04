@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tracing::{debug, error, info, warn};
 use vapor_forge_abi::{
-    package_info, CUtlMemoryGrowFn, GetPackageInfoFn, MarkLicenseAsChangedFn,
+    package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
     ProcessPendingLicenseUpdatesFn,
 };
 use vapor_forge_config::AppId;
@@ -32,10 +32,13 @@ const PKG_STATUS_AVAILABLE: u32 = 0;
 static mut FN_MARK_LICENSE: Option<MarkLicenseAsChangedFn> = None;
 static mut FN_PROCESS_UPDATES: Option<ProcessPendingLicenseUpdatesFn> = None;
 static mut FN_GROW: Option<CUtlMemoryGrowFn> = None;
-static mut FN_GET_PKG_INFO: Option<GetPackageInfoFn> = None;
+static mut FN_GET_PKG_INFO: Option<GetPackageInfoArchFn> = None;
 
 /// Captured IClientUser `this` pointer from CheckAppOwnership.
 pub(crate) static CUSER_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Captured package helper `this` pointer.
+pub(crate) static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Captured pkg0 PackageInfo pointer.
 pub(crate) static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -50,25 +53,29 @@ static PENDING_MARK: AtomicBool = AtomicBool::new(false);
 /// Resolve all 4 function addresses needed for pkg0 injection.
 /// Not hooks. These are just address resolutions via pattern matching and are called directly.
 pub fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
-    resolve_from_registry_raw(
+    let _ = resolve_from_registry_raw(
         registry,
         code,
         "CUser::MarkLicenseAsChanged",
         std::ptr::addr_of_mut!(FN_MARK_LICENSE),
     );
-    resolve_from_registry_raw(
+    let _ = resolve_from_registry_raw(
         registry,
         code,
         "CUser::ProcessPendingLicenseUpdates",
         std::ptr::addr_of_mut!(FN_PROCESS_UPDATES),
     );
-    resolve_from_registry_raw(
+    // x86_64 resolves this through the CUtlVector<u32> append helper callsite used
+    // by pkg0's app-id list. The shared Grow body has several nearby variants and
+    // RIP-relative selector strings, so following the typed callsite is the more
+    // stable callable entry.
+    let _ = resolve_from_registry_raw(
         registry,
         code,
         "CUtlMemory::Grow",
         std::ptr::addr_of_mut!(FN_GROW),
     );
-    resolve_from_registry_raw(
+    let _ = resolve_from_registry_raw(
         registry,
         code,
         "CPackageInfo::GetPackageInfo",
@@ -82,24 +89,25 @@ fn resolve_from_registry_raw<F: Copy>(
     code: &CodeRegion,
     name: &str,
     storage: *mut Option<F>,
-) {
+) -> Option<usize> {
     let entry = match registry.get(name) {
         Some(e) => e,
         None => {
             warn!(hook = name, "pattern not found in registry");
-            return;
+            return None;
         }
     };
 
     let addr = match crate::detour::resolve_pattern_entry(code, name, &entry) {
         Some(a) => a,
-        None => return,
+        None => return None,
     };
 
     // SAFETY: transmuting validated code address to typed fn pointer.
     unsafe {
         storage.write(Some(std::mem::transmute_copy(&addr)));
     }
+    Some(addr)
 }
 
 /// Get the resolved GetPackageInfo function address (for hooking).
@@ -108,14 +116,59 @@ pub fn get_package_info_addr() -> Option<usize> {
     unsafe { (*std::ptr::addr_of!(FN_GET_PKG_INFO)).map(|f| f as usize) }
 }
 
+pub(crate) fn capture_pkg_info_this(this: *mut c_void) {
+    if CPKG_INFO_PTR.load(Ordering::Acquire) == 0 {
+        CPKG_INFO_PTR.store(this as usize, Ordering::Release);
+        info!(
+            "package: captured package helper this at 0x{:x}",
+            this as usize
+        );
+    }
+}
+
+pub(crate) fn try_capture_pkg0_from_package_info(this: *mut c_void) {
+    if PKG0_PTR.load(Ordering::Acquire) != 0 {
+        return;
+    }
+
+    capture_pkg_info_this(this);
+    let Some(pkg_ptr) = query_pkg0(this) else {
+        return;
+    };
+    capture_validated_pkg0(pkg_ptr);
+}
+
+fn query_pkg0(this: *mut c_void) -> Option<*mut u8> {
+    let get_pkg = match unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) } {
+        Some(f) => f,
+        None => return None,
+    };
+
+    // The package lookup has different ABI surfaces per architecture. 32-bit
+    // receives (package_id, access_token), while Linux x86_64 receives a pointer
+    // to the package token key and searches the token-keyed package map.
+    #[cfg(target_pointer_width = "64")]
+    let pkg_ptr = get_pkg(this, &PKG0_ACCESS_TOKEN);
+    #[cfg(target_pointer_width = "32")]
+    let pkg_ptr = get_pkg(this, 0, PKG0_ACCESS_TOKEN);
+
+    if pkg_ptr.is_null() {
+        debug!("package: GetPackageInfo(pkg0 token) returned null");
+        None
+    } else {
+        Some(pkg_ptr)
+    }
+}
+
 /// Check whether all required functions are resolved.
 pub fn all_functions_resolved() -> bool {
     // SAFETY: these are only written once during do_install, read-only after.
     unsafe {
-        (*std::ptr::addr_of!(FN_MARK_LICENSE)).is_some()
+        let common = (*std::ptr::addr_of!(FN_MARK_LICENSE)).is_some()
             && (*std::ptr::addr_of!(FN_PROCESS_UPDATES)).is_some()
-            && (*std::ptr::addr_of!(FN_GROW)).is_some()
-            && (*std::ptr::addr_of!(FN_GET_PKG_INFO)).is_some()
+            && (*std::ptr::addr_of!(FN_GROW)).is_some();
+
+        common && (*std::ptr::addr_of!(FN_GET_PKG_INFO)).is_some()
     }
 }
 
@@ -139,32 +192,10 @@ pub unsafe fn try_capture_pkg0(cuser: *mut c_void) {
         return;
     }
 
-    // Need GetPackageInfo to be resolved
-    // SAFETY: FN_GET_PKG_INFO written once during init, read-only after.
-    let get_pkg = match unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) } {
-        Some(f) => f,
-        None => return,
-    };
-
-    let pkg_ptr = get_pkg(cuser, 0, PKG0_ACCESS_TOKEN);
-    if pkg_ptr.is_null() {
-        debug!("package: GetPackageInfo(0) returned null");
-        return;
+    let cpkg = CPKG_INFO_PTR.load(Ordering::Acquire);
+    if cpkg != 0 {
+        try_capture_pkg0_from_package_info(cpkg as *mut c_void);
     }
-
-    // Verify status == Available (0)
-    // SAFETY: pkg_ptr points to valid PackageInfo in Steam memory.
-    let status = unsafe { package_info::status(pkg_ptr) };
-    if status != PKG_STATUS_AVAILABLE {
-        warn!(
-            status = status,
-            "package: pkg0 status != Available, skipping"
-        );
-        return;
-    }
-
-    PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
-    info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +332,35 @@ pub fn pump_mark_and_process() {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+pub(crate) fn capture_validated_pkg0(pkg_ptr: *mut u8) {
+    if pkg_ptr.is_null() {
+        return;
+    }
+
+    // SAFETY: caller found pkg_ptr through Steam's package structures.
+    let package_id = unsafe { package_info::package_id(pkg_ptr) };
+    if package_id != 0 {
+        warn!(
+            package_id = package_id,
+            "package: token lookup did not return pkg0, skipping"
+        );
+        return;
+    }
+
+    // SAFETY: caller found pkg_ptr through Steam's package structures.
+    let status = unsafe { package_info::status(pkg_ptr) };
+    if status != PKG_STATUS_AVAILABLE {
+        warn!(
+            status = status,
+            "package: pkg0 status != Available, skipping"
+        );
+        return;
+    }
+
+    PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
+    info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
+}
 
 /// Append a value to a CUtlVector<u32>, growing the backing CUtlMemory if needed.
 fn append_growing(vec: &mut vapor_forge_abi::CUtlVector<u32>, value: u32) -> bool {

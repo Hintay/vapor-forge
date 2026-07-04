@@ -1,20 +1,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(all(target_os = "linux", not(target_pointer_width = "32")))]
-compile_error!("vapor-forge-audit-loader only supports 32-bit Linux targets");
-
-#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[cfg(target_os = "linux")]
 use once_cell::sync::Lazy;
-#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[cfg(target_os = "linux")]
 use vapor_forge_core::{Lifecycle, SteamModuleState};
 
-#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[cfg(target_os = "linux")]
 static LIFECYCLE: Lazy<Lifecycle> = Lazy::new(Lifecycle::new);
-#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[cfg(target_os = "linux")]
 static STEAM_MODULES: Lazy<SteamModuleState> = Lazy::new(SteamModuleState::new);
 
-#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[cfg(target_os = "linux")]
 mod linux_audit {
     use core::ffi::{c_char, c_uint, c_void};
 

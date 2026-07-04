@@ -15,9 +15,10 @@ use super::install::{config, IPC_SERVER};
 // ---------------------------------------------------------------------------
 
 // Library injection: BuildSpawnEnvBlock builds the child process env block for
-// a game launch. CGameID is 8 bytes: low 24 bits = AppId, byte 3 = type (2 = app).
+// a game launch. CGameID is passed by pointer and is 8 bytes on both i686 and
+// x86_64: low 24 bits = AppId, byte 3 = type (2 = app).
 pub(crate) type BuildSpawnEnvBlockFn = extern "C" fn(
-    *mut c_void, // CGameID* (param_2 at [EBP+8])
+    *mut c_void, // CGameID*
     *const i8,   // pExePath
     *const i8,   // pWorkingDir
     *mut c_void, // pLaunchOptionsOrContext
@@ -31,7 +32,9 @@ pub(crate) type BuildSpawnEnvBlockFn = extern "C" fn(
 // the env map built by BuildSpawnEnvBlock.
 pub(crate) type SetEnvStringFn = extern "C" fn(*mut c_void, *const i8, *const i8);
 
-// CUser::SpawnProcess: launches a game. pCommandLine contains user launch options.
+// CUser::SpawnProcess: launches a game. On x86_64 SysV, this/exe/command/dir/
+// CGameID/extra are register args and later flags stay on the native ABI stack.
+// pCommandLine contains user launch options.
 pub(crate) type SpawnProcessFn = extern "C" fn(
     *mut c_void, // this (CUser)
     *const i8,   // pExePath
@@ -86,7 +89,8 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         return result;
     }
 
-    // CGameID low 24 bits = AppId. SAFETY: game_id is a valid CGameID* from Steam's caller.
+    // CGameID low 24 bits = AppId.
+    // SAFETY: game_id is a valid CGameID* from Steam's caller.
     let raw = unsafe { *(game_id as *const u32) };
     let app_id = AppId(raw & 0x00FF_FFFF);
 
@@ -214,7 +218,7 @@ pub(crate) extern "C" fn hk_spawn_process(
     flags3: u32,
     p_pid: *mut u32,
 ) -> i32 {
-    // Extract AppId from CGameID (low 24 bits)
+    // Extract AppId from CGameID (low 24 bits).
     if !game_id.is_null() {
         let raw = unsafe { *(game_id as *const u32) };
         let app_id = AppId(raw & 0x00FF_FFFF);

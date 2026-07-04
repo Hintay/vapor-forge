@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use retour::GenericDetour;
 use tracing::{debug, info, warn};
 use vapor_forge_config::AppId;
-use vapor_forge_patterns::registry::PatternRegistry;
 
-use crate::detour::{self, CodeRegion};
 use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
@@ -88,6 +86,8 @@ fn install_cloud_vmt(this: *mut c_void) {
         return;
     }
 
+    capture_set_cloud_from_vtable(this);
+
     // Store original BEFORE swapping the vtable slot, so the hook callback
     // can find the original immediately if it fires on another thread.
     // SAFETY: this points to an IClientRemoteStorage C++ object; read vtable slot.
@@ -113,6 +113,30 @@ fn install_cloud_vmt(this: *mut c_void) {
     unsafe {
         vmt::swap_vtable_slot("IsCloudEnabledForApp", this, slot, replacement);
     }
+}
+
+fn capture_set_cloud_from_vtable(this: *mut c_void) {
+    let Some(slot) = crate::vtable_scan::slot_of("IClientRemoteStorage", "SetCloudEnabledForApp")
+    else {
+        warn!("hook-install: SetCloudEnabledForApp slot not found in VtableScan");
+        return;
+    };
+
+    let Some(addr) = (unsafe { read_vtable_slot(this, slot) }) else {
+        return;
+    };
+    let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
+    if !validate_vmt_hook_eligibility("SetCloudEnabledForApp", addr, replacement) {
+        return;
+    }
+
+    // SAFETY: vtable slot was decoded from the live IClientRemoteStorage object.
+    let f: SetCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
+    unsafe { std::ptr::addr_of_mut!(SET_CLOUD_FN).write(Some(f)) };
+    debug!(
+        addr = format_args!("0x{:x}", addr),
+        slot, "SetCloudEnabledForApp captured from vtable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -145,23 +169,4 @@ pub(crate) extern "C" fn hk_write_vdf_file(
     // SAFETY: pass through unmodified.
     let original = detour_or_return!("WriteVdfFile", WRITE_VDF_DETOUR, 0);
     original.call(a0, a1, a2, a3, buffer, size)
-}
-
-/// Resolve SetCloudEnabledForApp as a raw fn pointer, not a detour. It is called directly.
-pub(crate) fn resolve_set_cloud_fn(registry: &PatternRegistry, code: &CodeRegion) {
-    let entry = match registry.get("IClientRemoteStorage::SetCloudEnabledForApp") {
-        Some(e) => e,
-        None => return,
-    };
-    let addr = match detour::resolve_pattern_entry(code, "SetCloudEnabledForApp", &entry) {
-        Some(a) => a,
-        None => return,
-    };
-    // SAFETY: addr is a validated code address.
-    let f: SetCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
-    unsafe { std::ptr::addr_of_mut!(SET_CLOUD_FN).write(Some(f)) };
-    debug!(
-        addr = format_args!("0x{:x}", addr),
-        "SetCloudEnabledForApp resolved"
-    );
 }

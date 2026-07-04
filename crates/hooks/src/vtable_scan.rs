@@ -243,7 +243,34 @@ fn is_in_segments(va: usize, len: usize, segs: &SegmentRanges) -> bool {
         .any(|&(lo, hi)| va >= lo && end <= hi)
 }
 
-fn resolve_slot_value(raw: u32, segs: &SegmentRanges, module_base: usize) -> usize {
+fn word_size() -> usize {
+    std::mem::size_of::<usize>()
+}
+
+#[cfg(target_pointer_width = "64")]
+unsafe fn read_word_unaligned(addr: usize) -> usize {
+    // SAFETY: caller verified addr..addr+8 is readable.
+    unsafe { (addr as *const u64).read_unaligned() as usize }
+}
+
+#[cfg(target_pointer_width = "32")]
+unsafe fn read_word_unaligned(addr: usize) -> usize {
+    // SAFETY: caller verified addr..addr+4 is readable.
+    unsafe { (addr as *const u32).read_unaligned() as usize }
+}
+
+#[cfg(target_pointer_width = "64")]
+fn resolve_slot_value(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
+    let _ = module_base;
+    let va = raw as usize;
+    if in_text(va, segs) {
+        return va;
+    }
+    0
+}
+
+#[cfg(target_pointer_width = "32")]
+fn resolve_slot_value(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
     let va = raw as usize;
     if in_text(va, segs) {
         return va;
@@ -255,7 +282,26 @@ fn resolve_slot_value(raw: u32, segs: &SegmentRanges, module_base: usize) -> usi
     0
 }
 
-fn resolve_any_module_ptr(raw: u32, segs: &SegmentRanges, module_base: usize) -> usize {
+#[cfg(target_pointer_width = "64")]
+fn resolve_any_module_ptr(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
+    let _ = module_base;
+    let module_end = segs
+        .text
+        .iter()
+        .chain(segs.rodata.iter())
+        .map(|&(_, hi)| hi)
+        .max()
+        .unwrap_or(0);
+
+    let va = raw as usize;
+    if va >= module_base && va < module_end {
+        return va;
+    }
+    0
+}
+
+#[cfg(target_pointer_width = "32")]
+fn resolve_any_module_ptr(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
     let module_end = segs
         .text
         .iter()
@@ -307,25 +353,26 @@ fn read_cstring(va: usize, segs: &SegmentRanges) -> String {
 
 fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String> {
     let base = module_base(segs);
+    let word = word_size();
 
-    // SAFETY: method0_va - 4 points to the typeinfo slot in the vtable header.
+    // SAFETY: method0_va - word points to the typeinfo slot in the vtable header.
     // Use read_unaligned: during dlmopen the data may not be fully relocated.
-    let ti_ptr = (method0_va - 4) as *const u32;
-    if !is_in_segments(ti_ptr as usize, 4, segs) {
+    let ti_ptr = method0_va.checked_sub(word)?;
+    if !is_in_segments(ti_ptr, word, segs) {
         return None;
     }
-    let ti_raw = unsafe { ti_ptr.read_unaligned() };
+    let ti_raw = unsafe { read_word_unaligned(ti_ptr) };
     let ti = resolve_any_module_ptr(ti_raw, segs, base);
     if ti == 0 {
         return None;
     }
 
-    // SAFETY: typeinfo + 4 points to the name pointer.
-    let name_ptr = (ti + 4) as *const u32;
-    if !is_in_segments(name_ptr as usize, 4, segs) {
+    // SAFETY: typeinfo + word points to the name pointer in Itanium C++ ABI.
+    let name_ptr = ti.checked_add(word)?;
+    if !is_in_segments(name_ptr, word, segs) {
         return None;
     }
-    let name_raw = unsafe { name_ptr.read_unaligned() };
+    let name_raw = unsafe { read_word_unaligned(name_ptr) };
     let name_va = resolve_any_module_ptr(name_raw, segs, base);
     if name_va == 0 {
         return None;
@@ -362,33 +409,34 @@ fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String
 
 fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
     let base = module_base(segs);
+    let word = word_size();
     let mut out = Vec::new();
 
     for &(seg_lo, seg_hi) in &segs.rodata {
-        let mut p = seg_lo + 8;
-        while p + 4 <= seg_hi {
+        let mut p = seg_lo + 2 * word;
+        while p + word <= seg_hi {
             // SAFETY: p is within a readable rodata segment.
-            let raw = unsafe { (p as *const u32).read_unaligned() };
+            let raw = unsafe { read_word_unaligned(p) };
             let method0 = resolve_slot_value(raw, segs, base);
             if method0 == 0 {
-                p += 4;
+                p += word;
                 continue;
             }
 
             // SAFETY: reading vtable header slots (use read_unaligned for safety).
-            let ti = unsafe { ((p - 4) as *const u32).read_unaligned() };
-            let ot = unsafe { ((p - 8) as *const u32).read_unaligned() };
+            let ti = unsafe { read_word_unaligned(p - word) };
+            let ot = unsafe { read_word_unaligned(p - 2 * word) };
             if ot != 0 || ti == 0 {
-                p += 4;
+                p += word;
                 continue;
             }
 
             let mut slots = Vec::with_capacity(64);
             slots.push(method0);
-            let mut q = p + 4;
-            while q + 4 <= seg_hi {
+            let mut q = p + word;
+            while q + word <= seg_hi {
                 // SAFETY: q is within the segment.
-                let v = unsafe { (q as *const u32).read_unaligned() };
+                let v = unsafe { read_word_unaligned(q) };
                 let resolved = resolve_slot_value(v, segs, base);
                 if resolved == 0 {
                     break;
@@ -397,19 +445,20 @@ fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
                 if slots.len() >= MAX_SLOTS {
                     break;
                 }
-                q += 4;
+                q += word;
             }
 
             if slots.len() >= 3 {
                 out.push((p, slots));
             }
-            p += 4;
+            p += word;
         }
     }
 
     out
 }
 
+#[cfg(target_pointer_width = "32")]
 fn find_pic_anchor(func_start: usize, scan_len: usize, segs: &SegmentRanges) -> usize {
     if !in_text(func_start, segs) {
         return 0;
@@ -439,6 +488,12 @@ fn find_pic_anchor(func_start: usize, scan_len: usize, segs: &SegmentRanges) -> 
     0
 }
 
+#[cfg(target_pointer_width = "64")]
+fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
+    decode_wrapper_x86_64(func_start, segs)
+}
+
+#[cfg(target_pointer_width = "32")]
 fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
     let pic_base = find_pic_anchor(func_start, 0x40, segs);
     if pic_base == 0 {
@@ -510,6 +565,76 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
 
         if tipc_matched && func_hash != 0 {
             return (method, func_hash);
+        }
+    }
+
+    (method, func_hash)
+}
+
+#[cfg(target_pointer_width = "64")]
+fn decode_wrapper_x86_64(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
+    if !in_text(func_start, segs) {
+        return (String::new(), 0);
+    }
+
+    // SAFETY: func_start is in .text, reading bounded instruction bytes.
+    let base = func_start as *const u8;
+    let mut recent = [const { String::new() }; RECENT_LEAS];
+    let mut head = 0usize;
+    let mut method = String::new();
+    let mut func_hash = 0u32;
+
+    for i in 0..EARLY_SCAN.saturating_sub(8) {
+        // SAFETY: bounded read in executable mapping.
+        let b = unsafe { *base.add(i) };
+
+        // RIP-relative LEA: 48/4c 8d modrm disp32.
+        if (b == 0x48 || b == 0x4c) && i + 7 <= EARLY_SCAN {
+            // SAFETY: bounded reads in executable mapping.
+            let op = unsafe { *base.add(i + 1) };
+            let modrm = unsafe { *base.add(i + 2) };
+            if op == 0x8d && (modrm & 0xc7) == 0x05 {
+                // SAFETY: disp32 is part of the instruction stream.
+                let disp = unsafe { ((func_start + i + 3) as *const i32).read_unaligned() };
+                let target = (func_start + i + 7).wrapping_add_signed(disp as isize);
+                let s = read_cstring(target, segs);
+                if !s.is_empty() {
+                    if method.is_empty() && is_method_shape(&s) {
+                        method = s.clone();
+                    }
+                    recent[head] = s;
+                    head = (head + 1) % RECENT_LEAS;
+                }
+            }
+        }
+
+        // Some wrappers move method names through recent LEAs before the IPC call.
+        if b == 0xe8 && method.is_empty() {
+            for k in 0..RECENT_LEAS {
+                let idx = (head + RECENT_LEAS - 1 - k) % RECENT_LEAS;
+                let s = &recent[idx];
+                if is_method_shape(s) {
+                    method = s.clone();
+                    break;
+                }
+            }
+        }
+
+        // Hash constants are passed as 32-bit immediates. Keep this deliberately
+        // broad; the name is what slot lookup uses today, the hash is diagnostic.
+        if func_hash == 0 && i + 5 <= EARLY_SCAN {
+            if b == 0xc7 {
+                // SAFETY: bounded reads in executable mapping.
+                let modrm = unsafe { *base.add(i + 1) };
+                if (modrm & 0xc0) == 0x40 || (modrm & 0xc0) == 0x80 {
+                    // SAFETY: reading a possible imm32 from instruction stream.
+                    func_hash = unsafe { ((func_start + i + 3) as *const u32).read_unaligned() };
+                }
+            }
+        }
+
+        if !method.is_empty() && func_hash != 0 {
+            break;
         }
     }
 
