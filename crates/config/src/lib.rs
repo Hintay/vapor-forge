@@ -9,7 +9,7 @@ mod template;
 mod tests;
 
 pub use model::*;
-pub use template::CONFIG_TEMPLATE;
+pub use template::{TemplateSyncDryRun, CONFIG_TEMPLATE};
 
 // Re-export newtypes so callers only need to depend on vapor-forge-config.
 pub use vapor_forge_core::{AppId, DepotId, ManifestId};

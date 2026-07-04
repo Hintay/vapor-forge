@@ -5,8 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+tools = ["dep:serde_json"]
+
+[[bin]]
+name = "vapor-forge-config-check"
+path = "src/bin/vapor-forge-config-check.rs"
+required-features = ["tools"]
+
 [dependencies]
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 vapor-forge-core = { path = "../runtime-core" }
 thiserror.workspace = true
 toml.workspace = true

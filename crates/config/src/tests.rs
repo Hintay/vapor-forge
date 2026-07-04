@@ -1,4 +1,4 @@
-use crate::template::{parse_commented_section_header, CommentedSectionHeader};
+use crate::template::{parse_commented_section_header, CommentedSectionHeader, TEMPLATE_EXAMPLES};
 use crate::{AppCategory, AppId, RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE};
 
 #[test]
@@ -23,6 +23,20 @@ fn template_parses_and_keeps_safe_defaults() {
     assert!(!config.cloud_enabled_for_controlled_apps());
     assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
     assert!(!config.ticket.auto_delegate);
+}
+
+#[test]
+fn template_example_metadata_matches_default_template() {
+    let dry_run = RuntimeConfig::sync_default_template_dry_run(CONFIG_TEMPLATE)
+        .expect("template dry-run should succeed");
+    let expected = TEMPLATE_EXAMPLES
+        .iter()
+        .map(|example| (*example).to_owned())
+        .collect::<Vec<_>>();
+
+    assert!(!dry_run.changed);
+    assert_eq!(dry_run.kept_commented_examples, expected);
+    assert!(dry_run.pruned_commented_examples.is_empty());
 }
 
 #[test]
@@ -213,6 +227,35 @@ control_api = false
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn sync_default_template_dry_run_reports_changes() {
+    let dry_run = RuntimeConfig::sync_default_template_dry_run(
+        r#"[runtime]
+diagnostics = true
+
+[debug]
+control_api = false
+"#,
+    )
+    .expect("dry-run should succeed");
+
+    assert!(dry_run.changed);
+    assert!(dry_run
+        .added_fields
+        .contains(&"runtime.log_level".to_owned()));
+    assert!(dry_run.added_fields.contains(&"toast.enabled".to_owned()));
+    assert!(dry_run
+        .kept_commented_examples
+        .contains(&"[[apps.inject]]".to_owned()));
+    assert!(dry_run
+        .pruned_commented_examples
+        .contains(&"[debug]".to_owned()));
+    assert!(!dry_run.synced.contains("# [debug]"));
+    let config: RuntimeConfig = toml::from_str(&dry_run.synced).expect("synced config parses");
+    assert!(config.runtime.diagnostics);
+    assert!(!config.debug.control_api);
 }
 
 #[test]

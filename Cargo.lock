@@ -1025,6 +1025,7 @@ name = "vapor-forge-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
  "toml_edit",
@@ -1132,6 +1133,8 @@ name = "vapor-forge-scripting"
 version = "0.1.0"
 dependencies = [
  "mlua",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
  "ureq",

@@ -4,9 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autobins = false
+
+[features]
+default = []
+tools = ["dep:serde", "dep:serde_json"]
+
+[[bin]]
+name = "vapor-forge-script-check"
+path = "src/bin/vapor-forge-script-check.rs"
+required-features = ["tools"]
 
 [dependencies]
 mlua.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 vapor-forge-core = { path = "../runtime-core" }
 thiserror.workspace = true
 tracing.workspace = true
