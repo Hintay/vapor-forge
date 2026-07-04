@@ -1,5 +1,5 @@
 [package]
-name = "vapor-forge-features"
+name = "vapor-forge-pe"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -11,16 +11,10 @@ default = []
 tools = ["dep:serde", "dep:serde_json"]
 
 [[bin]]
-name = "vapor-forge-ticket-tool"
-path = "src/bin/vapor-forge-ticket-tool.rs"
+name = "vapor-forge-pe-scan"
+path = "src/bin/vapor-forge-pe-scan.rs"
 required-features = ["tools"]
 
 [dependencies]
-prost.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-vapor-forge-abi = { path = "../steam-abi" }
-vapor-forge-config = { path = "../config" }
-vapor-forge-core = { path = "../runtime-core" }
-tracing.workspace = true
-ureq.workspace = true

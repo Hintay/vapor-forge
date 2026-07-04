@@ -167,13 +167,28 @@ pub fn read_message(reader: &mut impl Read) -> Result<Message, DecodeError> {
     decode_payload(&buf)
 }
 
+pub fn decode_message_bytes(bytes: &[u8]) -> Result<Message, DecodeError> {
+    if bytes.len() < 4 {
+        return Err(DecodeError::TooShort);
+    }
+    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    if len == 0 || len as usize > MAX_MSG_SIZE {
+        return Err(DecodeError::BadLength(len));
+    }
+    let payload_len = len as usize;
+    if bytes.len() < 4 + payload_len {
+        return Err(DecodeError::TooShort);
+    }
+    decode_payload(&bytes[4..4 + payload_len])
+}
+
 pub fn write_message(writer: &mut impl Write, msg: &Message) -> io::Result<()> {
     let bytes = msg.encode();
     writer.write_all(&bytes)?;
     writer.flush()
 }
 
-fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
+pub fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
     if buf.is_empty() {
         return Err(DecodeError::TooShort);
     }

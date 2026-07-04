@@ -1052,6 +1052,8 @@ name = "vapor-forge-features"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "serde",
+ "serde_json",
  "tracing",
  "ureq",
  "vapor-forge-abi",
@@ -1121,11 +1123,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vapor-forge-pe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "vapor-forge-proton-inject"
 version = "0.1.0"
 dependencies = [
  "libc",
  "vapor-forge-inject-protocol",
+ "vapor-forge-pe",
 ]
 
 [[package]]
