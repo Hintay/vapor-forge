@@ -17,6 +17,7 @@ Yet another mod for the Linux Steam client, built with Rust.
 - **Rust** 1.80+ (MSRV), toolchain **1.96.0** pinned in `rust-toolchain.toml`
 - **Targets:** `i686-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`
 - **i686 linker:** `gcc` with 32-bit libc headers (`-m32`)
+- **x86_64 Linux linker:** `x86_64-linux-gnu-gcc` when cross-building from a non-Linux host
 
 `rustup` will install the pinned toolchain and targets automatically on first build.
 
@@ -24,19 +25,31 @@ Yet another mod for the Linux Steam client, built with Rust.
 
 ```sh
 cargo build-main            # 32-bit main library  (libvapor_forge.so)
+cargo build-main64          # 64-bit main library  (libvapor_forge.so)
 cargo build-inject          # 64-bit Proton helper (libvapor_forge_proton_inject.so)
 
 cargo build-main-release    # release variants
+cargo build-main64-release
 cargo build-inject-release
 ```
 
 ## Install
 
-Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment:
+Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment.
+Use the library whose target architecture matches the Steam process:
+
+- 32-bit Steam: `target/i686-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
+- 64-bit Steam: `target/x86_64-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
 
 ```sh
 LD_AUDIT=/path/to/libvapor_forge.so
 ```
+
+The 64-bit audit loader initializes configuration, scripting, diagnostics, debug IPC, SteamClient
+hooks, SteamUI hooks, VMT-scanner hooks, and launch-environment injection. pkg0 PackageInfo field
+offsets are verified for the current 64-bit Steam baseline (`PackageId` at `+0x00`, `status` at
+`+0x18`, `m_vecAppIDs` at `+0x40`). The 64-bit `CPackageInfo::GetPackageInfo` hook captures the
+package-store object and calls Steam's token-map lookup with pkg0's known access token.
 
 ### File layout
 
