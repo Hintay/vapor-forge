@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+pub mod vtable_scan;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternToken {
     Byte(u8),
@@ -83,24 +85,15 @@ impl Pattern {
             return Vec::new();
         }
         let limit = haystack.len() - self.tokens.len();
-        let Some((anchor_index, anchor_byte)) =
-            self.tokens
-                .iter()
-                .enumerate()
-                .find_map(|(index, token)| match token {
-                    PatternToken::Byte(byte) => Some((index, *byte)),
-                    PatternToken::Wildcard => None,
-                })
-        else {
+
+        let Some((anchor_index, anchor_bytes)) = self.longest_literal_run() else {
             return (0..=limit).collect();
         };
 
         let mut matches = Vec::new();
-        let mut search_from = anchor_index;
-        while search_from < haystack.len() {
-            let Some(relative) = memchr::memchr(anchor_byte, &haystack[search_from..]) else {
-                break;
-            };
+        let finder = memchr::memmem::Finder::new(&anchor_bytes);
+        let mut search_from = 0usize;
+        while let Some(relative) = finder.find(&haystack[search_from..]) {
             let anchor_offset = search_from + relative;
             if anchor_offset >= anchor_index {
                 let candidate = anchor_offset - anchor_index;
@@ -121,6 +114,44 @@ impl Pattern {
             1 => Ok(matches[0]),
             n => Err(PatternError::Ambiguous(n)),
         }
+    }
+
+    fn longest_literal_run(&self) -> Option<(usize, Vec<u8>)> {
+        let mut best_start = 0usize;
+        let mut best_len = 0usize;
+        let mut current_start = 0usize;
+        let mut current_len = 0usize;
+
+        for (idx, token) in self.tokens.iter().enumerate() {
+            match token {
+                PatternToken::Byte(_) => {
+                    if current_len == 0 {
+                        current_start = idx;
+                    }
+                    current_len += 1;
+                    if current_len > best_len {
+                        best_start = current_start;
+                        best_len = current_len;
+                    }
+                }
+                PatternToken::Wildcard => {
+                    current_len = 0;
+                }
+            }
+        }
+
+        if best_len == 0 {
+            return None;
+        }
+
+        let bytes = self.tokens[best_start..best_start + best_len]
+            .iter()
+            .map(|token| match token {
+                PatternToken::Byte(byte) => *byte,
+                PatternToken::Wildcard => unreachable!("literal run contains no wildcards"),
+            })
+            .collect();
+        Some((best_start, bytes))
     }
 }
 
@@ -234,6 +265,7 @@ pub fn follow_last_call_before_ret(
 // ---------------------------------------------------------------------------
 
 pub mod registry;
+pub mod scan;
 
 #[cfg(test)]
 mod tests {
@@ -282,6 +314,17 @@ mod tests {
         let haystack = [0x00, 0x83, 0xC4, 0x90, 0x83, 0x10];
         let pattern = Pattern::parse("? 83").expect("pattern should parse");
         assert_eq!(pattern.find_all(&haystack), vec![0, 3]);
+    }
+
+    #[test]
+    fn finds_overlapping_literal_anchor_matches() {
+        let haystack = [0xAA, 0xAA, 0xAA];
+        let pattern = Pattern::parse("AA AA").expect("pattern should parse");
+        assert_eq!(pattern.find_all(&haystack), vec![0, 1]);
+        assert_eq!(
+            pattern.find_unique(&haystack),
+            Err(PatternError::Ambiguous(2))
+        );
     }
 
     #[test]

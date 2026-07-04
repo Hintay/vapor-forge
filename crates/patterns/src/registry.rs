@@ -49,7 +49,7 @@ pub struct RuntimePatternEntry {
 
 /// Pattern registry with embedded defaults + optional runtime overrides.
 pub struct PatternRegistry {
-    overrides: HashMap<String, RuntimePatternEntry>,
+    overrides: HashMap<String, Vec<RuntimePatternEntry>>,
 }
 
 impl PatternRegistry {
@@ -81,12 +81,16 @@ impl PatternRegistry {
     /// Look up a pattern by function name. Runtime override wins over embedded.
     pub fn get(&self, name: &str) -> Option<PatternLookup<'_>> {
         if let Some(rt) = self.overrides.get(name) {
-            return Some(PatternLookup::Runtime(rt));
+            return Some(PatternLookup {
+                variants: rt.iter().map(PatternVariantLookup::Runtime).collect(),
+            });
         }
-        EMBEDDED_PATTERNS
+        let variants = EMBEDDED_PATTERNS
             .iter()
-            .find(|p| p.name == name)
-            .map(PatternLookup::Embedded)
+            .filter(|p| p.name == name)
+            .map(PatternVariantLookup::Embedded)
+            .collect::<Vec<_>>();
+        (!variants.is_empty()).then_some(PatternLookup { variants })
     }
 
     /// Number of unique patterns (embedded + overrides).
@@ -106,13 +110,62 @@ impl PatternRegistry {
     }
 }
 
-/// A looked-up pattern from either embedded or runtime data.
-pub enum PatternLookup<'a> {
+/// Parse a complete TOML pattern file (same format as res/patterns.toml).
+pub fn parse_toml_patterns(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, String> {
+    parse_toml_entries(text)
+}
+
+/// A looked-up pattern group from either embedded or runtime data.
+pub struct PatternLookup<'a> {
+    variants: Vec<PatternVariantLookup<'a>>,
+}
+
+impl<'a> PatternLookup<'a> {
+    pub fn variants(&self) -> impl Iterator<Item = PatternVariantLookup<'a>> + '_ {
+        self.variants.iter().copied()
+    }
+
+    fn primary(&self) -> &PatternVariantLookup<'a> {
+        &self.variants[0]
+    }
+
+    pub fn pattern(&self) -> &str {
+        self.primary().pattern()
+    }
+
+    pub fn follow(&self) -> FollowMode {
+        self.primary().follow()
+    }
+
+    pub fn prologue_bytes(&self) -> Option<&[u8]> {
+        self.primary().prologue_bytes()
+    }
+
+    pub fn callee_pattern(&self) -> Option<&str> {
+        self.primary().callee_pattern()
+    }
+
+    pub fn optional(&self) -> bool {
+        self.primary().optional()
+    }
+
+    pub fn pic_entry(&self) -> bool {
+        self.primary().pic_entry()
+    }
+
+    pub fn module(&self) -> &str {
+        self.primary().module()
+    }
+}
+
+/// A single candidate in a looked-up pattern group.
+#[derive(Clone, Copy)]
+pub enum PatternVariantLookup<'a> {
     Embedded(&'a PatternDef),
     Runtime(&'a RuntimePatternEntry),
 }
 
-impl<'a> PatternLookup<'a> {
+impl<'a> PatternVariantLookup<'a> {
     pub fn pattern(&self) -> &str {
         match self {
             Self::Embedded(p) => p.pattern,
@@ -164,30 +217,42 @@ impl<'a> PatternLookup<'a> {
 }
 
 /// Parse TOML overrides (same format as res/patterns.toml).
-fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntry>, String> {
+fn parse_toml_overrides(text: &str) -> Result<HashMap<String, Vec<RuntimePatternEntry>>, String> {
+    let mut result = HashMap::new();
+    for (name, entry) in parse_toml_entries(text)? {
+        result.entry(name).or_insert_with(Vec::new).push(entry);
+    }
+    Ok(result)
+}
+
+fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, String> {
     // Minimal manual TOML parsing to avoid serde at runtime.
     // Format: [steamclient."FunctionName"] or [steamui."FunctionName"]
-    let mut result = HashMap::new();
+    let mut result = Vec::new();
+    let mut defaults: HashMap<(String, String), RuntimePatternEntry> = HashMap::new();
     let mut current_name: Option<String> = None;
     let mut current_module: Option<String> = None;
+    let mut current_is_variant = false;
     let mut current_start_line = 0usize;
     let mut current_pattern: Option<String> = None;
-    let mut current_follow = FollowMode::None;
+    let mut current_follow: Option<FollowMode> = None;
     let mut current_prologue: Option<Vec<u8>> = None;
     let mut current_callee_pattern: Option<String> = None;
-    let mut current_optional = false;
-    let mut current_pic_entry = false;
+    let mut current_optional: Option<bool> = None;
+    let mut current_pic_entry: Option<bool> = None;
 
-    let flush = |result: &mut HashMap<String, RuntimePatternEntry>,
+    let flush = |result: &mut Vec<(String, RuntimePatternEntry)>,
+                 defaults: &mut HashMap<(String, String), RuntimePatternEntry>,
                  name: Option<String>,
                  module: Option<String>,
+                 is_variant: bool,
                  start_line: usize,
                  pattern: Option<String>,
-                 follow: FollowMode,
+                 follow: Option<FollowMode>,
                  prologue: Option<Vec<u8>>,
                  callee_pattern: Option<String>,
-                 optional: bool,
-                 pic_entry: bool|
+                 optional: Option<bool>,
+                 pic_entry: Option<bool>|
      -> Result<(), String> {
         let Some(name) = name else {
             return Ok(());
@@ -202,20 +267,24 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
                 "line {start_line}: missing required pattern for {name:?}"
             ));
         };
+        let inherited = is_variant
+            .then(|| defaults.get(&(module.clone(), name.clone())))
+            .flatten();
         let entry = RuntimePatternEntry {
             pattern,
-            follow,
-            prologue,
-            callee_pattern,
-            optional,
-            pic_entry,
-            module,
+            follow: follow
+                .unwrap_or_else(|| inherited.map_or(FollowMode::None, |entry| entry.follow)),
+            prologue: prologue.or_else(|| inherited.and_then(|entry| entry.prologue.clone())),
+            callee_pattern: callee_pattern
+                .or_else(|| inherited.and_then(|entry| entry.callee_pattern.clone())),
+            optional: optional.unwrap_or_else(|| inherited.is_some_and(|entry| entry.optional)),
+            pic_entry: pic_entry.unwrap_or_else(|| inherited.is_some_and(|entry| entry.pic_entry)),
+            module: module.clone(),
         };
-        if result.insert(name.clone(), entry).is_some() {
-            return Err(format!(
-                "line {start_line}: duplicate pattern override {name:?}"
-            ));
+        if !is_variant {
+            defaults.insert((module, name.clone()), entry.clone());
         }
+        result.push((name, entry));
 
         Ok(())
     };
@@ -228,11 +297,13 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
         }
 
         if line.starts_with('[') {
-            let (module, name) = parse_section_header(line, line_no)?;
+            let (module, name, is_variant) = parse_section_header(line, line_no)?;
             flush(
                 &mut result,
+                &mut defaults,
                 current_name.take(),
                 current_module.take(),
+                current_is_variant,
                 current_start_line,
                 current_pattern.take(),
                 current_follow,
@@ -241,13 +312,14 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
                 current_optional,
                 current_pic_entry,
             )?;
-            current_follow = FollowMode::None;
+            current_follow = None;
             current_prologue = None;
             current_callee_pattern = None;
-            current_optional = false;
-            current_pic_entry = false;
+            current_optional = None;
+            current_pic_entry = None;
             current_module = Some(module);
             current_name = Some(name);
+            current_is_variant = is_variant;
             current_start_line = line_no;
         } else if let Some((key, value)) = line.split_once('=') {
             if current_name.is_none() {
@@ -258,15 +330,18 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
             match key {
                 "pattern" => current_pattern = Some(parse_quoted_string(value, line_no, key)?),
                 "follow" => {
-                    current_follow = match parse_quoted_string(value, line_no, key)?.as_str() {
-                        "none" => FollowMode::None,
-                        "relative" => FollowMode::Relative,
-                        "upward" => FollowMode::Upward,
-                        "call" => FollowMode::Call,
-                        other => {
-                            return Err(format!("line {line_no}: unknown follow mode {other:?}"));
-                        }
-                    };
+                    current_follow =
+                        Some(match parse_quoted_string(value, line_no, key)?.as_str() {
+                            "none" => FollowMode::None,
+                            "relative" => FollowMode::Relative,
+                            "upward" => FollowMode::Upward,
+                            "call" => FollowMode::Call,
+                            other => {
+                                return Err(format!(
+                                    "line {line_no}: unknown follow mode {other:?}"
+                                ));
+                            }
+                        });
                 }
                 "prologue" => {
                     let value = parse_quoted_string(value, line_no, key)?;
@@ -275,8 +350,13 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
                 "callee_pattern" => {
                     current_callee_pattern = Some(parse_quoted_string(value, line_no, key)?)
                 }
-                "optional" => current_optional = parse_bool(value, line_no, key)?,
-                "pic_entry" => current_pic_entry = parse_bool(value, line_no, key)?,
+                "optional" if current_is_variant => {
+                    return Err(format!(
+                        "line {line_no}: optional is only allowed on the primary pattern section"
+                    ));
+                }
+                "optional" => current_optional = Some(parse_bool(value, line_no, key)?),
+                "pic_entry" => current_pic_entry = Some(parse_bool(value, line_no, key)?),
                 _ => return Err(format!("line {line_no}: unknown key {key:?}")),
             }
         } else {
@@ -289,8 +369,10 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, RuntimePatternEntr
     // Flush last entry
     flush(
         &mut result,
+        &mut defaults,
         current_name,
         current_module,
+        current_is_variant,
         current_start_line,
         current_pattern,
         current_follow,
@@ -315,11 +397,23 @@ fn strip_inline_comment(line: &str) -> &str {
     line
 }
 
-fn parse_section_header(line: &str, line_no: usize) -> Result<(String, String), String> {
-    if !line.ends_with(']') {
+fn parse_section_header(line: &str, line_no: usize) -> Result<(String, String, bool), String> {
+    let (inner, is_variant) = if line.starts_with("[[") {
+        if !line.ends_with("]]") {
+            return Err(format!("line {line_no}: malformed section header"));
+        }
+        (&line[2..line.len() - 2], true)
+    } else {
+        if !line.ends_with(']') {
+            return Err(format!("line {line_no}: malformed section header"));
+        }
+        (&line[1..line.len() - 1], false)
+    };
+
+    if is_variant && !inner.ends_with(".variants") {
         return Err(format!("line {line_no}: malformed section header"));
     }
-    let inner = &line[1..line.len() - 1];
+    let inner = inner.strip_suffix(".variants").unwrap_or(inner);
     let (module, quoted_name) = inner
         .split_once('.')
         .ok_or_else(|| format!("line {line_no}: malformed section header"))?;
@@ -332,7 +426,7 @@ fn parse_section_header(line: &str, line_no: usize) -> Result<(String, String), 
     if name.is_empty() {
         return Err(format!("line {line_no}: empty pattern section name"));
     }
-    Ok((module.to_owned(), name))
+    Ok((module.to_owned(), name, is_variant))
 }
 
 fn parse_quoted_string(value: &str, line_no: usize, key: &str) -> Result<String, String> {
@@ -381,12 +475,15 @@ mod tests {
     fn registry_finds_embedded() {
         let reg = PatternRegistry::embedded();
         let lookup = reg.get("CUser::CheckAppOwnership").expect("should find");
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(lookup.follow(), FollowMode::None);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         assert_eq!(lookup.follow(), FollowMode::Relative);
         assert!(!lookup.pattern().is_empty());
     }
 
     #[test]
-    fn registry_finds_upward_with_prologue() {
+    fn registry_finds_optional_ticket_pattern() {
         let reg = PatternRegistry::embedded();
         let lookup = reg
             .get("IClientUser::GetAppOwnershipTicketExtendedData")
@@ -466,8 +563,41 @@ pattern = "AA BB CC" # bytes
 optional = true
 "#;
         let overrides = parse_toml_overrides(toml).unwrap();
-        let entry = overrides.get("CUser::CheckAppOwnership").unwrap();
+        let entry = &overrides.get("CUser::CheckAppOwnership").unwrap()[0];
         assert_eq!(entry.pattern, "AA BB CC");
         assert!(entry.optional);
+    }
+
+    #[test]
+    fn runtime_override_allows_variants() {
+        let toml = r#"
+[steamclient."CUser::CheckAppOwnership"]
+follow = "relative"
+pattern = "E8 ? ? ? ?"
+optional = true
+
+[[steamclient."CUser::CheckAppOwnership".variants]]
+pattern = "E9 ? ? ? ?"
+"#;
+        let overrides = parse_toml_overrides(toml).unwrap();
+        let entries = overrides.get("CUser::CheckAppOwnership").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].pattern, "E9 ? ? ? ?");
+        assert_eq!(entries[1].follow, FollowMode::Relative);
+        assert!(entries[1].optional);
+    }
+
+    #[test]
+    fn runtime_override_rejects_variant_optional() {
+        let toml = r#"
+[steamclient."CUser::CheckAppOwnership"]
+pattern = "E8 ? ? ? ?"
+
+[[steamclient."CUser::CheckAppOwnership".variants]]
+pattern = "E9 ? ? ? ?"
+optional = true
+"#;
+        let err = parse_toml_overrides(toml).unwrap_err();
+        assert!(err.contains("optional is only allowed on the primary pattern section"));
     }
 }

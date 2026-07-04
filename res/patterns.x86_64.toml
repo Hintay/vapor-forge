@@ -1,0 +1,136 @@
+# Pattern definitions for 64-bit Linux steamclient.so and steamui.so, baseline Steam public manifest 1782866176.
+
+[steamclient."CUser::CheckAppOwnership"]
+follow = "relative"
+# Follow the internal ownership recheck callsite back to the function entry.
+pattern = "E8 ? ? ? ? 84 C0 74 ? 8B 44 24 78 41 39 46 08"
+
+[steamclient."CUser::GetSubscribedApps"]
+follow = "none"
+pattern = "41 57 41 56 41 55 41 54 55 53 48 83 EC ? 66 0F 6F 05 ? ? ? ? 48 89 74 24 ? 89 54 24 ? 88 4C 24 ? 64 48 8B 04 25 28 00 00 00 48 89 44 24 ? 31 C0 8B 87 ? ? ? ?"
+
+[steamclient."IClientRemoteStorage::RunIPCFrame"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 41 56 49 89 D6 BA 04 00 00 00"
+
+[steamclient."IClientAppManager::RunIPCFrame"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 FC 53 48 89 F3 48 81 EC 38 03 00 00 48 89 DF 48 89 95 C8 FC FF FF BA 04 00 00 00 64 4C 8B 34 25 28 00 00 00 4C 89 75 C8 49 89 CE 48 8D B5 D8 FC FF FF E8 ? ? ? ? 8B 85 D8 FC FF FF 3D ? 85 0A 7A"
+
+[steamclient."IClientApps::RunIPCFrame"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 41 56 49 89 F6 41 55 48 8D B5 ? ? ? ? 41 54 49 89 FC 4C 89 F7 53 48 81 EC ? ? ? ? 48 89 95 ? ? ? ? BA 04 00 00 00 64 4C 8B 2C 25 28 00 00 00"
+
+[steamclient."LoadDepotDecryptionKey"]
+follow = "none"
+pattern = "41 54 48 89 D7 55 89 F5 BE 80 00 00 00 53 48 81 EC ? ? ? ?"
+
+[steamclient."BuildDepotDependency"]
+follow = "none"
+pattern = "41 57 4D 89 CF 41 56 49 89 FE 41 55 41 54 55 53"
+
+[steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame"]
+follow = "none"
+pattern = "41 57 41 56 41 55 41 89 F5 41 54 49 89 FC 55 53 48 89 D3"
+
+[steamclient."CCMConnection::RecvPkt"]
+follow = "none"
+pattern = "41 54 49 89 FC 55 53 48 83 EC ? 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 ? 48 89 F5 BE 01 00 00 00 48 89 EF E8 ? ? ? ? 48 85 C0"
+
+[steamclient."IClientUser::GetAppOwnershipTicketExtendedData"]
+follow = "upward"
+prologue = "54 41 CD 89 49 55 41 56 41"
+pattern = "49 8D BC 24 30 E0 FF FF 4D 89 F1 48 89 DE 48 89 44 24 ? 6A 04 4C 8D 44 24 ? E8 ? ? ? ?"
+optional = true
+
+[steamclient."IClientUser::BUpdateAppOwnershipTicket"]
+follow = "upward"
+prologue = "53 55 54 41 55 41 56 41 57 41"
+pattern = "89 EE C7 44 24 70 FF FF FF FF 48 8D 7C 24 74 F3 48 AB 48 8D 54 24 70 C7 07 00 00 00 00 48 89 DF E8 ? ? ? ? 84 C0"
+optional = true
+
+[steamclient."IClientUser::IsUserSubscribedAppInTicket"]
+follow = "none"
+# Bottom CUser ticket lookup reached from the service-side thunk.
+pattern = "41 57 41 56 41 55 41 54 55 53 48 83 EC ? 89 4C 24 ? 8B 8F ? ? ? ? 85 C9 0F 8E ? ? ? ? 49 89 F6 48 89 FD 49 89 D5"
+optional = true
+
+[steamclient."CUser::MarkLicenseAsChanged"]
+follow = "none"
+pattern = "41 56 41 55 41 54 49 89 FC 55 53 48 81 EC ? ? ? ? 4C 8D 2D ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 9C 24 ? ? ? ? 89 F3"
+optional = true
+
+[steamclient."CUser::ProcessPendingLicenseUpdates"]
+follow = "none"
+pattern = "41 57 48 89 F8 41 56 41 55 41 54 55 53 48 83 EC ?"
+optional = true
+
+[steamclient."CUtlMemory::Grow"]
+follow = "relative"
+# Follow the pkg0 CUtlVector<u32> append helper callsite to CUtlMemory<u32>::Grow(int).
+pattern = "E8 ? ? ? ? 8B 45 10 8D 70 01 EB ? 66 0F 1F 44 00 00 29 C6 48 89 EF E8 ? ? ? ? 8B 45 10 8D 70 01 E9 ? ? ? ?"
+optional = true
+
+# Linux x86_64 package lookup by package token key.
+[steamclient."CPackageInfo::GetPackageInfo"]
+follow = "none"
+pattern = "48 63 87 ? ? ? ? 83 F8 FF 74 ? 48 8B BF ? ? ? ? 48 8B 0E EB ?"
+
+[steamclient."CConfigStore::WriteVdfFile"]
+follow = "upward"
+prologue = "53 54 41 55 41 D6 89 41 56 41 57 41"
+pattern = "48 83 EC 08 48 89 C1 44 89 F2 6A 01 44 89 EE 4C 89 E7 6A 00 6A 01 6A 00 53 E8 ? ? ? ? 48 83 C4 30"
+optional = true
+
+[steamclient."CUser::SpawnProcess"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 49 89 FF 41 56 41 55 41 54 4D 89 C4"
+optional = true
+
+[steamclient."CUser::BuildSpawnEnvBlock"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 48 8B 45 10 48 89 B5 ? ? ? ?"
+optional = true
+
+[steamclient."SetEnvString"]
+follow = "upward"
+prologue = "53 55 54 41 55 41 56 41 FF 89 49 57 41"
+pattern = "41 8B 87 A4 00 00 00 85 C0 0F 84 ? ? ? ? 4D 8D B7 80 00 00 00 48 89 DF E8 ? ? ? ? B9 01 00 00 00"
+optional = true
+
+# steamui.so patterns.
+
+[steamui."CSteamUIAppController::RunFrame"]
+follow = "none"
+pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 5D ? 48 89 FB E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? 48 C7 85 ? ? ? ? 00 00 00 00 48 C7 85 ? ? ? ? 00 00 00 00"
+optional = true
+
+[steamui."CSteamUIAppController::FillInAppOverview"]
+follow = "upward"
+prologue = "53 55 54 41 55 41 56 41 57 41"
+pattern = "48 8B 45 00 48 89 EF 48 8D 0D ? ? ? ? 48 8B 90 B0 00 00 00 48 39 CA 0F 85 ? ? ? ? FF 50 68 83 E0 01 84 C0 74 ? 81 4B 10 00 00 10 00 C6 83 ED 00 00 00 01"
+optional = true
+
+[steamui."CSteamUIAppController::BuildCompleteAppOverviewChange"]
+follow = "none"
+pattern = "41 57 41 56 41 55 41 54 55 48 89 FD 53 48 89 F3 48 81 EC ? ? ? ? 48 89 54 24 ? 64 48 8B 04 25 28 00 00 00 48 89 84 24 ? ? ? ? 31 C0 E8 ? ? ? ? 84 C0"
+optional = true
+
+[steamui."google::protobuf::RepeatedField<uint32>::Add"]
+follow = "none"
+pattern = "41 54 55 48 89 FD 53 48 89 F3 48 83 EC 30 8B 47 04 39 07 7C ? 4C 8D 64 24 10 B9 F7 04 00 00 BE 03 00 00 00 48 8D 15 AF 69 E7 FE 4C 89 E7 E8 49 05 FE FF 48 8D 35 7F CD E6 FE 4C 89 E7 E8 D6 FF FD FF 48 89 C6 48 8D 7C 24 0F E8 03 08 FE FF 4C 89 E7 E8 3F 05 FE FF 48 89 EF E8 6F F9 FF FF 49 89 C0 48 63 45 00 8D 50 01 89 55 00 8B 13 41 89 14 80"
+optional = true
+
+[[steamui."google::protobuf::RepeatedField<uint32>::Add".variants]]
+pattern = "41 54 55 48 89 FD 53 48 89 F3 48 83 EC 30 8B 47 04 39 07 7C ? 4C 8D 64 24 10 B9 F7 04 00 00 BE 03 00 00 00 48 8D 15 40 F0 E7 FE 4C 89 E7 E8 49 05 FE FF 48 8D 35 27 54 E7 FE 4C 89 E7 E8 D6 FF FD FF 48 89 C6 48 8D 7C 24 0F E8 03 08 FE FF 4C 89 E7 E8 3F 05 FE FF 48 89 EF E8 6F F9 FF FF 49 89 C0 48 63 45 00 8D 50 01 89 55 00 8B 13 41 89 14 80"
+
+[steamui."CSteamUIAppController::GetAppByID"]
+follow = "none"
+pattern = "41 57 41 56 49 89 FE 41 55 41 54 55 53 48 83 EC ? 89 74 24 ? 89 54 24 ? 64 48 8B 04 25 28 00 00 00 48 89 44 24 ? 48 8B 05 ? ? ? ? 8B 00 85 C0"
+optional = true
+
+[steamui."CUpdateManager::MarkAppChange"]
+follow = "upward"
+prologue = "53 FD 89 48 55 54 41 55 41 56 41 F7 89 41 57 41"
+pattern = "48 83 45 68 01 41 83 FF 07 0F 84 ? ? ? ? E8 ? ? ? ? 48 8B B8 58 0B 00 00 31 D2 44 89 FE E8 ? ? ? ? 48 85 C0 49 89 C4 74 ?"
+optional = true

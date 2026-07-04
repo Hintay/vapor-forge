@@ -8,16 +8,33 @@ autobins = false
 
 [features]
 default = []
-tools = []
+tools = ["dep:iced-x86", "dep:keyvalues-parser", "dep:serde", "dep:serde_json", "dep:sha2", "dep:ureq", "dep:zip"]
 
 [[bin]]
 name = "vapor-forge-pattern-scan"
 path = "src/bin/vapor-forge-pattern-scan.rs"
 required-features = ["tools"]
 
+[[bin]]
+name = "vapor-forge-steam-cdn-fetch"
+path = "src/bin/vapor-forge-steam-cdn-fetch.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "vapor-forge-vtable-scan"
+path = "src/bin/vapor-forge-vtable-scan.rs"
+required-features = ["tools"]
+
 [dependencies]
+iced-x86 = { workspace = true, optional = true }
+keyvalues-parser = { workspace = true, optional = true }
 memchr.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
+ureq = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
