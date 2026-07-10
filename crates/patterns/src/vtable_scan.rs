@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const PT_LOAD: u32 = 1;
-const PF_X: u32 = 0x1;
+pub use crate::elf::ElfClass;
+use crate::elf::ElfImage;
+
 const MAX_SLOTS: usize = 250;
 const STRING_MAX: usize = 96;
 const RECENT_LEAS: usize = 6;
@@ -15,28 +16,6 @@ pub const DEFAULT_INTERFACES: &[&str] = &[
     "IClientUser",
     "IClientUtils",
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfClass {
-    Elf32,
-    Elf64,
-}
-
-impl ElfClass {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Elf32 => "ELF32",
-            Self::Elf64 => "ELF64",
-        }
-    }
-
-    fn word_size(self) -> usize {
-        match self {
-            Self::Elf32 => 4,
-            Self::Elf64 => 8,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct VtableScanReport {
@@ -124,164 +103,12 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
     })
 }
 
-struct ElfImage<'a> {
-    data: &'a [u8],
-    class: ElfClass,
-    loads: Vec<LoadSegment>,
-}
-
-#[derive(Clone, Copy)]
-struct LoadSegment {
-    offset: u64,
-    vaddr: u64,
-    filesz: u64,
-    flags: u32,
-}
-
-impl<'a> ElfImage<'a> {
-    fn parse(data: &'a [u8]) -> Result<Self, String> {
-        if data.get(..4) != Some(b"\x7fELF") {
-            return Err("input is not an ELF file".to_owned());
-        }
-        if data.get(5) != Some(&1) {
-            return Err("big-endian ELF files are not supported".to_owned());
-        }
-
-        let class = match data.get(4) {
-            Some(1) => ElfClass::Elf32,
-            Some(2) => ElfClass::Elf64,
-            _ => return Err("unsupported ELF class".to_owned()),
-        };
-
-        let loads = match class {
-            ElfClass::Elf32 => parse_loads_elf32(data)?,
-            ElfClass::Elf64 => parse_loads_elf64(data)?,
-        };
-        if loads.is_empty() {
-            return Err("ELF file has no PT_LOAD segments".to_owned());
-        }
-
-        Ok(Self { data, class, loads })
-    }
-
-    fn word_size(&self) -> usize {
-        self.class.word_size()
-    }
-
-    fn va_to_offset(&self, va: u64) -> Option<usize> {
-        for load in &self.loads {
-            let end = load.vaddr.checked_add(load.filesz)?;
-            if va >= load.vaddr && va < end {
-                return Some((load.offset + (va - load.vaddr)) as usize);
-            }
-        }
-        None
-    }
-
-    fn in_text(&self, va: u64) -> bool {
-        self.loads
-            .iter()
-            .any(|load| load.flags & PF_X != 0 && va >= load.vaddr && va < load.vaddr + load.filesz)
-    }
-
-    fn in_module(&self, va: u64) -> bool {
-        self.loads
-            .iter()
-            .any(|load| va >= load.vaddr && va < load.vaddr + load.filesz)
-    }
-
-    fn read_word_va(&self, va: u64) -> Option<u64> {
-        let offset = self.va_to_offset(va)?;
-        match self.class {
-            ElfClass::Elf32 => read_u32(self.data, offset).ok().map(u64::from),
-            ElfClass::Elf64 => read_u64(self.data, offset).ok(),
-        }
-    }
-
-    fn read_u32_va(&self, va: u64) -> Option<u32> {
-        read_u32(self.data, self.va_to_offset(va)?).ok()
-    }
-
-    fn read_i32_va(&self, va: u64) -> Option<i32> {
-        let offset = self.va_to_offset(va)?;
-        let bytes = self.data.get(offset..offset + 4)?;
-        Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn read_u8_va(&self, va: u64) -> Option<u8> {
-        self.data.get(self.va_to_offset(va)?).copied()
-    }
-
-    fn read_cstring(&self, va: u64) -> String {
-        let Some(offset) = self.va_to_offset(va) else {
-            return String::new();
-        };
-        let mut out = String::new();
-        for &byte in self.data[offset..].iter().take(STRING_MAX) {
-            if byte == 0 {
-                return out;
-            }
-            if !(0x20..=0x7e).contains(&byte) {
-                return String::new();
-            }
-            out.push(byte as char);
-        }
-        String::new()
-    }
-}
-
-fn parse_loads_elf32(data: &[u8]) -> Result<Vec<LoadSegment>, String> {
-    let phoff = read_u32(data, 28)? as usize;
-    let phentsize = read_u16(data, 42)? as usize;
-    let phnum = read_u16(data, 44)? as usize;
-    let mut loads = Vec::new();
-
-    for idx in 0..phnum {
-        let off = phoff + idx * phentsize;
-        let p_type = read_u32(data, off)?;
-        if p_type != PT_LOAD {
-            continue;
-        }
-        loads.push(LoadSegment {
-            offset: read_u32(data, off + 4)? as u64,
-            vaddr: read_u32(data, off + 8)? as u64,
-            filesz: read_u32(data, off + 16)? as u64,
-            flags: read_u32(data, off + 24)?,
-        });
-    }
-
-    Ok(loads)
-}
-
-fn parse_loads_elf64(data: &[u8]) -> Result<Vec<LoadSegment>, String> {
-    let phoff = read_u64(data, 32)? as usize;
-    let phentsize = read_u16(data, 54)? as usize;
-    let phnum = read_u16(data, 56)? as usize;
-    let mut loads = Vec::new();
-
-    for idx in 0..phnum {
-        let off = phoff + idx * phentsize;
-        let p_type = read_u32(data, off)?;
-        if p_type != PT_LOAD {
-            continue;
-        }
-        loads.push(LoadSegment {
-            flags: read_u32(data, off + 4)?,
-            offset: read_u64(data, off + 8)?,
-            vaddr: read_u64(data, off + 16)?,
-            filesz: read_u64(data, off + 32)?,
-        });
-    }
-
-    Ok(loads)
-}
-
 fn find_candidate_vtables(image: &ElfImage<'_>) -> Vec<(u64, Vec<u64>)> {
     let word = image.word_size() as u64;
     let mut out = Vec::new();
 
     for load in &image.loads {
-        if load.flags & PF_X != 0 {
+        if load.is_executable() {
             continue;
         }
         let mut p = load.vaddr + 2 * word;
@@ -339,7 +166,7 @@ fn typeinfo_iface_name(image: &ElfImage<'_>, vtable_va: u64) -> Option<String> {
     if !image.in_module(name_va) {
         return None;
     }
-    let name = image.read_cstring(name_va);
+    let name = image.read_cstring(name_va, STRING_MAX);
     let (digits, body) = split_decimal_prefix(&name)?;
     if body.len() != digits || !body.starts_with("IClient") || !body.ends_with("Map") {
         return None;
@@ -394,7 +221,7 @@ fn decode_wrapper_x86(image: &ElfImage<'_>, func_va: u64) -> (String, u32) {
                 if (modrm & 0xc0) == 0x80 && (modrm & 0x07) != 4 {
                     if let Some(disp) = image.read_i32_va(va + 2) {
                         let target = (pic_base as i64 + disp as i64) as u32 as u64;
-                        let text = image.read_cstring(target);
+                        let text = image.read_cstring(target, STRING_MAX);
                         if !text.is_empty() {
                             recent.push(text);
                             if recent.len() > RECENT_LEAS {
@@ -466,7 +293,7 @@ fn decode_wrapper_x86_64(image: &ElfImage<'_>, func_va: u64) -> (String, u32) {
         {
             if let Some(disp) = image.read_i32_va(va + 3) {
                 let target = (va + 7).wrapping_add_signed(disp as i64);
-                let text = image.read_cstring(target);
+                let text = image.read_cstring(target, STRING_MAX);
                 if !text.is_empty() {
                     if method.is_empty() && is_method_shape(&text) {
                         method = text.clone();
@@ -540,27 +367,4 @@ fn is_method_shape(text: &str) -> bool {
     text.as_bytes()
         .first()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-}
-
-fn read_u16(data: &[u8], offset: usize) -> Result<u16, String> {
-    let bytes = data
-        .get(offset..offset + 2)
-        .ok_or_else(|| "ELF header is truncated".to_owned())?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_u32(data: &[u8], offset: usize) -> Result<u32, String> {
-    let bytes = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| "ELF header is truncated".to_owned())?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64(data: &[u8], offset: usize) -> Result<u64, String> {
-    let bytes = data
-        .get(offset..offset + 8)
-        .ok_or_else(|| "ELF header is truncated".to_owned())?;
-    Ok(u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
 }

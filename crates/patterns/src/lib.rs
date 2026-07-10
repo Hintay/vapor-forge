@@ -2,6 +2,7 @@
 
 use thiserror::Error;
 
+pub mod elf;
 pub mod vtable_scan;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
