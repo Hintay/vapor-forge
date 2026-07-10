@@ -267,12 +267,6 @@ fn publish_runtime(
     let dlc_count: usize = new_config.apps.inject.iter().map(|app| app.dlc.len()).sum();
     let controlled =
         vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
-    vapor_forge_features::achievements::load_stat_steam_ids(&new_script_state.stat_steam_ids);
-    vapor_forge_features::app_avatar::load_static_map(&new_config.app_avatar);
-    for (&app, &avatar) in &new_script_state.avatars {
-        vapor_forge_features::app_avatar::set_avatar(app, avatar);
-    }
-
     base_config_store.store(Arc::new(base_config));
     let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
     crate::client::install::ensure_ipc_server_for_config(&snapshot.config);

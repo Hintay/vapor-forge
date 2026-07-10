@@ -1,4 +1,67 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use tracing::{debug, error, info};
+
+const INSTALL_IDLE: u8 = 0;
+const INSTALLING: u8 = 1;
+const INSTALLED: u8 = 2;
+const DISABLED: u8 = 3;
+
+pub(crate) struct InstallGate(AtomicU8);
+
+impl InstallGate {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU8::new(INSTALL_IDLE))
+    }
+
+    pub(crate) fn is_installed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == INSTALLED
+    }
+
+    pub(crate) fn is_settled(&self) -> bool {
+        self.is_installed() || self.0.load(Ordering::Acquire) == DISABLED
+    }
+
+    pub(crate) fn begin(&self) -> Option<InstallAttempt<'_>> {
+        self.0
+            .compare_exchange(
+                INSTALL_IDLE,
+                INSTALLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| InstallAttempt {
+                gate: self,
+                committed: false,
+            })
+    }
+}
+
+pub(crate) struct InstallAttempt<'a> {
+    gate: &'a InstallGate,
+    committed: bool,
+}
+
+impl InstallAttempt<'_> {
+    pub(crate) fn commit(mut self) {
+        self.gate.0.store(INSTALLED, Ordering::Release);
+        self.committed = true;
+    }
+
+    pub(crate) fn disable(mut self) {
+        self.gate.0.store(DISABLED, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl Drop for InstallAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.gate.0.store(INSTALL_IDLE, Ordering::Release);
+        }
+    }
+}
 
 /// Swap a vtable slot pointer and return the original value.
 ///
@@ -69,4 +132,33 @@ pub unsafe fn swap_vtable_slot(
 
     info!(hook = name, slot = slot, "VMT hook INSTALLED");
     Some(original)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InstallGate;
+
+    #[test]
+    fn install_gate_retries_failure_and_commits_success() {
+        let gate = InstallGate::new();
+        {
+            let _failed_attempt = gate.begin().expect("first attempt");
+            assert!(gate.begin().is_none());
+        }
+        assert!(!gate.is_installed());
+
+        gate.begin().expect("retry after failure").commit();
+        assert!(gate.is_installed());
+        assert!(gate.is_settled());
+        assert!(gate.begin().is_none());
+    }
+
+    #[test]
+    fn install_gate_distinguishes_disabled_from_installed() {
+        let gate = InstallGate::new();
+        gate.begin().unwrap().disable();
+        assert!(gate.is_settled());
+        assert!(!gate.is_installed());
+        assert!(gate.begin().is_none());
+    }
 }

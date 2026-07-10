@@ -1,6 +1,4 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use retour::GenericDetour;
 use tracing::{debug, warn};
 use vapor_forge_config::AppId;
@@ -31,8 +29,9 @@ pub(crate) static mut CLIENT_APPS_DETOUR: Option<GenericDetour<RunIPCFrameFn>> =
 pub(crate) static mut ORIG_IS_APP_DLC_INSTALLED: Option<IsAppDlcInstalledFn> = None;
 pub(crate) static mut ORIG_B_IS_DLC_ENABLED: Option<BIsDlcEnabledFn> = None;
 pub(crate) static mut ORIG_LAUNCH_APP: Option<LaunchAppFn> = None;
-pub(crate) static APP_MANAGER_VMT_DONE: AtomicBool = AtomicBool::new(false);
-pub(crate) static CLIENT_APPS_VMT_DONE: AtomicBool = AtomicBool::new(false);
+static IS_APP_DLC_INSTALLED_GATE: vmt::InstallGate = vmt::InstallGate::new();
+static B_IS_DLC_ENABLED_GATE: vmt::InstallGate = vmt::InstallGate::new();
+static LAUNCH_APP_GATE: vmt::InstallGate = vmt::InstallGate::new();
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: IClientAppManager::RunIPCFrame (DLC VMT)
@@ -44,7 +43,7 @@ pub(crate) extern "C" fn hk_app_manager_run_ipc_frame(
     a2: *mut c_void,
     a3: *mut c_void,
 ) {
-    if !APP_MANAGER_VMT_DONE.load(Ordering::Acquire) {
+    if !app_manager_vmt_settled() {
         install_app_manager_vmt(this);
     }
 
@@ -94,68 +93,89 @@ extern "C" fn hk_launch_app(
 }
 
 fn install_app_manager_vmt(this: *mut c_void) {
-    if APP_MANAGER_VMT_DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    let slot_installed = crate::vtable_scan::slot_of("IClientAppManager", "IsAppDlcInstalled");
-    let slot_enabled = crate::vtable_scan::slot_of("IClientAppManager", "BIsDlcEnabled");
-    let slot_launch = crate::vtable_scan::slot_of("IClientAppManager", "LaunchApp");
-
-    if let Some(slot) = slot_installed {
-        // SAFETY: this is the live IClientAppManager object passed by Steam.
-        if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-            let repl = hk_is_app_dlc_installed as *const () as usize;
-            if validate_vmt_hook_eligibility("IsAppDlcInstalled", addr, repl) {
-                // SAFETY: addr was read from the validated slot; original is
-                // stored before replacing that same slot.
-                unsafe {
-                    std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED).write(Some(
-                        std::mem::transmute::<usize, IsAppDlcInstalledFn>(addr),
-                    ));
-                    vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, repl);
+    if let Some(attempt) = IS_APP_DLC_INSTALLED_GATE.begin() {
+        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "IsAppDlcInstalled") {
+            // SAFETY: this is the live IClientAppManager object passed by Steam.
+            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
+                let repl = hk_is_app_dlc_installed as *const () as usize;
+                if validate_vmt_hook_eligibility("IsAppDlcInstalled", addr, repl) {
+                    // SAFETY: original is stored before replacing the validated slot.
+                    unsafe {
+                        std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED).write(Some(
+                            std::mem::transmute::<usize, IsAppDlcInstalledFn>(addr),
+                        ));
+                        if vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, repl).is_some() {
+                            attempt.commit();
+                        }
+                    }
+                } else {
+                    attempt.disable();
                 }
             }
+        } else {
+            warn!("hook-install: IsAppDlcInstalled slot not found");
+            attempt.disable();
         }
-    } else {
-        warn!("hook-install: IsAppDlcInstalled slot not found");
     }
 
-    if let Some(slot) = slot_enabled {
-        // SAFETY: this is the live IClientAppManager object passed by Steam.
-        if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-            let repl = hk_b_is_dlc_enabled as *const () as usize;
-            if validate_vmt_hook_eligibility("BIsDlcEnabled", addr, repl) {
-                // SAFETY: addr was read from the validated slot; original is
-                // stored before replacing that same slot.
-                unsafe {
-                    std::ptr::addr_of_mut!(ORIG_B_IS_DLC_ENABLED)
-                        .write(Some(std::mem::transmute::<usize, BIsDlcEnabledFn>(addr)));
-                    vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, repl);
+    if let Some(attempt) = B_IS_DLC_ENABLED_GATE.begin() {
+        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "BIsDlcEnabled") {
+            // SAFETY: this is the live IClientAppManager object passed by Steam.
+            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
+                let repl = hk_b_is_dlc_enabled as *const () as usize;
+                if validate_vmt_hook_eligibility("BIsDlcEnabled", addr, repl) {
+                    // SAFETY: original is stored before replacing the validated slot.
+                    unsafe {
+                        std::ptr::addr_of_mut!(ORIG_B_IS_DLC_ENABLED)
+                            .write(Some(std::mem::transmute::<usize, BIsDlcEnabledFn>(addr)));
+                        if vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, repl).is_some() {
+                            attempt.commit();
+                        }
+                    }
+                } else {
+                    attempt.disable();
                 }
             }
+        } else {
+            warn!("hook-install: BIsDlcEnabled slot not found");
+            attempt.disable();
         }
-    } else {
-        warn!("hook-install: BIsDlcEnabled slot not found");
     }
 
     // LaunchApp: intercept to evaluate AppAvatar flag rules at game-launch time.
-    if let Some(slot) = slot_launch {
-        // SAFETY: this is the live IClientAppManager object passed by Steam.
-        if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-            let repl = hk_launch_app as *const () as usize;
-            if validate_vmt_hook_eligibility("LaunchApp", addr, repl) {
-                // SAFETY: original stored before VMT slot is replaced.
-                unsafe {
-                    std::ptr::addr_of_mut!(ORIG_LAUNCH_APP)
-                        .write(Some(std::mem::transmute::<usize, LaunchAppFn>(addr)));
-                    vmt::swap_vtable_slot("LaunchApp", this, slot, repl);
+    if let Some(attempt) = LAUNCH_APP_GATE.begin() {
+        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "LaunchApp") {
+            // SAFETY: this is the live IClientAppManager object passed by Steam.
+            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
+                let repl = hk_launch_app as *const () as usize;
+                if validate_vmt_hook_eligibility("LaunchApp", addr, repl) {
+                    // SAFETY: original is stored before replacing the validated slot.
+                    unsafe {
+                        std::ptr::addr_of_mut!(ORIG_LAUNCH_APP).write(Some(std::mem::transmute::<
+                            usize,
+                            LaunchAppFn,
+                        >(
+                            addr
+                        )));
+                        if vmt::swap_vtable_slot("LaunchApp", this, slot, repl).is_some() {
+                            attempt.commit();
+                        }
+                    }
+                } else {
+                    attempt.disable();
                 }
             }
+        } else {
+            debug!("hook-install: LaunchApp slot not found (app-avatar flag rules inactive)");
+            attempt.disable();
         }
-    } else {
-        debug!("hook-install: LaunchApp slot not found (app-avatar flag rules inactive)");
     }
+}
+
+fn app_manager_vmt_settled() -> bool {
+    IS_APP_DLC_INSTALLED_GATE.is_settled()
+        && B_IS_DLC_ENABLED_GATE.is_settled()
+        && LAUNCH_APP_GATE.is_settled()
 }
 
 // ---------------------------------------------------------------------------
@@ -168,10 +188,6 @@ pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
     a2: *mut c_void,
     a3: *mut c_void,
 ) {
-    if !CLIENT_APPS_VMT_DONE.load(Ordering::Acquire) {
-        install_client_apps_vmt(this);
-    }
-
     // SAFETY: CLIENT_APPS_DETOUR set before enabled.
     let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR);
     original.call(this, a1, a2, a3);
@@ -180,8 +196,3 @@ pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
 // DLC enumeration (GetDLCCount / BGetDLCDataByIndex) is NOT hooked.
 // DLC app IDs go into pkg0 alongside main app IDs, so Steam downloads
 // their appinfo and handles enumeration natively.
-
-fn install_client_apps_vmt(_this: *mut c_void) {
-    if CLIENT_APPS_VMT_DONE.swap(true, Ordering::AcqRel) {}
-    // IClientApps VMT hooks removed. DLC handled via pkg0 injection.
-}

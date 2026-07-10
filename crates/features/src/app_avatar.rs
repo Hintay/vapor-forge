@@ -13,33 +13,15 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tracing::{debug, info};
-use vapor_forge_config::{AppAvatarRule, AppAvatarSection, AppId};
-
-// Static + Lua mappings (replaced on config reload).
-static STATIC_MAP: Mutex<Option<HashMap<AppId, AppId>>> = Mutex::new(None);
+use vapor_forge_config::{AppAvatarRule, AppId};
 
 // Runtime flag-driven mappings (set at LaunchApp, per-launch).
 // Writes happen on Steam main thread; reads on IPC threads.
 static RUNTIME_MAP: Mutex<Option<HashMap<AppId, AppId>>> = Mutex::new(None);
 
-/// Populate the static map from the config section.
-/// Replaces the entire map so hot-reload is clean.
-pub fn load_static_map(section: &AppAvatarSection) {
-    *STATIC_MAP.lock().unwrap() = Some(section.static_map.clone());
-}
-
-/// Insert a single avatar mapping (called from Lua setavatar and hot-reload merge).
-pub fn set_avatar(app_id: AppId, avatar: AppId) {
-    STATIC_MAP
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .insert(app_id, avatar);
-}
-
 /// Resolve the avatar AppId for a given real AppId.
 /// Returns None if no mapping is configured.
-pub fn get_avatar(app_id: AppId) -> Option<AppId> {
+pub fn get_avatar(app_id: AppId, static_map: &HashMap<AppId, AppId>) -> Option<AppId> {
     // 1. Runtime flag-driven map (per-launch).
     if let Some(map) = RUNTIME_MAP.lock().unwrap().as_ref() {
         if let Some(&avatar) = map.get(&app_id) {
@@ -47,29 +29,29 @@ pub fn get_avatar(app_id: AppId) -> Option<AppId> {
         }
     }
     // 2. Static map (config + lua).
-    let guard = STATIC_MAP.lock().unwrap();
-    if let Some(map) = guard.as_ref() {
-        if let Some(&avatar) = map.get(&app_id) {
-            return Some(avatar);
-        }
-        // 3. Wildcard: key AppId(0) applies to every app.
-        if let Some(&avatar) = map.get(&AppId(0)) {
-            return Some(avatar);
-        }
+    if let Some(&avatar) = static_map.get(&app_id) {
+        return Some(avatar);
+    }
+    // 3. Wildcard: key AppId(0) applies to every app.
+    if let Some(&avatar) = static_map.get(&AppId(0)) {
+        return Some(avatar);
     }
     None
 }
 
 /// Rewrite CMsgClientGamesPlayed body: replace game_id for avatared apps.
 /// Returns Some(new_body) if any game_id was changed, None otherwise.
-pub fn rewrite_games_played(body_bytes: &[u8]) -> Option<Vec<u8>> {
+pub fn rewrite_games_played(
+    body_bytes: &[u8],
+    static_map: &HashMap<AppId, AppId>,
+) -> Option<Vec<u8>> {
     use prost::Message;
     let mut msg = vapor_forge_abi::CMsgClientGamesPlayed::decode(body_bytes).ok()?;
     let mut changed = false;
     for game in &mut msg.games_played {
         if let Some(gid) = game.game_id {
             let app_id = AppId(gid as u32);
-            if let Some(avatar) = get_avatar(app_id) {
+            if let Some(avatar) = get_avatar(app_id, static_map) {
                 game.game_id = Some(avatar.0 as u64);
                 changed = true;
                 debug!(
@@ -194,13 +176,7 @@ mod tests {
     #[test]
     fn get_avatar_wildcard() {
         // Wildcard AppId(0) should match any app not explicitly listed.
-        *STATIC_MAP.lock().unwrap() = Some({
-            let mut m = HashMap::new();
-            m.insert(AppId(0), AppId(480));
-            m
-        });
-        assert_eq!(get_avatar(AppId(12345)), Some(AppId(480)));
-        // Clean up for other tests.
-        *STATIC_MAP.lock().unwrap() = None;
+        let map = HashMap::from([(AppId(0), AppId(480))]);
+        assert_eq!(get_avatar(AppId(12345), &map), Some(AppId(480)));
     }
 }

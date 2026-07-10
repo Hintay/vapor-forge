@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Once, OnceLock};
 
 use tracing::{info, warn};
@@ -14,14 +15,24 @@ pub(crate) struct RuntimeSnapshot {
     pub config: Arc<RuntimeConfig>,
     pub script_state: Arc<ScriptState>,
     pub manifest_code_provider: Option<Arc<ManifestCodeProvider>>,
+    pub avatar_map: Arc<HashMap<AppId, AppId>>,
 }
 
 impl RuntimeSnapshot {
     pub(crate) fn new(config: RuntimeConfig, script_runtime: ScriptRuntime) -> Self {
+        let mut avatar_map = config.app_avatar.static_map.clone();
+        avatar_map.extend(
+            script_runtime
+                .state
+                .avatars
+                .iter()
+                .map(|(&app, &avatar)| (app, avatar)),
+        );
         Self {
             config: Arc::new(config),
             script_state: Arc::new(script_runtime.state),
             manifest_code_provider: script_runtime.manifest_code_provider.map(Arc::new),
+            avatar_map: Arc::new(avatar_map),
         }
     }
 }
@@ -76,12 +87,6 @@ pub fn ensure_runtime_initialized() {
             sharing = config.apps.shared.enabled,
             "hook-install: config ready"
         );
-
-        vapor_forge_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
-        vapor_forge_features::app_avatar::load_static_map(&config.app_avatar);
-        for (&app, &avatar) in &script_state.avatars {
-            vapor_forge_features::app_avatar::set_avatar(app, avatar);
-        }
 
         BASE_CONFIG.store(Arc::new(base_config));
         let snapshot = RuntimeSnapshot::new(config, script_runtime);
@@ -299,5 +304,19 @@ mod tests {
 
         let after_script_removal = merge_script_apps(base.clone(), &[]);
         assert!(after_script_removal.apps.inject.is_empty());
+    }
+
+    #[test]
+    fn runtime_snapshot_merges_avatar_map_with_lua_precedence() {
+        let mut config = RuntimeConfig::default();
+        config.app_avatar.static_map.insert(AppId(480), AppId(10));
+        config.app_avatar.static_map.insert(AppId(481), AppId(11));
+        let mut scripts = ScriptRuntime::default();
+        scripts.state.avatars.insert(AppId(480), AppId(20));
+
+        let snapshot = RuntimeSnapshot::new(config, scripts);
+
+        assert_eq!(snapshot.avatar_map.get(&AppId(480)), Some(&AppId(20)));
+        assert_eq!(snapshot.avatar_map.get(&AppId(481)), Some(&AppId(11)));
     }
 }

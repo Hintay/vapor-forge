@@ -25,25 +25,10 @@ const DEFAULT_REF_STEAMID: u64 = 76561198028121353;
 // Donor SteamID registry
 // ---------------------------------------------------------------------------
 
-static STAT_STEAM_IDS: Mutex<Option<HashMap<AppId, u64>>> = Mutex::new(None);
-
-pub fn set_stat_steamid(app_id: AppId, steamid: u64) {
-    let mut guard = STAT_STEAM_IDS.lock().unwrap();
-    guard
-        .get_or_insert_with(HashMap::new)
-        .insert(app_id, steamid);
-}
-
-pub fn load_stat_steam_ids(ids: &HashMap<AppId, u64>) {
-    *STAT_STEAM_IDS.lock().unwrap() = Some(ids.clone());
-}
-
-fn get_ref_steamid(app_id: AppId) -> u64 {
-    STAT_STEAM_IDS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&app_id).copied())
+fn get_ref_steamid(stat_steam_ids: &HashMap<AppId, u64>, app_id: AppId) -> u64 {
+    stat_steam_ids
+        .get(&app_id)
+        .copied()
         .unwrap_or(DEFAULT_REF_STEAMID)
 }
 
@@ -179,6 +164,7 @@ pub fn on_send_service_stats(
     hdr: &CMsgProtoBufHeader,
     body_bytes: &[u8],
     config: &RuntimeConfig,
+    stat_steam_ids: &HashMap<AppId, u64>,
 ) -> Option<Vec<u8>> {
     let mut req = PlayerGetUserStatsRequest::decode(body_bytes).ok()?;
     let app_id = req.appid?;
@@ -201,7 +187,7 @@ pub fn on_send_service_stats(
         req.sha_schema = None;
     }
 
-    let ref_id = get_ref_steamid(AppId(app_id));
+    let ref_id = get_ref_steamid(stat_steam_ids, AppId(app_id));
     req.steamid = Some(ref_id);
 
     add_pending(job_id, AppId(app_id));
@@ -217,7 +203,11 @@ pub fn on_send_service_stats(
 
 /// Process an outgoing Legacy (EMsg 818) CMsgClientGetUserStats request.
 /// Returns `Some(modified_body_bytes)` if rewritten, `None` to pass through.
-pub fn on_send_legacy_stats(body_bytes: &[u8], config: &RuntimeConfig) -> Option<Vec<u8>> {
+pub fn on_send_legacy_stats(
+    body_bytes: &[u8],
+    config: &RuntimeConfig,
+    stat_steam_ids: &HashMap<AppId, u64>,
+) -> Option<Vec<u8>> {
     let mut req = ClientGetUserStatsRequest::decode(body_bytes).ok()?;
     let game_id = req.game_id?;
     let app_id = game_id as u32;
@@ -233,7 +223,7 @@ pub fn on_send_legacy_stats(body_bytes: &[u8], config: &RuntimeConfig) -> Option
         return Some(Vec::new()); // drop frame
     }
 
-    let ref_id = get_ref_steamid(AppId(app_id));
+    let ref_id = get_ref_steamid(stat_steam_ids, AppId(app_id));
     req.steam_id_for_user = Some(ref_id);
 
     add_legacy_pending(AppId(app_id));

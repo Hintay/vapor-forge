@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
 use core::fmt;
 use thiserror::Error;
 
@@ -15,12 +16,16 @@ pub enum HookState {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum HookBoundaryError {
+    #[cfg(test)]
     #[error("hook plan is empty")]
     EmptyPlan,
+    #[cfg(test)]
     #[error("hook plan target is missing")]
     MissingTarget,
+    #[cfg(test)]
     #[error("hook plan replacement is missing")]
     MissingReplacement,
+    #[cfg(test)]
     #[error("hook slot is already installed")]
     AlreadyInstalled,
     #[error("raw hook module name is empty")]
@@ -43,8 +48,10 @@ pub enum HookBoundaryError {
     PatchLengthTooSmall,
     #[error("patch plan relative jump is outside the supported range")]
     RelativeJumpOutOfRange,
+    #[cfg(test)]
     #[error("synthetic patch buffer is too small")]
     SyntheticBufferTooSmall,
+    #[cfg(test)]
     #[error("synthetic patch range is outside the buffer")]
     SyntheticPatchOutsideBuffer,
 }
@@ -133,6 +140,7 @@ pub struct PatchPlanDecision {
     pub state: HookState,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntheticPatchSimulationReport {
     pub patch_offset: usize,
@@ -229,6 +237,7 @@ pub fn validate_patch_plan(input: PatchPlanInput<'_>) -> Result<PatchPlanDecisio
     })
 }
 
+#[cfg(test)]
 pub fn simulate_synthetic_patch(
     buffer: &mut [u8],
     plan: &PatchPlanDecision,
@@ -256,6 +265,7 @@ pub fn simulate_synthetic_patch(
     })
 }
 
+#[cfg(test)]
 const SYNTHETIC_PATCH_MARKER: u8 = 0xD5;
 
 fn relative_jump32_displacement(
@@ -278,6 +288,7 @@ fn module_name_matches(module_name: &str, expected_module_name: &str) -> bool {
         || module_name.rsplit('/').next() == Some(expected_module_name)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub struct SyntheticHookPlan<F>
 where
@@ -288,6 +299,7 @@ where
     state: HookState,
 }
 
+#[cfg(test)]
 impl<F> fmt::Debug for SyntheticHookPlan<F>
 where
     F: Copy,
@@ -302,6 +314,7 @@ where
     }
 }
 
+#[cfg(test)]
 impl<F> SyntheticHookPlan<F>
 where
     F: Copy,
@@ -359,6 +372,7 @@ where
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub struct SyntheticHookSlot<F>
 where
@@ -368,6 +382,7 @@ where
     state: HookState,
 }
 
+#[cfg(test)]
 impl<F> SyntheticHookSlot<F>
 where
     F: Copy,

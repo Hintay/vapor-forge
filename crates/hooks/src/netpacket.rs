@@ -107,8 +107,13 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         }
 
         if method == achievements::STATS_JOB_NAME {
-            let cfg = config();
-            if let Some(new_body) = achievements::on_send_service_stats(&hdr, body_bytes, &cfg) {
+            let runtime = crate::client::install::runtime_snapshot();
+            if let Some(new_body) = achievements::on_send_service_stats(
+                &hdr,
+                body_bytes,
+                &runtime.config,
+                &runtime.script_state.stat_steam_ids,
+            ) {
                 if new_body.is_empty() {
                     decision = SendFrameDecision::Drop;
                     crate::packet_capture::capture(
@@ -135,8 +140,12 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     }
 
     if emsg == EMSG_REQUEST_USERSTATS {
-        let cfg = config();
-        if let Some(new_body) = achievements::on_send_legacy_stats(body_bytes, &cfg) {
+        let runtime = crate::client::install::runtime_snapshot();
+        if let Some(new_body) = achievements::on_send_legacy_stats(
+            body_bytes,
+            &runtime.config,
+            &runtime.script_state.stat_steam_ids,
+        ) {
             if new_body.is_empty() {
                 crate::packet_capture::capture(
                     PacketDirection::Send,
@@ -161,9 +170,12 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     // which real AppId is being played for rich presence rewriting.
     if emsg == EMSG_GAMESPLAYED || emsg == EMSG_GAMESPLAYED_WITH_DATABLOB {
         capture_local_steamid(header_bytes);
-        track_games_played(body_bytes);
+        let runtime = crate::client::install::runtime_snapshot();
+        track_games_played(body_bytes, &runtime);
 
-        if let Some(new_body) = vapor_forge_features::app_avatar::rewrite_games_played(body_bytes) {
+        if let Some(new_body) =
+            vapor_forge_features::app_avatar::rewrite_games_played(body_bytes, &runtime.avatar_map)
+        {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
             crate::packet_capture::capture(
                 PacketDirection::Send,
@@ -187,7 +199,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 
     // Inject access tokens into CMsgClientPICSProductInfoRequest.
     if emsg == EMSG_PICS_PRODUCT_INFO_REQUEST {
-        let ss = crate::client::install::script_state();
+        let runtime = crate::client::install::runtime_snapshot();
+        let ss = &runtime.script_state;
         if !ss.access_tokens.is_empty() {
             if let Some(new_body) = inject_access_tokens(body_bytes, &ss.access_tokens, &ss.apps) {
                 let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
@@ -221,7 +234,7 @@ fn capture_local_steamid(header_bytes: &[u8]) {
 
 /// Feed the outgoing CMsgClientGamesPlayed body to rich_presence so it can
 /// track which real AppId (pre-avatar-rewrite) is currently being played.
-fn track_games_played(body_bytes: &[u8]) {
+fn track_games_played(body_bytes: &[u8], runtime: &crate::client::install::RuntimeSnapshot) {
     let Ok(msg) = vapor_forge_abi::CMsgClientGamesPlayed::decode(body_bytes) else {
         return;
     };
@@ -232,18 +245,20 @@ fn track_games_played(body_bytes: &[u8]) {
         .map(|gid| AppId(gid as u32))
         .collect();
     rich_presence::on_games_played_update(&app_ids, |app_id| {
-        vapor_forge_features::app_avatar::get_avatar(app_id).is_some()
+        vapor_forge_features::app_avatar::get_avatar(app_id, &runtime.avatar_map).is_some()
     });
 
-    reset_stopped_delegate_windows(&app_ids);
+    reset_stopped_delegate_windows(&app_ids, &runtime.config);
 }
 
 /// Reset the ticket-delegate window for any controlled app that has stopped
 /// being played (no longer present in the current GamesPlayed list), so a
 /// future relaunch of that app gets a fresh delegate window.
-fn reset_stopped_delegate_windows(now_playing: &[AppId]) {
-    let cfg = config();
-    for app in &cfg.apps.inject {
+fn reset_stopped_delegate_windows(
+    now_playing: &[AppId],
+    config: &vapor_forge_config::RuntimeConfig,
+) {
+    for app in &config.apps.inject {
         if app.ticket != vapor_forge_config::TicketMode::Delegate {
             continue;
         }
@@ -254,7 +269,7 @@ fn reset_stopped_delegate_windows(now_playing: &[AppId]) {
 
     // Revoke IPC session tokens for games that have exited.
     if let Some(server) = crate::client::install::IPC_SERVER.get() {
-        for app in &cfg.apps.inject {
+        for app in &config.apps.inject {
             if !now_playing.contains(&app.id) {
                 server.revoke_app_tokens(app.id.0);
             }

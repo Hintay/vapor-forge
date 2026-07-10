@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use retour::GenericDetour;
@@ -47,7 +46,7 @@ pub(crate) static mut IS_SUBSCRIBED_IN_TICKET_DETOUR: Option<
     GenericDetour<IsSubscribedInTicketFn>,
 > = None;
 pub(crate) static mut ORIG_GET_STEAMID: Option<GetSteamIDFn> = None;
-pub(crate) static STEAMID_VMT_DONE: AtomicBool = AtomicBool::new(false);
+static STEAMID_VMT_GATE: vmt::InstallGate = vmt::InstallGate::new();
 
 /// Source ticket from appId 7, lazily acquired on first derivation attempt.
 pub(crate) static SOURCE_TICKET_7: OnceLock<Option<Vec<u8>>> = OnceLock::new();
@@ -407,12 +406,13 @@ extern "C" fn hk_get_steamid(this: *mut c_void) -> u64 {
 }
 
 pub(crate) fn install_steamid_vmt(this: *mut c_void) {
-    if STEAMID_VMT_DONE.swap(true, Ordering::AcqRel) {
+    let Some(attempt) = STEAMID_VMT_GATE.begin() else {
         return;
-    }
+    };
 
     let Some(slot) = crate::vtable_scan::slot_of("IClientUser", "GetSteamID") else {
         warn!("hook-install: GetSteamID slot not found in VtableScan");
+        attempt.disable();
         return;
     };
 
@@ -423,6 +423,7 @@ pub(crate) fn install_steamid_vmt(this: *mut c_void) {
     let repl = hk_get_steamid as *const () as usize;
 
     if !validate_vmt_hook_eligibility("GetSteamID", addr, repl) {
+        attempt.disable();
         return;
     }
 
@@ -432,9 +433,13 @@ pub(crate) fn install_steamid_vmt(this: *mut c_void) {
     unsafe { std::ptr::addr_of_mut!(ORIG_GET_STEAMID).write(Some(orig_fn)) };
 
     // SAFETY: swap the vtable slot (original already stored).
-    unsafe {
-        vmt::swap_vtable_slot("GetSteamID", this, slot, repl);
+    if unsafe { vmt::swap_vtable_slot("GetSteamID", this, slot, repl) }.is_some() {
+        attempt.commit();
     }
+}
+
+pub(crate) fn steamid_vmt_settled() -> bool {
+    STEAMID_VMT_GATE.is_settled()
 }
 
 #[cfg(test)]

@@ -50,7 +50,7 @@ pub(crate) extern "C" fn hk_check_app_ownership(
 
     // CUser also implements IClientUser; install the GetSteamID VMT hook once
     // we have a live instance, so ticket-delegate mode can spoof it.
-    if !super::ticket::STEAMID_VMT_DONE.load(Ordering::Acquire) {
+    if !super::ticket::steamid_vmt_settled() {
         super::ticket::install_steamid_vmt(this);
     }
 

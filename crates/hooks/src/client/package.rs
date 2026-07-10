@@ -55,43 +55,47 @@ static PENDING_RELOAD: Mutex<Option<Vec<AppId>>> = Mutex::new(None);
 /// Resolve all 4 function addresses needed for pkg0 injection.
 /// Not hooks. These are just address resolutions via pattern matching and are called directly.
 pub fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
-    let _ = resolve_from_registry_raw(
-        registry,
-        code,
-        "CUser::MarkLicenseAsChanged",
-        std::ptr::addr_of_mut!(FN_MARK_LICENSE),
-    );
-    let _ = resolve_from_registry_raw(
-        registry,
-        code,
-        "CUser::ProcessPendingLicenseUpdates",
-        std::ptr::addr_of_mut!(FN_PROCESS_UPDATES),
-    );
+    if let Some(addr) = resolve_raw_address(registry, code, "CUser::MarkLicenseAsChanged") {
+        // SAFETY: the registry entry identifies this concrete Steam function ABI.
+        unsafe {
+            std::ptr::addr_of_mut!(FN_MARK_LICENSE)
+                .write(Some(std::mem::transmute::<usize, MarkLicenseAsChangedFn>(
+                    addr,
+                )));
+        }
+    }
+    if let Some(addr) = resolve_raw_address(registry, code, "CUser::ProcessPendingLicenseUpdates") {
+        // SAFETY: the registry entry identifies this concrete Steam function ABI.
+        unsafe {
+            std::ptr::addr_of_mut!(FN_PROCESS_UPDATES).write(Some(std::mem::transmute::<
+                usize,
+                ProcessPendingLicenseUpdatesFn,
+            >(addr)));
+        }
+    }
     // x86_64 resolves this through the CUtlVector<u32> append helper callsite used
     // by pkg0's app-id list. The shared Grow body has several nearby variants and
     // RIP-relative selector strings, so following the typed callsite is the more
     // stable callable entry.
-    let _ = resolve_from_registry_raw(
-        registry,
-        code,
-        "CUtlMemory::Grow",
-        std::ptr::addr_of_mut!(FN_GROW),
-    );
-    let _ = resolve_from_registry_raw(
-        registry,
-        code,
-        "CPackageInfo::GetPackageInfo",
-        std::ptr::addr_of_mut!(FN_GET_PKG_INFO),
-    );
+    if let Some(addr) = resolve_raw_address(registry, code, "CUtlMemory::Grow") {
+        // SAFETY: the registry entry identifies this concrete Steam function ABI.
+        unsafe {
+            std::ptr::addr_of_mut!(FN_GROW)
+                .write(Some(std::mem::transmute::<usize, CUtlMemoryGrowFn>(addr)));
+        }
+    }
+    if let Some(addr) = resolve_raw_address(registry, code, "CPackageInfo::GetPackageInfo") {
+        // SAFETY: the registry entry identifies this architecture-specific ABI.
+        unsafe {
+            std::ptr::addr_of_mut!(FN_GET_PKG_INFO)
+                .write(Some(std::mem::transmute::<usize, GetPackageInfoArchFn>(
+                    addr,
+                )));
+        }
+    }
 }
 
-/// Resolve a function address from the registry and store it as a raw fn pointer.
-fn resolve_from_registry_raw<F: Copy>(
-    registry: &PatternRegistry,
-    code: &CodeRegion,
-    name: &str,
-    storage: *mut Option<F>,
-) -> Option<usize> {
+fn resolve_raw_address(registry: &PatternRegistry, code: &CodeRegion, name: &str) -> Option<usize> {
     let entry = match registry.get(name) {
         Some(e) => e,
         None => {
@@ -100,13 +104,7 @@ fn resolve_from_registry_raw<F: Copy>(
         }
     };
 
-    let addr = crate::detour::resolve_pattern_entry(code, name, &entry)?;
-
-    // SAFETY: transmuting validated code address to typed fn pointer.
-    unsafe {
-        storage.write(Some(std::mem::transmute_copy(&addr)));
-    }
-    Some(addr)
+    crate::detour::resolve_pattern_entry(code, name, &entry)
 }
 
 /// Get the resolved GetPackageInfo function address (for hooking).

@@ -1,6 +1,4 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use retour::GenericDetour;
 use tracing::{debug, info, warn};
 use vapor_forge_config::AppId;
@@ -28,7 +26,8 @@ pub(crate) static mut REMOTE_STORAGE_RUN_IPC_DETOUR: Option<GenericDetour<RunIPC
 pub(crate) static mut WRITE_VDF_DETOUR: Option<GenericDetour<WriteVdfFileFn>> = None;
 pub(crate) static mut ORIGINAL_IS_CLOUD_ENABLED: Option<IsCloudEnabledForAppFn> = None;
 pub(crate) static mut SET_CLOUD_FN: Option<SetCloudEnabledForAppFn> = None;
-pub(crate) static CLOUD_VMT_DONE: AtomicBool = AtomicBool::new(false);
+static CLOUD_VMT_GATE: vmt::InstallGate = vmt::InstallGate::new();
+static SET_CLOUD_CAPTURE_GATE: vmt::InstallGate = vmt::InstallGate::new();
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: IClientRemoteStorage::RunIPCFrame (cloud VMT)
@@ -40,7 +39,7 @@ pub(crate) extern "C" fn hk_remote_storage_run_ipc_frame(
     a2: *mut c_void,
     a3: *mut c_void,
 ) {
-    if !CLOUD_VMT_DONE.load(Ordering::Acquire) {
+    if !CLOUD_VMT_GATE.is_settled() {
         install_cloud_vmt(this);
     }
 
@@ -82,9 +81,9 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
 }
 
 fn install_cloud_vmt(this: *mut c_void) {
-    if CLOUD_VMT_DONE.swap(true, Ordering::AcqRel) {
+    let Some(attempt) = CLOUD_VMT_GATE.begin() else {
         return;
-    }
+    };
 
     capture_set_cloud_from_vtable(this);
 
@@ -94,6 +93,7 @@ fn install_cloud_vmt(this: *mut c_void) {
     let Some(slot) = crate::vtable_scan::slot_of("IClientRemoteStorage", "IsCloudEnabledForApp")
     else {
         warn!("hook-install: IsCloudEnabledForApp slot not found in VtableScan");
+        attempt.disable();
         return;
     };
 
@@ -103,24 +103,32 @@ fn install_cloud_vmt(this: *mut c_void) {
     let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
 
     if !validate_vmt_hook_eligibility("IsCloudEnabledForApp", addr, replacement) {
+        attempt.disable();
         return;
     }
 
     // SAFETY: transmuting a valid function address to a typed fn pointer.
     let orig_fn: IsCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
-    // SAFETY: initialization is serialized by CLOUD_VMT_DONE before slot swap.
+    // SAFETY: initialization is serialized by CLOUD_VMT_GATE before slot swap.
     unsafe { std::ptr::addr_of_mut!(ORIGINAL_IS_CLOUD_ENABLED).write(Some(orig_fn)) };
 
     // SAFETY: swap the vtable slot (original already stored).
-    unsafe {
-        vmt::swap_vtable_slot("IsCloudEnabledForApp", this, slot, replacement);
+    if unsafe { vmt::swap_vtable_slot("IsCloudEnabledForApp", this, slot, replacement) }.is_some() {
+        attempt.commit();
     }
 }
 
 fn capture_set_cloud_from_vtable(this: *mut c_void) {
+    if SET_CLOUD_CAPTURE_GATE.is_settled() {
+        return;
+    }
+    let Some(attempt) = SET_CLOUD_CAPTURE_GATE.begin() else {
+        return;
+    };
     let Some(slot) = crate::vtable_scan::slot_of("IClientRemoteStorage", "SetCloudEnabledForApp")
     else {
         warn!("hook-install: SetCloudEnabledForApp slot not found in VtableScan");
+        attempt.disable();
         return;
     };
 
@@ -130,13 +138,15 @@ fn capture_set_cloud_from_vtable(this: *mut c_void) {
     };
     let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
     if !validate_vmt_hook_eligibility("SetCloudEnabledForApp", addr, replacement) {
+        attempt.disable();
         return;
     }
 
     // SAFETY: vtable slot was decoded from the live IClientRemoteStorage object.
     let f: SetCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
-    // SAFETY: initialization is serialized by CLOUD_VMT_DONE.
+    // SAFETY: initialization is serialized by SET_CLOUD_CAPTURE_GATE.
     unsafe { std::ptr::addr_of_mut!(SET_CLOUD_FN).write(Some(f)) };
+    attempt.commit();
     debug!(
         addr = format_args!("0x{:x}", addr),
         slot, "SetCloudEnabledForApp captured from vtable"
