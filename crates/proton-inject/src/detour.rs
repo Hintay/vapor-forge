@@ -10,17 +10,21 @@ use iced_x86::{
 const ABS_JMP_LEN: usize = 14;
 const MAX_PROLOGUE_SCAN: usize = 64;
 
-pub struct Detour {
-    pub trampoline: usize,
+pub struct PreparedDetour {
+    target: usize,
+    hook: usize,
+    stolen: usize,
+    trampoline: usize,
+    allocation_size: usize,
+    activated: bool,
 }
 
-impl Detour {
-    /// Install a detour and return a relocated trampoline for the original.
+impl PreparedDetour {
+    /// Build a relocated trampoline without changing the target function.
     ///
     /// # Safety
-    /// `target` must be a mapped executable function address whose first
-    /// instructions may be replaced while no other thread executes them.
-    pub unsafe fn install(target: usize, hook: usize) -> Option<Self> {
+    /// `target` must be a mapped executable function address.
+    pub unsafe fn prepare(target: usize, hook: usize) -> Option<Self> {
         let readable = crate::maps::mapping_size_at(target)?.min(MAX_PROLOGUE_SCAN);
         if readable < ABS_JMP_LEN {
             return None;
@@ -52,32 +56,66 @@ impl Detour {
             return None;
         }
 
-        if !set_memory_protection(
+        Some(Self {
             target,
+            hook,
             stolen,
+            trampoline,
+            allocation_size,
+            activated: false,
+        })
+    }
+
+    pub fn trampoline(&self) -> usize {
+        self.trampoline
+    }
+
+    /// Activate the prepared jump after the caller has published `trampoline`.
+    ///
+    /// # Safety
+    /// No other thread may execute the first `stolen` bytes of the target while
+    /// this method changes them.
+    pub unsafe fn activate(mut self) -> Option<Detour> {
+        if !set_memory_protection(
+            self.target,
+            self.stolen,
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         ) {
-            free_trampoline(trampoline, allocation_size);
             return None;
         }
 
         // SAFETY: target is writable for `stolen` bytes and stolen >= ABS_JMP_LEN.
         unsafe {
-            write_abs_jmp(target, hook);
+            write_abs_jmp(self.target, self.hook);
             ptr::write_bytes(
-                (target + ABS_JMP_LEN) as *mut u8,
+                (self.target + ABS_JMP_LEN) as *mut u8,
                 0x90,
-                stolen - ABS_JMP_LEN,
+                self.stolen - ABS_JMP_LEN,
             );
         }
 
         // Keep the hook usable even if restoring RX unexpectedly fails. Returning
         // None after patching would leave an active hook without publishing its
         // trampoline to the caller.
-        let _ = set_memory_protection(target, stolen, libc::PROT_READ | libc::PROT_EXEC);
+        let _ = set_memory_protection(self.target, self.stolen, libc::PROT_READ | libc::PROT_EXEC);
 
-        Some(Self { trampoline })
+        self.activated = true;
+        Some(Detour {
+            trampoline: self.trampoline,
+        })
     }
+}
+
+impl Drop for PreparedDetour {
+    fn drop(&mut self) {
+        if !self.activated {
+            free_trampoline(self.trampoline, self.allocation_size);
+        }
+    }
+}
+
+pub struct Detour {
+    pub trampoline: usize,
 }
 
 fn decode_stolen(bytes: &[u8], ip: u64) -> Option<(Vec<Instruction>, usize)> {
@@ -183,5 +221,36 @@ mod tests {
             page_range(page * 2 + page - 8, 14),
             Some((page * 2, page * 2))
         );
+    }
+
+    #[test]
+    fn prepare_does_not_modify_target() {
+        let page = page_size().unwrap();
+        // SAFETY: mapping is test-owned and released before returning.
+        let mapped = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        let target = mapped as usize;
+        // SAFETY: the mapping has at least one page of writable bytes.
+        unsafe {
+            ptr::write_bytes(target as *mut u8, 0x90, 32);
+            *((target + 31) as *mut u8) = 0xC3;
+        }
+        // SAFETY: target is the executable mapping created above.
+        let prepared = unsafe { PreparedDetour::prepare(target, target + 31) }.unwrap();
+        // SAFETY: target remains mapped for the assertion.
+        let bytes = unsafe { std::slice::from_raw_parts(target as *const u8, ABS_JMP_LEN) };
+        assert!(bytes.iter().all(|byte| *byte == 0x90));
+        drop(prepared);
+        // SAFETY: mapped/page are the exact values returned by mmap.
+        unsafe { libc::munmap(mapped, page) };
     }
 }

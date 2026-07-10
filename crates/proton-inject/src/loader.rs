@@ -1,14 +1,18 @@
 // Orchestration: install LdrLoadDll detour, detect trigger, load user DLL.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use crate::detour::Detour;
+use crate::detour::PreparedDetour;
 use crate::maps;
-use crate::nt_types::{LdrLoadDllFn, UnicodeString, STATUS_SUCCESS};
+use crate::nt_types::{
+    LdrLoadDllFn, LdrLockLoaderLockFn, LdrUnlockLoaderLockFn, UnicodeString, STATUS_SUCCESS,
+};
 use crate::pe;
 use crate::trigger;
 
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 static HELPER_LOADING: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -16,6 +20,10 @@ const PE_NTDLL_SUFFIX: &str = "x86_64-windows/ntdll.dll";
 
 /// Try to install the LdrLoadDll detour. Returns true if installed.
 pub fn install_trigger() -> bool {
+    let Ok(_install_guard) = INSTALL_LOCK.lock() else {
+        log("detour install lock poisoned");
+        return false;
+    };
     if TRAMPOLINE.load(Ordering::Acquire) != 0 {
         return true;
     }
@@ -31,26 +39,55 @@ pub fn install_trigger() -> bool {
         Err(_) => return false,
     };
 
-    let rva = match pe::find_export_rva(&pe_bytes, "LdrLoadDll") {
-        Some(r) => r,
+    let load_rva = match pe::find_export_rva(&pe_bytes, "LdrLoadDll") {
+        Some(rva) => rva,
         None => {
             log("no LdrLoadDll export in PE ntdll");
             return false;
         }
     };
+    let Some(lock_rva) = pe::find_export_rva(&pe_bytes, "LdrLockLoaderLock") else {
+        log("no LdrLockLoaderLock export in PE ntdll");
+        return false;
+    };
+    let Some(unlock_rva) = pe::find_export_rva(&pe_bytes, "LdrUnlockLoaderLock") else {
+        log("no LdrUnlockLoaderLock export in PE ntdll");
+        return false;
+    };
 
-    let target = pe_base + rva as usize;
+    let target = pe_base + load_rva as usize;
+    // SAFETY: all three addresses are exports from the same mapped PE ntdll.
+    let Some(_loader_guard) = (unsafe {
+        WineLoaderGuard::acquire(pe_base + lock_rva as usize, pe_base + unlock_rva as usize)
+    }) else {
+        log("failed to acquire Wine loader lock");
+        return false;
+    };
 
     // SAFETY: target is LdrLoadDll's address in the mapped PE ntdll.
-    let detour = match unsafe { Detour::install(target, hook_ldr_load_dll as *const () as usize) } {
-        Some(d) => d,
+    let prepared =
+        match unsafe { PreparedDetour::prepare(target, hook_ldr_load_dll as *const () as usize) } {
+            Some(prepared) => prepared,
+            None => {
+                log("detour preparation failed");
+                return false;
+            }
+        };
+
+    let trampoline = prepared.trampoline();
+    TRAMPOLINE.store(trampoline, Ordering::Release);
+
+    // SAFETY: install_trigger is serialized. The loader invokes this during
+    // pre-initialization or its dedicated retry path, before publishing success.
+    let detour = match unsafe { prepared.activate() } {
+        Some(detour) => detour,
         None => {
-            log("detour install failed");
+            let _ = TRAMPOLINE.compare_exchange(trampoline, 0, Ordering::AcqRel, Ordering::Acquire);
+            log("detour activation failed");
             return false;
         }
     };
-
-    TRAMPOLINE.store(detour.trampoline, Ordering::Release);
+    debug_assert_eq!(detour.trampoline, trampoline);
 
     log("LdrLoadDll detour installed");
 
@@ -61,6 +98,34 @@ pub fn install_trigger() -> bool {
     }
 
     true
+}
+
+struct WineLoaderGuard {
+    unlock: LdrUnlockLoaderLockFn,
+    cookie: usize,
+}
+
+impl WineLoaderGuard {
+    /// # Safety
+    /// Both addresses must be matching exports from the live PE ntdll image.
+    unsafe fn acquire(lock_addr: usize, unlock_addr: usize) -> Option<Self> {
+        // SAFETY: caller validated both addresses as matching ntdll exports.
+        let lock: LdrLockLoaderLockFn = unsafe { std::mem::transmute(lock_addr) };
+        // SAFETY: caller validated both addresses as matching ntdll exports.
+        let unlock: LdrUnlockLoaderLockFn = unsafe { std::mem::transmute(unlock_addr) };
+        let mut disposition = 0u32;
+        let mut cookie = 0usize;
+        // SAFETY: output pointers are valid for the duration of the call.
+        let status = unsafe { lock(0, &mut disposition, &mut cookie) };
+        (status == STATUS_SUCCESS && cookie != 0).then_some(Self { unlock, cookie })
+    }
+}
+
+impl Drop for WineLoaderGuard {
+    fn drop(&mut self) {
+        // SAFETY: cookie was returned by the matching successful lock call.
+        let _ = unsafe { (self.unlock)(0, self.cookie) };
+    }
 }
 
 pub fn mark_pending() {
