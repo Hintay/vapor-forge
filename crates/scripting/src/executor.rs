@@ -3,10 +3,20 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 use vapor_forge_core::ScriptState;
 
-use crate::bindings::execute_file;
+use crate::manifest_provider::{ManifestCodeProvider, ScriptSource};
 use crate::report::{ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport};
 
+#[derive(Clone, Debug, Default)]
+pub struct ScriptRuntime {
+    pub state: ScriptState,
+    pub manifest_code_provider: Option<ManifestCodeProvider>,
+}
+
 pub fn execute_scripts(dirs: &[String]) -> ScriptState {
+    execute_scripts_runtime(dirs).state
+}
+
+pub fn execute_scripts_runtime(dirs: &[String]) -> ScriptRuntime {
     let report = execute_scripts_report_with_options(dirs, ScriptExecutionOptions::runtime());
 
     for skipped in &report.skipped_dirs {
@@ -22,17 +32,28 @@ pub fn execute_scripts(dirs: &[String]) -> ScriptState {
         }
     }
 
-    if !report.state.apps.is_empty() {
+    if !report.state.apps.is_empty() || report.manifest_code_provider.is_some() {
         info!(
             apps = report.state.apps.len(),
             depot_keys = report.state.depot_keys.len(),
             manifests = report.state.manifests.len(),
             tickets = report.state.app_tickets.len(),
+            manifest_code = report
+                .manifest_code_provider
+                .as_ref()
+                .is_some_and(ManifestCodeProvider::has_basic),
+            manifest_code_ex = report
+                .manifest_code_provider
+                .as_ref()
+                .is_some_and(ManifestCodeProvider::has_extended),
             "scripting: scripts loaded"
         );
     }
 
-    report.state
+    ScriptRuntime {
+        state: report.state,
+        manifest_code_provider: report.manifest_code_provider,
+    }
 }
 
 pub fn execute_scripts_report(dirs: &[String]) -> ScriptExecutionReport {
@@ -44,6 +65,7 @@ pub fn execute_scripts_report_with_options(
     options: ScriptExecutionOptions,
 ) -> ScriptExecutionReport {
     let mut report = ScriptExecutionReport::default();
+    let mut sources = Vec::new();
 
     for dir in dirs {
         let expanded = expand_dir(dir);
@@ -69,13 +91,27 @@ pub fn execute_scripts_report_with_options(
 
         for entry in entries {
             let path = entry.path();
-            let result = execute_file(&path, &mut report.state, &options, &mut report.calls)
-                .map_err(|error| error.to_string());
-            report.files.push(ScriptFileReport {
-                path: path.display().to_string(),
-                result,
-            });
+            match std::fs::read_to_string(&path) {
+                Ok(source) => sources.push(ScriptSource { path, source }),
+                Err(error) => report.files.push(ScriptFileReport {
+                    path: path.display().to_string(),
+                    result: Err(error.to_string()),
+                }),
+            }
         }
+    }
+
+    match ManifestCodeProvider::execute(sources, options) {
+        Ok(execution) => {
+            report.state = execution.state;
+            report.files.extend(execution.files);
+            report.calls = execution.calls;
+            report.manifest_code_provider = execution.provider;
+        }
+        Err(error) => report.files.push(ScriptFileReport {
+            path: "<lua-runtime>".to_owned(),
+            result: Err(error),
+        }),
     }
 
     report

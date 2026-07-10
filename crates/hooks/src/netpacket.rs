@@ -189,7 +189,7 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     if emsg == EMSG_PICS_PRODUCT_INFO_REQUEST {
         let ss = crate::client::install::script_state();
         if !ss.access_tokens.is_empty() {
-            if let Some(new_body) = inject_access_tokens(body_bytes, &ss.access_tokens) {
+            if let Some(new_body) = inject_access_tokens(body_bytes, &ss.access_tokens, &ss.apps) {
                 let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
                 crate::packet_capture::capture(
                     PacketDirection::Send,
@@ -265,16 +265,21 @@ fn reset_stopped_delegate_windows(now_playing: &[AppId]) {
 fn inject_access_tokens(
     body_bytes: &[u8],
     tokens: &std::collections::HashMap<AppId, u64>,
+    controlled_apps: &[AppId],
 ) -> Option<Vec<u8>> {
     let mut req = vapor_forge_abi::PicsProductInfoRequest::decode(body_bytes).ok()?;
     let mut changed = false;
     for app in &mut req.apps {
         let app_id = AppId(app.appid.unwrap_or(0));
-        if let Some(&token) = tokens.get(&app_id) {
-            app.access_token = Some(token);
-            changed = true;
-            debug!(app_id = app_id.0, token, "netpacket: access token injected");
+        let Some(&token) = tokens.get(&app_id) else {
+            continue;
+        };
+        if token == 0 || !controlled_apps.contains(&app_id) {
+            continue;
         }
+        app.access_token = Some(token);
+        changed = true;
+        debug!(app_id = app_id.0, token, "netpacket: access token injected");
     }
     if changed {
         Some(req.encode_to_vec())
@@ -312,7 +317,21 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
         app_id,
         depot_id, gid, job_id, "netpacket: intercepted manifest request code"
     );
-    PENDING.queue_fetch(job_id, gid, header_bytes.to_vec(), &cfg);
+    let lua_callback = crate::client::install::manifest_code_provider().map(|provider| {
+        std::sync::Arc::new(move |app_id, depot_id, gid| provider.fetch(app_id, depot_id, gid))
+            as request_code::ManifestCodeCallback
+    });
+    PENDING.queue_fetch(
+        request_code::ManifestCodeFetch {
+            job_id,
+            app_id,
+            depot_id,
+            gid,
+            req_hdr_bytes: header_bytes.to_vec(),
+        },
+        &cfg,
+        lua_callback,
+    );
 
     true
 }
@@ -594,5 +613,61 @@ impl Drop for PacketSwapGuard {
             *self.p_data = self.orig_data;
             *self.p_size = self.orig_size;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn access_tokens_require_addappid_and_skip_zero() {
+        let request = vapor_forge_abi::PicsProductInfoRequest {
+            apps: vec![
+                vapor_forge_abi::PicsAppInfo {
+                    appid: Some(480),
+                    access_token: None,
+                    only_public_obsolete: None,
+                },
+                vapor_forge_abi::PicsAppInfo {
+                    appid: Some(730),
+                    access_token: Some(7),
+                    only_public_obsolete: None,
+                },
+                vapor_forge_abi::PicsAppInfo {
+                    appid: Some(999),
+                    access_token: None,
+                    only_public_obsolete: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let tokens = HashMap::from([(AppId(480), 42), (AppId(730), 0), (AppId(999), 99)]);
+
+        let rewritten =
+            inject_access_tokens(&request.encode_to_vec(), &tokens, &[AppId(480), AppId(730)])
+                .unwrap();
+        let rewritten =
+            vapor_forge_abi::PicsProductInfoRequest::decode(rewritten.as_slice()).unwrap();
+        assert_eq!(rewritten.apps[0].access_token, Some(42));
+        assert_eq!(rewritten.apps[1].access_token, Some(7));
+        assert_eq!(rewritten.apps[2].access_token, None);
+    }
+
+    #[test]
+    fn access_token_rewrite_is_none_without_eligible_apps() {
+        let request = vapor_forge_abi::PicsProductInfoRequest {
+            apps: vec![vapor_forge_abi::PicsAppInfo {
+                appid: Some(480),
+                access_token: None,
+                only_public_obsolete: None,
+            }],
+            ..Default::default()
+        };
+        let tokens = HashMap::from([(AppId(480), 42)]);
+
+        assert!(inject_access_tokens(&request.encode_to_vec(), &tokens, &[]).is_none());
     }
 }

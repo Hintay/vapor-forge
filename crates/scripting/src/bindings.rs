@@ -8,10 +8,13 @@ use mlua::prelude::*;
 use vapor_forge_core::{AppId, DepotId, ManifestId};
 
 use crate::report::{ScriptCallReport, ScriptExecutionOptions};
-use crate::{ManifestOverride, ScriptError, ScriptState};
+use crate::{ManifestOverride, ScriptState};
 
-#[derive(Default)]
-struct FileState {
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 10_000;
+const MAX_HTTP_BODY_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeState {
     apps: Vec<AppId>,
     depot_keys: HashMap<DepotId, Vec<u8>>,
     manifests: HashMap<DepotId, ManifestOverride>,
@@ -25,19 +28,23 @@ struct FileState {
 type Shared<T> = Rc<RefCell<T>>;
 
 #[derive(Clone)]
-struct ScriptRunContext {
-    path: String,
+pub(crate) struct ScriptRunContext {
+    path: Shared<String>,
     calls: Shared<Vec<ScriptCallReport>>,
     record_calls: bool,
 }
 
 impl ScriptRunContext {
-    fn new(path: String, record_calls: bool) -> Self {
+    fn new(record_calls: bool) -> Self {
         Self {
-            path,
+            path: Rc::new(RefCell::new(String::new())),
             calls: Rc::new(RefCell::new(Vec::new())),
             record_calls,
         }
+    }
+
+    pub(crate) fn set_path(&self, path: &str) {
+        path.clone_into(&mut self.path.borrow_mut());
     }
 
     fn push_call(&self, function: &'static str, detail: String) {
@@ -45,87 +52,186 @@ impl ScriptRunContext {
             return;
         }
         self.calls.borrow_mut().push(ScriptCallReport {
-            path: self.path.clone(),
+            path: self.path.borrow().clone(),
             function,
             detail,
         });
     }
 
-    fn drain_calls(&self) -> Vec<ScriptCallReport> {
+    pub(crate) fn drain_calls(&self) -> Vec<ScriptCallReport> {
         self.calls.borrow_mut().drain(..).collect()
     }
 }
 
-pub(crate) fn execute_file(
-    path: &Path,
-    state: &mut ScriptState,
+pub(crate) fn create_runtime(
     options: &ScriptExecutionOptions,
-    calls: &mut Vec<ScriptCallReport>,
-) -> Result<(), ScriptError> {
-    let source = std::fs::read_to_string(path)?;
+) -> LuaResult<(Lua, Shared<RuntimeState>, ScriptRunContext)> {
     let lua = Lua::new();
-    let file_state = Rc::new(RefCell::new(FileState::default()));
-    let ctx = ScriptRunContext::new(path.display().to_string(), options.record_calls);
+    let state = Rc::new(RefCell::new(RuntimeState::default()));
+    let ctx = ScriptRunContext::new(options.record_calls);
+    install_lua_api(&lua, &state, &ctx, options)?;
+    Ok((lua, state, ctx))
+}
 
-    install_lua_api(&lua, &file_state, &ctx, options)?;
+pub(crate) fn execute_source(
+    lua: &Lua,
+    path: &Path,
+    source: &str,
+    ctx: &ScriptRunContext,
+) -> Vec<String> {
+    ctx.set_path(&path.display().to_string());
+    let mut errors = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_start = 1;
 
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    let exec_result = lua.load(&source).set_name(filename.into_owned()).exec();
-    calls.extend(ctx.drain_calls());
-    exec_result?;
+    for (index, line) in source.lines().enumerate() {
+        let line_no = index + 1;
+        if chunk.is_empty() {
+            chunk_start = line_no;
+        } else {
+            chunk.push('\n');
+        }
+        chunk.push_str(line);
 
-    merge_file_state(state, file_state);
-    Ok(())
+        match lua
+            .load(&chunk)
+            .set_name(path.to_string_lossy())
+            .into_function()
+        {
+            Ok(function) => {
+                if let Err(error) = function.call::<()>(()) {
+                    errors.push(format!("line {chunk_start}: {error}"));
+                }
+                chunk.clear();
+            }
+            Err(LuaError::SyntaxError {
+                incomplete_input: true,
+                ..
+            }) => {}
+            Err(error) => {
+                errors.push(format!("line {chunk_start}: {error}"));
+                chunk.clear();
+            }
+        }
+    }
+
+    if !chunk.trim().is_empty() {
+        errors.push(format!(
+            "line {chunk_start}: incomplete statement at end of file"
+        ));
+    }
+    errors
+}
+
+pub(crate) fn snapshot_state(state: &Shared<RuntimeState>) -> ScriptState {
+    let state = state.borrow();
+    ScriptState {
+        apps: state.apps.clone(),
+        depot_keys: state.depot_keys.clone(),
+        manifests: state.manifests.clone(),
+        app_tickets: state.app_tickets.clone(),
+        enc_tickets: state.enc_tickets.clone(),
+        stat_steam_ids: state.stat_steam_ids.clone(),
+        avatars: state.avatars.clone(),
+        access_tokens: state.access_tokens.clone(),
+    }
 }
 
 fn install_lua_api(
     lua: &Lua,
-    state: &Shared<FileState>,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
     options: &ScriptExecutionOptions,
 ) -> Result<(), mlua::Error> {
     let globals = lua.globals();
-    install_addappid(lua, &globals, state, ctx)?;
-    install_setmanifestid(lua, &globals, state, ctx)?;
-    install_ticket_api(lua, &globals, state, ctx)?;
-    install_setstat(lua, &globals, state, ctx)?;
-    install_setavatar(lua, &globals, state, ctx)?;
-    install_setaccesstoken(lua, &globals, state, ctx)?;
-    install_http_api(lua, &globals, options, ctx)
+    let registry = install_case_insensitive_lookup(lua, &globals)?;
+    install_addappid(lua, &globals, &registry, state, ctx)?;
+    install_setmanifestid(lua, &globals, &registry, state, ctx)?;
+    install_ticket_api(lua, &globals, &registry, state, ctx)?;
+    install_setstat(lua, &globals, &registry, state, ctx)?;
+    install_setavatar(lua, &globals, &registry, state, ctx)?;
+    install_addtoken(lua, &globals, &registry, state, ctx)?;
+    install_http_api(lua, &globals, &registry, options, ctx)
+}
+
+fn install_case_insensitive_lookup(lua: &Lua, globals: &LuaTable) -> LuaResult<LuaTable> {
+    let registry = lua.create_table()?;
+    let lookup = registry.clone();
+    let metatable = globals.metatable().unwrap_or(lua.create_table()?);
+    metatable.set(
+        "__index",
+        lua.create_function(move |_, (_table, key): (LuaTable, LuaValue)| {
+            let LuaValue::String(name) = key else {
+                return Ok(LuaValue::Nil);
+            };
+            let Ok(name) = name.to_str() else {
+                return Ok(LuaValue::Nil);
+            };
+            lookup.raw_get(name.to_ascii_lowercase())
+        })?,
+    )?;
+    globals.set_metatable(Some(metatable));
+    Ok(registry)
+}
+
+fn register_function(
+    globals: &LuaTable,
+    registry: &LuaTable,
+    name: &'static str,
+    function: LuaFunction,
+) -> LuaResult<()> {
+    globals.set(name, function.clone())?;
+    registry.set(name, function)
 }
 
 fn install_addappid(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         "addappid",
         lua.create_function(move |_, args: LuaMultiValue| {
             let id_raw = args
                 .front()
                 .and_then(|value| match value {
-                    LuaValue::Integer(n) => Some(*n as u32),
+                    LuaValue::Integer(n) => u32::try_from(*n).ok(),
                     _ => None,
                 })
                 .ok_or_else(|| {
                     mlua::Error::RuntimeError("addappid: arg1 must be integer".into())
                 })?;
 
-            let key_hex = args.get(2).and_then(|value| match value {
-                LuaValue::String(s) => Some(s.to_str().ok()?.to_owned()),
-                _ => None,
-            });
+            let key_hex = match args.get(2) {
+                Some(LuaValue::String(value)) => Some(value.to_str()?.to_owned()),
+                Some(_) => {
+                    return Err(mlua::Error::RuntimeError(
+                        "addappid: arg3 must be a depot key string".into(),
+                    ));
+                }
+                None => None,
+            };
 
             let mut detail = format!("app_id={id_raw}");
             let mut state = state.borrow_mut();
-            state.apps.push(AppId(id_raw));
+            let app_id = AppId(id_raw);
+            if !state.apps.contains(&app_id) {
+                state.apps.push(app_id);
+            }
 
             if let Some(hex) = key_hex {
-                if let Some(key) = parse_hex_key(&hex) {
+                if hex.len() == 64 {
+                    let Some(key) = parse_hex_key(&hex) else {
+                        return Err(mlua::Error::RuntimeError(
+                            "addappid: arg3 must contain exactly 64 hex digits".into(),
+                        ));
+                    };
                     let key_len = key.len();
                     state.depot_keys.insert(DepotId(id_raw), key);
                     detail.push_str(&format!(" depot_key_len={key_len}"));
@@ -141,7 +247,8 @@ fn install_addappid(
 fn install_setmanifestid(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
@@ -169,19 +276,20 @@ fn install_setmanifestid(
             Ok(())
         },
     )?;
-    globals.set("setmanifestid", function.clone())?;
-    globals.set("setManifestid", function)
+    register_function(globals, registry, "setmanifestid", function)
 }
 
 fn install_ticket_api(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     install_hex_ticket_fn(
         lua,
         globals,
+        registry,
         state,
         ctx,
         "setappticket",
@@ -192,6 +300,7 @@ fn install_ticket_api(
     install_hex_ticket_fn(
         lua,
         globals,
+        registry,
         state,
         ctx,
         "seteticket",
@@ -204,14 +313,17 @@ fn install_ticket_api(
 fn install_hex_ticket_fn(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
     name: &'static str,
-    store: fn(&mut FileState, AppId, Vec<u8>),
+    store: fn(&mut RuntimeState, AppId, Vec<u8>),
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         name,
         lua.create_function(move |_, (app_id_raw, hex): (u32, String)| {
             let bytes = parse_hex_key(&hex)
@@ -226,12 +338,15 @@ fn install_hex_ticket_fn(
 fn install_setstat(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         "setstat",
         lua.create_function(move |_, (app_id_raw, steamid_str): (u32, String)| {
             let steamid: u64 = steamid_str.parse().map_err(|_| {
@@ -250,12 +365,15 @@ fn install_setstat(
 fn install_setavatar(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         "setavatar",
         lua.create_function(move |_, (app_id_raw, avatar_raw): (u32, u32)| {
             state
@@ -271,25 +389,32 @@ fn install_setavatar(
     )
 }
 
-fn install_setaccesstoken(
+fn install_addtoken(
     lua: &Lua,
     globals: &LuaTable,
-    state: &Shared<FileState>,
+    registry: &LuaTable,
+    state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
-        "setaccesstoken",
-        lua.create_function(move |_, (app_id_raw, token): (u32, u64)| {
-            state
-                .borrow_mut()
-                .access_tokens
-                .insert(AppId(app_id_raw), token);
-            ctx.push_call(
-                "setaccesstoken",
-                format!("app_id={app_id_raw} token={token}"),
-            );
+    register_function(
+        globals,
+        registry,
+        "addtoken",
+        lua.create_function(move |_, (app_id_raw, token): (u32, Option<String>)| {
+            if let Some(token) = token {
+                let token = token.parse::<u64>().map_err(|_| {
+                    mlua::Error::RuntimeError(
+                        "addtoken: arg2 must be a decimal uint64 string".into(),
+                    )
+                })?;
+                state
+                    .borrow_mut()
+                    .access_tokens
+                    .insert(AppId(app_id_raw), token);
+                ctx.push_call("addtoken", format!("app_id={app_id_raw} token={token}"));
+            }
             Ok(())
         })?,
     )
@@ -298,59 +423,95 @@ fn install_setaccesstoken(
 fn install_http_api(
     lua: &Lua,
     globals: &LuaTable,
+    registry: &LuaTable,
     options: &ScriptExecutionOptions,
     ctx: &ScriptRunContext,
 ) -> Result<(), mlua::Error> {
     let get_options = options.clone();
     let get_ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         "http_get",
-        lua.create_function(move |_, url: String| {
+        lua.create_function(move |lua, (url, headers): (String, Option<LuaTable>)| {
             get_ctx.push_call(
                 "http_get",
                 format!("url={}", display_url(&url, get_options.redact_network_urls)),
             );
             ensure_network_allowed(&get_options, &url, "http_get")?;
-            let body = http_agent(get_options.network_timeout_ms)
-                .get(&url)
-                .call()
-                .map_err(|error| mlua::Error::RuntimeError(format!("http_get failed: {error}")))?
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("http_get read failed: {error}"))
-                })?;
-            Ok(body)
+            let mut request = http_agent(get_options.network_timeout_ms).get(&url);
+            for (name, value) in collect_headers(headers)? {
+                request = request.header(name, value);
+            }
+            match request.call() {
+                Ok(mut response) => {
+                    let status = response.status().as_u16() as LuaInteger;
+                    let body = read_http_body(response.body_mut(), "http_get")?;
+                    Ok((Some(body), LuaValue::Integer(status)))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "http_get failed");
+                    Ok((
+                        None,
+                        LuaValue::String(lua.create_string("HTTP request failed")?),
+                    ))
+                }
+            }
         })?,
     )?;
 
     let post_options = options.clone();
     let post_ctx = ctx.clone();
-    globals.set(
+    register_function(
+        globals,
+        registry,
         "http_post",
-        lua.create_function(move |_, (url, body): (String, String)| {
-            post_ctx.push_call(
-                "http_post",
-                format!(
-                    "url={} body_bytes={}",
-                    display_url(&url, post_options.redact_network_urls),
-                    body.len()
-                ),
-            );
-            ensure_network_allowed(&post_options, &url, "http_post")?;
-            let response = http_agent(post_options.network_timeout_ms)
-                .post(&url)
-                .content_type("application/x-www-form-urlencoded")
-                .send(body.as_bytes())
-                .map_err(|error| mlua::Error::RuntimeError(format!("http_post failed: {error}")))?
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| {
-                    mlua::Error::RuntimeError(format!("http_post read failed: {error}"))
-                })?;
-            Ok(response)
-        })?,
+        lua.create_function(
+            move |lua, (url, body, headers): (String, String, Option<LuaTable>)| {
+                post_ctx.push_call(
+                    "http_post",
+                    format!(
+                        "url={} body_bytes={}",
+                        display_url(&url, post_options.redact_network_urls),
+                        body.len()
+                    ),
+                );
+                ensure_network_allowed(&post_options, &url, "http_post")?;
+                let mut request = http_agent(post_options.network_timeout_ms).post(&url);
+                for (name, value) in collect_headers(headers)? {
+                    request = request.header(name, value);
+                }
+                match request.send(body.as_bytes()) {
+                    Ok(mut response) => {
+                        let status = response.status().as_u16() as LuaInteger;
+                        let body = read_http_body(response.body_mut(), "http_post")?;
+                        Ok((Some(body), LuaValue::Integer(status)))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "http_post failed");
+                        Ok((
+                            None,
+                            LuaValue::String(lua.create_string("HTTP request failed")?),
+                        ))
+                    }
+                }
+            },
+        )?,
     )
+}
+
+fn collect_headers(headers: Option<LuaTable>) -> LuaResult<Vec<(String, String)>> {
+    headers
+        .map(|headers| headers.pairs::<String, String>().collect())
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn read_http_body(body: &mut ureq::Body, function: &str) -> LuaResult<String> {
+    body.with_config()
+        .limit(MAX_HTTP_BODY_BYTES)
+        .lossy_utf8(true)
+        .read_to_string()
+        .map_err(|error| mlua::Error::RuntimeError(format!("{function} read failed: {error}")))
 }
 
 fn ensure_network_allowed(
@@ -384,12 +545,11 @@ fn ensure_network_allowed(
 }
 
 fn http_agent(timeout_ms: Option<u64>) -> ureq::Agent {
-    let Some(timeout_ms) = timeout_ms else {
-        return ureq::Agent::new_with_defaults();
-    };
-
     ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(timeout_ms)))
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_millis(
+            timeout_ms.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS),
+        )))
         .build()
         .new_agent()
 }
@@ -428,20 +588,6 @@ fn url_host(url: &str) -> Option<&str> {
     } else {
         Some(host)
     }
-}
-
-fn merge_file_state(state: &mut ScriptState, file_state: Shared<FileState>) {
-    let mut file_state = file_state.borrow_mut();
-    state.apps.append(&mut file_state.apps);
-    state.depot_keys.extend(file_state.depot_keys.drain());
-    state.manifests.extend(file_state.manifests.drain());
-    state.app_tickets.extend(file_state.app_tickets.drain());
-    state.enc_tickets.extend(file_state.enc_tickets.drain());
-    state
-        .stat_steam_ids
-        .extend(file_state.stat_steam_ids.drain());
-    state.avatars.extend(file_state.avatars.drain());
-    state.access_tokens.extend(file_state.access_tokens.drain());
 }
 
 pub(crate) fn parse_hex_key(hex: &str) -> Option<Vec<u8>> {

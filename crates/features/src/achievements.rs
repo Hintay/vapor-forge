@@ -35,12 +35,7 @@ pub fn set_stat_steamid(app_id: AppId, steamid: u64) {
 }
 
 pub fn load_stat_steam_ids(ids: &HashMap<AppId, u64>) {
-    if ids.is_empty() {
-        return;
-    }
-    let mut guard = STAT_STEAM_IDS.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    map.extend(ids.iter().map(|(&k, &v)| (k, v)));
+    *STAT_STEAM_IDS.lock().unwrap() = Some(ids.clone());
 }
 
 fn get_ref_steamid(app_id: AppId) -> u64 {

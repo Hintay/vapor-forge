@@ -3,7 +3,7 @@ use std::sync::{Arc, Once, OnceLock};
 
 use tracing::{info, warn};
 use vapor_forge_config::{AppId, RuntimeConfig};
-use vapor_forge_scripting::ScriptState;
+use vapor_forge_scripting::{ManifestCodeProvider, ScriptRuntime, ScriptState};
 
 const CONFIG_FILENAME: &str = "config.toml";
 
@@ -15,8 +15,15 @@ pub(crate) static IPC_SERVER: OnceLock<Option<Arc<crate::ipc_server::IpcServer>>
 static CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
 
+static BASE_CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
+
 static SCRIPT_STATE: once_cell::sync::Lazy<arc_swap::ArcSwap<ScriptState>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(ScriptState::default()));
+
+static MANIFEST_CODE_PROVIDER: once_cell::sync::Lazy<
+    arc_swap::ArcSwapOption<ManifestCodeProvider>,
+> = once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
 
 static PACKAGE_STATE: once_cell::sync::Lazy<vapor_forge_features::package::PackageState> =
     once_cell::sync::Lazy::new(vapor_forge_features::package::PackageState::new);
@@ -39,12 +46,13 @@ pub fn ensure_runtime_initialized() {
         // Early init so config loading errors can be logged.
         vapor_forge_diagnostics::init("info");
 
-        let (config, config_path) = load_config();
+        let (base_config, config_path) = load_config();
 
-        vapor_forge_diagnostics::init(&config.runtime.log_level);
+        vapor_forge_diagnostics::init(&base_config.runtime.log_level);
 
         // Execute Lua scripts and merge addappid results into config.
-        let (config, script_state) = execute_and_merge_scripts(config);
+        let (config, script_runtime) = build_runtime(&base_config);
+        let script_state = &script_runtime.state;
 
         let has_script_apps = !script_state.apps.is_empty();
         let hooks_enabled =
@@ -75,9 +83,20 @@ pub fn ensure_runtime_initialized() {
             }
         }
 
+        BASE_CONFIG.store(Arc::new(base_config));
         CONFIG.store(Arc::new(config));
-        SCRIPT_STATE.store(Arc::new(script_state));
+        SCRIPT_STATE.store(Arc::new(script_runtime.state));
+        MANIFEST_CODE_PROVIDER.store(script_runtime.manifest_code_provider.map(Arc::new));
         RUNTIME_HOOKS_ENABLED.store(hooks_enabled, Ordering::Release);
+
+        crate::watcher::start(
+            &BASE_CONFIG,
+            &CONFIG,
+            &SCRIPT_STATE,
+            &MANIFEST_CODE_PROVIDER,
+            &PACKAGE_STATE,
+            config_path,
+        );
 
         #[cfg(debug_assertions)]
         if CONFIG.load().debug.control_api {
@@ -113,8 +132,6 @@ pub fn ensure_runtime_initialized() {
 
         // Force TICKET_CACHE lazy init while config is loaded.
         let _ = &*TICKET_CACHE;
-
-        crate::watcher::start(&CONFIG, &SCRIPT_STATE, &PACKAGE_STATE, config_path);
     });
 }
 
@@ -142,6 +159,10 @@ pub(crate) fn effective_ticket_mode(
 
 pub(crate) fn script_state() -> arc_swap::Guard<Arc<ScriptState>> {
     SCRIPT_STATE.load()
+}
+
+pub(crate) fn manifest_code_provider() -> Option<Arc<ManifestCodeProvider>> {
+    MANIFEST_CODE_PROVIDER.load_full()
 }
 
 pub(crate) fn package_state() -> &'static vapor_forge_features::package::PackageState {
@@ -178,20 +199,23 @@ pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
 
 /// Execute Lua scripts from default + config directories and merge addappid
 /// results into the config's inject list.
-fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, ScriptState) {
-    let dirs = build_script_dirs(&config);
+pub(crate) fn build_runtime(base_config: &RuntimeConfig) -> (RuntimeConfig, ScriptRuntime) {
+    let dirs = build_script_dirs(base_config);
     if dirs.is_empty() {
-        return (config, ScriptState::default());
+        return (base_config.clone(), ScriptRuntime::default());
     }
 
-    let state = vapor_forge_scripting::execute_scripts(&dirs);
+    let runtime = vapor_forge_scripting::execute_scripts_runtime(&dirs);
+    let config = merge_script_apps(base_config.clone(), &runtime.state.apps);
+    (config, runtime)
+}
 
-    // Merge script-added app IDs into config.apps.inject (dedup)
-    let existing_ids: std::collections::HashSet<AppId> =
+fn merge_script_apps(mut config: RuntimeConfig, apps: &[AppId]) -> RuntimeConfig {
+    let mut existing_ids: std::collections::HashSet<AppId> =
         config.apps.inject.iter().map(|a| a.id).collect();
 
-    for &app_id in &state.apps {
-        if !existing_ids.contains(&app_id) {
+    for &app_id in apps {
+        if existing_ids.insert(app_id) {
             config.apps.inject.push(vapor_forge_config::InjectApp {
                 id: app_id,
                 dlc: Vec::new(),
@@ -201,7 +225,7 @@ fn execute_and_merge_scripts(mut config: RuntimeConfig) -> (RuntimeConfig, Scrip
         }
     }
 
-    (config, state)
+    config
 }
 
 fn config_search_paths() -> Vec<std::path::PathBuf> {
@@ -277,5 +301,23 @@ pub(crate) fn sync_config_template(path: &std::path::Path) {
             error = %e,
             "hook-install: config template sync failed"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_apps_never_mutate_the_base_config() {
+        let base = RuntimeConfig::default();
+        let effective = merge_script_apps(base.clone(), &[AppId(480), AppId(480)]);
+
+        assert!(base.apps.inject.is_empty());
+        assert_eq!(effective.apps.inject.len(), 1);
+        assert_eq!(effective.apps.inject[0].id, AppId(480));
+
+        let after_script_removal = merge_script_apps(base.clone(), &[]);
+        assert!(after_script_removal.apps.inject.is_empty());
     }
 }

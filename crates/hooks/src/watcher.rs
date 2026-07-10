@@ -1,17 +1,32 @@
-use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use inotify::{Inotify, WatchMask};
+use inotify::{Inotify, WatchDescriptor, WatchMask};
 use tracing::{debug, info, warn};
-use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_config::RuntimeConfig;
 use vapor_forge_features::package::PackageState;
-use vapor_forge_scripting::ScriptState;
+use vapor_forge_scripting::{ManifestCodeProvider, ScriptState};
+
+#[derive(Default)]
+struct WatchTarget {
+    config_names: HashSet<OsString>,
+    scripts: bool,
+}
+
+#[derive(Default)]
+struct WatchSet {
+    paths: HashMap<PathBuf, WatchDescriptor>,
+    targets: HashMap<WatchDescriptor, WatchTarget>,
+}
 
 pub fn start(
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
     config_store: &'static ArcSwap<RuntimeConfig>,
     script_store: &'static ArcSwap<ScriptState>,
+    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
     package_state: &'static PackageState,
     config_path: Option<PathBuf>,
 ) {
@@ -21,140 +36,303 @@ pub fn start(
     };
 
     std::thread::Builder::new()
-        .name("config-watcher".into())
-        .spawn(move || watch_loop(path, config_store, script_store, package_state))
+        .name("config-script-watcher".into())
+        .spawn(move || {
+            watch_loop(
+                path,
+                base_config_store,
+                config_store,
+                script_store,
+                manifest_provider_store,
+                package_state,
+            )
+        })
         .ok();
 }
 
 fn watch_loop(
     path: PathBuf,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
     config_store: &'static ArcSwap<RuntimeConfig>,
     script_store: &'static ArcSwap<ScriptState>,
+    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
     package_state: &'static PackageState,
 ) {
     let mut inotify = match Inotify::init() {
-        Ok(i) => i,
-        Err(e) => {
-            warn!(error = %e, "watcher: inotify init failed");
+        Ok(inotify) => inotify,
+        Err(error) => {
+            warn!(%error, "watcher: inotify init failed");
             return;
         }
     };
+    let mut watches = WatchSet::default();
+    register_config_watch(&mut inotify, &mut watches, &path);
+    refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
 
-    let dir = match path.parent() {
-        Some(d) => d,
-        None => return,
-    };
-
-    if let Err(e) = inotify.watches().add(
-        dir,
-        WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::CREATE,
-    ) {
-        warn!(error = %e, dir = %dir.display(), "watcher: add watch failed");
-        return;
-    }
-
-    let filename = match path.file_name() {
-        Some(f) => f.to_owned(),
-        None => return,
-    };
-
-    info!(path = %path.display(), "watcher: watching config");
-
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 16 * 1024];
     loop {
         let events = match inotify.read_events_blocking(&mut buf) {
             Ok(events) => events,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                warn!(error = %e, "watcher: read_events failed");
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                warn!(%error, "watcher: read_events failed");
                 return;
             }
         };
 
-        let matched = events
-            .into_iter()
-            .any(|event| event.name.as_deref() == Some(OsStr::new(&filename)));
+        let mut config_changed = false;
+        let mut lua_changed = false;
+        for event in events {
+            classify_event(
+                &watches,
+                &event.wd,
+                event.name,
+                &mut config_changed,
+                &mut lua_changed,
+            );
+        }
 
-        if matched {
+        if config_changed || lua_changed {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            reload_config(&path, config_store, script_store, package_state);
+            loop {
+                match inotify.read_events(&mut buf) {
+                    Ok(events) => {
+                        for event in events {
+                            classify_event(
+                                &watches,
+                                &event.wd,
+                                event.name,
+                                &mut config_changed,
+                                &mut lua_changed,
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        warn!(%error, "watcher: failed to drain debounced events");
+                        break;
+                    }
+                }
+            }
+            if config_changed {
+                if reload_config(
+                    &path,
+                    base_config_store,
+                    config_store,
+                    script_store,
+                    manifest_provider_store,
+                    package_state,
+                ) {
+                    refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
+                }
+            } else {
+                reload_lua(
+                    base_config_store,
+                    config_store,
+                    script_store,
+                    manifest_provider_store,
+                    package_state,
+                );
+            }
         }
     }
 }
 
-fn reload_config(
-    path: &PathBuf,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    package_state: &'static PackageState,
+fn classify_event(
+    watches: &WatchSet,
+    wd: &WatchDescriptor,
+    name: Option<&OsStr>,
+    config_changed: &mut bool,
+    lua_changed: &mut bool,
 ) {
-    match RuntimeConfig::load(path) {
-        Ok(mut new_config) => {
-            crate::client::install::sync_config_template(path);
+    let Some(target) = watches.targets.get(wd) else {
+        return;
+    };
+    let Some(name) = name else {
+        return;
+    };
+    if target.config_names.contains(name) {
+        *config_changed = true;
+    }
+    if target.scripts && Path::new(name).extension() == Some(OsStr::new("lua")) {
+        *lua_changed = true;
+    }
+}
 
-            // Re-execute Lua scripts
-            let script_dirs = crate::client::install::build_script_dirs(&new_config);
-            let new_script_state = if !script_dirs.is_empty() {
-                vapor_forge_scripting::execute_scripts(&script_dirs)
-            } else {
-                ScriptState::default()
-            };
+fn register_config_watch(inotify: &mut Inotify, watches: &mut WatchSet, path: &Path) {
+    let Some(filename) = path.file_name() else {
+        return;
+    };
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if let Some(wd) = add_watch(inotify, watches, dir) {
+        watches
+            .targets
+            .entry(wd)
+            .or_default()
+            .config_names
+            .insert(filename.to_owned());
+        info!(path = %path.display(), "watcher: watching config");
+    }
+}
 
-            // Merge script apps into config (same as initial load)
-            let existing_ids: std::collections::HashSet<AppId> =
-                new_config.apps.inject.iter().map(|a| a.id).collect();
-            for &app_id in &new_script_state.apps {
-                if !existing_ids.contains(&app_id) {
-                    new_config.apps.inject.push(vapor_forge_config::InjectApp {
-                        id: app_id,
-                        dlc: Vec::new(),
-                        ticket: Default::default(),
-                        purchase_time: 0,
-                    });
-                }
+fn refresh_script_watches(inotify: &mut Inotify, watches: &mut WatchSet, config: &RuntimeConfig) {
+    for target in watches.targets.values_mut() {
+        target.scripts = false;
+    }
+
+    let desired = crate::client::install::build_script_dirs(config)
+        .into_iter()
+        .map(|dir| expand_dir(&dir))
+        .filter(|path| path.is_dir())
+        .collect::<HashSet<_>>();
+    for path in desired {
+        if let Some(wd) = add_watch(inotify, watches, &path) {
+            let target = watches.targets.entry(wd).or_default();
+            if !target.scripts {
+                info!(path = %path.display(), "watcher: watching Lua scripts");
             }
-
-            let inject_count = new_config.apps.inject.len();
-            let dlc_count: usize = new_config.apps.inject.iter().map(|a| a.dlc.len()).sum();
-
-            // Compute pkg0 diff BEFORE updating stores
-            let controlled = vapor_forge_features::package::controlled_app_ids(
-                &new_config,
-                &new_script_state.apps,
-            );
-            let diff = package_state.compute_hot_reload_diff(&controlled);
-
-            // Reload AppAvatar static map (config + lua).
-            vapor_forge_features::app_avatar::load_static_map(&new_config.app_avatar);
-            for (&app, &avatar) in &new_script_state.avatars {
-                vapor_forge_features::app_avatar::set_avatar(app, avatar);
-            }
-
-            // Update stores
-            config_store.store(Arc::new(new_config));
-            script_store.store(Arc::new(new_script_state));
-
-            // Apply pkg0 diff if pkg0 injection is active
-            if package_state.is_active()
-                && (!diff.additions.is_empty() || !diff.removals.is_empty())
-            {
-                // SAFETY: pkg0 and cuser are captured when package_state is active,
-                // and all function pointers are resolved.
-                unsafe { crate::client::package::apply_reload_diff(&diff) };
-                package_state.apply_diff(&diff);
-                info!(
-                    additions = diff.additions.len(),
-                    removals = diff.removals.len(),
-                    "watcher: pkg0 diff applied"
-                );
-            }
-
-            info!(inject = inject_count, dlc = dlc_count, "config reloaded");
-        }
-        Err(e) => {
-            warn!(error = %e, "watcher: reload failed, keeping previous");
+            target.scripts = true;
         }
     }
+
+    let stale = watches
+        .targets
+        .iter()
+        .filter(|(_, target)| !target.scripts && target.config_names.is_empty())
+        .map(|(wd, _)| wd.clone())
+        .collect::<Vec<_>>();
+    for wd in stale {
+        if let Err(error) = inotify.watches().remove(wd.clone()) {
+            warn!(%error, "watcher: remove stale Lua watch failed");
+        }
+        watches.targets.remove(&wd);
+        watches.paths.retain(|_, existing| existing != &wd);
+    }
+}
+
+fn add_watch(
+    inotify: &mut Inotify,
+    watches: &mut WatchSet,
+    path: &Path,
+) -> Option<WatchDescriptor> {
+    if let Some(wd) = watches.paths.get(path) {
+        return Some(wd.clone());
+    }
+    let mask = WatchMask::CLOSE_WRITE
+        | WatchMask::MOVED_TO
+        | WatchMask::MOVED_FROM
+        | WatchMask::CREATE
+        | WatchMask::DELETE;
+    match inotify.watches().add(path, mask) {
+        Ok(wd) => {
+            watches.paths.insert(path.to_path_buf(), wd.clone());
+            watches.targets.entry(wd.clone()).or_default();
+            Some(wd)
+        }
+        Err(error) => {
+            warn!(%error, path = %path.display(), "watcher: add watch failed");
+            None
+        }
+    }
+}
+
+fn expand_dir(dir: &str) -> PathBuf {
+    if let Some(rest) = dir.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(dir)
+}
+
+fn reload_config(
+    path: &Path,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    config_store: &'static ArcSwap<RuntimeConfig>,
+    script_store: &'static ArcSwap<ScriptState>,
+    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
+    package_state: &'static PackageState,
+) -> bool {
+    match RuntimeConfig::load(path) {
+        Ok(base_config) => {
+            crate::client::install::sync_config_template(path);
+            publish_runtime(
+                base_config,
+                base_config_store,
+                config_store,
+                script_store,
+                manifest_provider_store,
+                package_state,
+                "config and Lua scripts reloaded",
+            );
+            true
+        }
+        Err(error) => {
+            warn!(%error, "watcher: config reload failed, keeping previous runtime");
+            false
+        }
+    }
+}
+
+fn reload_lua(
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    config_store: &'static ArcSwap<RuntimeConfig>,
+    script_store: &'static ArcSwap<ScriptState>,
+    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
+    package_state: &'static PackageState,
+) {
+    publish_runtime(
+        (**base_config_store.load()).clone(),
+        base_config_store,
+        config_store,
+        script_store,
+        manifest_provider_store,
+        package_state,
+        "Lua scripts reloaded",
+    );
+}
+
+fn publish_runtime(
+    base_config: RuntimeConfig,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    config_store: &'static ArcSwap<RuntimeConfig>,
+    script_store: &'static ArcSwap<ScriptState>,
+    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
+    package_state: &'static PackageState,
+    message: &'static str,
+) {
+    let (new_config, new_script_runtime) = crate::client::install::build_runtime(&base_config);
+    let new_script_state = &new_script_runtime.state;
+    let inject_count = new_config.apps.inject.len();
+    let dlc_count: usize = new_config.apps.inject.iter().map(|app| app.dlc.len()).sum();
+    let controlled =
+        vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
+    let diff = package_state.compute_hot_reload_diff(&controlled);
+
+    vapor_forge_features::achievements::load_stat_steam_ids(&new_script_state.stat_steam_ids);
+    vapor_forge_features::app_avatar::load_static_map(&new_config.app_avatar);
+    for (&app, &avatar) in &new_script_state.avatars {
+        vapor_forge_features::app_avatar::set_avatar(app, avatar);
+    }
+
+    base_config_store.store(Arc::new(base_config));
+    config_store.store(Arc::new(new_config));
+    script_store.store(Arc::new(new_script_runtime.state));
+    manifest_provider_store.store(new_script_runtime.manifest_code_provider.map(Arc::new));
+
+    if package_state.is_active() && (!diff.additions.is_empty() || !diff.removals.is_empty()) {
+        // SAFETY: active package state owns the captured pkg0/cuser pointers and hooks.
+        unsafe { crate::client::package::apply_reload_diff(&diff) };
+        package_state.apply_diff(&diff);
+        info!(
+            additions = diff.additions.len(),
+            removals = diff.removals.len(),
+            "watcher: pkg0 diff applied"
+        );
+    }
+
+    info!(inject = inject_count, dlc = dlc_count, message);
 }

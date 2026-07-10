@@ -15,6 +15,17 @@ use vapor_forge_abi::{
 };
 use vapor_forge_config::{AppId, RuntimeConfig};
 
+pub type ManifestCodeCallback =
+    Arc<dyn Fn(u32, u32, u64) -> Result<Option<u64>, String> + Send + Sync>;
+
+pub struct ManifestCodeFetch {
+    pub job_id: u64,
+    pub app_id: u32,
+    pub depot_id: u32,
+    pub gid: u64,
+    pub req_hdr_bytes: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -75,11 +86,17 @@ impl PendingQueue {
     /// the external providers and stores the result for later draining.
     pub fn queue_fetch(
         &self,
-        job_id: u64,
-        gid: u64,
-        req_hdr_bytes: Vec<u8>,
+        request: ManifestCodeFetch,
         config: &RuntimeConfig,
+        lua_callback: Option<ManifestCodeCallback>,
     ) {
+        let ManifestCodeFetch {
+            job_id,
+            app_id,
+            depot_id,
+            gid,
+            req_hdr_bytes,
+        } = request;
         let result = Arc::new(Mutex::new(None));
         let done = Arc::new(AtomicBool::new(false));
 
@@ -105,7 +122,16 @@ impl PendingQueue {
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
         std::thread::spawn(move || {
-            let code = fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms);
+            let lua_code =
+                lua_callback.and_then(|callback| match callback(app_id, depot_id, gid) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        warn!(gid, %error, "request_code: Lua provider unavailable");
+                        None
+                    }
+                });
+            let code = lua_code
+                .or_else(|| fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms));
             {
                 let mut lock = result_clone.lock().unwrap();
                 // Some(0) = failed, Some(n) = success
@@ -371,6 +397,44 @@ mod tests {
         };
         assert!(should_intercept(AppId(480), &config));
         assert!(!should_intercept(AppId(999), &config));
+    }
+
+    #[test]
+    fn pending_queue_uses_lua_callback_with_request_context() {
+        let queue = PendingQueue::new();
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_callback = Arc::clone(&seen);
+        let callback: ManifestCodeCallback = Arc::new(move |app_id, depot_id, gid| {
+            *seen_by_callback.lock().unwrap() = Some((app_id, depot_id, gid));
+            Ok(Some(4444))
+        });
+
+        queue.queue_fetch(
+            ManifestCodeFetch {
+                job_id: 99,
+                app_id: 480,
+                depot_id: 481,
+                gid: 1234,
+                req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
+            },
+            &RuntimeConfig::default(),
+            Some(callback),
+        );
+
+        let completed = (0..100)
+            .find_map(|_| {
+                let completed = queue.drain_completed();
+                if completed.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                } else {
+                    Some(completed)
+                }
+            })
+            .expect("Lua callback did not complete");
+        assert_eq!(*seen.lock().unwrap(), Some((480, 481, 1234)));
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].code, 4444);
     }
 
     #[test]

@@ -54,6 +54,20 @@ fn print_text(args: &Args, dirs: &[String], report: &ScriptExecutionReport) {
         println!("network_timeout_ms={timeout_ms}");
     }
     print_list("skipped_dirs", &report.skipped_dirs);
+    println!(
+        "fetch_manifest_code={}",
+        report
+            .manifest_code_provider
+            .as_ref()
+            .is_some_and(|provider| provider.has_basic())
+    );
+    println!(
+        "fetch_manifest_code_ex={}",
+        report
+            .manifest_code_provider
+            .as_ref()
+            .is_some_and(|provider| provider.has_extended())
+    );
 
     println!("file_execution_order:");
     if report.files.is_empty() {
@@ -323,6 +337,8 @@ struct JsonOutput {
     allowed_hosts: Vec<String>,
     network_timeout_ms: Option<u64>,
     skipped_dirs: Vec<String>,
+    fetch_manifest_code: bool,
+    fetch_manifest_code_ex: bool,
     files: Vec<JsonFile>,
     lua_calls: Vec<JsonCall>,
     state: JsonState,
@@ -336,6 +352,14 @@ impl JsonOutput {
             allowed_hosts: args.allowed_hosts.clone(),
             network_timeout_ms: args.network_timeout_ms,
             skipped_dirs: report.skipped_dirs.clone(),
+            fetch_manifest_code: report
+                .manifest_code_provider
+                .as_ref()
+                .is_some_and(|provider| provider.has_basic()),
+            fetch_manifest_code_ex: report
+                .manifest_code_provider
+                .as_ref()
+                .is_some_and(|provider| provider.has_extended()),
             files: report
                 .files
                 .iter()

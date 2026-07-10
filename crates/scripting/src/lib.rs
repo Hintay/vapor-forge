@@ -4,12 +4,17 @@ use thiserror::Error;
 
 mod bindings;
 mod executor;
+mod manifest_provider;
 mod report;
 
 #[cfg(test)]
 mod tests;
 
-pub use executor::{execute_scripts, execute_scripts_report, execute_scripts_report_with_options};
+pub use executor::{
+    execute_scripts, execute_scripts_report, execute_scripts_report_with_options,
+    execute_scripts_runtime, ScriptRuntime,
+};
+pub use manifest_provider::ManifestCodeProvider;
 pub use report::{
     ScriptCallReport, ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport,
 };

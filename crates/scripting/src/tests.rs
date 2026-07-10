@@ -3,7 +3,7 @@ use vapor_forge_core::{AppId, DepotId, ManifestId};
 use crate::bindings::parse_hex_key;
 use crate::{
     execute_scripts, execute_scripts_report, execute_scripts_report_with_options,
-    ScriptExecutionOptions,
+    execute_scripts_runtime, ScriptExecutionOptions,
 };
 
 #[test]
@@ -20,10 +20,51 @@ fn parses_hex_key() {
 fn executes_addappid_script() {
     let dir = std::env::temp_dir().join(format!("lua-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    std::fs::write(dir.join("test.lua"), "addappid(480)\naddappid(730)\n").unwrap();
+    std::fs::write(dir.join("test.lua"), "AddAppId(480)\nADDAPPID(730)\n").unwrap();
 
     let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
     assert_eq!(state.apps, vec![AppId(480), AppId(730)]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn addappid_deduplicates_and_rejects_out_of_range_ids() {
+    let dir = std::env::temp_dir().join(format!("lua-addappid-validation-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        "addappid(-1)\naddappid(480)\naddappid(480)\n",
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert_eq!(report.state.apps, vec![AppId(480)]);
+    assert!(report.files[0]
+        .result
+        .as_ref()
+        .unwrap_err()
+        .contains("arg1 must be integer"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn addappid_only_records_exact_depot_keys() {
+    let dir = std::env::temp_dir().join(format!("lua-depot-key-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "addappid(480, 1, \"deadbeef\")\n",
+            "addappid(730, 1, \"0000000000000000000000000000000000000000000000000000000000000000\")\n",
+        ),
+    )
+    .unwrap();
+
+    let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
+    assert!(!state.depot_keys.contains_key(&DepotId(480)));
+    assert_eq!(state.depot_keys[&DepotId(730)], vec![0; 32]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -36,7 +77,7 @@ fn executes_setmanifestid_script() {
         dir.join("test.lua"),
         concat!(
             "setmanifestid(12345, \"9876543210\", 1024)\n",
-            "setManifestid(12346, \"9876543211\", 2048)\n",
+            "SETManifestID(12346, \"9876543211\", 2048)\n",
         ),
     )
     .unwrap();
@@ -59,7 +100,7 @@ fn executes_setstat_script() {
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(
         dir.join("test.lua"),
-        "setstat(480, \"76561198000000000\")\n",
+        "setStat(480, \"76561198000000000\")\n",
     )
     .unwrap();
 
@@ -68,6 +109,170 @@ fn executes_setstat_script() {
         state.stat_steam_ids.get(&AppId(480)),
         Some(&76561198000000000)
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn registered_functions_are_case_insensitive_and_addtoken_is_standard() {
+    let dir = std::env::temp_dir().join(format!("lua-case-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "AddAppId(480)\n",
+            "SetAppTicket(480, \"deadbeef\")\n",
+            "SETETICKET(480, \"cafebabe\")\n",
+            "SetStat(480, \"76561198000000000\")\n",
+            "SetAvatar(480, 730)\n",
+            "AddToken(480, \"18446744073709551615\")\n",
+            "assert(setAccessToken == nil)\n",
+        ),
+    )
+    .unwrap();
+
+    let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
+    assert_eq!(state.apps, vec![AppId(480)]);
+    assert_eq!(state.app_tickets[&AppId(480)], vec![0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(state.enc_tickets[&AppId(480)], vec![0xca, 0xfe, 0xba, 0xbe]);
+    assert_eq!(state.stat_steam_ids[&AppId(480)], 76561198000000000);
+    assert_eq!(state.avatars[&AppId(480)], AppId(730));
+    assert_eq!(state.access_tokens[&AppId(480)], u64::MAX);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn manifest_code_callbacks_prefer_extended_then_fall_back_to_basic() {
+    let dir = std::env::temp_dir().join(format!("lua-provider-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("00-helper.lua"),
+        "function extended_code() return \"18446744073709551615\" end\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("manifest.lua"),
+        concat!(
+            "function fetch_manifest_code_ex(app_id, depot_id, gid)\n",
+            "  if app_id == 480 and depot_id == 481 then return extended_code() end\n",
+            "  return nil\n",
+            "end\n",
+            "function fetch_manifest_code(gid)\n",
+            "  return \"9876543210\"\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let provider = runtime.manifest_code_provider.unwrap();
+    assert!(provider.has_extended());
+    assert!(provider.has_basic());
+    assert_eq!(provider.fetch(480, 481, 123).unwrap(), Some(u64::MAX));
+    assert_eq!(provider.fetch(999, 1000, 123).unwrap(), Some(9876543210));
+    assert_eq!(provider.fetch(0, 1000, 123).unwrap(), Some(9876543210));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn manifest_callback_receives_exact_64_bit_gid() {
+    let dir = std::env::temp_dir().join(format!("lua-provider-gid-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("manifest.lua"),
+        "function fetch_manifest_code(gid) return tostring(gid) end\n",
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let provider = runtime.manifest_code_provider.unwrap();
+    let gid = 7_722_356_807_987_328_477_u64;
+    assert_eq!(provider.fetch(1, 1, gid).unwrap(), Some(gid));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scripts_share_one_vm_and_continue_after_runtime_errors() {
+    let dir = std::env::temp_dir().join(format!("lua-shared-runtime-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("00-helper.lua"),
+        "function shared_app() return 480 end\naddappid(shared_app())\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("10-consumer.lua"),
+        concat!(
+            "error(\"expected failure\")\n",
+            "addappid(730)\n",
+            "function fetch_manifest_code(gid) return tostring(shared_app() + gid) end\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert_eq!(report.state.apps, vec![AppId(480), AppId(730)]);
+    assert!(report.files.iter().any(|file| file.result.is_err()));
+    assert!(report
+        .manifest_code_provider
+        .unwrap()
+        .fetch(1, 1, 1)
+        .unwrap()
+        .is_some_and(|code| code == 481));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn provider_scripts_execute_top_level_side_effects_once() {
+    let dir = std::env::temp_dir().join(format!("lua-single-execution-{}", std::process::id()));
+    let marker = dir.join("runs.txt");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("manifest.lua"),
+        format!(
+            concat!(
+                "side_effect_file = assert(io.open(\"{}\", \"a\"))\n",
+                "side_effect_file:write(\"x\")\n",
+                "side_effect_file:close()\n",
+                "function fetch_manifest_code(gid) return \"1\" end\n",
+            ),
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    assert!(runtime.manifest_code_provider.is_some());
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn http_helpers_accept_headers_and_return_failure_status() {
+    let dir = std::env::temp_dir().join(format!("lua-http-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "body, status = HTTP_GET(\"invalid://manifest\", ",
+            "{[\"X-Test\"] = \"yes\"})\n",
+            "assert(body == nil)\n",
+            "assert(status == \"HTTP request failed\")\n",
+            "post_body, post_status = HTTP_POST(\"invalid://manifest\", \"x=1\", ",
+            "{[\"X-Test\"] = \"yes\"})\n",
+            "assert(post_body == nil)\n",
+            "assert(post_status == \"HTTP request failed\")\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert!(report.files.iter().all(|file| file.result.is_ok()));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

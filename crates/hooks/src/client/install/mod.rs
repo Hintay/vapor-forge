@@ -19,8 +19,8 @@ mod steamui;
 pub use runtime::ensure_runtime_initialized;
 use runtime::runtime_hooks_enabled;
 pub(crate) use runtime::{
-    build_script_dirs, config, effective_ticket_mode, package_state, script_state,
-    sync_config_template, IPC_SERVER, TICKET_CACHE,
+    build_runtime, build_script_dirs, config, effective_ticket_mode, manifest_code_provider,
+    package_state, script_state, sync_config_template, IPC_SERVER, TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
