@@ -633,6 +633,386 @@ pub struct GetManifestRequestCodeResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Steam client Cloud service RPCs
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, prost::Message)]
+pub struct CloudCdnReportNotification {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steam_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub url: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub success: Option<bool>,
+    #[prost(uint32, optional, tag = "4")]
+    pub http_status_code: Option<u32>,
+    #[prost(uint64, optional, tag = "5")]
+    pub expected_bytes: Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub received_bytes: Option<u64>,
+    #[prost(uint32, optional, tag = "7")]
+    pub duration: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudExternalStorageTransferReportNotification {
+    #[prost(string, optional, tag = "1")]
+    pub host: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub path: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub is_upload: Option<bool>,
+    #[prost(bool, optional, tag = "4")]
+    pub success: Option<bool>,
+    #[prost(uint32, optional, tag = "5")]
+    pub http_status_code: Option<u32>,
+    #[prost(uint64, optional, tag = "6")]
+    pub bytes_expected: Option<u64>,
+    #[prost(uint64, optional, tag = "7")]
+    pub bytes_actual: Option<u64>,
+    #[prost(uint32, optional, tag = "8")]
+    pub duration_ms: Option<u32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub cell_id: Option<u32>,
+    #[prost(bool, optional, tag = "10")]
+    pub proxied: Option<bool>,
+    #[prost(bool, optional, tag = "11")]
+    pub ipv6_local: Option<bool>,
+    #[prost(bool, optional, tag = "12")]
+    pub ipv6_remote: Option<bool>,
+    #[prost(uint32, optional, tag = "13")]
+    pub time_to_connect_ms: Option<u32>,
+    #[prost(uint32, optional, tag = "14")]
+    pub time_to_send_request_ms: Option<u32>,
+    #[prost(uint32, optional, tag = "15")]
+    pub time_to_first_byte_ms: Option<u32>,
+    #[prost(uint32, optional, tag = "16")]
+    pub time_to_last_byte_ms: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudBeginAppUploadBatchRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(string, optional, tag = "2")]
+    pub machine_name: Option<String>,
+    #[prost(string, repeated, tag = "3")]
+    pub files_to_upload: Vec<String>,
+    #[prost(string, repeated, tag = "4")]
+    pub files_to_delete: Vec<String>,
+    #[prost(uint64, optional, tag = "5")]
+    pub client_id: Option<u64>,
+    #[prost(uint64, optional, tag = "6")]
+    pub app_build_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudBeginAppUploadBatchResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub batch_id: Option<u64>,
+    #[prost(uint64, optional, tag = "4")]
+    pub app_change_number: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudCompleteAppUploadBatchRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub batch_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub batch_eresult: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudCompleteAppUploadBatchResponse {}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientBeginFileUploadRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub file_size: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub raw_file_size: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub file_sha: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "5")]
+    pub timestamp: Option<u64>,
+    #[prost(string, optional, tag = "6")]
+    pub filename: Option<String>,
+    #[prost(uint32, optional, tag = "7")]
+    pub platforms_to_sync: Option<u32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub cell_id: Option<u32>,
+    #[prost(bool, optional, tag = "10")]
+    pub can_encrypt: Option<bool>,
+    #[prost(bool, optional, tag = "11")]
+    pub is_shared_file: Option<bool>,
+    #[prost(uint32, optional, tag = "12")]
+    pub deprecated_realm: Option<u32>,
+    #[prost(uint64, optional, tag = "13")]
+    pub upload_batch_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudHttpHeader {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub value: Option<String>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudFileUploadBlockDetails {
+    #[prost(string, optional, tag = "1")]
+    pub url_host: Option<String>,
+    #[prost(string, optional, tag = "2")]
+    pub url_path: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub use_https: Option<bool>,
+    #[prost(int32, optional, tag = "4")]
+    pub http_method: Option<i32>,
+    #[prost(message, repeated, tag = "5")]
+    pub request_headers: Vec<CloudHttpHeader>,
+    #[prost(uint64, optional, tag = "6")]
+    pub block_offset: Option<u64>,
+    #[prost(uint32, optional, tag = "7")]
+    pub block_length: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "8")]
+    pub explicit_body_data: Option<Vec<u8>>,
+    #[prost(bool, optional, tag = "9")]
+    pub may_parallelize: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientBeginFileUploadResponse {
+    #[prost(bool, optional, tag = "1")]
+    pub encrypt_file: Option<bool>,
+    #[prost(message, repeated, tag = "2")]
+    pub block_requests: Vec<CloudFileUploadBlockDetails>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientCommitFileUploadRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub transfer_succeeded: Option<bool>,
+    #[prost(uint32, optional, tag = "2")]
+    pub app_id: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub file_sha: Option<Vec<u8>>,
+    #[prost(string, optional, tag = "4")]
+    pub filename: Option<String>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientCommitFileUploadResponse {
+    #[prost(bool, optional, tag = "1")]
+    pub file_committed: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientFileDownloadRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(string, optional, tag = "2")]
+    pub filename: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub realm: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub force_proxy: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientFileDownloadResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub file_size: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub raw_file_size: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub sha_file: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "5")]
+    pub timestamp: Option<u64>,
+    #[prost(bool, optional, tag = "6")]
+    pub is_explicit_delete: Option<bool>,
+    #[prost(string, optional, tag = "7")]
+    pub url_host: Option<String>,
+    #[prost(string, optional, tag = "8")]
+    pub url_path: Option<String>,
+    #[prost(bool, optional, tag = "9")]
+    pub use_https: Option<bool>,
+    #[prost(message, repeated, tag = "10")]
+    pub request_headers: Vec<CloudHttpHeader>,
+    #[prost(bool, optional, tag = "11")]
+    pub encrypted: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientDeleteFileRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(string, optional, tag = "2")]
+    pub filename: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub is_explicit_delete: Option<bool>,
+    #[prost(uint64, optional, tag = "4")]
+    pub upload_batch_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientDeleteFileResponse {}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientConflictResolutionNotification {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(bool, optional, tag = "2")]
+    pub chose_local_files: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudGetAppFileChangelistRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub synced_change_number: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppFileInfo {
+    #[prost(string, optional, tag = "1")]
+    pub file_name: Option<String>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub sha_file: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "3")]
+    pub timestamp: Option<u64>,
+    #[prost(uint32, optional, tag = "4")]
+    pub raw_file_size: Option<u32>,
+    #[prost(int32, optional, tag = "5")]
+    pub persist_state: Option<i32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub platforms_to_sync: Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    pub path_prefix_index: Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    pub machine_name_index: Option<u32>,
+    #[prost(bool, optional, tag = "9")]
+    pub reupload_requested: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudGetAppFileChangelistResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub current_change_number: Option<u64>,
+    #[prost(message, repeated, tag = "2")]
+    pub files: Vec<CloudAppFileInfo>,
+    #[prost(bool, optional, tag = "3")]
+    pub is_only_delta: Option<bool>,
+    #[prost(string, repeated, tag = "4")]
+    pub path_prefixes: Vec<String>,
+    #[prost(string, repeated, tag = "5")]
+    pub machine_names: Vec<String>,
+    #[prost(uint64, optional, tag = "6")]
+    pub app_build_id_hwm: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppSessionSuspendRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub client_id: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub machine_name: Option<String>,
+    #[prost(bool, optional, tag = "4")]
+    pub cloud_sync_completed: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppSessionSuspendResponse {}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppSessionResumeRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub client_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppSessionResumeResponse {}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppLaunchIntentRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub client_id: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub machine_name: Option<String>,
+    #[prost(bool, optional, tag = "4")]
+    pub ignore_pending_operations: Option<bool>,
+    #[prost(int32, optional, tag = "5")]
+    pub os_type: Option<i32>,
+    #[prost(int32, optional, tag = "6")]
+    pub device_type: Option<i32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudPendingRemoteOperation {
+    #[prost(int32, optional, tag = "1")]
+    pub operation: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub machine_name: Option<String>,
+    #[prost(uint64, optional, tag = "3")]
+    pub client_id: Option<u64>,
+    #[prost(uint32, optional, tag = "4")]
+    pub time_last_updated: Option<u32>,
+    #[prost(int32, optional, tag = "5")]
+    pub os_type: Option<i32>,
+    #[prost(int32, optional, tag = "6")]
+    pub device_type: Option<i32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppLaunchIntentResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub pending_remote_operations: Vec<CloudPendingRemoteOperation>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudAppExitSyncDoneNotification {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub client_id: Option<u64>,
+    #[prost(bool, optional, tag = "3")]
+    pub uploads_completed: Option<bool>,
+    #[prost(bool, optional, tag = "4")]
+    pub uploads_required: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientGetAppQuotaUsageRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CloudClientGetAppQuotaUsageResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub existing_files: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub existing_bytes: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub max_num_files: Option<u32>,
+    #[prost(uint64, optional, tag = "4")]
+    pub max_num_bytes: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // Encrypted app ticket
 // ---------------------------------------------------------------------------
 
