@@ -36,7 +36,12 @@ pub(crate) extern "C" fn hk_check_app_ownership(
 ) -> u32 {
     // SAFETY: OWNERSHIP_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("CheckAppOwnership", OWNERSHIP_DETOUR, 0);
+    let pkg0_was_injected = PKG0_INJECTED.load(Ordering::Acquire);
     let result = original.call(this, app_id, out);
+
+    if !pkg0_was_injected {
+        vapor_forge_features::apps::record_actual_ownership(AppId(app_id), result != 0);
+    }
 
     if out.is_null() {
         return result;
@@ -66,6 +71,8 @@ pub(crate) extern "C" fn hk_check_app_ownership(
         let pkg_state = package_state();
         let plan = pkg_state.compute_injection(&controlled);
 
+        snapshot_with_original(original, this, &plan.app_ids);
+
         // SAFETY: pkg0 and cuser captured, function pointers resolved.
         let injected = unsafe { super::package::try_inject_once(&plan.app_ids) };
         pkg_state.record_injected(&injected);
@@ -81,6 +88,36 @@ pub(crate) extern "C" fn hk_check_app_ownership(
     // If pkg0 injection is active, Steam's original already sees ownership
     // from pkg0. Still run the spoof as fallback for edge cases.
     vapor_forge_features::apps::on_check_ownership(&cfg, AppId(app_id), result, info)
+}
+
+fn snapshot_with_original(
+    original: &GenericDetour<CheckAppOwnershipFn>,
+    this: *mut c_void,
+    app_ids: &[AppId],
+) {
+    for &app_id in app_ids {
+        let mut info = CAppOwnershipInfo::zeroed();
+        let result = original.call(this, app_id.0, &mut info);
+        vapor_forge_features::apps::record_actual_ownership(app_id, result != 0);
+    }
+}
+
+/// Snapshot hot-reload additions before they are appended to pkg0.
+///
+/// # Safety
+/// The captured CUser pointer and ownership detour must still be valid.
+pub(crate) unsafe fn snapshot_actual_ownership(app_ids: &[AppId]) {
+    if app_ids.is_empty() {
+        return;
+    }
+    let Some(original) = (unsafe { (*std::ptr::addr_of!(OWNERSHIP_DETOUR)).as_ref() }) else {
+        return;
+    };
+    let this = super::package::CUSER_PTR.load(Ordering::Acquire) as *mut c_void;
+    if this.is_null() {
+        return;
+    }
+    snapshot_with_original(original, this, app_ids);
 }
 
 // ---------------------------------------------------------------------------

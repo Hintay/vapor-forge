@@ -348,6 +348,9 @@ pub fn pump_reload() {
     }
     let package_state = crate::client::install::package_state();
     let diff = package_state.compute_hot_reload_diff(&controlled);
+    // Query through the original detour before additions become visible in pkg0.
+    // SAFETY: this pump runs inside CheckAppOwnership with a captured CUser.
+    unsafe { super::ownership::snapshot_actual_ownership(&diff.additions) };
     // SAFETY: this pump runs inside CheckAppOwnership after pkg0/cuser capture.
     let applied = unsafe { apply_reload_diff(&diff) };
     package_state.apply_diff(&applied);

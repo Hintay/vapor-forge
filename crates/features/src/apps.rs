@@ -1,19 +1,33 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tracing::info;
 use vapor_forge_abi::CAppOwnershipInfo;
 use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
-static ACTUALLY_OWNED: Mutex<Option<HashSet<AppId>>> = Mutex::new(None);
+static ACTUAL_OWNERSHIP: Mutex<Option<HashMap<AppId, bool>>> = Mutex::new(None);
 
-/// Returns true if a controlled app is actually owned by the user.
-pub fn is_actually_owned(app_id: AppId) -> bool {
-    ACTUALLY_OWNED
+/// Return the ownership result captured before pkg0 could affect it.
+pub fn actual_ownership(app_id: AppId) -> Option<bool> {
+    ACTUAL_OWNERSHIP
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|s| s.contains(&app_id))
+        .and_then(|ownership| ownership.get(&app_id).copied())
+}
+
+/// Returns true if a controlled app is actually owned by the user.
+pub fn is_actually_owned(app_id: AppId) -> bool {
+    actual_ownership(app_id) == Some(true)
+}
+
+/// Record an ownership result obtained before the app is added to pkg0.
+pub fn record_actual_ownership(app_id: AppId, owned: bool) {
+    ACTUAL_OWNERSHIP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(app_id, owned);
 }
 
 pub fn on_check_ownership(
@@ -25,13 +39,6 @@ pub fn on_check_ownership(
     let category = config.app_category(app_id);
 
     if let Some(AppCategory::Inject | AppCategory::InjectDlc { .. }) = category {
-        if original_result != 0 {
-            ACTUALLY_OWNED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert_with(HashSet::new)
-                .insert(app_id);
-        }
         if original_result == 0 {
             info.grant_spoofed_ownership(1_600_000_000);
             info!(app_id = app_id.0, "feat: ownership granted");
@@ -121,6 +128,22 @@ mod tests {
         let result = on_check_ownership(&config, AppId(480), 1, &mut info);
         assert_eq!(result, 1);
         assert_eq!(info.owner(), 99);
+    }
+
+    #[test]
+    fn spoofed_followup_result_does_not_poison_actual_ownership() {
+        let app_id = AppId(246_813_581);
+        let config = config_with_inject(&[app_id.0]);
+        record_actual_ownership(app_id, false);
+
+        let mut info = zeroed_info();
+        assert_eq!(on_check_ownership(&config, app_id, 1, &mut info), 1);
+        assert_eq!(actual_ownership(app_id), Some(false));
+        assert!(!is_actually_owned(app_id));
+
+        record_actual_ownership(app_id, true);
+        assert_eq!(actual_ownership(app_id), Some(true));
+        assert!(is_actually_owned(app_id));
     }
 
     #[test]
