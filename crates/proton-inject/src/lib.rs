@@ -71,6 +71,11 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
+/// Observe a loader object-open callback without requesting symbol interception.
+///
+/// # Safety
+/// Called by glibc with loader-owned pointers; this implementation does not
+/// dereference them.
 pub unsafe extern "C" fn la_objopen(
     _map: *mut c_void,
     _lmid: libc::c_long,
@@ -81,6 +86,11 @@ pub unsafe extern "C" fn la_objopen(
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
+/// Observe a loader object-close callback.
+///
+/// # Safety
+/// Called by glibc with a loader-owned cookie; this implementation does not
+/// dereference it.
 pub unsafe extern "C" fn la_objclose(_cookie: *mut usize) -> c_uint {
     0
 }

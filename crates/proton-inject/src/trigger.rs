@@ -22,7 +22,7 @@ pub fn trigger_already_loaded(maps: &[MapEntry]) -> bool {
             e.path
                 .rsplit('/')
                 .next()
-                .map_or(false, |name| ascii_eq_ci(name, dll))
+                .is_some_and(|name| ascii_eq_ci(name, dll))
         })
     })
 }
@@ -63,14 +63,14 @@ fn ascii_eq_ci(a: &str, b: &str) -> bool {
     }
     a.bytes()
         .zip(b.bytes())
-        .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+        .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 fn ascii_char_eq_ci(wide: u16, ascii: u8) -> bool {
     if wide > 127 {
         return false;
     }
-    (wide as u8).to_ascii_lowercase() == ascii.to_ascii_lowercase()
+    (wide as u8).eq_ignore_ascii_case(&ascii)
 }
 
 #[cfg(test)]

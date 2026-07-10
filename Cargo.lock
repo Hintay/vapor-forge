@@ -1144,6 +1144,7 @@ dependencies = [
 name = "vapor-forge-proton-inject"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "libc",
  "vapor-forge-inject-protocol",
  "vapor-forge-pe",

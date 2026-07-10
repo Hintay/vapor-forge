@@ -51,7 +51,6 @@ pub fn install_trigger() -> bool {
     };
 
     TRAMPOLINE.store(detour.trampoline, Ordering::Release);
-    std::mem::forget(detour); // trampoline must live forever
 
     log("LdrLoadDll detour installed");
 
@@ -159,6 +158,8 @@ fn load_helper_now() {
     };
     let mut base: *mut core::ffi::c_void = std::ptr::null_mut();
 
+    // SAFETY: orig is the relocated LdrLoadDll trampoline and all pointers live
+    // through the call.
     let status = unsafe { orig(std::ptr::null_mut(), 0, &mut us, &mut base) };
     if status == STATUS_SUCCESS {
         log("DLL loaded successfully");
@@ -226,6 +227,8 @@ pub(crate) fn log(msg: &str) {
 
     const MAX_LOG_SIZE: libc::off_t = 512 * 1024;
 
+    // SAFETY: all libc calls use the valid CString path or stack/string buffers,
+    // and failures are handled by returning early or ignoring diagnostic output.
     unsafe {
         let fd = libc::open(
             path.as_ptr(),

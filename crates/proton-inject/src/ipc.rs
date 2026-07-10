@@ -54,6 +54,7 @@ pub fn try_connect() {
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.set_read_timeout(Some(timeout));
 
+    // SAFETY: getpid has no preconditions.
     let pid = unsafe { libc::getpid() } as u32;
     let hello = Message::Hello { token, app_id, pid };
     if let Err(e) = proto::write_message(&mut stream, &hello) {
