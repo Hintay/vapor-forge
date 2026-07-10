@@ -12,6 +12,8 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use retour::GenericDetour;
+#[cfg(target_pointer_width = "64")]
+use tracing::error;
 use tracing::{info, warn};
 use vapor_forge_abi::steamui::CSteamApp;
 use vapor_forge_config::AppId;

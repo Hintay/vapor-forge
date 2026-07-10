@@ -22,5 +22,6 @@ serde_json = { workspace = true, optional = true }
 vapor-forge-abi = { path = "../steam-abi" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }
+vapor-forge-packet-inspect = { path = "../packet-inspect" }
 tracing.workspace = true
 ureq.workspace = true

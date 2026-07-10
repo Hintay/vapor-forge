@@ -146,32 +146,31 @@ fn install_setmanifestid(
 ) -> Result<(), mlua::Error> {
     let state = state.clone();
     let ctx = ctx.clone();
-    globals.set(
-        "setmanifestid",
-        lua.create_function(
-            move |_, (depot_id_raw, gid_str, size): (u32, String, Option<u64>)| {
-                let gid_raw: u64 = gid_str.parse().map_err(|_| {
-                    mlua::Error::RuntimeError("setmanifestid: gid must be decimal".into())
-                })?;
-                let depot_id = DepotId(depot_id_raw);
-                state.borrow_mut().manifests.insert(
+    let function = lua.create_function(
+        move |_, (depot_id_raw, gid_str, size): (u32, String, Option<u64>)| {
+            let gid_raw: u64 = gid_str.parse().map_err(|_| {
+                mlua::Error::RuntimeError("setmanifestid: gid must be decimal".into())
+            })?;
+            let depot_id = DepotId(depot_id_raw);
+            state.borrow_mut().manifests.insert(
+                depot_id,
+                ManifestOverride {
                     depot_id,
-                    ManifestOverride {
-                        depot_id,
-                        gid: ManifestId(gid_raw),
-                        size,
-                    },
-                );
+                    gid: ManifestId(gid_raw),
+                    size,
+                },
+            );
 
-                let detail = match size {
-                    Some(size) => format!("depot_id={depot_id_raw} gid={gid_raw} size={size}"),
-                    None => format!("depot_id={depot_id_raw} gid={gid_raw} size=(none)"),
-                };
-                ctx.push_call("setmanifestid", detail);
-                Ok(())
-            },
-        )?,
-    )
+            let detail = match size {
+                Some(size) => format!("depot_id={depot_id_raw} gid={gid_raw} size={size}"),
+                None => format!("depot_id={depot_id_raw} gid={gid_raw} size=(none)"),
+            };
+            ctx.push_call("setmanifestid", detail);
+            Ok(())
+        },
+    )?;
+    globals.set("setmanifestid", function.clone())?;
+    globals.set("setManifestid", function)
 }
 
 fn install_ticket_api(
@@ -433,7 +432,7 @@ fn url_host(url: &str) -> Option<&str> {
 
 fn merge_file_state(state: &mut ScriptState, file_state: Shared<FileState>) {
     let mut file_state = file_state.borrow_mut();
-    state.apps.extend(file_state.apps.drain(..));
+    state.apps.append(&mut file_state.apps);
     state.depot_keys.extend(file_state.depot_keys.drain());
     state.manifests.extend(file_state.manifests.drain());
     state.app_tickets.extend(file_state.app_tickets.drain());

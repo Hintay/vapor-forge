@@ -20,7 +20,7 @@ use vapor_forge_config::{AppId, RuntimeConfig};
 // ---------------------------------------------------------------------------
 
 /// ServiceMethod name we intercept.
-pub const TARGET_JOB_NAME: &str = "ContentServerDirectory.GetManifestRequestCode#1";
+pub use vapor_forge_packet_inspect::MANIFEST_REQUEST_CODE_JOB_NAME as TARGET_JOB_NAME;
 
 /// Manifest code provider endpoints.
 /// `{gid}` is replaced with the manifest ID.

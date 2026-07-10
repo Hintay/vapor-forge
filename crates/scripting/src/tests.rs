@@ -34,15 +34,21 @@ fn executes_setmanifestid_script() {
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(
         dir.join("test.lua"),
-        "setmanifestid(12345, \"9876543210\", 1024)\n",
+        concat!(
+            "setmanifestid(12345, \"9876543210\", 1024)\n",
+            "setManifestid(12346, \"9876543211\", 2048)\n",
+        ),
     )
     .unwrap();
 
     let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(state.manifests.len(), 1);
+    assert_eq!(state.manifests.len(), 2);
     let manifest = &state.manifests[&DepotId(12345)];
     assert_eq!(manifest.gid, ManifestId(9876543210));
     assert_eq!(manifest.size, Some(1024));
+    let camel_case_manifest = &state.manifests[&DepotId(12346)];
+    assert_eq!(camel_case_manifest.gid, ManifestId(9876543211));
+    assert_eq!(camel_case_manifest.size, Some(2048));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

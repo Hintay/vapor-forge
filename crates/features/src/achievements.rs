@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use vapor_forge_abi::*;
 use vapor_forge_config::{AppId, RuntimeConfig};
 
-pub const STATS_JOB_NAME: &str = "Player.GetUserStats#1";
+pub use vapor_forge_packet_inspect::STATS_JOB_NAME;
 const DEFAULT_REF_STEAMID: u64 = 76561198028121353;
 
 // ---------------------------------------------------------------------------

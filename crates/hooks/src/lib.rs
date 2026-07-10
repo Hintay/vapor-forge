@@ -22,6 +22,8 @@ pub mod ipc_server;
 pub mod netpacket;
 #[cfg(target_os = "linux")]
 pub(crate) mod original;
+#[cfg(any(target_os = "linux", test))]
+pub mod packet_capture;
 pub mod pic_thunk;
 #[cfg(target_os = "linux")]
 pub mod ui;

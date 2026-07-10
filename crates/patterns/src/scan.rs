@@ -205,9 +205,9 @@ fn prefer_resolve_error(previous: Option<ResolveError>, current: ResolveError) -
     };
     let previous_rank = resolve_error_rank(&previous);
     let current_rank = resolve_error_rank(&current);
-    if current_rank > previous_rank {
-        current
-    } else if current_rank == previous_rank && current.match_count() > previous.match_count() {
+    if current_rank > previous_rank
+        || current_rank == previous_rank && current.match_count() > previous.match_count()
+    {
         current
     } else {
         previous
@@ -376,48 +376,6 @@ fn find_pic_entry(haystack: &[u8], prologue_offset: usize) -> Option<usize> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    static VARIANT_A: PatternDef = PatternDef {
-        name: "Test::VariantConflict",
-        pattern: "AA BB",
-        follow: FollowMode::None,
-        prologue: None,
-        callee_pattern: None,
-        optional: false,
-        pic_entry: false,
-        module: "steamclient",
-    };
-
-    static VARIANT_B: PatternDef = PatternDef {
-        name: "Test::VariantConflict",
-        pattern: "CC DD",
-        follow: FollowMode::None,
-        prologue: None,
-        callee_pattern: None,
-        optional: false,
-        pic_entry: false,
-        module: "steamclient",
-    };
-
-    #[test]
-    fn entry_group_reports_variant_target_conflicts() {
-        let haystack = [0xAA, 0xBB, 0x90, 0xCC, 0xDD];
-        let entries = [&VARIANT_A, &VARIANT_B];
-
-        let result = resolve_entry_group(&haystack, &entries);
-        match result {
-            Err(ResolveError::VariantConflict(targets)) => {
-                assert_eq!(targets, vec![0, 3]);
-            }
-            Ok(_) => panic!("variant conflict should not resolve as OK"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
-    }
-}
-
 struct ExecutableSegment<'a> {
     bytes: &'a [u8],
     file_offset: u64,
@@ -538,4 +496,46 @@ fn read_u64(data: &[u8], offset: usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static VARIANT_A: PatternDef = PatternDef {
+        name: "Test::VariantConflict",
+        pattern: "AA BB",
+        follow: FollowMode::None,
+        prologue: None,
+        callee_pattern: None,
+        optional: false,
+        pic_entry: false,
+        module: "steamclient",
+    };
+
+    static VARIANT_B: PatternDef = PatternDef {
+        name: "Test::VariantConflict",
+        pattern: "CC DD",
+        follow: FollowMode::None,
+        prologue: None,
+        callee_pattern: None,
+        optional: false,
+        pic_entry: false,
+        module: "steamclient",
+    };
+
+    #[test]
+    fn entry_group_reports_variant_target_conflicts() {
+        let haystack = [0xAA, 0xBB, 0x90, 0xCC, 0xDD];
+        let entries = [&VARIANT_A, &VARIANT_B];
+
+        let result = resolve_entry_group(&haystack, &entries);
+        match result {
+            Err(ResolveError::VariantConflict(targets)) => {
+                assert_eq!(targets, vec![0, 3]);
+            }
+            Ok(_) => panic!("variant conflict should not resolve as OK"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
 }

@@ -15,6 +15,7 @@ use vapor_forge_abi::{
 use vapor_forge_features::achievements;
 use vapor_forge_features::request_code::{self, PendingQueue};
 use vapor_forge_features::rich_presence;
+use vapor_forge_packet_inspect::{PacketChange, PacketDirection};
 
 use vapor_forge_config::AppId;
 
@@ -38,13 +39,23 @@ pub enum SendFrameDecision {
 
 /// Inspect an outgoing frame and decide whether to pass, drop, or rewrite it.
 pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
+    let mut decision = SendFrameDecision::Pass;
     let (emsg_raw, header_bytes, body_bytes) = match vapor_forge_abi::unpack_raw(data) {
         Some(v) => v,
-        None => return SendFrameDecision::Pass,
+        None => {
+            crate::packet_capture::capture(
+                PacketDirection::Send,
+                data,
+                PacketChange::DecodeFailed,
+                None,
+            );
+            return SendFrameDecision::Pass;
+        }
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
     let is_proto = emsg_raw & K_MSG_HDR_PROTO_FLAG != 0;
     if !is_proto {
+        crate::packet_capture::capture(PacketDirection::Send, data, PacketChange::Unchanged, None);
         return SendFrameDecision::Pass;
     }
 
@@ -52,48 +63,97 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     if emsg == EMSG_SERVICE_METHOD_CALL_FROM_CLIENT {
         let hdr = match CMsgProtoBufHeader::decode(header_bytes) {
             Ok(h) => h,
-            Err(_) => return SendFrameDecision::Pass,
+            Err(_) => {
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::DecodeFailed,
+                    None,
+                );
+                return SendFrameDecision::Pass;
+            }
         };
         let method = match &hdr.target_job_name {
             Some(m) => m.as_str(),
-            None => return SendFrameDecision::Pass,
+            None => {
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Unchanged,
+                    None,
+                );
+                return SendFrameDecision::Pass;
+            }
         };
 
         if method == request_code::TARGET_JOB_NAME {
             if handle_manifest_send(&hdr, header_bytes, body_bytes) {
-                return SendFrameDecision::Drop;
+                decision = SendFrameDecision::Drop;
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Dropped,
+                    Some(0),
+                );
+                return decision;
             }
-            return SendFrameDecision::Pass;
+            crate::packet_capture::capture(
+                PacketDirection::Send,
+                data,
+                PacketChange::Unchanged,
+                None,
+            );
+            return decision;
         }
 
         if method == achievements::STATS_JOB_NAME {
             let cfg = config();
             if let Some(new_body) = achievements::on_send_service_stats(&hdr, body_bytes, &cfg) {
                 if new_body.is_empty() {
-                    return SendFrameDecision::Drop;
+                    decision = SendFrameDecision::Drop;
+                    crate::packet_capture::capture(
+                        PacketDirection::Send,
+                        data,
+                        PacketChange::Dropped,
+                        Some(0),
+                    );
+                    return decision;
                 }
-                return SendFrameDecision::Rewrite(vapor_forge_abi::assemble_raw(
-                    emsg_raw,
-                    header_bytes,
-                    &new_body,
-                ));
+                let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Rewritten,
+                    Some(replacement.len()),
+                );
+                return SendFrameDecision::Rewrite(replacement);
             }
         }
 
-        return SendFrameDecision::Pass;
+        crate::packet_capture::capture(PacketDirection::Send, data, PacketChange::Unchanged, None);
+        return decision;
     }
 
     if emsg == EMSG_REQUEST_USERSTATS {
         let cfg = config();
         if let Some(new_body) = achievements::on_send_legacy_stats(body_bytes, &cfg) {
             if new_body.is_empty() {
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Dropped,
+                    Some(0),
+                );
                 return SendFrameDecision::Drop;
             }
-            return SendFrameDecision::Rewrite(vapor_forge_abi::assemble_raw(
-                emsg_raw,
-                header_bytes,
-                &new_body,
-            ));
+            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+            crate::packet_capture::capture(
+                PacketDirection::Send,
+                data,
+                PacketChange::Rewritten,
+                Some(replacement.len()),
+            );
+            return SendFrameDecision::Rewrite(replacement);
         }
     }
 
@@ -104,11 +164,14 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         track_games_played(body_bytes);
 
         if let Some(new_body) = vapor_forge_features::app_avatar::rewrite_games_played(body_bytes) {
-            return SendFrameDecision::Rewrite(vapor_forge_abi::assemble_raw(
-                emsg_raw,
-                header_bytes,
-                &new_body,
-            ));
+            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+            crate::packet_capture::capture(
+                PacketDirection::Send,
+                data,
+                PacketChange::Rewritten,
+                Some(replacement.len()),
+            );
+            return SendFrameDecision::Rewrite(replacement);
         }
     }
 
@@ -127,16 +190,20 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         let ss = crate::client::install::script_state();
         if !ss.access_tokens.is_empty() {
             if let Some(new_body) = inject_access_tokens(body_bytes, &ss.access_tokens) {
-                return SendFrameDecision::Rewrite(vapor_forge_abi::assemble_raw(
-                    emsg_raw,
-                    header_bytes,
-                    &new_body,
-                ));
+                let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Rewritten,
+                    Some(replacement.len()),
+                );
+                return SendFrameDecision::Rewrite(replacement);
             }
         }
     }
 
-    SendFrameDecision::Pass
+    crate::packet_capture::capture(PacketDirection::Send, data, PacketChange::Unchanged, None);
+    decision
 }
 
 /// Record the local SteamID from a CMsgProtoBufHeader, if present.
@@ -289,6 +356,12 @@ pub unsafe fn try_inject<F>(
             code = entry.code,
             "netpacket: injecting manifest response"
         );
+        crate::packet_capture::capture(
+            PacketDirection::Recv,
+            &response_bytes,
+            PacketChange::Injected,
+            None,
+        );
         let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
         call_original(this, packet);
     }
@@ -296,6 +369,12 @@ pub unsafe fn try_inject<F>(
     // Inject offline achievement responses
     let offline = achievements::drain_offline_responses();
     for resp in offline {
+        crate::packet_capture::capture(
+            PacketDirection::Recv,
+            &resp.packet,
+            PacketChange::Injected,
+            None,
+        );
         let _guard = unsafe { PacketSwapGuard::new(packet, resp.packet) };
         call_original(this, packet);
     }
@@ -310,6 +389,12 @@ pub unsafe fn try_inject<F>(
                 info!(
                     app = app.0,
                     "netpacket: injecting manufactured PersonaState"
+                );
+                crate::packet_capture::capture(
+                    PacketDirection::Recv,
+                    &inject_bytes,
+                    PacketChange::Injected,
+                    None,
                 );
                 let _guard = unsafe { PacketSwapGuard::new(packet, inject_bytes) };
                 call_original(this, packet);
@@ -342,18 +427,34 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
 
     let buf = unsafe { std::slice::from_raw_parts(data, size as usize) };
     let Some((emsg_raw, hdr_bytes, body_bytes)) = vapor_forge_abi::unpack_raw(buf) else {
+        crate::packet_capture::capture(
+            PacketDirection::Recv,
+            buf,
+            PacketChange::DecodeFailed,
+            None,
+        );
         return;
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
+    let mut change = PacketChange::Unchanged;
+    let mut final_len = None;
 
     // ServiceMethod response (147): achievement stats
     if emsg == EMSG_SERVICE_METHOD_RESPONSE {
         let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) else {
+            crate::packet_capture::capture(
+                PacketDirection::Recv,
+                buf,
+                PacketChange::DecodeFailed,
+                None,
+            );
             return;
         };
         if let Some((new_hdr, new_body)) = achievements::on_recv_service_stats(&hdr, body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, &new_hdr, &new_body);
+            final_len = Some(replacement.len());
             unsafe { replace_packet_data(packet, replacement) };
+            change = PacketChange::Rewritten;
         }
     }
 
@@ -362,7 +463,9 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         let cfg = config();
         if let Some(new_body) = achievements::on_recv_legacy_stats(body_bytes, &cfg) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(replacement.len());
             unsafe { replace_packet_data(packet, replacement) };
+            change = PacketChange::Rewritten;
         }
     }
 
@@ -370,7 +473,9 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     if emsg == EMSG_ENCRYPTED_APPTICKET_RESPONSE {
         if let Some(new_body) = handle_encrypted_ticket_response(body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(replacement.len());
             unsafe { replace_packet_data(packet, replacement) };
+            change = PacketChange::Rewritten;
         }
     }
 
@@ -381,9 +486,13 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         rich_presence::cache_self_persona(hdr_bytes, body_bytes);
         if let Some(new_body) = rich_presence::patch_persona_state(body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(replacement.len());
             unsafe { replace_packet_data(packet, replacement) };
+            change = PacketChange::Rewritten;
         }
     }
+
+    crate::packet_capture::capture(PacketDirection::Recv, buf, change, final_len);
 }
 
 fn handle_encrypted_ticket_response(body_bytes: &[u8]) -> Option<Vec<u8>> {

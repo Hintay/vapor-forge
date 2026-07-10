@@ -1059,6 +1059,7 @@ dependencies = [
  "vapor-forge-abi",
  "vapor-forge-config",
  "vapor-forge-core",
+ "vapor-forge-packet-inspect",
 ]
 
 [[package]]
@@ -1089,6 +1090,7 @@ dependencies = [
  "vapor-forge-hook-boundary",
  "vapor-forge-inject-protocol",
  "vapor-forge-memory",
+ "vapor-forge-packet-inspect",
  "vapor-forge-patterns",
  "vapor-forge-scripting",
 ]
@@ -1104,6 +1106,14 @@ dependencies = [
  "object",
  "thiserror",
  "vapor-forge-core",
+]
+
+[[package]]
+name = "vapor-forge-packet-inspect"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "vapor-forge-abi",
 ]
 
 [[package]]

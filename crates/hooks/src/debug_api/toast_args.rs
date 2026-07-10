@@ -10,25 +10,36 @@ pub(crate) struct ParsedToast {
     pub icon: Option<String>,
 }
 
+struct ToastOptions {
+    kind: vapor_forge_features::toast::ToastKind,
+    style: Option<vapor_forge_features::toast::ToastStyle>,
+    title: Option<String>,
+    body: Option<String>,
+    duration_ms: u32,
+    icon: Option<String>,
+}
+
 pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
     let tokens = tokenize_toast_args(args)?;
-    let mut kind = vapor_forge_features::toast::ToastKind::Info;
-    let mut style = None;
-    let mut title: Option<String> = None;
-    let mut body: Option<String> = None;
-    let mut duration_ms = DEFAULT_DURATION_MS;
-    let mut icon: Option<String> = None;
+    let mut options = ToastOptions {
+        kind: vapor_forge_features::toast::ToastKind::Info,
+        style: None,
+        title: None,
+        body: None,
+        duration_ms: DEFAULT_DURATION_MS,
+        icon: None,
+    };
     let mut body_words = Vec::new();
     let mut index = 0;
 
     while index < tokens.len() {
         if let Some(parsed_kind) = parse_toast_kind(&tokens[index]) {
-            kind = parsed_kind;
+            options.kind = parsed_kind;
             index += 1;
             continue;
         }
         if let Some(parsed_style) = parse_toast_style(&tokens[index]) {
-            style = Some(parsed_style);
+            options.style = Some(parsed_style);
             index += 1;
             continue;
         }
@@ -38,16 +49,7 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
     while index < tokens.len() {
         if token_is_toast_option(&tokens[index]) {
             let (key, value, next_index) = parse_toast_option(&tokens, index)?;
-            apply_toast_option(
-                key,
-                value,
-                &mut kind,
-                &mut style,
-                &mut title,
-                &mut body,
-                &mut duration_ms,
-                &mut icon,
-            )?;
+            apply_toast_option(key, value, &mut options)?;
             index = next_index;
         } else {
             body_words.push(tokens[index].as_str());
@@ -55,17 +57,17 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
         }
     }
 
-    if body.is_none() && !body_words.is_empty() {
-        body = Some(body_words.join(" "));
+    if options.body.is_none() && !body_words.is_empty() {
+        options.body = Some(body_words.join(" "));
     }
 
     Ok(ParsedToast {
-        kind,
-        style,
-        title: non_empty(title.as_deref().unwrap_or(""), "Vapor Forge").to_owned(),
-        body: non_empty(body.as_deref().unwrap_or(""), DEFAULT_TOAST_BODY).to_owned(),
-        duration_ms,
-        icon,
+        kind: options.kind,
+        style: options.style,
+        title: non_empty(options.title.as_deref().unwrap_or(""), "Vapor Forge").to_owned(),
+        body: non_empty(options.body.as_deref().unwrap_or(""), DEFAULT_TOAST_BODY).to_owned(),
+        duration_ms: options.duration_ms,
+        icon: options.icon,
     })
 }
 
@@ -96,19 +98,10 @@ fn parse_toast_option(tokens: &[String], index: usize) -> Result<(&str, &str, us
     ))
 }
 
-fn apply_toast_option(
-    key: &str,
-    value: &str,
-    kind: &mut vapor_forge_features::toast::ToastKind,
-    style: &mut Option<vapor_forge_features::toast::ToastStyle>,
-    title: &mut Option<String>,
-    body: &mut Option<String>,
-    duration_ms: &mut u32,
-    icon: &mut Option<String>,
-) -> Result<(), String> {
+fn apply_toast_option(key: &str, value: &str, options: &mut ToastOptions) -> Result<(), String> {
     match key.trim().to_ascii_lowercase().as_str() {
         "kind" | "type" => {
-            *kind = parse_toast_kind(value).ok_or_else(|| {
+            options.kind = parse_toast_kind(value).ok_or_else(|| {
                 format!(
                     "err invalid toast kind: {}",
                     super::command::quote_text(value)
@@ -116,17 +109,17 @@ fn apply_toast_option(
             })?;
         }
         "style" => {
-            *style = Some(parse_toast_style(value).ok_or_else(|| {
+            options.style = Some(parse_toast_style(value).ok_or_else(|| {
                 format!(
                     "err invalid toast style: {}",
                     super::command::quote_text(value)
                 )
             })?);
         }
-        "title" => *title = Some(value.to_owned()),
-        "body" | "message" | "text" => *body = Some(value.to_owned()),
-        "duration" | "duration_ms" | "ms" => *duration_ms = parse_duration(value)?,
-        "icon" => *icon = Some(value.to_owned()),
+        "title" => options.title = Some(value.to_owned()),
+        "body" | "message" | "text" => options.body = Some(value.to_owned()),
+        "duration" | "duration_ms" | "ms" => options.duration_ms = parse_duration(value)?,
+        "icon" => options.icon = Some(value.to_owned()),
         _ => {
             return Err(format!(
                 "err unknown toast option: {}",

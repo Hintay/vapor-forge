@@ -3,9 +3,11 @@ use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
 use serde_json::json;
+use vapor_forge_packet_inspect::{PacketChange, PacketDirection, PacketSummary, PacketType};
 
 use super::toast_args::{default_toast_style, parse_toast_args, toast_kind_name, toast_style_name};
 use super::{DebugTarget, DEFAULT_DURATION_MS, DEFAULT_TOAST_BODY};
+use crate::packet_capture::{CapturedPacket, PacketCaptureFilter, PacketCaptureMode};
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum DebugCommand<'a> {
@@ -16,6 +18,7 @@ pub(crate) enum DebugCommand<'a> {
     Hooks,
     Apps,
     Pkg0,
+    Packet(&'a str),
     Patterns,
     Version,
     Log(&'a str),
@@ -68,6 +71,7 @@ fn dispatch_local(target: DebugTarget, command: &str, json: bool) -> String {
         DebugCommand::Hooks => hooks_response(json),
         DebugCommand::Apps => apps_response(json),
         DebugCommand::Pkg0 => pkg0_response(json),
+        DebugCommand::Packet(args) => packet_response(target, args, json),
         DebugCommand::Patterns => patterns_response(json),
         DebugCommand::Version => version_response(json),
         DebugCommand::Log(level) => log_response(level, json),
@@ -109,6 +113,12 @@ pub(crate) fn parse_command(command: &str) -> DebugCommand<'_> {
     }
     if trimmed == "pkg0" {
         return DebugCommand::Pkg0;
+    }
+    if trimmed == "packet" {
+        return DebugCommand::Packet("");
+    }
+    if let Some(args) = trimmed.strip_prefix("packet ") {
+        return DebugCommand::Packet(args.trim());
     }
     if trimmed == "patterns" {
         return DebugCommand::Patterns;
@@ -218,11 +228,12 @@ fn help_response() -> String {
     out.push_str("  hooks                 installed hooks and addresses\n");
     out.push_str("  apps                  controlled apps with ownership status\n");
     out.push_str("  pkg0                  package injection status\n");
+    out.push_str("  packet ...            packet capture and inspection\n");
     out.push_str("  patterns              pattern match results\n");
     out.push_str("  log [level]           query or set log level\n");
     out.push_str("  dump/status           toast subsystem status\n");
     out.push_str("  toast [args]          queue a toast notification\n");
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("  Add --json to any command for machine-readable output.\n");
     out.push_str("  Prefix with steamui/steamclient to select target.");
     out
@@ -462,6 +473,399 @@ fn pkg0_response(json_mode: bool) -> String {
     let _ = writeln!(out, "  cuser:     {}", check(cuser_captured));
     let _ = writeln!(out, "  injected:  {} apps", inject_count);
     let _ = write!(out, "  active:    {}", check(active));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Packet capture
+// ---------------------------------------------------------------------------
+
+fn packet_response(target: DebugTarget, args: &str, json_mode: bool) -> String {
+    if target != DebugTarget::SteamClient {
+        return "err packet is a steamclient command".to_owned();
+    }
+
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    match tokens.as_slice() {
+        [] | ["help"] => packet_help_response(),
+        ["capture", rest @ ..] => packet_capture_response(rest, json_mode),
+        ["list", rest @ ..] => packet_list_response(rest, json_mode),
+        ["show", id] => match parse_u64_arg(id) {
+            Ok(id) => packet_show_response(id, json_mode),
+            Err(e) => e,
+        },
+        ["save", id, path] => match parse_u64_arg(id) {
+            Ok(id) => packet_save_response(id, path, json_mode),
+            Err(e) => e,
+        },
+        other => format!("err unknown packet command: {}", other.join(" ")),
+    }
+}
+
+fn packet_help_response() -> String {
+    let mut out = String::from("ok packet commands:\n");
+    out.push_str("  packet capture status\n");
+    out.push_str("  packet capture on [summary|raw] [direction=recv] [type=encrypted-ticket] [emsg=5527] [app=480] [changed=rewritten]\n");
+    out.push_str("  packet capture off\n");
+    out.push_str("  packet capture clear\n");
+    out.push_str("  packet capture limit N\n");
+    out.push_str("  packet capture filter clear\n");
+    out.push_str("  packet list [direction=recv] [type=...] [emsg=...] [app=...] [changed=...]\n");
+    out.push_str("  packet show ID\n");
+    out.push_str("  packet save ID PATH");
+    out
+}
+
+fn packet_capture_response(tokens: &[&str], json_mode: bool) -> String {
+    match tokens {
+        [] | ["status"] => packet_capture_status_response(json_mode),
+        ["off"] => {
+            crate::packet_capture::set_mode(PacketCaptureMode::Off);
+            if json_mode {
+                format!("ok {}", json!({ "mode": "off" }))
+            } else {
+                "ok packet capture mode=off".to_owned()
+            }
+        }
+        ["clear"] => {
+            crate::packet_capture::clear();
+            if json_mode {
+                format!("ok {}", json!({ "cleared": true }))
+            } else {
+                "ok packet capture cleared".to_owned()
+            }
+        }
+        ["limit", value] => match value.parse::<usize>() {
+            Ok(limit) => {
+                let applied = crate::packet_capture::set_limit(limit);
+                if json_mode {
+                    format!("ok {}", json!({ "limit": applied }))
+                } else {
+                    format!("ok packet capture limit={applied}")
+                }
+            }
+            Err(e) => format!("err invalid limit: {e}"),
+        },
+        ["filter", "clear"] => {
+            crate::packet_capture::clear_filter();
+            if json_mode {
+                format!("ok {}", json!({ "filter_cleared": true }))
+            } else {
+                "ok packet capture filter cleared".to_owned()
+            }
+        }
+        ["on", rest @ ..] => packet_capture_on_response(rest, json_mode),
+        other => format!("err unknown packet capture command: {}", other.join(" ")),
+    }
+}
+
+fn packet_capture_status_response(json_mode: bool) -> String {
+    let status = crate::packet_capture::status();
+    if json_mode {
+        return format!(
+            "ok {}",
+            json!({
+                "mode": status.mode.label(),
+                "limit": status.limit,
+                "len": status.len,
+                "next_id": status.next_id,
+                "filter": filter_json(&status.filter),
+            })
+        );
+    }
+
+    format!(
+        "ok packet capture mode={} len={} limit={} filter={}",
+        status.mode.label(),
+        status.len,
+        status.limit,
+        filter_text(&status.filter)
+    )
+}
+
+fn packet_capture_on_response(tokens: &[&str], json_mode: bool) -> String {
+    let mut mode = PacketCaptureMode::Summary;
+    let mut filter = PacketCaptureFilter::empty();
+
+    for token in tokens {
+        match *token {
+            "summary" => mode = PacketCaptureMode::Summary,
+            "raw" => mode = PacketCaptureMode::Raw,
+            key_value => {
+                if let Err(e) = apply_filter_token(&mut filter, key_value) {
+                    return e;
+                }
+            }
+        }
+    }
+
+    crate::packet_capture::set_filter(filter.clone());
+    crate::packet_capture::set_mode(mode);
+    if json_mode {
+        return format!(
+            "ok {}",
+            json!({
+                "mode": mode.label(),
+                "filter": filter_json(&filter),
+            })
+        );
+    }
+    format!(
+        "ok packet capture mode={} filter={}",
+        mode.label(),
+        filter_text(&filter)
+    )
+}
+
+fn packet_list_response(tokens: &[&str], json_mode: bool) -> String {
+    let filter = match parse_filter_tokens(tokens) {
+        Ok(filter) => filter,
+        Err(e) => return e,
+    };
+    let packets: Vec<_> = crate::packet_capture::list()
+        .into_iter()
+        .filter(|packet| filter.matches(&packet.summary))
+        .collect();
+
+    if json_mode {
+        let values: Vec<_> = packets.iter().map(packet_json).collect();
+        return format!("ok {}", serde_json::Value::Array(values));
+    }
+
+    if packets.is_empty() {
+        return "ok no captured packets".to_owned();
+    }
+
+    let mut out = String::from("ok\n");
+    for packet in packets {
+        let _ = writeln!(out, "  {}", summary_line(&packet.summary));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+fn packet_show_response(id: u64, json_mode: bool) -> String {
+    let Some(packet) = crate::packet_capture::get(id) else {
+        return format!("err packet {id} not found");
+    };
+
+    if json_mode {
+        return format!("ok {}", packet_json(&packet));
+    }
+
+    let mut out = format!("ok {}\n", summary_line(&packet.summary));
+    if let Some(raw) = &packet.raw {
+        let _ = writeln!(out, "  raw_len: {}", raw.len());
+        let _ = writeln!(out, "  raw_hex_prefix: {}", hex_prefix(raw, 96));
+    } else {
+        out.push_str("  raw: not captured\n");
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+fn packet_save_response(id: u64, path: &str, json_mode: bool) -> String {
+    let Some(packet) = crate::packet_capture::get(id) else {
+        return format!("err packet {id} not found");
+    };
+    let Some(raw) = packet.raw else {
+        return format!("err packet {id} has no raw bytes; enable raw capture first");
+    };
+    let len = raw.len();
+    match std::fs::write(path, raw) {
+        Ok(()) if json_mode => format!(
+            "ok {}",
+            json!({
+                "id": id,
+                "path": path,
+                "bytes": len,
+            })
+        ),
+        Ok(()) => format!("ok saved packet {id} to {path}"),
+        Err(e) => format!("err save failed: {e}"),
+    }
+}
+
+fn parse_filter_tokens(tokens: &[&str]) -> Result<PacketCaptureFilter, String> {
+    let mut filter = PacketCaptureFilter::empty();
+    for token in tokens {
+        apply_filter_token(&mut filter, token)?;
+    }
+    Ok(filter)
+}
+
+fn apply_filter_token(filter: &mut PacketCaptureFilter, token: &str) -> Result<(), String> {
+    let Some((key, value)) = token.split_once('=') else {
+        return Err(format!(
+            "err expected key=value filter, got {}",
+            quote_text(token)
+        ));
+    };
+    match key {
+        "direction" | "dir" => filter.direction = Some(parse_direction(value)?),
+        "type" => filter.packet_type = Some(parse_packet_type(value)?),
+        "emsg" => filter.emsg = Some(parse_u32_arg(value)?),
+        "app" | "app_id" | "appid" => filter.app_id = Some(parse_u32_arg(value)?),
+        "changed" | "change" => filter.changed = Some(parse_change(value)?),
+        other => return Err(format!("err unknown packet filter key: {other}")),
+    }
+    Ok(())
+}
+
+fn parse_direction(value: &str) -> Result<PacketDirection, String> {
+    match value {
+        "send" => Ok(PacketDirection::Send),
+        "recv" => Ok(PacketDirection::Recv),
+        other => Err(format!("err unknown direction: {other}")),
+    }
+}
+
+fn parse_packet_type(value: &str) -> Result<PacketType, String> {
+    match value {
+        "encrypted-ticket" | "ticket" => Ok(PacketType::EncryptedTicket),
+        "pics" => Ok(PacketType::Pics),
+        "manifest-code" | "manifest" => Ok(PacketType::ManifestCode),
+        "stats" => Ok(PacketType::Stats),
+        "rich-presence" | "rp" => Ok(PacketType::RichPresence),
+        "games-played" => Ok(PacketType::GamesPlayed),
+        "persona" => Ok(PacketType::Persona),
+        "unknown" => Ok(PacketType::Unknown),
+        other => Err(format!("err unknown packet type: {other}")),
+    }
+}
+
+fn parse_change(value: &str) -> Result<PacketChange, String> {
+    match value {
+        "unchanged" => Ok(PacketChange::Unchanged),
+        "dropped" | "drop" => Ok(PacketChange::Dropped),
+        "rewritten" | "rewrite" => Ok(PacketChange::Rewritten),
+        "injected" | "inject" => Ok(PacketChange::Injected),
+        "queued" | "queue" => Ok(PacketChange::Queued),
+        "decode-failed" | "decode_failed" => Ok(PacketChange::DecodeFailed),
+        other => Err(format!("err unknown packet change: {other}")),
+    }
+}
+
+fn parse_u32_arg(value: &str) -> Result<u32, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|e| format!("err invalid u32: {e}"))
+    } else {
+        value
+            .parse::<u32>()
+            .map_err(|e| format!("err invalid u32: {e}"))
+    }
+}
+
+fn parse_u64_arg(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|e| format!("err invalid id: {e}"))
+}
+
+fn summary_line(summary: &PacketSummary) -> String {
+    let emsg = summary
+        .emsg
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let apps = if summary.app_ids.is_empty() {
+        "-".to_owned()
+    } else {
+        format!("{:?}", summary.app_ids)
+    };
+    let len = match summary.final_len {
+        Some(final_len) if final_len != summary.original_len => {
+            format!("{}->{final_len}", summary.original_len)
+        }
+        _ => summary.original_len.to_string(),
+    };
+    format!(
+        "#{:<4} {:<4} emsg={:<5} type={:<16} app={} change={:<13} len={}",
+        summary.id,
+        summary.direction.label(),
+        emsg,
+        summary.packet_type.label(),
+        apps,
+        summary.change.label(),
+        len
+    )
+}
+
+fn packet_json(packet: &CapturedPacket) -> serde_json::Value {
+    json!({
+        "summary": summary_json(&packet.summary),
+        "raw": packet.raw.as_ref().map(|raw| json!({
+            "len": raw.len(),
+            "hex_prefix": hex_prefix(raw, 96),
+        })),
+    })
+}
+
+fn summary_json(summary: &PacketSummary) -> serde_json::Value {
+    json!({
+        "id": summary.id,
+        "direction": summary.direction.label(),
+        "emsg_raw": summary.emsg_raw,
+        "emsg": summary.emsg,
+        "proto": summary.proto,
+        "type": summary.packet_type.label(),
+        "app_ids": summary.app_ids,
+        "steamid": summary.steamid,
+        "job": summary.job,
+        "eresult": summary.eresult,
+        "change": summary.change.label(),
+        "original_len": summary.original_len,
+        "final_len": summary.final_len,
+        "header_len": summary.header_len,
+        "body_len": summary.body_len,
+        "decode_error": summary.decode_error,
+    })
+}
+
+fn filter_json(filter: &PacketCaptureFilter) -> serde_json::Value {
+    json!({
+        "direction": filter.direction.map(PacketDirection::label),
+        "type": filter.packet_type.map(PacketType::label),
+        "emsg": filter.emsg,
+        "app_id": filter.app_id,
+        "changed": filter.changed.map(PacketChange::label),
+    })
+}
+
+fn filter_text(filter: &PacketCaptureFilter) -> String {
+    let mut parts = Vec::new();
+    if let Some(direction) = filter.direction {
+        parts.push(format!("direction={}", direction.label()));
+    }
+    if let Some(packet_type) = filter.packet_type {
+        parts.push(format!("type={}", packet_type.label()));
+    }
+    if let Some(emsg) = filter.emsg {
+        parts.push(format!("emsg={emsg}"));
+    }
+    if let Some(app_id) = filter.app_id {
+        parts.push(format!("app={app_id}"));
+    }
+    if let Some(changed) = filter.changed {
+        parts.push(format!("changed={}", changed.label()));
+    }
+    if parts.is_empty() {
+        "none".to_owned()
+    } else {
+        parts.join(",")
+    }
+}
+
+fn hex_prefix(bytes: &[u8], max: usize) -> String {
+    let mut out = String::new();
+    for byte in bytes.iter().take(max) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    if bytes.len() > max {
+        out.push_str("...");
+    }
     out
 }
 

@@ -202,6 +202,11 @@ fn command_parser_normalizes_known_commands() {
     assert_eq!(parse_command("hooks"), DebugCommand::Hooks);
     assert_eq!(parse_command("apps"), DebugCommand::Apps);
     assert_eq!(parse_command("pkg0"), DebugCommand::Pkg0);
+    assert_eq!(parse_command("packet"), DebugCommand::Packet(""));
+    assert_eq!(
+        parse_command("packet capture status"),
+        DebugCommand::Packet("capture status")
+    );
     assert_eq!(parse_command("patterns"), DebugCommand::Patterns);
     assert_eq!(parse_command("version"), DebugCommand::Version);
     assert_eq!(parse_command("log debug"), DebugCommand::Log("debug"));
@@ -356,6 +361,103 @@ fn pkg0_returns_capture_status() {
     assert!(response.contains("\"cuser_captured\":"));
     assert!(response.contains("\"inject_count\":"));
     assert!(response.contains("\"active\":"));
+}
+
+#[test]
+fn packet_capture_status_and_filter_are_exposed() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = dispatch("packet capture off");
+    let _ = dispatch("packet capture clear");
+    let _ = dispatch("packet capture filter clear");
+
+    let response = dispatch("packet capture status --json");
+    assert!(response.starts_with("ok {"));
+    assert!(response.contains("\"mode\":\"off\""));
+
+    let response = dispatch("packet capture on raw direction=recv type=persona changed=rewritten");
+    assert_eq!(
+        response,
+        "ok packet capture mode=raw filter=direction=recv,type=persona,changed=rewritten"
+    );
+
+    let response = dispatch("packet capture status --json");
+    assert!(response.contains("\"mode\":\"raw\""));
+    assert!(response.contains("\"direction\":\"recv\""));
+    assert!(response.contains("\"type\":\"persona\""));
+    assert!(response.contains("\"changed\":\"rewritten\""));
+
+    let response = dispatch("packet capture limit 64 --json");
+    assert_eq!(response, "ok {\"limit\":64}");
+    let response = dispatch("packet capture off --json");
+    assert_eq!(response, "ok {\"mode\":\"off\"}");
+
+    let _ = dispatch("packet capture limit 128");
+    let _ = dispatch("packet capture clear");
+    let _ = dispatch("packet capture filter clear");
+}
+
+#[test]
+fn packet_capture_filters_limits_and_exposes_raw_packets() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = dispatch("packet capture off");
+    let _ = dispatch("packet capture clear");
+    let _ = dispatch("packet capture filter clear");
+    let _ = dispatch("packet capture limit 2");
+    assert_eq!(
+        dispatch("packet capture on raw direction=recv"),
+        "ok packet capture mode=raw filter=direction=recv"
+    );
+
+    crate::packet_capture::capture(
+        vapor_forge_packet_inspect::PacketDirection::Send,
+        b"filtered",
+        vapor_forge_packet_inspect::PacketChange::Unchanged,
+        None,
+    );
+    for raw in [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+    ] {
+        crate::packet_capture::capture(
+            vapor_forge_packet_inspect::PacketDirection::Recv,
+            raw,
+            vapor_forge_packet_inspect::PacketChange::Unchanged,
+            None,
+        );
+    }
+
+    let packets = crate::packet_capture::list();
+    assert_eq!(packets.len(), 2);
+    assert_eq!(packets[0].raw.as_deref(), Some(b"second".as_slice()));
+    assert_eq!(packets[1].raw.as_deref(), Some(b"third".as_slice()));
+    assert!(packets[0].summary.id < packets[1].summary.id);
+    assert_eq!(
+        packets[0].summary.change,
+        vapor_forge_packet_inspect::PacketChange::DecodeFailed
+    );
+
+    let list = dispatch("packet list direction=recv --json");
+    let payload = list.strip_prefix("ok ").unwrap();
+    let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(value.as_array().unwrap().len(), 2);
+
+    let show = dispatch(&format!("packet show {} --json", packets[1].summary.id));
+    assert!(show.contains("\"raw\":{\"hex_prefix\":\"7468697264\",\"len\":5}"));
+
+    let _ = dispatch("packet capture off");
+    let _ = dispatch("packet capture clear");
+    let _ = dispatch("packet capture filter clear");
+    let _ = dispatch("packet capture limit 128");
+}
+
+#[test]
+fn packet_command_is_steamclient_only() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    assert_eq!(
+        dispatch("steamui packet capture status"),
+        "err packet is a steamclient command"
+    );
 }
 
 #[test]

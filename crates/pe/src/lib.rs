@@ -141,7 +141,7 @@ pub fn section_names(pe_bytes: &[u8]) -> Vec<String> {
     names
 }
 
-pub fn denuvo_section_matches<'a>(sections: &'a [String]) -> Vec<&'a str> {
+pub fn denuvo_section_matches(sections: &[String]) -> Vec<&str> {
     sections
         .iter()
         .filter_map(|section| {
