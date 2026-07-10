@@ -19,13 +19,13 @@ use vapor_forge_packet_inspect::{PacketChange, PacketDirection};
 
 use vapor_forge_config::AppId;
 
-use crate::client::install::config;
-
 // ---------------------------------------------------------------------------
 // Singleton pending queue (manifest request codes)
 // ---------------------------------------------------------------------------
 
 static PENDING: once_cell::sync::Lazy<PendingQueue> = once_cell::sync::Lazy::new(PendingQueue::new);
+static CLOUD_PENDING: once_cell::sync::Lazy<vapor_forge_features::cloud_rpc::CloudRpcQueue> =
+    once_cell::sync::Lazy::new(vapor_forge_features::cloud_rpc::CloudRpcQueue::new);
 
 // ---------------------------------------------------------------------------
 // Outgoing frame handling called from BBuildAndAsyncSendFrame hook
@@ -106,8 +106,19 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             return decision;
         }
 
+        let runtime = crate::client::install::runtime_snapshot();
+        if CLOUD_PENDING.intercept(method, &hdr, header_bytes, body_bytes, &runtime.config) {
+            info!(method, "netpacket: intercepted client cloud RPC");
+            crate::packet_capture::capture(
+                PacketDirection::Send,
+                data,
+                PacketChange::Dropped,
+                Some(0),
+            );
+            return SendFrameDecision::Drop;
+        }
+
         if method == achievements::STATS_JOB_NAME {
-            let runtime = crate::client::install::runtime_snapshot();
             if let Some(new_body) = achievements::on_send_service_stats(
                 &hdr,
                 body_bytes,
@@ -368,7 +379,11 @@ pub unsafe fn try_inject<F>(
     F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
 {
     let rp_inject_due = rich_presence::tracked_app().0 != 0 && rich_presence::has_inject_pending();
-    if PENDING.is_empty() && !achievements::has_offline_responses() && !rp_inject_due {
+    if PENDING.is_empty()
+        && CLOUD_PENDING.is_empty()
+        && !achievements::has_offline_responses()
+        && !rp_inject_due
+    {
         return;
     }
 
@@ -398,6 +413,14 @@ pub unsafe fn try_inject<F>(
             None,
         );
         // SAFETY: packet is valid for this callback and the guard restores it.
+        let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
+        call_original(this, packet);
+    }
+
+    // Inject Cumulus-backed Steam client Cloud service responses.
+    for response_bytes in CLOUD_PENDING.drain_completed() {
+        // Upload responses carry the Cumulus bearer token in HTTP headers, so
+        // they must not be retained by the diagnostic packet capture.
         let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
         call_original(this, packet);
     }

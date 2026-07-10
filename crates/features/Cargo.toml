@@ -8,7 +8,7 @@ autobins = false
 
 [features]
 default = []
-tools = ["dep:serde", "dep:serde_json"]
+tools = []
 
 [[bin]]
 name = "vapor-forge-ticket-tool"
@@ -17,8 +17,9 @@ required-features = ["tools"]
 
 [dependencies]
 prost.workspace = true
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 vapor-forge-abi = { path = "../steam-abi" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }

@@ -69,6 +69,29 @@ All configuration lives in `~/.config/vapor-forge/config.toml`. The file is opti
 
 See `res/config.default.toml` for the full generated template and commented examples.
 
+### Cumulus cloud saves
+
+Set the Cumulus origin and a device bearer token under `[cloud]`. A complete
+Cumulus configuration enables cloud sync for controlled, unowned apps even when
+the legacy `enabled` flag is left false. Owned apps remain on Steam's normal
+cloud path.
+
+```toml
+[cloud]
+server_url = "https://cloud.example.com"
+token = "device-bearer-token"
+timeout_connect_ms = 5000
+timeout_ms = 15000
+```
+
+The token is sent to Cumulus by both the metadata adapter and Steam's HTTP byte
+transfers. Use HTTPS outside a trusted private network.
+
+`IClientRemoteStorage` is used only to keep Steam's per-app cloud enable gate
+open. Save synchronization is handled separately by intercepting the Steam
+client's decoded `Cloud.*#1` service RPCs on the CM connection; game-facing
+`FileRead`/`FileWrite` calls are not redirected.
+
 ### Lua scripting
 
 Lua scripts can register apps, set avatars, provide stat donors, and more. Scripts are loaded from (in priority order):
