@@ -288,7 +288,11 @@ fn config_response(json_mode: bool) -> String {
             json!({
                 "runtime": {"log_level": cfg.runtime.log_level, "diagnostics": cfg.runtime.diagnostics},
                 "apps": {"inject_count": cfg.apps.inject.len(), "inject_ids": inject_ids, "shared_enabled": cfg.apps.shared.enabled},
-                "cloud": {"enabled": cfg.cloud.enabled},
+                "cloud": {
+                    "enabled": cfg.cloud.enabled,
+                    "cumulus_configured": cfg.cumulus_configured(),
+                    "server_url": cfg.cloud.server_url,
+                },
                 "ticket": {"cache": ticket_cache, "auto_delegate": cfg.ticket.auto_delegate},
                 "toast": {"enabled": cfg.toast.enabled},
                 "scripting": {"paths": cfg.scripting.paths},
@@ -317,6 +321,15 @@ fn config_response(json_mode: bool) -> String {
     let _ = writeln!(out, "    shared:         {}", cfg.apps.shared.enabled);
     let _ = writeln!(out, "  [cloud]");
     let _ = writeln!(out, "    enabled:        {cloud_str}");
+    let _ = writeln!(
+        out,
+        "    cumulus:        {}",
+        if cfg.cumulus_configured() {
+            cfg.cloud.server_url.as_str()
+        } else {
+            "disabled"
+        }
+    );
     let _ = writeln!(out, "  [ticket]");
     let _ = writeln!(out, "    cache:          {ticket_cache}");
     let _ = writeln!(out, "    auto_delegate:  {}", cfg.ticket.auto_delegate);

@@ -389,6 +389,28 @@ fn parses_inject_with_dlc() {
 fn cloud_defaults_to_disabled() {
     let config: RuntimeConfig = toml::from_str("").expect("parse");
     assert!(!config.cloud_enabled_for_controlled_apps());
+    assert!(!config.cumulus_configured());
+    assert_eq!(config.cloud.timeout_connect_ms, 5000);
+    assert_eq!(config.cloud.timeout_ms, 15000);
+}
+
+#[test]
+fn cumulus_configuration_enables_controlled_cloud() {
+    let config: RuntimeConfig = toml::from_str(
+        r#"
+            [cloud]
+            server_url = "https://cloud.example.com/base"
+            token = "device-token"
+            timeout_connect_ms = 123
+            timeout_ms = 456
+            "#,
+    )
+    .expect("parse");
+
+    assert!(config.cumulus_configured());
+    assert!(config.cloud_enabled_for_controlled_apps());
+    assert_eq!(config.cloud.timeout_connect_ms, 123);
+    assert_eq!(config.cloud.timeout_ms, 456);
 }
 
 #[test]

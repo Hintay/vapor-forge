@@ -140,11 +140,31 @@ impl Default for SharedSection {
     }
 }
 
-/// Cloud control for controlled apps.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// Cloud control and optional Cumulus backend for controlled apps.
+#[derive(Clone, Debug, Deserialize)]
 pub struct CloudSection {
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub server_url: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_timeout_connect_ms")]
+    pub timeout_connect_ms: u64,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for CloudSection {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            server_url: String::new(),
+            token: String::new(),
+            timeout_connect_ms: default_timeout_connect_ms(),
+            timeout_ms: default_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -438,6 +458,10 @@ impl RuntimeConfig {
     }
 
     pub fn cloud_enabled_for_controlled_apps(&self) -> bool {
-        self.cloud.enabled.unwrap_or(false)
+        self.cumulus_configured() || self.cloud.enabled.unwrap_or(false)
+    }
+
+    pub fn cumulus_configured(&self) -> bool {
+        !self.cloud.server_url.trim().is_empty() && !self.cloud.token.trim().is_empty()
     }
 }

@@ -7,6 +7,12 @@ use vapor_forge_config::{AppId, RuntimeConfig};
 pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool) -> bool {
     let controlled =
         config.app_category(app_id).is_some() && !crate::apps::is_actually_owned(app_id);
+    if controlled && config.cumulus_configured() {
+        if !original {
+            info!(app_id = app_id.0, "feat: Cumulus cloud enabled");
+        }
+        return true;
+    }
     if controlled && !config.cloud_enabled_for_controlled_apps() {
         if original {
             info!(app_id = app_id.0, "feat: cloud managed");
@@ -239,6 +245,46 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vapor_forge_config::{CloudSection, InjectApp};
+
+    const TEST_APP_ID: AppId = AppId(246_813_579);
+
+    fn controlled_config(cloud: CloudSection) -> RuntimeConfig {
+        RuntimeConfig {
+            apps: vapor_forge_config::AppsSection {
+                inject: vec![InjectApp {
+                    id: TEST_APP_ID,
+                    dlc: Vec::new(),
+                    ticket: Default::default(),
+                    purchase_time: 0,
+                }],
+                ..Default::default()
+            },
+            cloud,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cumulus_forces_the_remote_storage_enable_gate_open() {
+        let config = controlled_config(CloudSection {
+            server_url: "https://cloud.example.com".into(),
+            token: "device-token".into(),
+            ..Default::default()
+        });
+
+        assert!(on_is_cloud_enabled(&config, TEST_APP_ID, false));
+    }
+
+    #[test]
+    fn legacy_cloud_flag_does_not_force_an_originally_disabled_app_on() {
+        let config = controlled_config(CloudSection {
+            enabled: Some(true),
+            ..Default::default()
+        });
+
+        assert!(!on_is_cloud_enabled(&config, TEST_APP_ID, false));
+    }
 
     #[test]
     fn strip_cloudenabled_only_block() {

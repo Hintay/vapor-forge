@@ -23,6 +23,10 @@ enabled = true
 # Cloud sync control for apps controlled by Vapor Forge.
 [cloud]
 enabled = false             # false strips CloudEnabled for controlled apps
+server_url = ""             # Cumulus origin, for example https://cloud.example.com
+token = ""                  # Cumulus device bearer token
+timeout_connect_ms = 5000
+timeout_ms = 15000
 
 # Ticket generation and ticket cache behavior.
 [ticket]
