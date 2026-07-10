@@ -67,6 +67,7 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
             let vec = p_depot_info as *mut vapor_forge_abi::CUtlVector<vapor_forge_abi::DepotEntry>;
             // SAFETY: vec is valid after BuildDepotDependency returned.
             let size = unsafe { (*vec).len() };
+            // SAFETY: vec is the same Steam-owned vector validated above.
             if size > 0 && size <= unsafe { (*vec).capacity() } {
                 // Collect depot IDs for safe lookup (convert raw u32 to DepotId).
                 let mut depot_ids: Vec<DepotId> = Vec::with_capacity(size);
@@ -74,7 +75,7 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
                     // SAFETY: i < size.
                     depot_ids.push(DepotId(unsafe { (*vec).get(i) }.depot_id));
                 }
-                let patches = vapor_forge_features::manifest::find_patches(&depot_ids, &*ss);
+                let patches = vapor_forge_features::manifest::find_patches(&depot_ids, &ss);
                 for patch in &patches {
                     for i in 0..size {
                         // SAFETY: i < size.
@@ -108,7 +109,7 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
 
 pub(crate) extern "C" fn hk_load_depot_decryption_key(
     this: *mut c_void,
-    foo: u32,
+    unknown: u32,
     key_name: *const i8,
     key_buf: *mut u8,
     key_size: u32,
@@ -130,7 +131,7 @@ pub(crate) extern "C" fn hk_load_depot_decryption_key(
 
     // SAFETY: calling original.
     let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
-    original.call(this, foo, key_name, key_buf, key_size)
+    original.call(this, unknown, key_name, key_buf, key_size)
 }
 
 pub(crate) fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
@@ -141,6 +142,7 @@ pub(crate) fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
     // SAFETY: bounded read of key_name up to MAX_SCAN bytes or NUL.
     let mut len = 0;
     while len < MAX_SCAN {
+        // SAFETY: caller supplied key_name and this scan is bounded to MAX_SCAN.
         let byte = unsafe { *key_name.add(len) } as u8;
         if byte == 0 {
             break;

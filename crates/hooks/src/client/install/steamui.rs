@@ -11,11 +11,6 @@ pub(super) static STEAMUI_BATCH_FINISHED: AtomicBool = AtomicBool::new(false);
 pub(super) fn install_hook_batch() {
     STEAMUI_BATCH_INSTALL_ONCE.call_once(|| {
         info!("hook-install: steamui batch started");
-        if !super::runtime_hooks_enabled() {
-            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
-            info!(installed = false, "hook-install: steamui batch finished");
-            return;
-        }
         let Some(ui_code) = crate::ui::install::get_steamui_code() else {
             warn!(
                 "hook-install: steamui.so executable mapping unavailable, skipping steamui hooks"

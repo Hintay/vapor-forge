@@ -262,7 +262,7 @@ unsafe fn read_word_unaligned(addr: usize) -> usize {
 #[cfg(target_pointer_width = "64")]
 fn resolve_slot_value(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
     let _ = module_base;
-    let va = raw as usize;
+    let va = raw;
     if in_text(va, segs) {
         return va;
     }
@@ -271,7 +271,7 @@ fn resolve_slot_value(raw: usize, segs: &SegmentRanges, module_base: usize) -> u
 
 #[cfg(target_pointer_width = "32")]
 fn resolve_slot_value(raw: usize, segs: &SegmentRanges, module_base: usize) -> usize {
-    let va = raw as usize;
+    let va = raw;
     if in_text(va, segs) {
         return va;
     }
@@ -293,7 +293,7 @@ fn resolve_any_module_ptr(raw: usize, segs: &SegmentRanges, module_base: usize) 
         .max()
         .unwrap_or(0);
 
-    let va = raw as usize;
+    let va = raw;
     if va >= module_base && va < module_end {
         return va;
     }
@@ -310,7 +310,7 @@ fn resolve_any_module_ptr(raw: usize, segs: &SegmentRanges, module_base: usize) 
         .max()
         .unwrap_or(0);
 
-    let va = raw as usize;
+    let va = raw;
     if va >= module_base && va < module_end {
         return va;
     }
@@ -343,7 +343,7 @@ fn read_cstring(va: usize, segs: &SegmentRanges) -> String {
         if byte == 0 {
             return out;
         }
-        if byte < 0x20 || byte > 0x7e {
+        if !(0x20..=0x7e).contains(&byte) {
             return String::new();
         }
         out.push(byte as char);
@@ -361,6 +361,7 @@ fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String
     if !is_in_segments(ti_ptr, word, segs) {
         return None;
     }
+    // SAFETY: ti_ptr range was checked against readable segments above.
     let ti_raw = unsafe { read_word_unaligned(ti_ptr) };
     let ti = resolve_any_module_ptr(ti_raw, segs, base);
     if ti == 0 {
@@ -372,6 +373,7 @@ fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String
     if !is_in_segments(name_ptr, word, segs) {
         return None;
     }
+    // SAFETY: name_ptr range was checked against readable segments above.
     let name_raw = unsafe { read_word_unaligned(name_ptr) };
     let name_va = resolve_any_module_ptr(name_raw, segs, base);
     if name_va == 0 {
@@ -425,6 +427,7 @@ fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
 
             // SAFETY: reading vtable header slots (use read_unaligned for safety).
             let ti = unsafe { read_word_unaligned(p - word) };
+            // SAFETY: p starts two words into the segment, so the header is readable.
             let ot = unsafe { read_word_unaligned(p - 2 * word) };
             if ot != 0 || ti == 0 {
                 p += word;
@@ -476,6 +479,7 @@ fn find_pic_anchor(func_start: usize, scan_len: usize, segs: &SegmentRanges) -> 
         for j in (i + 5)..end {
             // SAFETY: bounded read.
             let b0 = unsafe { *base.add(j) };
+            // SAFETY: end is capped so j + 1 remains inside the scan range.
             let b1 = unsafe { *base.add(j + 1) };
             if b0 == 0x81 && (b1 & 0xF8) == 0xC0 {
                 // add r32, imm32
@@ -592,6 +596,7 @@ fn decode_wrapper_x86_64(func_start: usize, segs: &SegmentRanges) -> (String, u3
         if (b == 0x48 || b == 0x4c) && i + 7 <= EARLY_SCAN {
             // SAFETY: bounded reads in executable mapping.
             let op = unsafe { *base.add(i + 1) };
+            // SAFETY: the instruction bound check above covers i + 2.
             let modrm = unsafe { *base.add(i + 2) };
             if op == 0x8d && (modrm & 0xc7) == 0x05 {
                 // SAFETY: disp32 is part of the instruction stream.
@@ -622,14 +627,12 @@ fn decode_wrapper_x86_64(func_start: usize, segs: &SegmentRanges) -> (String, u3
 
         // Hash constants are passed as 32-bit immediates. Keep this deliberately
         // broad; the name is what slot lookup uses today, the hash is diagnostic.
-        if func_hash == 0 && i + 5 <= EARLY_SCAN {
-            if b == 0xc7 {
-                // SAFETY: bounded reads in executable mapping.
-                let modrm = unsafe { *base.add(i + 1) };
-                if (modrm & 0xc0) == 0x40 || (modrm & 0xc0) == 0x80 {
-                    // SAFETY: reading a possible imm32 from instruction stream.
-                    func_hash = unsafe { ((func_start + i + 3) as *const u32).read_unaligned() };
-                }
+        if func_hash == 0 && i + 5 <= EARLY_SCAN && b == 0xc7 {
+            // SAFETY: bounded reads in executable mapping.
+            let modrm = unsafe { *base.add(i + 1) };
+            if (modrm & 0xc0) == 0x40 || (modrm & 0xc0) == 0x80 {
+                // SAFETY: reading a possible imm32 from instruction stream.
+                func_hash = unsafe { ((func_start + i + 3) as *const u32).read_unaligned() };
             }
         }
 

@@ -8,7 +8,7 @@ use vapor_forge_config::AppId;
 
 use crate::original::detour_or_return;
 
-use super::install::{config, package_state, script_state, PKG0_INJECTED};
+use super::install::{config, package_state, runtime_snapshot, PKG0_INJECTED};
 
 // ---------------------------------------------------------------------------
 // Function type alias
@@ -58,20 +58,21 @@ pub(crate) extern "C" fn hk_check_app_ownership(
     if super::package::PKG0_PTR.load(Ordering::Acquire) != 0
         && !PKG0_INJECTED.swap(true, Ordering::AcqRel)
     {
-        let cfg = config();
-        let ss = script_state();
-        let controlled = vapor_forge_features::package::controlled_app_ids(&*cfg, &ss.apps);
+        let runtime = runtime_snapshot();
+        let controlled = vapor_forge_features::package::controlled_app_ids(
+            &runtime.config,
+            &runtime.script_state.apps,
+        );
         let pkg_state = package_state();
         let plan = pkg_state.compute_injection(&controlled);
 
         // SAFETY: pkg0 and cuser captured, function pointers resolved.
-        unsafe { super::package::try_inject_once(&plan.app_ids) };
-        pkg_state.record_injected(&plan.app_ids);
+        let injected = unsafe { super::package::try_inject_once(&plan.app_ids) };
+        pkg_state.record_injected(&injected);
         pkg_state.set_active();
     }
 
-    // Pump pending markAndProcess from watcher thread (runs on this Steam thread).
-    super::package::pump_mark_and_process();
+    super::package::pump_reload();
 
     let cfg = config();
     // SAFETY: out is a valid pointer provided by Steam's caller, filled by original.
@@ -79,7 +80,7 @@ pub(crate) extern "C" fn hk_check_app_ownership(
 
     // If pkg0 injection is active, Steam's original already sees ownership
     // from pkg0. Still run the spoof as fallback for edge cases.
-    vapor_forge_features::apps::on_check_ownership(&*cfg, AppId(app_id), result, info)
+    vapor_forge_features::apps::on_check_ownership(&cfg, AppId(app_id), result, info)
 }
 
 // ---------------------------------------------------------------------------
@@ -99,10 +100,10 @@ pub(crate) extern "C" fn hk_get_subscribed_apps(
     let cfg = config();
 
     if app_list.is_null() || size == 0 {
-        return count + vapor_forge_features::apps::get_subscribed_count_adjustment(&*cfg);
+        return count + vapor_forge_features::apps::get_subscribed_count_adjustment(&cfg);
     }
 
     // SAFETY: app_list buffer has `size` u32 slots, provided by Steam's caller.
     let slice = unsafe { std::slice::from_raw_parts_mut(app_list, size as usize) };
-    vapor_forge_features::apps::on_get_subscribed_apps(&*cfg, slice, count)
+    vapor_forge_features::apps::on_get_subscribed_apps(&cfg, slice, count)
 }

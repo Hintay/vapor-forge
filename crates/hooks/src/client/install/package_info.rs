@@ -65,9 +65,13 @@ extern "C" fn hk_get_package_info64(this: *mut c_void, key: *const u64) -> *mut 
         super::super::package::capture_pkg_info_this(this);
 
         let pkg0_token = super::super::package::PKG0_ACCESS_TOKEN;
-        let pkg0 = if !result.is_null()
-            && unsafe { vapor_forge_abi::package_info::package_id(result) } == 0
-        {
+        let result_is_pkg0 = if result.is_null() {
+            false
+        } else {
+            // SAFETY: result is a non-null PackageInfo returned by Steam.
+            unsafe { vapor_forge_abi::package_info::package_id(result) == 0 }
+        };
+        let pkg0 = if result_is_pkg0 {
             result
         } else {
             original.call(this, &pkg0_token)

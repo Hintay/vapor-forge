@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -135,12 +136,42 @@ impl TicketCache {
 
     fn save_to_disk(&self, app_id: AppId, prefix: &str, data: &[u8]) {
         let Some(dir) = &self.cache_dir else { return };
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(error) = create_private_dir(dir) {
+            warn!(%error, app_id = app_id.0, "ticket: cache directory setup failed");
+            return;
+        }
         let path = dir.join(format!("{}_{}.bin", prefix, app_id.0));
-        if let Err(e) = std::fs::write(&path, data) {
-            warn!(error = %e, app_id = app_id.0, "ticket: disk cache write failed");
+        if let Err(error) = write_private_file(&path, data) {
+            warn!(%error, app_id = app_id.0, "ticket: disk cache write failed");
         }
     }
+}
+
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +373,23 @@ mod tests {
 
         let ticket = vec![0x11, 0x22, 0x33, 0x44];
         cache.store_app_ticket(AppId(999), ticket.clone(), true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(dir.join("ticket_999.bin"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
 
         // Fresh cache (simulates restart) reads from disk
         let cache2 = TicketCache::new(Some(dir.clone()));

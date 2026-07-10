@@ -47,8 +47,7 @@ pub(crate) extern "C" fn hk_remote_storage_run_ipc_frame(
     // SAFETY: REMOTE_STORAGE_RUN_IPC_DETOUR set before enabled.
     let original = detour_or_return!(
         "IClientRemoteStorage::RunIPCFrame",
-        REMOTE_STORAGE_RUN_IPC_DETOUR,
-        ()
+        REMOTE_STORAGE_RUN_IPC_DETOUR
     );
     original.call(this, a1, a2, a3);
 }
@@ -68,6 +67,7 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
         // This prevents the "out of date" cloud badge after hot-reload.
         // The VDF write filter strips it before disk flush.
         if vapor_forge_features::cloud::mark_cloud_wrote(AppId(app_id)) {
+            // SAFETY: captured from this object's VMT before the hook is enabled.
             if let Some(set_fn) = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) } {
                 set_fn(this, app_id, false);
                 info!(
@@ -78,7 +78,7 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
         }
     }
 
-    vapor_forge_features::cloud::on_is_cloud_enabled(&*cfg, AppId(app_id), result)
+    vapor_forge_features::cloud::on_is_cloud_enabled(&cfg, AppId(app_id), result)
 }
 
 fn install_cloud_vmt(this: *mut c_void) {
@@ -97,6 +97,7 @@ fn install_cloud_vmt(this: *mut c_void) {
         return;
     };
 
+    // SAFETY: this is the live IClientRemoteStorage object passed by Steam.
     let orig_addr = unsafe { read_vtable_slot(this, slot) };
     let Some(addr) = orig_addr else { return };
     let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
@@ -107,6 +108,7 @@ fn install_cloud_vmt(this: *mut c_void) {
 
     // SAFETY: transmuting a valid function address to a typed fn pointer.
     let orig_fn: IsCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: initialization is serialized by CLOUD_VMT_DONE before slot swap.
     unsafe { std::ptr::addr_of_mut!(ORIGINAL_IS_CLOUD_ENABLED).write(Some(orig_fn)) };
 
     // SAFETY: swap the vtable slot (original already stored).
@@ -122,6 +124,7 @@ fn capture_set_cloud_from_vtable(this: *mut c_void) {
         return;
     };
 
+    // SAFETY: this is the live IClientRemoteStorage object passed by Steam.
     let Some(addr) = (unsafe { read_vtable_slot(this, slot) }) else {
         return;
     };
@@ -132,6 +135,7 @@ fn capture_set_cloud_from_vtable(this: *mut c_void) {
 
     // SAFETY: vtable slot was decoded from the live IClientRemoteStorage object.
     let f: SetCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: initialization is serialized by CLOUD_VMT_DONE.
     unsafe { std::ptr::addr_of_mut!(SET_CLOUD_FN).write(Some(f)) };
     debug!(
         addr = format_args!("0x{:x}", addr),

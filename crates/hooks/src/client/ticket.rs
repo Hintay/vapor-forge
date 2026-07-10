@@ -10,8 +10,8 @@ use crate::original::{detour_or_return, vmt_or_return};
 use crate::vmt;
 
 use super::install::{
-    config, effective_ticket_mode, read_vtable_slot, script_state, validate_vmt_hook_eligibility,
-    TICKET_CACHE,
+    config, effective_ticket_mode, read_vtable_slot, runtime_snapshot,
+    validate_vmt_hook_eligibility, TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,13 +103,14 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
     }
 
     // Original returned 0, so check if this is a controlled app.
-    let cfg = config();
+    let runtime = runtime_snapshot();
+    let cfg = &runtime.config;
     if cfg.app_category(AppId(app_id)).is_none() {
         return result;
     }
 
-    let ticket_mode = effective_ticket_mode(&cfg, AppId(app_id));
-    let ss = script_state();
+    let ticket_mode = effective_ticket_mode(cfg, AppId(app_id));
+    let ss = &runtime.script_state;
 
     // Delegate mode: while inside the initial request window, prefer the
     // cached ticket (from a previous owner session) over forging so the
@@ -192,6 +193,7 @@ pub(crate) fn extract_steamid_from_ticket(ticket: &[u8]) -> Option<u64> {
 }
 
 /// Copy ticket data into the output buffer and populate offset pointers.
+#[allow(clippy::too_many_arguments)] // Mirrors Steam's FFI output parameters.
 pub(crate) fn copy_ticket_to_buffer(
     ticket: &[u8],
     p_ticket: *mut u8,
@@ -203,26 +205,28 @@ pub(crate) fn copy_ticket_to_buffer(
     app_id: u32,
     source: &str,
 ) -> u32 {
-    let copy_len = ticket.len().min(buf_size as usize);
-    if p_ticket.is_null() || copy_len == 0 {
+    const SIGNATURE_SIZE: usize = 128;
+    const STEAM_ID_END: usize = 16;
+    let minimum_size = SIGNATURE_SIZE + 4;
+    if p_ticket.is_null()
+        || ticket.len() < minimum_size.max(STEAM_ID_END)
+        || ticket.len() > buf_size as usize
+        || ticket.len() > u32::MAX as usize
+    {
         return 0;
     }
 
     // SAFETY: p_ticket is a valid buffer of buf_size bytes, provided by Steam's caller.
     unsafe {
-        std::ptr::copy_nonoverlapping(ticket.as_ptr(), p_ticket, copy_len);
+        std::ptr::copy_nonoverlapping(ticket.as_ptr(), p_ticket, ticket.len());
     }
 
     // Fill out offset pointers for the forged ticket structure.
     // Use sensible defaults: signature is the last 128 bytes.
-    let sig_size: u32 = 128;
-    let total = copy_len as u32;
-    let sig_offset = if total > sig_size {
-        total - sig_size
-    } else {
-        0
-    };
-    let app_offset = if sig_offset >= 4 { sig_offset - 4 } else { 0 };
+    let sig_size = SIGNATURE_SIZE as u32;
+    let total = ticket.len() as u32;
+    let sig_offset = total - sig_size;
+    let app_offset = sig_offset - 4;
 
     if !pi_app_id.is_null() {
         // SAFETY: pi_app_id is a valid pointer from Steam's caller.
@@ -241,7 +245,12 @@ pub(crate) fn copy_ticket_to_buffer(
         unsafe { *pcb_signature = sig_size };
     }
 
-    info!(app_id, size = copy_len, source, "ticket: provided to Steam");
+    info!(
+        app_id,
+        size = ticket.len(),
+        source,
+        "ticket: provided to Steam"
+    );
     total
 }
 
@@ -407,6 +416,7 @@ pub(crate) fn install_steamid_vmt(this: *mut c_void) {
         return;
     };
 
+    // SAFETY: this is the live IClientUser object passed by Steam.
     let Some(addr) = (unsafe { read_vtable_slot(this, slot) }) else {
         return;
     };
@@ -418,10 +428,75 @@ pub(crate) fn install_steamid_vmt(this: *mut c_void) {
 
     // SAFETY: transmuting a valid function address to a typed fn pointer.
     let orig_fn: GetSteamIDFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: initialization is serialized before replacing the VMT slot.
     unsafe { std::ptr::addr_of_mut!(ORIG_GET_STEAMID).write(Some(orig_fn)) };
 
     // SAFETY: swap the vtable slot (original already stored).
     unsafe {
         vmt::swap_vtable_slot("GetSteamID", this, slot, repl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_ticket_to_buffer;
+
+    #[test]
+    fn copy_ticket_rejects_short_ticket() {
+        let ticket = vec![0xAA; 64];
+        let mut output = vec![0u8; 256];
+        assert_eq!(
+            copy_ticket_to_buffer(
+                &ticket,
+                output.as_mut_ptr(),
+                output.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                480,
+                "test",
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn copy_ticket_rejects_truncation_and_reports_valid_offsets() {
+        let ticket = vec![0xAA; 256];
+        let mut short_output = vec![0u8; 128];
+        assert_eq!(
+            copy_ticket_to_buffer(
+                &ticket,
+                short_output.as_mut_ptr(),
+                short_output.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                480,
+                "test",
+            ),
+            0
+        );
+
+        let mut output = vec![0u8; ticket.len()];
+        let (mut app, mut steam, mut signature, mut signature_size) = (0, 0, 0, 0);
+        assert_eq!(
+            copy_ticket_to_buffer(
+                &ticket,
+                output.as_mut_ptr(),
+                output.len() as u32,
+                &mut app,
+                &mut steam,
+                &mut signature,
+                &mut signature_size,
+                480,
+                "test",
+            ),
+            ticket.len() as u32
+        );
+        assert_eq!((app, steam, signature, signature_size), (124, 8, 128, 128));
+        assert_eq!(output, ticket);
     }
 }

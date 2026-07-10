@@ -253,7 +253,7 @@ fn reset_stopped_delegate_windows(now_playing: &[AppId]) {
     }
 
     // Revoke IPC session tokens for games that have exited.
-    if let Some(Some(server)) = crate::client::install::IPC_SERVER.get() {
+    if let Some(server) = crate::client::install::IPC_SERVER.get() {
         for app in &cfg.apps.inject {
             if !now_playing.contains(&app.id) {
                 server.revoke_app_tokens(app.id.0);
@@ -308,8 +308,9 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
         }
     };
 
-    let cfg = config();
-    if !request_code::should_intercept(AppId(app_id), &cfg) {
+    let runtime = crate::client::install::runtime_snapshot();
+    let cfg = &runtime.config;
+    if !request_code::should_intercept(AppId(app_id), cfg) {
         return false;
     }
 
@@ -317,9 +318,11 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
         app_id,
         depot_id, gid, job_id, "netpacket: intercepted manifest request code"
     );
-    let lua_callback = crate::client::install::manifest_code_provider().map(|provider| {
-        std::sync::Arc::new(move |app_id, depot_id, gid| provider.fetch(app_id, depot_id, gid))
-            as request_code::ManifestCodeCallback
+    let provider_timeout = std::time::Duration::from_millis(cfg.manifest.timeout_ms);
+    let lua_callback = runtime.manifest_code_provider.clone().map(|provider| {
+        std::sync::Arc::new(move |app_id, depot_id, gid| {
+            provider.fetch_with_timeout(app_id, depot_id, gid, provider_timeout)
+        }) as request_code::ManifestCodeCallback
     });
     PENDING.queue_fetch(
         request_code::ManifestCodeFetch {
@@ -329,11 +332,9 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
             gid,
             req_hdr_bytes: header_bytes.to_vec(),
         },
-        &cfg,
+        cfg,
         lua_callback,
-    );
-
-    true
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +382,7 @@ pub unsafe fn try_inject<F>(
             PacketChange::Injected,
             None,
         );
+        // SAFETY: packet is valid for this callback and the guard restores it.
         let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
         call_original(this, packet);
     }
@@ -394,6 +396,7 @@ pub unsafe fn try_inject<F>(
             PacketChange::Injected,
             None,
         );
+        // SAFETY: packet is valid for this callback and the guard restores it.
         let _guard = unsafe { PacketSwapGuard::new(packet, resp.packet) };
         call_original(this, packet);
     }
@@ -415,6 +418,7 @@ pub unsafe fn try_inject<F>(
                     PacketChange::Injected,
                     None,
                 );
+                // SAFETY: packet is valid for this callback and the guard restores it.
                 let _guard = unsafe { PacketSwapGuard::new(packet, inject_bytes) };
                 call_original(this, packet);
             }
@@ -436,14 +440,19 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     if packet.is_null() {
         return;
     }
+    // SAFETY: packet is the non-null CNetPacket supplied by Steam.
     let p_data = unsafe { cnet_packet::data_slot(packet) };
+    // SAFETY: packet is the same validated CNetPacket.
     let p_size = unsafe { cnet_packet::size_slot(packet) };
+    // SAFETY: both slots point into the live CNetPacket.
     let data = unsafe { *p_data };
+    // SAFETY: both slots point into the live CNetPacket.
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
         return;
     }
 
+    // SAFETY: Steam's packet supplies a non-null data pointer and byte size.
     let buf = unsafe { std::slice::from_raw_parts(data, size as usize) };
     let Some((emsg_raw, hdr_bytes, body_bytes)) = vapor_forge_abi::unpack_raw(buf) else {
         crate::packet_capture::capture(
@@ -472,6 +481,7 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         if let Some((new_hdr, new_body)) = achievements::on_recv_service_stats(&hdr, body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, &new_hdr, &new_body);
             final_len = Some(replacement.len());
+            // SAFETY: packet remains valid for this hook callback.
             unsafe { replace_packet_data(packet, replacement) };
             change = PacketChange::Rewritten;
         }
@@ -483,6 +493,7 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         if let Some(new_body) = achievements::on_recv_legacy_stats(body_bytes, &cfg) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
             final_len = Some(replacement.len());
+            // SAFETY: packet remains valid for this hook callback.
             unsafe { replace_packet_data(packet, replacement) };
             change = PacketChange::Rewritten;
         }
@@ -493,6 +504,7 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         if let Some(new_body) = handle_encrypted_ticket_response(body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
             final_len = Some(replacement.len());
+            // SAFETY: packet remains valid for this hook callback.
             unsafe { replace_packet_data(packet, replacement) };
             change = PacketChange::Rewritten;
         }
@@ -506,6 +518,7 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         if let Some(new_body) = rich_presence::patch_persona_state(body_bytes) {
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
             final_len = Some(replacement.len());
+            // SAFETY: packet remains valid for this hook callback.
             unsafe { replace_packet_data(packet, replacement) };
             change = PacketChange::Rewritten;
         }
@@ -520,13 +533,14 @@ fn handle_encrypted_ticket_response(body_bytes: &[u8]) -> Option<Vec<u8>> {
     let eresult = resp.eresult.unwrap_or(2);
 
     let ticket_cache = &*crate::client::install::TICKET_CACHE;
-    let ss = crate::client::install::script_state();
+    let runtime = crate::client::install::runtime_snapshot();
+    let ss = &runtime.script_state;
 
     if eresult == vapor_forge_abi::ERESULT_OK {
         // Success: cache the ticket for future use
         if let Some(ticket) = &resp.encrypted_app_ticket {
             if let Some(data) = &ticket.encrypted_ticket {
-                let cfg = config();
+                let cfg = &runtime.config;
                 let persist = if cfg.app_category(app_id).is_some() {
                     cfg.ticket_mode(app_id) == vapor_forge_config::TicketMode::Delegate
                 } else {
@@ -567,6 +581,7 @@ unsafe fn replace_packet_data(packet: *mut std::ffi::c_void, data: Vec<u8>) {
     let len = boxed.len() as u32;
     let ptr = Box::into_raw(boxed) as *mut u8;
 
+    // SAFETY: packet is valid and ptr remains allocated for process lifetime.
     unsafe { cnet_packet::set_data(packet, ptr, len) };
 }
 
@@ -586,12 +601,18 @@ impl PacketSwapGuard {
     /// # Safety
     /// `packet` must be a valid CNetPacket pointer.
     unsafe fn new(packet: *mut std::ffi::c_void, response: Vec<u8>) -> Self {
+        // SAFETY: caller guarantees packet is a valid CNetPacket.
         let p_data = unsafe { cnet_packet::data_slot(packet) };
+        // SAFETY: caller guarantees packet is a valid CNetPacket.
         let p_size = unsafe { cnet_packet::size_slot(packet) };
+        // SAFETY: the slots above point into the live packet.
         let orig_data = unsafe { *p_data };
+        // SAFETY: the slots above point into the live packet.
         let orig_size = unsafe { *p_size };
 
         let mut response_box = response.into_boxed_slice();
+        // SAFETY: both slots point into the live packet and response_box stays
+        // owned by the guard until restoration.
         unsafe {
             *p_data = response_box.as_mut_ptr();
             *p_size = response_box.len() as u32;
@@ -609,6 +630,7 @@ impl PacketSwapGuard {
 
 impl Drop for PacketSwapGuard {
     fn drop(&mut self) {
+        // SAFETY: the guard cannot outlive the packet callback that created it.
         unsafe {
             *self.p_data = self.orig_data;
             *self.p_size = self.orig_size;

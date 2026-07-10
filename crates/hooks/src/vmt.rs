@@ -26,6 +26,7 @@ pub unsafe fn swap_vtable_slot(
 
     // SAFETY: reading the original slot value.
     let slot_ptr = unsafe { vtable.add(slot) };
+    // SAFETY: slot_ptr was derived from the validated vtable and slot index.
     let original = unsafe { *slot_ptr };
 
     debug!(

@@ -49,7 +49,7 @@ pub(crate) extern "C" fn hk_app_manager_run_ipc_frame(
     }
 
     // SAFETY: APP_MANAGER_DETOUR set before enabled.
-    let original = detour_or_return!("IClientAppManager::RunIPCFrame", APP_MANAGER_DETOUR, ());
+    let original = detour_or_return!("IClientAppManager::RunIPCFrame", APP_MANAGER_DETOUR);
     original.call(this, a1, a2, a3);
 }
 
@@ -59,7 +59,7 @@ extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u3
     let result = original(this, app_id, dlc_id);
 
     let cfg = config();
-    vapor_forge_features::dlc::on_is_dlc_installed(&*cfg, AppId(app_id), AppId(dlc_id), result)
+    vapor_forge_features::dlc::on_is_dlc_installed(&cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
 extern "C" fn hk_b_is_dlc_enabled(
@@ -73,7 +73,7 @@ extern "C" fn hk_b_is_dlc_enabled(
     let result = original(this, app_id, dlc_id, unknown);
 
     let cfg = config();
-    vapor_forge_features::dlc::on_is_dlc_enabled(&*cfg, AppId(app_id), AppId(dlc_id), result)
+    vapor_forge_features::dlc::on_is_dlc_enabled(&cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
 extern "C" fn hk_launch_app(
@@ -84,6 +84,7 @@ extern "C" fn hk_launch_app(
     a4: *mut c_void,
 ) -> *mut c_void {
     if !p_app_id.is_null() {
+        // SAFETY: p_app_id is a non-null pointer supplied by Steam.
         let app_id = unsafe { *p_app_id };
         debug!(app_id, "LaunchApp");
     }
@@ -102,12 +103,16 @@ fn install_app_manager_vmt(this: *mut c_void) {
     let slot_launch = crate::vtable_scan::slot_of("IClientAppManager", "LaunchApp");
 
     if let Some(slot) = slot_installed {
+        // SAFETY: this is the live IClientAppManager object passed by Steam.
         if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
             let repl = hk_is_app_dlc_installed as *const () as usize;
             if validate_vmt_hook_eligibility("IsAppDlcInstalled", addr, repl) {
+                // SAFETY: addr was read from the validated slot; original is
+                // stored before replacing that same slot.
                 unsafe {
-                    std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED)
-                        .write(Some(std::mem::transmute(addr)));
+                    std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED).write(Some(
+                        std::mem::transmute::<usize, IsAppDlcInstalledFn>(addr),
+                    ));
                     vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, repl);
                 }
             }
@@ -117,12 +122,15 @@ fn install_app_manager_vmt(this: *mut c_void) {
     }
 
     if let Some(slot) = slot_enabled {
+        // SAFETY: this is the live IClientAppManager object passed by Steam.
         if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
             let repl = hk_b_is_dlc_enabled as *const () as usize;
             if validate_vmt_hook_eligibility("BIsDlcEnabled", addr, repl) {
+                // SAFETY: addr was read from the validated slot; original is
+                // stored before replacing that same slot.
                 unsafe {
                     std::ptr::addr_of_mut!(ORIG_B_IS_DLC_ENABLED)
-                        .write(Some(std::mem::transmute(addr)));
+                        .write(Some(std::mem::transmute::<usize, BIsDlcEnabledFn>(addr)));
                     vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, repl);
                 }
             }
@@ -133,12 +141,14 @@ fn install_app_manager_vmt(this: *mut c_void) {
 
     // LaunchApp: intercept to evaluate AppAvatar flag rules at game-launch time.
     if let Some(slot) = slot_launch {
+        // SAFETY: this is the live IClientAppManager object passed by Steam.
         if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
             let repl = hk_launch_app as *const () as usize;
             if validate_vmt_hook_eligibility("LaunchApp", addr, repl) {
                 // SAFETY: original stored before VMT slot is replaced.
                 unsafe {
-                    std::ptr::addr_of_mut!(ORIG_LAUNCH_APP).write(Some(std::mem::transmute(addr)));
+                    std::ptr::addr_of_mut!(ORIG_LAUNCH_APP)
+                        .write(Some(std::mem::transmute::<usize, LaunchAppFn>(addr)));
                     vmt::swap_vtable_slot("LaunchApp", this, slot, repl);
                 }
             }
@@ -163,7 +173,7 @@ pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
     }
 
     // SAFETY: CLIENT_APPS_DETOUR set before enabled.
-    let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR, ());
+    let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR);
     original.call(this, a1, a2, a3);
 }
 
@@ -172,8 +182,6 @@ pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
 // their appinfo and handles enumeration natively.
 
 fn install_client_apps_vmt(_this: *mut c_void) {
-    if CLIENT_APPS_VMT_DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
+    if CLIENT_APPS_VMT_DONE.swap(true, Ordering::AcqRel) {}
     // IClientApps VMT hooks removed. DLC handled via pkg0 injection.
 }

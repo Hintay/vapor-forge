@@ -116,11 +116,8 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     }
 
     // SAFETY: calling through the trampoline with captured this pointers.
-    let get_app_by_id = detour_or_return!(
-        "CSteamUIAppController::GetAppByID",
-        GET_APP_BY_ID_DETOUR,
-        ()
-    );
+    let get_app_by_id =
+        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
     let app_ptr = get_app_by_id.call(controller, app_id.0, false);
     if app_ptr.is_null() {
         return;
@@ -146,7 +143,7 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     // Notify UI.
     // SAFETY: calling through the trampoline.
     let mark_app_change =
-        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
     mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     info!(app = app_id.0, "steamui: app removed from library");
 }
@@ -165,11 +162,8 @@ pub fn remove_app_and_send_change(app_id: AppId) {
     }
 
     // SAFETY: calling through the trampoline with captured this pointers.
-    let get_app_by_id = detour_or_return!(
-        "CSteamUIAppController::GetAppByID",
-        GET_APP_BY_ID_DETOUR,
-        ()
-    );
+    let get_app_by_id =
+        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
     let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
     if app_ptr.is_null() {
         return;
@@ -183,7 +177,7 @@ pub fn remove_app_and_send_change(app_id: AppId) {
     // Notify UI.
     // SAFETY: calling through the trampoline.
     let mark_app_change =
-        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
     mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     info!(app = app_id.0, "steamui: app removed from library");
 }
@@ -200,11 +194,8 @@ pub fn stamp_purchase_time(app_id: AppId, time: u32) {
     }
 
     // SAFETY: calling through the trampoline.
-    let get_app_by_id = detour_or_return!(
-        "CSteamUIAppController::GetAppByID",
-        GET_APP_BY_ID_DETOUR,
-        ()
-    );
+    let get_app_by_id =
+        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
     let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
     if app_ptr.is_null() {
         return;
@@ -218,7 +209,7 @@ pub fn stamp_purchase_time(app_id: AppId, time: u32) {
     // Notify UI.
     // SAFETY: calling through the trampoline.
     let mark_app_change =
-        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
     mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
     debug!(app = app_id.0, time, "steamui: purchase time stamped");
 }

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use mlua::prelude::*;
 use tracing::{info, warn};
@@ -7,6 +8,8 @@ use vapor_forge_core::ScriptState;
 
 use crate::bindings::{create_runtime, execute_source, snapshot_state};
 use crate::report::{ScriptCallReport, ScriptExecutionOptions, ScriptFileReport};
+
+const MAX_PROVIDER_QUEUE: usize = 16;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScriptSource {
@@ -23,7 +26,7 @@ pub(crate) struct ProviderExecution {
 
 #[derive(Clone)]
 pub struct ManifestCodeProvider {
-    sender: mpsc::Sender<ProviderRequest>,
+    sender: mpsc::SyncSender<ProviderRequest>,
     has_basic: bool,
     has_extended: bool,
 }
@@ -66,7 +69,7 @@ impl ManifestCodeProvider {
             });
         }
 
-        let (request_tx, request_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::sync_channel(MAX_PROVIDER_QUEUE);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("lua-runtime".to_owned())
@@ -90,18 +93,43 @@ impl ManifestCodeProvider {
     }
 
     pub fn fetch(&self, app_id: u32, depot_id: u32, gid: u64) -> Result<Option<u64>, String> {
+        self.fetch_timeout(app_id, depot_id, gid, None)
+    }
+
+    pub fn fetch_with_timeout(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        gid: u64,
+        timeout: Duration,
+    ) -> Result<Option<u64>, String> {
+        self.fetch_timeout(app_id, depot_id, gid, Some(timeout))
+    }
+
+    fn fetch_timeout(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        gid: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Option<u64>, String> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.sender
-            .send(ProviderRequest {
+            .try_send(ProviderRequest {
                 app_id,
                 depot_id,
                 gid,
                 response: response_tx,
             })
-            .map_err(|_| "Lua manifest provider is no longer running".to_owned())?;
-        response_rx
-            .recv()
-            .map_err(|_| "Lua manifest provider stopped before responding".to_owned())?
+            .map_err(|error| format!("Lua manifest provider queue unavailable: {error}"))?;
+        match timeout {
+            Some(timeout) => response_rx
+                .recv_timeout(timeout)
+                .map_err(|error| format!("Lua manifest provider response failed: {error}"))?,
+            None => response_rx
+                .recv()
+                .map_err(|_| "Lua manifest provider stopped before responding".to_owned())?,
+        }
     }
 
     pub fn has_basic(&self) -> bool {

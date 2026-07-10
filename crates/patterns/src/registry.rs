@@ -475,9 +475,6 @@ mod tests {
     fn registry_finds_embedded() {
         let reg = PatternRegistry::embedded();
         let lookup = reg.get("CUser::CheckAppOwnership").expect("should find");
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(lookup.follow(), FollowMode::None);
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         assert_eq!(lookup.follow(), FollowMode::Relative);
         assert!(!lookup.pattern().is_empty());
     }

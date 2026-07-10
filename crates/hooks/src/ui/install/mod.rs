@@ -48,7 +48,7 @@ extern "C" fn hk_run_frame(controller: *mut c_void) {
     }
     crate::ui::toast_bridge::bootstrap();
     // SAFETY: detour set before hook enabled.
-    let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR, ());
+    let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR);
     original.call(controller);
     maybe_show_init_toast();
     crate::ui::toast_bridge::pump();
@@ -71,6 +71,7 @@ extern "C" fn hk_fill_in_app_overview(
             // Use configured purchase time, or fall back to current time.
             let mut t = cfg.purchase_time(AppId(app_id_raw));
             if t == 0 {
+                // SAFETY: passing null asks libc::time to return only the timestamp.
                 t = unsafe { libc::time(std::ptr::null_mut()) } as u32;
             }
             // Stamp BEFORE the original copies the field into the overview.
@@ -96,8 +97,7 @@ extern "C" fn hk_build_complete_change(
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!(
         "CSteamUIAppController::BuildCompleteAppOverviewChange",
-        BUILD_COMPLETE_DETOUR,
-        ()
+        BUILD_COMPLETE_DETOUR
     );
     original.call(controller, change, callback_slot);
 
@@ -130,7 +130,7 @@ extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
         APP_CHANGE_SOURCE.store(source as usize, Ordering::Release);
     }
     // SAFETY: detour set before hook enabled.
-    let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR, ());
+    let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
     original.call(source, app_id, flags);
     crate::ui::toast_bridge::pump();
 }
@@ -321,18 +321,12 @@ fn resolve_repeated_field_add(
     steamui_code: &crate::detour::CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
-    let entry = match registry.get("google::protobuf::RepeatedField<uint32>::Add") {
-        Some(e) => e,
-        None => return None,
-    };
-    let addr = match crate::detour::resolve_pattern_entry(
+    let entry = registry.get("google::protobuf::RepeatedField<uint32>::Add")?;
+    let addr = crate::detour::resolve_pattern_entry(
         steamui_code,
         "google::protobuf::RepeatedField<uint32>::Add",
         &entry,
-    ) {
-        Some(a) => a,
-        None => return None,
-    };
+    )?;
 
     #[cfg(target_pointer_width = "64")]
     if !is_repeated_field_u32_add_abi(steamui_code, addr) {

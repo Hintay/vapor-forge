@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 
 use tracing::{info, warn};
@@ -8,22 +7,36 @@ use vapor_forge_scripting::{ManifestCodeProvider, ScriptRuntime, ScriptState};
 const CONFIG_FILENAME: &str = "config.toml";
 
 static RUNTIME_INIT: Once = Once::new();
-static RUNTIME_HOOKS_ENABLED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) static IPC_SERVER: OnceLock<Option<Arc<crate::ipc_server::IpcServer>>> = OnceLock::new();
+pub(crate) static IPC_SERVER: OnceLock<Arc<crate::ipc_server::IpcServer>> = OnceLock::new();
 
-static CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
-    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
+pub(crate) struct RuntimeSnapshot {
+    pub config: Arc<RuntimeConfig>,
+    pub script_state: Arc<ScriptState>,
+    pub manifest_code_provider: Option<Arc<ManifestCodeProvider>>,
+}
+
+impl RuntimeSnapshot {
+    pub(crate) fn new(config: RuntimeConfig, script_runtime: ScriptRuntime) -> Self {
+        Self {
+            config: Arc::new(config),
+            script_state: Arc::new(script_runtime.state),
+            manifest_code_provider: script_runtime.manifest_code_provider.map(Arc::new),
+        }
+    }
+}
+
+impl Default for RuntimeSnapshot {
+    fn default() -> Self {
+        Self::new(RuntimeConfig::default(), ScriptRuntime::default())
+    }
+}
+
+static RUNTIME: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeSnapshot>> =
+    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeSnapshot::default()));
 
 static BASE_CONFIG: once_cell::sync::Lazy<arc_swap::ArcSwap<RuntimeConfig>> =
     once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(RuntimeConfig::default()));
-
-static SCRIPT_STATE: once_cell::sync::Lazy<arc_swap::ArcSwap<ScriptState>> =
-    once_cell::sync::Lazy::new(|| arc_swap::ArcSwap::from_pointee(ScriptState::default()));
-
-static MANIFEST_CODE_PROVIDER: once_cell::sync::Lazy<
-    arc_swap::ArcSwapOption<ManifestCodeProvider>,
-> = once_cell::sync::Lazy::new(arc_swap::ArcSwapOption::empty);
 
 static PACKAGE_STATE: once_cell::sync::Lazy<vapor_forge_features::package::PackageState> =
     once_cell::sync::Lazy::new(vapor_forge_features::package::PackageState::new);
@@ -54,80 +67,32 @@ pub fn ensure_runtime_initialized() {
         let (config, script_runtime) = build_runtime(&base_config);
         let script_state = &script_runtime.state;
 
-        let has_script_apps = !script_state.apps.is_empty();
-        let hooks_enabled =
-            config.has_any_inject_apps() || has_script_apps || config.apps.shared.enabled;
-
         let inject_count = config.apps.inject.len();
         let dlc_count: usize = config.apps.inject.iter().map(|a| a.dlc.len()).sum();
-        if hooks_enabled {
-            info!(
-                inject = inject_count,
-                dlc = dlc_count,
-                script_apps = script_state.apps.len(),
-                sharing = config.apps.shared.enabled,
-                "hook-install: config ready"
-            );
-        } else {
-            info!("hook-install: nothing to do, skipping");
-        }
+        info!(
+            inject = inject_count,
+            dlc = dlc_count,
+            script_apps = script_state.apps.len(),
+            sharing = config.apps.shared.enabled,
+            "hook-install: config ready"
+        );
 
-        if hooks_enabled {
-            // Load stat donor SteamIDs from Lua scripts.
-            vapor_forge_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
-
-            // Load AppAvatar mappings from config static_map and Lua setavatar.
-            vapor_forge_features::app_avatar::load_static_map(&config.app_avatar);
-            for (&app, &avatar) in &script_state.avatars {
-                vapor_forge_features::app_avatar::set_avatar(app, avatar);
-            }
+        vapor_forge_features::achievements::load_stat_steam_ids(&script_state.stat_steam_ids);
+        vapor_forge_features::app_avatar::load_static_map(&config.app_avatar);
+        for (&app, &avatar) in &script_state.avatars {
+            vapor_forge_features::app_avatar::set_avatar(app, avatar);
         }
 
         BASE_CONFIG.store(Arc::new(base_config));
-        CONFIG.store(Arc::new(config));
-        SCRIPT_STATE.store(Arc::new(script_runtime.state));
-        MANIFEST_CODE_PROVIDER.store(script_runtime.manifest_code_provider.map(Arc::new));
-        RUNTIME_HOOKS_ENABLED.store(hooks_enabled, Ordering::Release);
+        let snapshot = RuntimeSnapshot::new(config, script_runtime);
+        ensure_ipc_server_for_config(&snapshot.config);
+        RUNTIME.store(Arc::new(snapshot));
 
-        crate::watcher::start(
-            &BASE_CONFIG,
-            &CONFIG,
-            &SCRIPT_STATE,
-            &MANIFEST_CODE_PROVIDER,
-            &PACKAGE_STATE,
-            config_path,
-        );
+        crate::watcher::start(&BASE_CONFIG, &RUNTIME, config_path);
 
         #[cfg(debug_assertions)]
-        if CONFIG.load().debug.control_api {
+        if RUNTIME.load().config.debug.control_api {
             crate::debug_api::start();
-        }
-
-        if !hooks_enabled {
-            return;
-        }
-
-        // Start the IPC server only when a feature that consumes IPC events
-        // is enabled and a proton helper is available.
-        {
-            let cfg = CONFIG.load();
-            let needs_ipc = hooks_enabled && cfg.ticket.auto_delegate;
-            let has_proton = needs_ipc
-                && (cfg
-                    .library_inject
-                    .libs
-                    .iter()
-                    .any(|l| l.path.ends_with(".dll"))
-                    || !cfg.library_inject.helper_path.is_empty());
-            let server = if has_proton {
-                crate::ipc_server::IpcServer::start()
-            } else {
-                if needs_ipc {
-                    warn!("hook-install: auto_delegate enabled but no proton helper configured");
-                }
-                None
-            };
-            let _ = IPC_SERVER.set(server);
         }
 
         // Force TICKET_CACHE lazy init while config is loaded.
@@ -135,12 +100,12 @@ pub fn ensure_runtime_initialized() {
     });
 }
 
-pub(crate) fn runtime_hooks_enabled() -> bool {
-    RUNTIME_HOOKS_ENABLED.load(Ordering::Acquire)
+pub(crate) fn config() -> Arc<RuntimeConfig> {
+    RUNTIME.load().config.clone()
 }
 
-pub(crate) fn config() -> arc_swap::Guard<Arc<RuntimeConfig>> {
-    CONFIG.load()
+pub(crate) fn runtime_snapshot() -> arc_swap::Guard<Arc<RuntimeSnapshot>> {
+    RUNTIME.load()
 }
 
 /// Config ticket mode overlaid with runtime auto-delegate detections.
@@ -157,12 +122,27 @@ pub(crate) fn effective_ticket_mode(
     mode
 }
 
-pub(crate) fn script_state() -> arc_swap::Guard<Arc<ScriptState>> {
-    SCRIPT_STATE.load()
+pub(crate) fn script_state() -> Arc<ScriptState> {
+    RUNTIME.load().script_state.clone()
 }
 
-pub(crate) fn manifest_code_provider() -> Option<Arc<ManifestCodeProvider>> {
-    MANIFEST_CODE_PROVIDER.load_full()
+pub(crate) fn ensure_ipc_server_for_config(config: &RuntimeConfig) {
+    if !config.ticket.auto_delegate || IPC_SERVER.get().is_some() {
+        return;
+    }
+    let has_proton = config
+        .library_inject
+        .libs
+        .iter()
+        .any(|library| library.path.ends_with(".dll"))
+        || !config.library_inject.helper_path.is_empty();
+    if !has_proton {
+        warn!("hook-install: auto_delegate enabled but no proton helper configured");
+        return;
+    }
+    if let Some(server) = crate::ipc_server::IpcServer::start() {
+        let _ = IPC_SERVER.set(server);
+    }
 }
 
 pub(crate) fn package_state() -> &'static vapor_forge_features::package::PackageState {

@@ -14,6 +14,7 @@ pub(crate) struct HookResult {
 // ---------------------------------------------------------------------------
 
 /// Lightweight copy of HookResult for cross-module queries.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) struct StoredHook {
     pub(crate) name: &'static str,
     pub(crate) installed: bool,
@@ -21,6 +22,7 @@ pub(crate) struct StoredHook {
 }
 
 /// Per-module storage entry.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) struct ModuleResults {
     pub(crate) module: &'static str,
     pub(crate) hooks: Vec<StoredHook>,
@@ -48,6 +50,7 @@ pub(crate) fn store_results(module: &'static str, results: &[HookResult]) {
 }
 
 /// Access stored results. The callback receives a slice of all module results.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) fn with_stored_results<R>(f: impl FnOnce(&[ModuleResults]) -> R) -> R {
     let guard = STORED_RESULTS.lock().unwrap_or_else(|e| e.into_inner());
     f(&guard)

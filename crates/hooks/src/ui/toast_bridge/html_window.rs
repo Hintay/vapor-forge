@@ -412,7 +412,7 @@ fn read_process_bytes(addr: usize, out: &mut [u8]) -> bool {
         return true;
     }
 
-    let mut local = libc::iovec {
+    let local = libc::iovec {
         iov_base: out.as_mut_ptr().cast(),
         iov_len: out.len(),
     };
@@ -425,7 +425,7 @@ fn read_process_bytes(addr: usize, out: &mut [u8]) -> bool {
     let read = unsafe {
         libc::process_vm_readv(
             libc::getpid(),
-            &mut local,
+            &local,
             1,
             &remote as *const libc::iovec,
             1,

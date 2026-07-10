@@ -189,33 +189,45 @@ fn handle_connection(
         };
 
         match msg {
-            Message::DenuvoDetected { app_id: aid } => {
-                info!(app_id = aid, pid, "ipc-server: Denuvo detected by helper");
-                on_denuvo_detected(aid);
+            Message::DenuvoDetected { app_id: aid } if aid == app_id => {
+                info!(app_id, pid, "ipc-server: Denuvo detected by helper");
+                on_denuvo_detected(app_id);
             }
-            Message::DllLoaded { app_id: aid, name } => {
-                debug!(app_id = aid, dll = %name, pid, "ipc-server: DLL loaded");
+            Message::DllLoaded { app_id: aid, name } if aid == app_id => {
+                debug!(app_id, dll = %name, pid, "ipc-server: DLL loaded");
             }
             Message::DllInjectResult {
                 app_id: aid,
                 success,
-            } => {
+            } if aid == app_id => {
                 if success {
-                    info!(app_id = aid, pid, "ipc-server: DLL injection succeeded");
+                    info!(app_id, pid, "ipc-server: DLL injection succeeded");
                 } else {
-                    warn!(app_id = aid, pid, "ipc-server: DLL injection failed");
+                    warn!(app_id, pid, "ipc-server: DLL injection failed");
                 }
             }
             Message::PeSection {
                 app_id: aid,
                 section_name,
-            } => {
+            } if aid == app_id => {
                 debug!(
-                    app_id = aid,
+                    app_id,
                     section = %section_name,
                     pid,
                     "ipc-server: PE section reported"
                 );
+            }
+            Message::DenuvoDetected { app_id: aid }
+            | Message::DllLoaded { app_id: aid, .. }
+            | Message::DllInjectResult { app_id: aid, .. }
+            | Message::PeSection { app_id: aid, .. } => {
+                warn!(
+                    authenticated = app_id,
+                    claimed = aid,
+                    pid,
+                    "ipc-server: message app_id mismatch"
+                );
+                break;
             }
             _ => {
                 debug!(?msg, "ipc-server: unexpected message from client");

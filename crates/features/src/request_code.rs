@@ -41,6 +41,8 @@ pub const PROVIDERS: &[(&str, &str)] = &[
     ("steamrun", "https://manifest.steam.run/api/manifest/{gid}"),
 ];
 
+const MAX_PENDING_FETCHES: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Pending fetch state
 // ---------------------------------------------------------------------------
@@ -89,7 +91,7 @@ impl PendingQueue {
         request: ManifestCodeFetch,
         config: &RuntimeConfig,
         lua_callback: Option<ManifestCodeCallback>,
-    ) {
+    ) -> bool {
         let ManifestCodeFetch {
             job_id,
             app_id,
@@ -110,6 +112,13 @@ impl PendingQueue {
 
         {
             let mut list = self.list.lock().unwrap();
+            if list.len() >= MAX_PENDING_FETCHES {
+                warn!(
+                    job_id,
+                    gid, "request_code: pending queue full, passing request through"
+                );
+                return false;
+            }
             list.push(pending);
             self.count.fetch_add(1, Ordering::Release);
         }
@@ -121,25 +130,41 @@ impl PendingQueue {
         // Spawn a thread to fetch the manifest code
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
-        std::thread::spawn(move || {
-            let lua_code =
-                lua_callback.and_then(|callback| match callback(app_id, depot_id, gid) {
-                    Ok(code) => code,
-                    Err(error) => {
-                        warn!(gid, %error, "request_code: Lua provider unavailable");
-                        None
-                    }
+        let spawn_result = std::thread::Builder::new()
+            .name("manifest-code-fetch".to_owned())
+            .spawn(move || {
+                let lua_code =
+                    lua_callback.and_then(|callback| match callback(app_id, depot_id, gid) {
+                        Ok(code) => code,
+                        Err(error) => {
+                            warn!(gid, %error, "request_code: Lua provider unavailable");
+                            None
+                        }
+                    });
+                let code = lua_code.or_else(|| {
+                    fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms)
                 });
-            let code = lua_code
-                .or_else(|| fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms));
+                {
+                    let mut lock = result_clone.lock().unwrap();
+                    // Some(0) = failed, Some(n) = success
+                    *lock = Some(code.unwrap_or(0));
+                }
+                done_clone.store(true, Ordering::Release);
+                debug!(gid, code = ?code, "request_code: fetch complete");
+            });
+        if let Err(error) = spawn_result {
+            let mut list = self.list.lock().unwrap();
+            if let Some(index) = list
+                .iter()
+                .position(|pending| pending.job_id == job_id && pending.gid == gid)
             {
-                let mut lock = result_clone.lock().unwrap();
-                // Some(0) = failed, Some(n) = success
-                *lock = Some(code.unwrap_or(0));
+                list.swap_remove(index);
+                self.count.fetch_sub(1, Ordering::Release);
             }
-            done_clone.store(true, Ordering::Release);
-            debug!(gid, code = ?code, "request_code: fetch complete");
-        });
+            warn!(job_id, gid, %error, "request_code: failed to start fetch thread");
+            return false;
+        }
+        true
     }
 
     /// Drain all completed entries from the pending list.
@@ -409,7 +434,7 @@ mod tests {
             Ok(Some(4444))
         });
 
-        queue.queue_fetch(
+        assert!(queue.queue_fetch(
             ManifestCodeFetch {
                 job_id: 99,
                 app_id: 480,
@@ -419,7 +444,7 @@ mod tests {
             },
             &RuntimeConfig::default(),
             Some(callback),
-        );
+        ));
 
         let completed = (0..100)
             .find_map(|_| {
@@ -435,6 +460,45 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some((480, 481, 1234)));
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].code, 4444);
+    }
+
+    #[test]
+    fn pending_queue_rejects_overload() {
+        let queue = PendingQueue::new();
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_PENDING_FETCHES + 1));
+        let callback: ManifestCodeCallback = {
+            let barrier = Arc::clone(&barrier);
+            Arc::new(move |_, _, _| {
+                barrier.wait();
+                Ok(Some(1))
+            })
+        };
+
+        for job_id in 0..MAX_PENDING_FETCHES as u64 {
+            assert!(queue.queue_fetch(
+                ManifestCodeFetch {
+                    job_id: job_id + 1,
+                    app_id: 480,
+                    depot_id: 481,
+                    gid: job_id + 100,
+                    req_hdr_bytes: Vec::new(),
+                },
+                &RuntimeConfig::default(),
+                Some(Arc::clone(&callback)),
+            ));
+        }
+        assert!(!queue.queue_fetch(
+            ManifestCodeFetch {
+                job_id: 99,
+                app_id: 480,
+                depot_id: 481,
+                gid: 999,
+                req_hdr_bytes: Vec::new(),
+            },
+            &RuntimeConfig::default(),
+            Some(callback),
+        ));
+        barrier.wait();
     }
 
     #[test]

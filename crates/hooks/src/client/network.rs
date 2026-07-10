@@ -66,6 +66,7 @@ pub(crate) extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> 
     // The closure calls the original RecvPkt.
     let call_original =
         |t, p| detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut()).call(t, p);
+    // SAFETY: this and packet are the unchanged arguments supplied by Steam.
     unsafe {
         crate::netpacket::try_inject(this, packet, call_original);
     }
@@ -77,6 +78,7 @@ pub(crate) extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> 
 
     // Post-process: strip achievement stats from incoming responses
     if !packet.is_null() {
+        // SAFETY: packet remains valid for the duration of the hook callback.
         unsafe { crate::netpacket::on_recv_packet(packet) };
     }
 

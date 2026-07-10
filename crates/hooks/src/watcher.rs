@@ -7,8 +7,8 @@ use arc_swap::ArcSwap;
 use inotify::{Inotify, WatchDescriptor, WatchMask};
 use tracing::{debug, info, warn};
 use vapor_forge_config::RuntimeConfig;
-use vapor_forge_features::package::PackageState;
-use vapor_forge_scripting::{ManifestCodeProvider, ScriptState};
+
+use crate::client::install::RuntimeSnapshot;
 
 #[derive(Default)]
 struct WatchTarget {
@@ -22,12 +22,9 @@ struct WatchSet {
     targets: HashMap<WatchDescriptor, WatchTarget>,
 }
 
-pub fn start(
+pub(crate) fn start(
     base_config_store: &'static ArcSwap<RuntimeConfig>,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
-    package_state: &'static PackageState,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
     config_path: Option<PathBuf>,
 ) {
     let Some(path) = config_path else {
@@ -37,26 +34,14 @@ pub fn start(
 
     std::thread::Builder::new()
         .name("config-script-watcher".into())
-        .spawn(move || {
-            watch_loop(
-                path,
-                base_config_store,
-                config_store,
-                script_store,
-                manifest_provider_store,
-                package_state,
-            )
-        })
+        .spawn(move || watch_loop(path, base_config_store, runtime_store))
         .ok();
 }
 
 fn watch_loop(
     path: PathBuf,
     base_config_store: &'static ArcSwap<RuntimeConfig>,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
-    package_state: &'static PackageState,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
 ) {
     let mut inotify = match Inotify::init() {
         Ok(inotify) => inotify,
@@ -115,24 +100,11 @@ fn watch_loop(
                 }
             }
             if config_changed {
-                if reload_config(
-                    &path,
-                    base_config_store,
-                    config_store,
-                    script_store,
-                    manifest_provider_store,
-                    package_state,
-                ) {
+                if reload_config(&path, base_config_store, runtime_store) {
                     refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
                 }
             } else {
-                reload_lua(
-                    base_config_store,
-                    config_store,
-                    script_store,
-                    manifest_provider_store,
-                    package_state,
-                );
+                reload_lua(base_config_store, runtime_store);
             }
         }
     }
@@ -251,10 +223,7 @@ fn expand_dir(dir: &str) -> PathBuf {
 fn reload_config(
     path: &Path,
     base_config_store: &'static ArcSwap<RuntimeConfig>,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
-    package_state: &'static PackageState,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
 ) -> bool {
     match RuntimeConfig::load(path) {
         Ok(base_config) => {
@@ -262,10 +231,7 @@ fn reload_config(
             publish_runtime(
                 base_config,
                 base_config_store,
-                config_store,
-                script_store,
-                manifest_provider_store,
-                package_state,
+                runtime_store,
                 "config and Lua scripts reloaded",
             );
             true
@@ -279,18 +245,12 @@ fn reload_config(
 
 fn reload_lua(
     base_config_store: &'static ArcSwap<RuntimeConfig>,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
-    package_state: &'static PackageState,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
 ) {
     publish_runtime(
         (**base_config_store.load()).clone(),
         base_config_store,
-        config_store,
-        script_store,
-        manifest_provider_store,
-        package_state,
+        runtime_store,
         "Lua scripts reloaded",
     );
 }
@@ -298,10 +258,7 @@ fn reload_lua(
 fn publish_runtime(
     base_config: RuntimeConfig,
     base_config_store: &'static ArcSwap<RuntimeConfig>,
-    config_store: &'static ArcSwap<RuntimeConfig>,
-    script_store: &'static ArcSwap<ScriptState>,
-    manifest_provider_store: &'static arc_swap::ArcSwapOption<ManifestCodeProvider>,
-    package_state: &'static PackageState,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
     message: &'static str,
 ) {
     let (new_config, new_script_runtime) = crate::client::install::build_runtime(&base_config);
@@ -310,8 +267,6 @@ fn publish_runtime(
     let dlc_count: usize = new_config.apps.inject.iter().map(|app| app.dlc.len()).sum();
     let controlled =
         vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
-    let diff = package_state.compute_hot_reload_diff(&controlled);
-
     vapor_forge_features::achievements::load_stat_steam_ids(&new_script_state.stat_steam_ids);
     vapor_forge_features::app_avatar::load_static_map(&new_config.app_avatar);
     for (&app, &avatar) in &new_script_state.avatars {
@@ -319,20 +274,11 @@ fn publish_runtime(
     }
 
     base_config_store.store(Arc::new(base_config));
-    config_store.store(Arc::new(new_config));
-    script_store.store(Arc::new(new_script_runtime.state));
-    manifest_provider_store.store(new_script_runtime.manifest_code_provider.map(Arc::new));
+    let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
+    crate::client::install::ensure_ipc_server_for_config(&snapshot.config);
+    runtime_store.store(Arc::new(snapshot));
 
-    if package_state.is_active() && (!diff.additions.is_empty() || !diff.removals.is_empty()) {
-        // SAFETY: active package state owns the captured pkg0/cuser pointers and hooks.
-        unsafe { crate::client::package::apply_reload_diff(&diff) };
-        package_state.apply_diff(&diff);
-        info!(
-            additions = diff.additions.len(),
-            removals = diff.removals.len(),
-            "watcher: pkg0 diff applied"
-        );
-    }
+    crate::client::package::queue_reload(controlled);
 
     info!(inject = inject_count, dlc = dlc_count, message);
 }

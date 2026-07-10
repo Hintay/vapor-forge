@@ -95,7 +95,8 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
     let app_id = AppId(raw & 0x00FF_FFFF);
 
     let injection = vapor_forge_features::library_inject::take_pending(app_id);
-    let ipc_server = IPC_SERVER.get().and_then(|s| s.as_ref());
+    let cfg = config();
+    let ipc_server = cfg.ticket.auto_delegate.then(|| IPC_SERVER.get()).flatten();
 
     if injection.is_none() && ipc_server.is_none() {
         return result;
@@ -112,11 +113,7 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         if !inj.native_libs.is_empty() {
             let ld_preload = inj.native_libs.join(":");
             if let Ok(value) = std::ffi::CString::new(ld_preload.as_str()) {
-                set_env(
-                    env_map,
-                    b"LD_PRELOAD\0".as_ptr() as *const i8,
-                    value.as_ptr(),
-                );
+                set_env(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr());
                 info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
             }
         }
@@ -141,11 +138,7 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
                 set_env(env_map, key.as_ptr(), val.as_ptr());
             }
             if let Ok(sock_val) = std::ffi::CString::new(server.socket_path()) {
-                set_env(
-                    env_map,
-                    b"VAPOR_FORGE_IPC_SOCK\0".as_ptr() as *const i8,
-                    sock_val.as_ptr(),
-                );
+                set_env(env_map, c"VAPOR_FORGE_IPC_SOCK".as_ptr(), sock_val.as_ptr());
             }
             debug!(app = app_id.0, "library_inject: IPC token injected");
         }
@@ -153,14 +146,9 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         // If no DLL injection is configured but IPC is needed, load the
         // proton helper anyway so it can scan PEs and report back.
         if !has_proton_dll {
-            let cfg = config();
             if let Some(path) = resolve_helper_path(&cfg.library_inject.helper_path) {
                 if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
-                    set_env(
-                        env_map,
-                        b"LD_AUDIT\0".as_ptr() as *const i8,
-                        audit_val.as_ptr(),
-                    );
+                    set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr());
                     debug!(app = app_id.0, helper = %path, "library_inject: helper loaded for IPC only");
                 }
             }
@@ -170,7 +158,6 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
     // Proton .dll injection via LD_AUDIT helper
     if let Some(ref inj) = injection {
         if let Some(dll_path) = &inj.proton_dll {
-            let cfg = config();
             let resolved = resolve_helper_path(&cfg.library_inject.helper_path);
             match resolved {
                 Some(path) => {
@@ -178,14 +165,10 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
                         std::ffi::CString::new(path.as_str()),
                         std::ffi::CString::new(dll_path.as_str()),
                     ) {
+                        set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr());
                         set_env(
                             env_map,
-                            b"LD_AUDIT\0".as_ptr() as *const i8,
-                            audit_val.as_ptr(),
-                        );
-                        set_env(
-                            env_map,
-                            b"VAPOR_FORGE_INJECT_DLL\0".as_ptr() as *const i8,
+                            c"VAPOR_FORGE_INJECT_DLL".as_ptr(),
                             dll_val.as_ptr(),
                         );
                         info!(app = app_id.0, dll = %dll_path, helper = %path, "library_inject: Proton DLL injection set");
@@ -220,11 +203,13 @@ pub(crate) extern "C" fn hk_spawn_process(
 ) -> i32 {
     // Extract AppId from CGameID (low 24 bits).
     if !game_id.is_null() {
+        // SAFETY: game_id is a non-null CGameID pointer supplied by Steam.
         let raw = unsafe { *(game_id as *const u32) };
         let app_id = AppId(raw & 0x00FF_FFFF);
 
         // Read command line for flag evaluation
         let launch_opts = if !command_line.is_null() {
+            // SAFETY: command_line is a non-null C string supplied by Steam.
             unsafe { bounded_cstr_to_string(command_line, 4096) }
         } else {
             String::new()
@@ -267,6 +252,8 @@ pub(crate) extern "C" fn hk_spawn_process(
 unsafe fn bounded_cstr_to_string(ptr: *const i8, max_len: usize) -> String {
     let mut len = 0usize;
     while len < max_len {
+        // SAFETY: caller guarantees ptr is readable through its NUL terminator;
+        // max_len provides an additional upper bound.
         if unsafe { *ptr.add(len) } == 0 {
             break;
         }
@@ -275,6 +262,7 @@ unsafe fn bounded_cstr_to_string(ptr: *const i8, max_len: usize) -> String {
     if len == 0 {
         return String::new();
     }
+    // SAFETY: the loop above just read the complete [0, len) range.
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -320,11 +308,14 @@ pub(crate) fn resolve_helper_path(configured: &str) -> Option<String> {
 
 /// Get the directory containing our own .so via dladdr.
 pub(crate) fn own_library_dir() -> Option<String> {
+    // SAFETY: Dl_info is a plain C output structure initialized before dladdr.
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     let self_addr = own_library_dir as *const () as *mut libc::c_void;
+    // SAFETY: self_addr names a function in this module and info is writable.
     if unsafe { libc::dladdr(self_addr, &mut info) } == 0 || info.dli_fname.is_null() {
         return None;
     }
+    // SAFETY: successful dladdr returned a non-null loader-owned C string.
     let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
     let path_str = path.to_str().ok()?;
     std::path::Path::new(path_str)
@@ -343,6 +334,7 @@ pub(crate) fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegi
     };
     // SAFETY: call_addr is a validated code address.
     let f: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
+    // SAFETY: hook installation is single-threaded and publishes this slot once.
     unsafe { std::ptr::addr_of_mut!(SET_ENV_STRING_FN).write(Some(f)) };
     debug!(
         addr = format_args!("0x{:x}", call_addr),
