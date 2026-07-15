@@ -39,8 +39,13 @@ pub(crate) extern "C" fn hk_check_app_ownership(
     let pkg0_was_injected = PKG0_INJECTED.load(Ordering::Acquire);
     let result = original.call(this, app_id, out);
 
-    if !pkg0_was_injected {
-        vapor_forge_features::apps::record_actual_ownership(AppId(app_id), result != 0);
+    if !pkg0_was_injected && !out.is_null() {
+        // SAFETY: the original call populated `out` and it remains valid for this callback.
+        let genuine =
+            vapor_forge_features::apps::original_result_is_genuinely_owned(result, unsafe {
+                &*out
+            });
+        vapor_forge_features::apps::record_actual_ownership(AppId(app_id), genuine);
     }
 
     if out.is_null() {
@@ -98,7 +103,8 @@ fn snapshot_with_original(
     for &app_id in app_ids {
         let mut info = CAppOwnershipInfo::zeroed();
         let result = original.call(this, app_id.0, &mut info);
-        vapor_forge_features::apps::record_actual_ownership(app_id, result != 0);
+        let genuine = vapor_forge_features::apps::original_result_is_genuinely_owned(result, &info);
+        vapor_forge_features::apps::record_actual_ownership(app_id, genuine);
     }
 }
 
@@ -110,6 +116,7 @@ pub(crate) unsafe fn snapshot_actual_ownership(app_ids: &[AppId]) {
     if app_ids.is_empty() {
         return;
     }
+    // SAFETY: the caller guarantees the detour remains initialized for this snapshot.
     let Some(original) = (unsafe { (*std::ptr::addr_of!(OWNERSHIP_DETOUR)).as_ref() }) else {
         return;
     };

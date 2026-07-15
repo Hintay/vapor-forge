@@ -782,7 +782,7 @@ fn simulate_manifest_request(
         );
     }
     let app_id = AppId(req.app_id.unwrap_or(0));
-    if config.app_category(app_id).is_some() {
+    if config.is_controlled_app(app_id) {
         return sim_result(
             SimDecision::Drop,
             "manifest-request-code",
@@ -831,7 +831,7 @@ fn simulate_service_stats(
             None,
         );
     };
-    if config.app_category(app_id).is_none() {
+    if !config.is_controlled_app(app_id) {
         return sim_result(
             SimDecision::Pass,
             "achievement-service-stats",
@@ -907,7 +907,7 @@ fn simulate_legacy_stats(
             None,
         );
     }
-    if config.app_category(app_id).is_none() {
+    if !config.is_controlled_app(app_id) {
         return sim_result(
             SimDecision::Pass,
             "achievement-legacy-stats",

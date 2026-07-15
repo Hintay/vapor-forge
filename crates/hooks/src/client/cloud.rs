@@ -57,8 +57,8 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
     let result = original(this, app_id);
 
     let cfg = config();
-    let should_disable = cfg.app_category(AppId(app_id)).is_some()
-        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
+    let should_disable = vapor_forge_features::apps::classify_app(&cfg, AppId(app_id))
+        .requires_injected_ownership()
         && !cfg.cloud_enabled_for_controlled_apps();
 
     if should_disable {

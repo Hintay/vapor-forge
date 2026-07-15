@@ -92,7 +92,7 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
         // SAFETY: p_ticket points to a buffer with at least `result` bytes written by Steam.
         let ticket_data = unsafe { std::slice::from_raw_parts(p_ticket, size) }.to_vec();
         let cfg = config();
-        let persist = if cfg.app_category(AppId(app_id)).is_some() {
+        let persist = if cfg.is_controlled_app(AppId(app_id)) {
             effective_ticket_mode(&cfg, AppId(app_id)) == vapor_forge_config::TicketMode::Delegate
         } else {
             cfg.ticket.cache == vapor_forge_config::TicketCacheMode::Disk
@@ -104,7 +104,7 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
     // Original returned 0, so check if this is a controlled app.
     let runtime = runtime_snapshot();
     let cfg = &runtime.config;
-    if cfg.app_category(AppId(app_id)).is_none() {
+    if !cfg.is_controlled_app(AppId(app_id)) {
         return result;
     }
 
@@ -311,9 +311,7 @@ pub(crate) fn acquire_source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
 
 pub(crate) extern "C" fn hk_update_ticket(this: *mut c_void, app_id: u32, force: bool) -> u32 {
     let cfg = config();
-    if cfg.app_category(AppId(app_id)).is_some()
-        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
-    {
+    if vapor_forge_features::apps::classify_app(&cfg, AppId(app_id)).requires_injected_ownership() {
         // For controlled apps, report success without asking Steam to update
         // (the real update would fail for apps we don't own).
         debug!(app_id, "ticket: BUpdateAppOwnershipTicket handled");
@@ -374,8 +372,7 @@ pub(crate) extern "C" fn hk_is_subscribed_in_ticket(
 
 fn is_controlled_unowned_ticket_app(app_id: u32) -> bool {
     let cfg = config();
-    cfg.app_category(AppId(app_id)).is_some()
-        && !vapor_forge_features::apps::is_actually_owned(AppId(app_id))
+    vapor_forge_features::apps::classify_app(&cfg, AppId(app_id)).requires_injected_ownership()
 }
 
 // ---------------------------------------------------------------------------

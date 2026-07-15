@@ -380,6 +380,9 @@ fn parses_inject_with_dlc() {
         Some(AppCategory::InjectDlc { parent: AppId(480) })
     );
     assert_eq!(config.app_category(AppId(999)), None);
+    assert!(config.is_controlled_app(AppId(480)));
+    assert!(config.is_controlled_app(AppId(505730)));
+    assert!(!config.is_controlled_app(AppId(999)));
 
     let all = config.inject_app_ids();
     assert_eq!(all.len(), 4);

@@ -5,8 +5,7 @@ use tracing::info;
 use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool) -> bool {
-    let controlled =
-        config.app_category(app_id).is_some() && !crate::apps::is_actually_owned(app_id);
+    let controlled = crate::apps::classify_app(config, app_id).requires_injected_ownership();
     if controlled && config.cumulus_configured() {
         if !original {
             info!(app_id = app_id.0, "feat: Cumulus cloud enabled");

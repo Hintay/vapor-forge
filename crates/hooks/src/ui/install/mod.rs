@@ -65,8 +65,8 @@ extern "C" fn hk_fill_in_app_overview(
         // SAFETY: steam_app points to the CSteamApp passed by SteamUI; this is a by-value read.
         let app_id_raw = unsafe { (*steam_app).app_id };
         let cfg = crate::client::install::config();
-        if cfg.app_category(AppId(app_id_raw)).is_some()
-            && !vapor_forge_features::apps::is_actually_owned(AppId(app_id_raw))
+        if vapor_forge_features::apps::classify_app(&cfg, AppId(app_id_raw))
+            .requires_injected_ownership()
         {
             // Use configured purchase time, or fall back to current time.
             let mut t = cfg.purchase_time(AppId(app_id_raw));

@@ -110,7 +110,7 @@ pub(crate) fn drain_pending_removals(controller: *mut c_void) {
 fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     // Skip if the app was re-added to config (hot-reload: unload then load).
     let cfg = crate::client::install::config();
-    if cfg.app_category(app_id).is_some() {
+    if cfg.is_controlled_app(app_id) {
         debug!(app = app_id.0, "steamui: app re-owned, skipping removal");
         return;
     }

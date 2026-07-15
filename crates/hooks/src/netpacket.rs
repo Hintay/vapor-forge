@@ -579,7 +579,7 @@ fn handle_encrypted_ticket_response(body_bytes: &[u8]) -> Option<Vec<u8>> {
         if let Some(ticket) = &resp.encrypted_app_ticket {
             if let Some(data) = &ticket.encrypted_ticket {
                 let cfg = &runtime.config;
-                let persist = if cfg.app_category(app_id).is_some() {
+                let persist = if cfg.is_controlled_app(app_id) {
                     cfg.ticket_mode(app_id) == vapor_forge_config::TicketMode::Delegate
                 } else {
                     cfg.ticket.cache == vapor_forge_config::TicketCacheMode::Disk

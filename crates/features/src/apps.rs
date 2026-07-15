@@ -7,18 +7,76 @@ use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
 static ACTUAL_OWNERSHIP: Mutex<Option<HashMap<AppId, bool>>> = Mutex::new(None);
 
-/// Return the ownership result captured before pkg0 could affect it.
-pub fn actual_ownership(app_id: AppId) -> Option<bool> {
-    ACTUAL_OWNERSHIP
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnershipState {
+    Unknown,
+    Unowned,
+    Owned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppAuthority {
+    Uncontrolled,
+    Controlled {
+        category: AppCategory,
+        ownership: OwnershipState,
+    },
+}
+
+impl AppAuthority {
+    /// Controlled apps need injected behavior until genuine ownership is confirmed.
+    pub fn requires_injected_ownership(self) -> bool {
+        matches!(
+            self,
+            Self::Controlled {
+                ownership: OwnershipState::Unknown | OwnershipState::Unowned,
+                ..
+            }
+        )
+    }
+
+    /// Some request paths intentionally wait for an explicit unowned sample.
+    pub fn is_confirmed_unowned(self) -> bool {
+        matches!(
+            self,
+            Self::Controlled {
+                ownership: OwnershipState::Unowned,
+                ..
+            }
+        )
+    }
+}
+
+/// Return the genuine ownership result captured before pkg0 could affect it.
+pub fn actual_ownership(app_id: AppId) -> OwnershipState {
+    match ACTUAL_OWNERSHIP
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|ownership| ownership.get(&app_id).copied())
+    {
+        Some(true) => OwnershipState::Owned,
+        Some(false) => OwnershipState::Unowned,
+        None => OwnershipState::Unknown,
+    }
 }
 
-/// Returns true if a controlled app is actually owned by the user.
-pub fn is_actually_owned(app_id: AppId) -> bool {
-    actual_ownership(app_id) == Some(true)
+pub fn classify_app(config: &RuntimeConfig, app_id: AppId) -> AppAuthority {
+    match config.app_category(app_id) {
+        Some(category) => AppAuthority::Controlled {
+            category,
+            ownership: actual_ownership(app_id),
+        },
+        None => AppAuthority::Uncontrolled,
+    }
+}
+
+/// Interpret a result returned by Steam's original ownership path.
+///
+/// A non-zero return alone is insufficient after package injection. Genuine
+/// ownership also has more than the injected package association.
+pub fn original_result_is_genuinely_owned(original_result: u32, info: &CAppOwnershipInfo) -> bool {
+    original_result != 0 && info.exist_in_package_nums > 1
 }
 
 /// Record an ownership result obtained before the app is added to pkg0.
@@ -36,14 +94,10 @@ pub fn on_check_ownership(
     original_result: u32,
     info: &mut CAppOwnershipInfo,
 ) -> u32 {
-    let category = config.app_category(app_id);
-
-    if let Some(AppCategory::Inject | AppCategory::InjectDlc { .. }) = category {
-        if original_result == 0 {
-            info.grant_spoofed_ownership(1_600_000_000);
-            info!(app_id = app_id.0, "feat: ownership granted");
-            return 1;
-        }
+    if config.is_controlled_app(app_id) && original_result == 0 {
+        info.grant_spoofed_ownership(1_600_000_000);
+        info!(app_id = app_id.0, "feat: ownership granted");
+        return 1;
     }
 
     if config.should_bypass_sharing(app_id) && original_result != 0 && info.is_family_shared() {
@@ -138,12 +192,40 @@ mod tests {
 
         let mut info = zeroed_info();
         assert_eq!(on_check_ownership(&config, app_id, 1, &mut info), 1);
-        assert_eq!(actual_ownership(app_id), Some(false));
-        assert!(!is_actually_owned(app_id));
+        assert_eq!(actual_ownership(app_id), OwnershipState::Unowned);
+        assert!(classify_app(&config, app_id).requires_injected_ownership());
 
         record_actual_ownership(app_id, true);
-        assert_eq!(actual_ownership(app_id), Some(true));
-        assert!(is_actually_owned(app_id));
+        assert_eq!(actual_ownership(app_id), OwnershipState::Owned);
+        assert!(!classify_app(&config, app_id).requires_injected_ownership());
+    }
+
+    #[test]
+    fn package_association_alone_is_not_genuine_ownership() {
+        let mut info = zeroed_info();
+        info.exist_in_package_nums = 1;
+        assert!(!original_result_is_genuinely_owned(1, &info));
+
+        info.exist_in_package_nums = 2;
+        assert!(original_result_is_genuinely_owned(1, &info));
+        assert!(!original_result_is_genuinely_owned(0, &info));
+    }
+
+    #[test]
+    fn app_authority_preserves_unknown_ownership() {
+        let app_id = AppId(246_813_582);
+        let config = config_with_inject(&[app_id.0]);
+
+        assert_eq!(actual_ownership(app_id), OwnershipState::Unknown);
+        assert_eq!(
+            classify_app(&config, app_id),
+            AppAuthority::Controlled {
+                category: AppCategory::Inject,
+                ownership: OwnershipState::Unknown,
+            }
+        );
+        assert!(classify_app(&config, app_id).requires_injected_ownership());
+        assert!(!classify_app(&config, app_id).is_confirmed_unowned());
     }
 
     #[test]

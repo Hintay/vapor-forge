@@ -208,7 +208,7 @@ impl Default for PendingQueue {
 /// Returns `true` if this app's request should be intercepted (dropped from
 /// the outgoing wire and fetched from an external provider instead).
 pub fn should_intercept(app_id: AppId, config: &RuntimeConfig) -> bool {
-    config.app_category(app_id).is_some()
+    config.is_controlled_app(app_id)
 }
 
 // ---------------------------------------------------------------------------

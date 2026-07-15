@@ -57,6 +57,18 @@ impl PackageState {
         guard.extend(ids.iter().copied());
     }
 
+    /// Returns whether this AppId has actually been written into pkg0.
+    ///
+    /// This is runtime diagnostics state, not an ownership or network-policy
+    /// signal. `RuntimeConfig::is_controlled_app` is authoritative for policy.
+    pub fn is_injected_into_pkg0(&self, app_id: AppId) -> bool {
+        self.injected_apps.lock().unwrap().contains(&app_id)
+    }
+
+    pub fn injected_count(&self) -> usize {
+        self.injected_apps.lock().unwrap().len()
+    }
+
     /// Compute the diff between current controlled set and what was previously injected.
     ///
     /// `controlled_ids` = union of config inject IDs + script addappid IDs.
@@ -150,6 +162,15 @@ mod tests {
         let diff = state.compute_hot_reload_diff(&[AppId(100), AppId(200), AppId(300)]);
         assert_eq!(diff.additions, vec![AppId(300)]);
         assert!(diff.removals.is_empty());
+    }
+
+    #[test]
+    fn reports_actual_pkg0_injection_state() {
+        let state = PackageState::new();
+        assert!(!state.is_injected_into_pkg0(AppId(100)));
+        state.record_injected(&[AppId(100)]);
+        assert!(state.is_injected_into_pkg0(AppId(100)));
+        assert!(!state.is_injected_into_pkg0(AppId(200)));
     }
 
     #[test]

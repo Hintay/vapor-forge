@@ -413,6 +413,15 @@ impl RuntimeConfig {
         None
     }
 
+    /// Returns whether this AppId is managed by the effective runtime config.
+    ///
+    /// Script-provided AppIds are merged into `apps.inject` before the runtime
+    /// config is published, so this remains the single source of truth for
+    /// both configured and scripted apps.
+    pub fn is_controlled_app(&self, app_id: AppId) -> bool {
+        self.app_category(app_id).is_some()
+    }
+
     pub fn purchase_time(&self, app_id: AppId) -> u32 {
         self.apps
             .inject

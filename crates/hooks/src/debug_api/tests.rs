@@ -360,6 +360,7 @@ fn pkg0_returns_capture_status() {
     assert!(response.contains("\"pkg0_captured\":"));
     assert!(response.contains("\"cuser_captured\":"));
     assert!(response.contains("\"inject_count\":"));
+    assert!(response.contains("\"injected_count\":"));
     assert!(response.contains("\"active\":"));
 }
 

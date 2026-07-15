@@ -396,19 +396,39 @@ fn apps_response(json_mode: bool) -> String {
     #[cfg(not(target_os = "linux"))]
     let cfg = vapor_forge_config::RuntimeConfig::default();
 
+    let injected_into_pkg0 = |app_id| {
+        #[cfg(target_os = "linux")]
+        {
+            crate::client::install::package_state().is_injected_into_pkg0(app_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = app_id;
+            false
+        }
+    };
+
     if json_mode {
         let controlled: Vec<_> = cfg
             .apps
             .inject
             .iter()
             .map(|app| {
-                let owned = vapor_forge_features::apps::is_actually_owned(app.id);
+                let ownership =
+                    ownership_label(vapor_forge_features::apps::actual_ownership(app.id));
+                let injected = injected_into_pkg0(app.id);
                 let ticket = match app.ticket {
                     vapor_forge_config::TicketMode::Forge => "forge",
                     vapor_forge_config::TicketMode::Delegate => "delegate",
                 };
                 let dlc: Vec<u32> = app.dlc.iter().map(|d| d.0).collect();
-                json!({"id": app.id.0, "owned": owned, "ticket": ticket, "dlc": dlc})
+                json!({
+                    "id": app.id.0,
+                    "ownership": ownership,
+                    "injected_into_pkg0": injected,
+                    "ticket": ticket,
+                    "dlc": dlc
+                })
             })
             .collect();
         return format!("ok {}", json!({"controlled": controlled}));
@@ -421,7 +441,8 @@ fn apps_response(json_mode: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "ok Controlled Apps ({}):", cfg.apps.inject.len());
     for app in &cfg.apps.inject {
-        let owned = vapor_forge_features::apps::is_actually_owned(app.id);
+        let ownership = ownership_label(vapor_forge_features::apps::actual_ownership(app.id));
+        let injected = injected_into_pkg0(app.id);
         let ticket = match app.ticket {
             vapor_forge_config::TicketMode::Forge => "forge",
             vapor_forge_config::TicketMode::Delegate => "delegate",
@@ -429,15 +450,24 @@ fn apps_response(json_mode: bool) -> String {
         let dlc: Vec<u32> = app.dlc.iter().map(|d| d.0).collect();
         let _ = writeln!(
             out,
-            "  {:<10} owned={:<5} ticket={:<10} dlc={:?}",
+            "  {:<10} ownership={:<7} injected={:<3} ticket={:<10} dlc={:?}",
             app.id.0,
-            if owned { "yes" } else { "no" },
+            ownership,
+            if injected { "yes" } else { "no" },
             ticket,
             dlc
         );
     }
     out.truncate(out.trim_end().len());
     out
+}
+
+fn ownership_label(state: vapor_forge_features::apps::OwnershipState) -> &'static str {
+    match state {
+        vapor_forge_features::apps::OwnershipState::Unknown => "unknown",
+        vapor_forge_features::apps::OwnershipState::Unowned => "unowned",
+        vapor_forge_features::apps::OwnershipState::Owned => "owned",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +493,11 @@ fn pkg0_response(json_mode: bool) -> String {
     let active = false;
 
     #[cfg(target_os = "linux")]
+    let injected_count = pkg_state.injected_count();
+    #[cfg(not(target_os = "linux"))]
+    let injected_count = 0;
+
+    #[cfg(target_os = "linux")]
     let cfg = crate::client::install::config();
     #[cfg(not(target_os = "linux"))]
     let cfg = vapor_forge_config::RuntimeConfig::default();
@@ -475,6 +510,7 @@ fn pkg0_response(json_mode: bool) -> String {
                 "pkg0_captured": pkg0_captured,
                 "cuser_captured": cuser_captured,
                 "inject_count": inject_count,
+                "injected_count": injected_count,
                 "active": active,
             })
         );
@@ -484,7 +520,8 @@ fn pkg0_response(json_mode: bool) -> String {
     let mut out = String::from("ok\n");
     let _ = writeln!(out, "  pkg0:      {}", check(pkg0_captured));
     let _ = writeln!(out, "  cuser:     {}", check(cuser_captured));
-    let _ = writeln!(out, "  injected:  {} apps", inject_count);
+    let _ = writeln!(out, "  desired:   {} apps", inject_count);
+    let _ = writeln!(out, "  injected:  {} apps", injected_count);
     let _ = write!(out, "  active:    {}", check(active));
     out
 }

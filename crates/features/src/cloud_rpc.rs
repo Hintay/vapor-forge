@@ -250,8 +250,7 @@ impl CloudRpcQueue {
             return false;
         };
         if !config.cumulus_configured()
-            || config.app_category(AppId(app_id)).is_none()
-            || crate::apps::actual_ownership(AppId(app_id)) != Some(false)
+            || !crate::apps::classify_app(config, AppId(app_id)).is_confirmed_unowned()
         {
             return false;
         }
@@ -1883,7 +1882,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(crate::apps::actual_ownership(app_id), None);
+        assert_eq!(
+            crate::apps::actual_ownership(app_id),
+            crate::apps::OwnershipState::Unknown
+        );
         assert!(!CloudRpcQueue::new().intercept(
             QUOTA_USAGE,
             &header,
