@@ -4,17 +4,26 @@
 //! Business logic lives in `vapor_forge_features::{request_code, achievements}`.
 
 use prost::Message;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+
 use tracing::{debug, info, warn};
 use vapor_forge_abi::{
-    cnet_packet, CMsgProtoBufHeader, GetManifestRequestCodeRequest, EMSG_CLIENT_PERSONA_STATE,
-    EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
-    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
+    cnet_packet, CMsgProtoBufHeader, EncryptedAppTicket, EncryptedAppTicketRequest,
+    EncryptedAppTicketResponse, GetAppOwnershipTicketRequest, GetAppOwnershipTicketResponse,
+    GetManifestRequestCodeRequest, EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
+    EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
+    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET,
+    EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
     EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
-    EMSG_SERVICE_METHOD_RESPONSE, K_MSG_HDR_PROTO_FLAG,
+    EMSG_SERVICE_METHOD_RESPONSE, EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS,
+    EMSG_STORE_USERSTATS2, ERESULT_OK, K_MSG_HDR_PROTO_FLAG,
 };
 use vapor_forge_features::achievements;
 use vapor_forge_features::request_code::{self, PendingQueue};
 use vapor_forge_features::rich_presence;
+use vapor_forge_features::valve_filter::{self, PrivacyAction};
 use vapor_forge_packet_inspect::{PacketChange, PacketDirection};
 
 use vapor_forge_config::AppId;
@@ -26,6 +35,12 @@ use vapor_forge_config::AppId;
 static PENDING: once_cell::sync::Lazy<PendingQueue> = once_cell::sync::Lazy::new(PendingQueue::new);
 static CLOUD_PENDING: once_cell::sync::Lazy<vapor_forge_features::cloud_rpc::CloudRpcQueue> =
     once_cell::sync::Lazy::new(vapor_forge_features::cloud_rpc::CloudRpcQueue::new);
+const MAX_LOCAL_RESPONSES: usize = 256;
+static LOCAL_RESPONSES: once_cell::sync::Lazy<Mutex<VecDeque<Vec<u8>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
+
+// A protected app without AppAvatar must not upload unscoped Rich Presence.
+static BLOCKED_RICH_PRESENCE_APP: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Outgoing frame handling called from BBuildAndAsyncSendFrame hook
@@ -86,6 +101,12 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             }
         };
 
+        vapor_forge_features::playtime::observe_request(
+            method,
+            &hdr,
+            rich_presence::local_steamid(),
+        );
+
         if method == request_code::TARGET_JOB_NAME {
             if handle_manifest_send(&hdr, header_bytes, body_bytes) {
                 decision = SendFrameDecision::Drop;
@@ -116,6 +137,38 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 Some(0),
             );
             return SendFrameDecision::Drop;
+        }
+
+        if let Some((app_id, expects_response)) =
+            vapor_forge_features::cloud_rpc::privacy_fallback(method, body_bytes, &runtime.config)
+        {
+            if expects_response && hdr.jobid_source.is_some_and(|job| job != 0) {
+                queue_local_response(valve_filter::service_response(header_bytes, Vec::new(), 2));
+            }
+            info!(app_id, method, "netpacket: blocked Cloud fallback to Valve");
+            capture_dropped(data);
+            return SendFrameDecision::Drop;
+        }
+
+        match valve_filter::service_method_action(&hdr, header_bytes, body_bytes, &runtime.config) {
+            PrivacyAction::Pass => {}
+            PrivacyAction::Drop { app_id } => {
+                info!(
+                    app_id,
+                    method, "netpacket: blocked Valve service notification"
+                );
+                capture_dropped(data);
+                return SendFrameDecision::Drop;
+            }
+            PrivacyAction::Respond { app_id, packet } => {
+                info!(
+                    app_id,
+                    method, "netpacket: answered Valve service request locally"
+                );
+                queue_local_response(packet);
+                capture_dropped(data);
+                return SendFrameDecision::Drop;
+            }
         }
 
         if method == achievements::STATS_JOB_NAME {
@@ -177,6 +230,48 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         }
     }
 
+    if emsg == EMSG_STORE_USERSTATS || emsg == EMSG_STORE_USERSTATS2 {
+        let runtime = crate::client::install::runtime_snapshot();
+        match valve_filter::store_stats_action(emsg, header_bytes, body_bytes, &runtime.config) {
+            PrivacyAction::Pass => {}
+            PrivacyAction::Drop { app_id } => {
+                info!(app_id, emsg, "netpacket: blocked StoreStats");
+                capture_dropped(data);
+                return SendFrameDecision::Drop;
+            }
+            PrivacyAction::Respond { app_id, packet } => {
+                info!(app_id, emsg, "netpacket: acknowledged StoreStats locally");
+                queue_local_response(packet);
+                capture_dropped(data);
+                return SendFrameDecision::Drop;
+            }
+        }
+    }
+
+    if emsg == EMSG_GET_APP_OWNERSHIP_TICKET {
+        if let Some((app_id, packet)) = local_ownership_ticket_response(header_bytes, body_bytes) {
+            info!(
+                app_id,
+                "netpacket: answered ownership ticket request locally"
+            );
+            queue_local_response(packet);
+            capture_dropped(data);
+            return SendFrameDecision::Drop;
+        }
+    }
+
+    if emsg == EMSG_ENCRYPTED_APPTICKET_REQUEST {
+        if let Some((app_id, packet)) = local_encrypted_ticket_response(header_bytes, body_bytes) {
+            info!(
+                app_id,
+                "netpacket: answered encrypted ticket request locally"
+            );
+            queue_local_response(packet);
+            capture_dropped(data);
+            return SendFrameDecision::Drop;
+        }
+    }
+
     // Rewrite CMsgClientGamesPlayed to substitute avatar AppIds, and track
     // which real AppId is being played for rich presence rewriting.
     if emsg == EMSG_GAMESPLAYED || emsg == EMSG_GAMESPLAYED_WITH_DATABLOB {
@@ -184,9 +279,24 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         let runtime = crate::client::install::runtime_snapshot();
         track_games_played(body_bytes, &runtime);
 
-        if let Some(new_body) =
-            vapor_forge_features::app_avatar::rewrite_games_played(body_bytes, &runtime.avatar_map)
+        if let Some(filtered) =
+            valve_filter::filter_games_played(body_bytes, &runtime.config, &runtime.avatar_map)
         {
+            BLOCKED_RICH_PRESENCE_APP.store(
+                filtered
+                    .blocked_rich_presence_app
+                    .map_or(0, |app_id| app_id.0),
+                Ordering::Release,
+            );
+            let Some(new_body) = filtered.body else {
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Unchanged,
+                    None,
+                );
+                return SendFrameDecision::Pass;
+            };
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
             crate::packet_capture::capture(
                 PacketDirection::Send,
@@ -205,6 +315,15 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             if let Some(kv_data) = &upload.rich_presence_kv {
                 rich_presence::on_rich_presence_upload(kv_data);
             }
+        }
+        let blocked_app = BLOCKED_RICH_PRESENCE_APP.load(Ordering::Acquire);
+        if blocked_app != 0 {
+            info!(
+                app_id = blocked_app,
+                "netpacket: blocked Rich Presence upload"
+            );
+            capture_dropped(data);
+            return SendFrameDecision::Drop;
         }
     }
 
@@ -230,17 +349,96 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     decision
 }
 
-/// Record the local SteamID from a CMsgProtoBufHeader, if present.
-/// Cheap no-op once the SteamID has already been captured.
+/// Refresh the local SteamID from a CMsgProtoBufHeader, if present.
 fn capture_local_steamid(header_bytes: &[u8]) {
-    if rich_presence::local_steamid() != 0 {
-        return;
-    }
     if let Ok(hdr) = CMsgProtoBufHeader::decode(header_bytes) {
         if let Some(steamid) = hdr.steamid {
             rich_presence::set_local_steamid(steamid);
         }
     }
+}
+
+fn capture_dropped(data: &[u8]) {
+    crate::packet_capture::capture(PacketDirection::Send, data, PacketChange::Dropped, Some(0));
+}
+
+fn queue_local_response(packet: Vec<u8>) {
+    let mut queue = LOCAL_RESPONSES.lock().unwrap();
+    if queue.len() == MAX_LOCAL_RESPONSES {
+        queue.pop_front();
+        warn!("netpacket: local response queue full; discarded oldest response");
+    }
+    queue.push_back(packet);
+}
+
+fn local_ownership_ticket_response(
+    header_bytes: &[u8],
+    body_bytes: &[u8],
+) -> Option<(u32, Vec<u8>)> {
+    let request = GetAppOwnershipTicketRequest::decode(body_bytes).ok()?;
+    let app_id = request.app_id.filter(|app_id| *app_id != 0)?;
+    let runtime = crate::client::install::runtime_snapshot();
+    if !vapor_forge_features::apps::classify_app(&runtime.config, AppId(app_id))
+        .requires_injected_ownership()
+    {
+        return None;
+    }
+    let ticket = crate::client::install::TICKET_CACHE
+        .get_app_ticket(AppId(app_id), &runtime.script_state.app_tickets);
+    let response = GetAppOwnershipTicketResponse {
+        eresult: Some(if ticket.is_some() {
+            ERESULT_OK as u32
+        } else {
+            2
+        }),
+        app_id: Some(app_id),
+        ticket,
+    };
+    Some((
+        app_id,
+        valve_filter::emsg_response(
+            EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE,
+            header_bytes,
+            response.encode_to_vec(),
+        ),
+    ))
+}
+
+fn local_encrypted_ticket_response(
+    header_bytes: &[u8],
+    body_bytes: &[u8],
+) -> Option<(u32, Vec<u8>)> {
+    let request = EncryptedAppTicketRequest::decode(body_bytes).ok()?;
+    let app_id = request.app_id.filter(|app_id| *app_id != 0)?;
+    let runtime = crate::client::install::runtime_snapshot();
+    if !vapor_forge_features::apps::classify_app(&runtime.config, AppId(app_id))
+        .requires_injected_ownership()
+    {
+        return None;
+    }
+    let encrypted_ticket = crate::client::install::TICKET_CACHE
+        .get_enc_ticket(AppId(app_id), &runtime.script_state.enc_tickets)
+        .map(|data| EncryptedAppTicket {
+            encrypted_ticket: Some(data),
+            ..Default::default()
+        });
+    let response = EncryptedAppTicketResponse {
+        app_id: Some(app_id),
+        eresult: Some(if encrypted_ticket.is_some() {
+            ERESULT_OK
+        } else {
+            2
+        }),
+        encrypted_app_ticket: encrypted_ticket,
+    };
+    Some((
+        app_id,
+        valve_filter::emsg_response(
+            EMSG_ENCRYPTED_APPTICKET_RESPONSE,
+            header_bytes,
+            response.encode_to_vec(),
+        ),
+    ))
 }
 
 /// Feed the outgoing CMsgClientGamesPlayed body to rich_presence so it can
@@ -280,11 +478,8 @@ fn reset_stopped_delegate_windows(
 
     // Revoke IPC session tokens for games that have exited.
     if let Some(server) = crate::client::install::IPC_SERVER.get() {
-        for app in &config.apps.inject {
-            if !now_playing.contains(&app.id) {
-                server.revoke_app_tokens(app.id.0);
-            }
-        }
+        let active_app_ids: Vec<u32> = now_playing.iter().map(|app_id| app_id.0).collect();
+        server.revoke_stopped_app_tokens(&active_app_ids);
     }
 }
 
@@ -381,6 +576,7 @@ pub unsafe fn try_inject<F>(
     let rp_inject_due = rich_presence::tracked_app().0 != 0 && rich_presence::has_inject_pending();
     if PENDING.is_empty()
         && CLOUD_PENDING.is_empty()
+        && LOCAL_RESPONSES.lock().unwrap().is_empty()
         && !achievements::has_offline_responses()
         && !rp_inject_due
     {
@@ -421,6 +617,21 @@ pub unsafe fn try_inject<F>(
     for response_bytes in CLOUD_PENDING.drain_completed() {
         // Upload responses carry the Cumulus bearer token in HTTP headers, so
         // they must not be retained by the diagnostic packet capture.
+        // SAFETY: packet is valid for this callback and the guard restores it.
+        let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
+        call_original(this, packet);
+    }
+
+    // Inject synchronous local privacy responses.
+    let local_responses = std::mem::take(&mut *LOCAL_RESPONSES.lock().unwrap());
+    for response_bytes in local_responses {
+        crate::packet_capture::capture(
+            PacketDirection::Recv,
+            &response_bytes,
+            PacketChange::Injected,
+            None,
+        );
+        // SAFETY: packet is valid for this callback and the guard restores it.
         let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
         call_original(this, packet);
     }
@@ -505,7 +716,7 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     let mut change = PacketChange::Unchanged;
     let mut final_len = None;
 
-    // ServiceMethod response (147): achievement stats
+    // ServiceMethod response (147): playtime observation and achievement stats.
     if emsg == EMSG_SERVICE_METHOD_RESPONSE {
         let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) else {
             crate::packet_capture::capture(
@@ -516,7 +727,24 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
             );
             return;
         };
-        if let Some((new_hdr, new_body)) = achievements::on_recv_service_stats(&hdr, body_bytes) {
+        if let Some(snapshot) = vapor_forge_features::playtime::observe_response(
+            &hdr,
+            body_bytes,
+            rich_presence::local_steamid(),
+        ) {
+            rich_presence::set_local_steamid(snapshot.steam_id64);
+            crate::playtime_worker::queue(snapshot);
+        }
+        if let Some((new_hdr, new_body, schema)) =
+            achievements::on_recv_service_stats(&hdr, body_bytes)
+        {
+            if let Some(schema) = schema {
+                crate::achievement_worker::queue_schema(
+                    schema.app_id,
+                    schema.schema_version,
+                    schema.content,
+                );
+            }
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, &new_hdr, &new_body);
             final_len = Some(replacement.len());
             // SAFETY: packet remains valid for this hook callback.
@@ -525,10 +753,41 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
         }
     }
 
-    // Legacy response (819): achievement stats
+    // ServiceMethodSendToClient (152): Steam's native playtime push.
+    if emsg == EMSG_SERVICE_METHOD_SEND_TO_CLIENT {
+        let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) else {
+            crate::packet_capture::capture(
+                PacketDirection::Recv,
+                buf,
+                PacketChange::DecodeFailed,
+                None,
+            );
+            return;
+        };
+        if let Some(method) = hdr.target_job_name.as_deref() {
+            if let Some(snapshot) = vapor_forge_features::playtime::observe_notification(
+                method,
+                &hdr,
+                body_bytes,
+                rich_presence::local_steamid(),
+            ) {
+                rich_presence::set_local_steamid(snapshot.steam_id64);
+                crate::playtime_worker::queue(snapshot);
+            }
+        }
+    }
+
+    // Legacy response (819): keep schema, remove reference-account values.
     if emsg == EMSG_REQUEST_USERSTATS_RESPONSE {
-        let cfg = config();
-        if let Some(new_body) = achievements::on_recv_legacy_stats(body_bytes, &cfg) {
+        let config = crate::client::install::config();
+        if let Some((new_body, schema)) = achievements::on_recv_legacy_stats(body_bytes, &config) {
+            if let Some(schema) = schema {
+                crate::achievement_worker::queue_schema(
+                    schema.app_id,
+                    schema.schema_version,
+                    schema.content,
+                );
+            }
             let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
             final_len = Some(replacement.len());
             // SAFETY: packet remains valid for this hook callback.

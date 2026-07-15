@@ -65,6 +65,22 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
     pi_signature: *mut u32,
     pcb_signature: *mut u32,
 ) -> u32 {
+    let runtime = runtime_snapshot();
+    let authority = vapor_forge_features::apps::classify_app(&runtime.config, AppId(app_id));
+    if authority.requires_injected_ownership() {
+        return provide_local_ticket(
+            this,
+            app_id,
+            p_ticket,
+            ticket_buf_size,
+            pi_app_id,
+            pi_steam_id,
+            pi_signature,
+            pcb_signature,
+            &runtime,
+        );
+    }
+
     // SAFETY: TICKET_EXT_DATA_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!(
         "GetAppOwnershipTicketExtendedData",
@@ -101,13 +117,22 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
         return result;
     }
 
-    // Original returned 0, so check if this is a controlled app.
-    let runtime = runtime_snapshot();
-    let cfg = &runtime.config;
-    if !cfg.is_controlled_app(AppId(app_id)) {
-        return result;
-    }
+    result
+}
 
+#[allow(clippy::too_many_arguments)] // Mirrors Steam's FFI output parameters.
+fn provide_local_ticket(
+    this: *mut c_void,
+    app_id: u32,
+    p_ticket: *mut u8,
+    ticket_buf_size: u32,
+    pi_app_id: *mut u32,
+    pi_steam_id: *mut u32,
+    pi_signature: *mut u32,
+    pcb_signature: *mut u32,
+    runtime: &super::install::RuntimeSnapshot,
+) -> u32 {
+    let cfg = &runtime.config;
     let ticket_mode = effective_ticket_mode(cfg, AppId(app_id));
     let ss = &runtime.script_state;
 
@@ -178,7 +203,7 @@ pub(crate) extern "C" fn hk_ticket_ext_data(
         app_id,
         "ticket: no ticket available (no cache, no source for forge)"
     );
-    result
+    0
 }
 
 /// Extract the SteamID embedded in a raw ownership ticket, using the

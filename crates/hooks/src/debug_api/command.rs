@@ -555,7 +555,7 @@ fn packet_response(target: DebugTarget, args: &str, json_mode: bool) -> String {
 fn packet_help_response() -> String {
     let mut out = String::from("ok packet commands:\n");
     out.push_str("  packet capture status\n");
-    out.push_str("  packet capture on [summary|raw] [direction=recv] [type=encrypted-ticket] [emsg=5527] [app=480] [changed=rewritten]\n");
+    out.push_str("  packet capture on [summary|raw] [direction=recv] [type=metrics] [emsg=5527] [app=480] [changed=rewritten]\n");
     out.push_str("  packet capture off\n");
     out.push_str("  packet capture clear\n");
     out.push_str("  packet capture limit N\n");
@@ -773,9 +773,13 @@ fn parse_direction(value: &str) -> Result<PacketDirection, String> {
 fn parse_packet_type(value: &str) -> Result<PacketType, String> {
     match value {
         "encrypted-ticket" | "ticket" => Ok(PacketType::EncryptedTicket),
+        "ownership-ticket" => Ok(PacketType::OwnershipTicket),
         "pics" => Ok(PacketType::Pics),
         "manifest-code" | "manifest" => Ok(PacketType::ManifestCode),
         "stats" => Ok(PacketType::Stats),
+        "metrics" => Ok(PacketType::Metrics),
+        "cloud" => Ok(PacketType::Cloud),
+        "app-metadata" | "metadata" => Ok(PacketType::AppMetadata),
         "rich-presence" | "rp" => Ok(PacketType::RichPresence),
         "games-played" => Ok(PacketType::GamesPlayed),
         "persona" => Ok(PacketType::Persona),

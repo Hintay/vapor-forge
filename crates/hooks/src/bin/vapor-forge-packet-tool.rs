@@ -8,9 +8,12 @@ use std::time::Duration;
 use prost::Message;
 use vapor_forge_abi::{
     CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientGetUserStatsRequest,
-    GetManifestRequestCodeRequest, PlayerGetUserStatsRequest, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
-    EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_PICS_PRODUCT_INFO_REQUEST,
-    EMSG_REQUEST_USERSTATS, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, K_MSG_HDR_PROTO_FLAG,
+    ClientStoreUserStats2Request, ClientStoreUserStatsRequest, EncryptedAppTicketRequest,
+    GetAppOwnershipTicketRequest, GetManifestRequestCodeRequest, PlayerGetUserStatsRequest,
+    EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_GAMESPLAYED,
+    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET, EMSG_PICS_PRODUCT_INFO_REQUEST,
+    EMSG_REQUEST_USERSTATS, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_STORE_USERSTATS,
+    EMSG_STORE_USERSTATS2, K_MSG_HDR_PROTO_FLAG,
 };
 use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_packet_inspect::{
@@ -552,7 +555,22 @@ fn explain_routes(summary: &PacketSummary) -> Vec<&'static str> {
             vec!["send: manifest request-code intercept/drop depends on config"]
         }
         (PacketDirection::Send, PacketType::Stats) => {
-            vec!["send: achievement stats offline response decision depends on config"]
+            vec!["send: schema requests and StoreStats privacy decisions depend on AppAuthority"]
+        }
+        (PacketDirection::Send, PacketType::OwnershipTicket) => {
+            vec!["send: protected app ownership tickets are answered locally"]
+        }
+        (PacketDirection::Send, PacketType::EncryptedTicket) => {
+            vec!["send: protected encrypted app tickets are answered locally"]
+        }
+        (PacketDirection::Send, PacketType::Metrics) => {
+            vec!["send: protected app metrics are dropped"]
+        }
+        (PacketDirection::Send, PacketType::Cloud) => {
+            vec!["send: protected Cloud RPC uses Cumulus or a local privacy response"]
+        }
+        (PacketDirection::Send, PacketType::AppMetadata) => {
+            vec!["send: recognized read-only app query passes through unchanged"]
         }
         (PacketDirection::Send, PacketType::GamesPlayed) => {
             vec!["send: games-played avatar rewrite and delegate-window reset"]
@@ -686,14 +704,23 @@ fn simulate_send(data: &[u8], config: &RuntimeConfig) -> SimulationResult {
     if emsg == EMSG_REQUEST_USERSTATS {
         return simulate_legacy_stats(emsg_raw, header_bytes, body_bytes, config);
     }
+    if emsg == EMSG_STORE_USERSTATS || emsg == EMSG_STORE_USERSTATS2 {
+        return simulate_store_stats(emsg, body_bytes, config);
+    }
+    if emsg == EMSG_GET_APP_OWNERSHIP_TICKET {
+        return simulate_ownership_ticket(body_bytes, config);
+    }
+    if emsg == EMSG_ENCRYPTED_APPTICKET_REQUEST {
+        return simulate_encrypted_ticket(body_bytes, config);
+    }
     if emsg == EMSG_GAMESPLAYED || emsg == EMSG_GAMESPLAYED_WITH_DATABLOB {
         return simulate_games_played(emsg_raw, header_bytes, body_bytes, config);
     }
     if emsg == EMSG_CLIENT_RICH_PRESENCE_UPLOAD {
         return sim_result(
-            SimDecision::Pass,
-            "rich-presence-capture",
-            "rich presence upload only updates runtime tracking state",
+            SimDecision::NeedsRuntimeState,
+            "rich-presence-privacy",
+            "upload is dropped when GamesPlayed tracks a protected app without AppAvatar",
             None,
         );
     }
@@ -744,6 +771,56 @@ fn simulate_send_service_method(
         return simulate_service_stats(emsg_raw, header_bytes, body_bytes, config);
     }
 
+    let packet = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, body_bytes);
+    let summary = summarize_packet(
+        0,
+        PacketDirection::Send,
+        &packet,
+        PacketChange::Unchanged,
+        None,
+    );
+    if summary.packet_type == PacketType::AppMetadata {
+        let app_id = summary.app_ids.first().copied().unwrap_or_default();
+        return sim_result(
+            SimDecision::Pass,
+            "app-metadata-query",
+            format!("read-only app query for {app_id} passes through"),
+            None,
+        );
+    }
+    if let Some(app_id) = summary.app_ids.first().copied().map(AppId) {
+        if config.is_controlled_app(app_id) {
+            let (handler, reason) = match summary.packet_type {
+                PacketType::Metrics => (
+                    "valve-metrics-privacy",
+                    format!("controlled app {} metrics are dropped", app_id.0),
+                ),
+                PacketType::Cloud => (
+                    "cloud-privacy",
+                    format!(
+                        "controlled app {} uses Cumulus or a local failure response",
+                        app_id.0
+                    ),
+                ),
+                _ => {
+                    return sim_result(
+                        SimDecision::Pass,
+                        "service-method",
+                        format!("unhandled service method {method:?}"),
+                        None,
+                    )
+                }
+            };
+            return sim_result_with_assumptions(
+                SimDecision::Drop,
+                handler,
+                reason,
+                Some(0),
+                vec!["controlled apps are treated as unowned in offline simulation"],
+            );
+        }
+    }
+
     sim_result(
         SimDecision::Pass,
         "service-method",
@@ -783,14 +860,15 @@ fn simulate_manifest_request(
     }
     let app_id = AppId(req.app_id.unwrap_or(0));
     if config.is_controlled_app(app_id) {
-        return sim_result(
+        return sim_result_with_assumptions(
             SimDecision::Drop,
             "manifest-request-code",
             format!(
-                "controlled app {} will be fetched through manifest providers",
+                "controlled app {} will use manifest providers when injected ownership is required",
                 app_id.0
             ),
             Some(0),
+            vec!["offline simulation cannot observe the runtime ownership snapshot"],
         );
     }
     sim_result(
@@ -899,14 +977,6 @@ fn simulate_legacy_stats(
         );
     };
     let app_id = AppId(game_id as u32);
-    if req.schema_local_version != Some(-1) {
-        return sim_result(
-            SimDecision::Pass,
-            "achievement-legacy-stats",
-            "schema_local_version is not -1",
-            None,
-        );
-    }
     if !config.is_controlled_app(app_id) {
         return sim_result(
             SimDecision::Pass,
@@ -920,26 +990,114 @@ fn simulate_legacy_stats(
             SimDecision::Drop,
             "achievement-legacy-stats",
             format!(
-                "offline_schema is enabled; controlled app {} gets an offline response",
+                "offline_schema is enabled; controlled app {} stays local",
                 app_id.0
             ),
             Some(0),
             vec!["controlled apps are treated as unowned in offline simulation"],
         );
     }
-
+    req.crc_stats = None;
+    req.schema_local_version = Some(-1);
     req.steam_id_for_user = Some(default_ref_steamid());
-    let new_body = req.encode_to_vec();
-    let final_len = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body).len();
+    let body = req.encode_to_vec();
+    let final_len = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &body).len();
     sim_result_with_assumptions(
         SimDecision::Rewrite,
         "achievement-legacy-stats",
         format!(
-            "controlled app {} legacy stats request would be redirected to a reference SteamID",
+            "controlled app {} is redirected to a reference SteamID with a full-schema request",
             app_id.0
         ),
         Some(final_len),
         vec!["controlled apps are treated as unowned in offline simulation"],
+    )
+}
+
+fn simulate_store_stats(emsg: u32, body_bytes: &[u8], config: &RuntimeConfig) -> SimulationResult {
+    let game_id = if emsg == EMSG_STORE_USERSTATS {
+        ClientStoreUserStatsRequest::decode(body_bytes)
+            .ok()
+            .and_then(|request| request.game_id)
+    } else {
+        ClientStoreUserStats2Request::decode(body_bytes)
+            .ok()
+            .and_then(|request| request.game_id)
+    };
+    let Some(app_id) = game_id.map(|game_id| AppId(game_id as u32)) else {
+        return sim_result(
+            SimDecision::Pass,
+            "store-stats-privacy",
+            "StoreStats body failed to decode or has no game_id",
+            None,
+        );
+    };
+    if !config.is_controlled_app(app_id) {
+        return sim_result(
+            SimDecision::Pass,
+            "store-stats-privacy",
+            format!("app {} is not controlled by config", app_id.0),
+            None,
+        );
+    }
+    sim_result_with_assumptions(
+        SimDecision::Drop,
+        "store-stats-privacy",
+        format!(
+            "controlled app {} StoreStats is acknowledged locally",
+            app_id.0
+        ),
+        Some(0),
+        vec!["controlled apps are treated as unowned in offline simulation"],
+    )
+}
+
+fn simulate_ownership_ticket(body_bytes: &[u8], config: &RuntimeConfig) -> SimulationResult {
+    let app_id = GetAppOwnershipTicketRequest::decode(body_bytes)
+        .ok()
+        .and_then(|request| request.app_id)
+        .map(AppId);
+    simulate_local_ticket(app_id, config, "ownership-ticket-privacy")
+}
+
+fn simulate_encrypted_ticket(body_bytes: &[u8], config: &RuntimeConfig) -> SimulationResult {
+    let app_id = EncryptedAppTicketRequest::decode(body_bytes)
+        .ok()
+        .and_then(|request| request.app_id)
+        .map(AppId);
+    simulate_local_ticket(app_id, config, "encrypted-ticket-privacy")
+}
+
+fn simulate_local_ticket(
+    app_id: Option<AppId>,
+    config: &RuntimeConfig,
+    handler: &'static str,
+) -> SimulationResult {
+    let Some(app_id) = app_id else {
+        return sim_result(
+            SimDecision::Pass,
+            handler,
+            "ticket body failed to decode or has no app_id",
+            None,
+        );
+    };
+    if !config.is_controlled_app(app_id) {
+        return sim_result(
+            SimDecision::Pass,
+            handler,
+            format!("app {} is not controlled by config", app_id.0),
+            None,
+        );
+    }
+    sim_result_with_assumptions(
+        SimDecision::Drop,
+        handler,
+        format!(
+            "controlled app {} receives a local cached or failure response",
+            app_id.0
+        ),
+        Some(0),
+        vec!["ticket availability is runtime state"],
     )
 }
 
@@ -959,19 +1117,25 @@ fn simulate_games_played(
     };
 
     let mut rewrites = Vec::new();
-    for game in &mut msg.games_played {
+    let mut removed = Vec::new();
+    msg.games_played.retain_mut(|game| {
         let Some(game_id) = game.game_id else {
-            continue;
+            return true;
         };
         let app_id = AppId(game_id as u32);
-        let Some(avatar) = avatar_from_static_config(app_id, config) else {
-            continue;
-        };
-        game.game_id = Some(avatar.0 as u64);
-        rewrites.push((app_id, avatar));
-    }
+        if let Some(avatar) = avatar_from_static_config(app_id, config) {
+            game.game_id = Some(avatar.0 as u64);
+            rewrites.push((app_id, avatar));
+            return true;
+        }
+        if config.is_controlled_app(app_id) {
+            removed.push(app_id);
+            return false;
+        }
+        true
+    });
 
-    if rewrites.is_empty() {
+    if rewrites.is_empty() && removed.is_empty() {
         return sim_result_with_assumptions(
             SimDecision::Pass,
             "games-played-avatar",
@@ -988,10 +1152,21 @@ fn simulate_games_played(
         .map(|(app, avatar)| format!("{}->{}", app.0, avatar.0))
         .collect::<Vec<_>>()
         .join(", ");
+    let removed = removed
+        .iter()
+        .map(|app| app.0.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = match (pairs.is_empty(), removed.is_empty()) {
+        (false, true) => format!("static app_avatar mapping rewrites {pairs}"),
+        (true, false) => format!("protected apps without AppAvatar are removed: {removed}"),
+        (false, false) => format!("rewrites {pairs}; removes protected apps {removed}"),
+        (true, true) => unreachable!(),
+    };
     sim_result_with_assumptions(
         SimDecision::Rewrite,
-        "games-played-avatar",
-        format!("static app_avatar mapping rewrites {pairs}"),
+        "games-played-privacy",
+        reason,
         Some(final_len),
         vec!["runtime launch-flag avatar rules are not simulated"],
     )
@@ -1307,6 +1482,17 @@ fn usage() -> String {
 mod tests {
     use super::*;
 
+    fn controlled_config(app_id: u32) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
+        config.apps.inject.push(vapor_forge_config::InjectApp {
+            id: AppId(app_id),
+            dlc: Vec::new(),
+            ticket: vapor_forge_config::TicketMode::Forge,
+            purchase_time: 0,
+        });
+        config
+    }
+
     #[test]
     fn parses_hex_dump_with_offsets_and_punctuation() {
         assert_eq!(
@@ -1392,17 +1578,47 @@ mod tests {
             &header.encode_to_vec(),
             &body.encode_to_vec(),
         );
-        let mut config = RuntimeConfig::default();
-        config.apps.inject.push(vapor_forge_config::InjectApp {
-            id: AppId(480),
-            dlc: Vec::new(),
-            ticket: vapor_forge_config::TicketMode::Forge,
-            purchase_time: 0,
-        });
+        let config = controlled_config(480);
 
         let result = simulate_send(&packet, &config);
         assert_eq!(result.decision, SimDecision::Drop);
         assert_eq!(result.handler, "manifest-request-code");
         assert_eq!(result.final_len, Some(0));
+    }
+
+    #[test]
+    fn simulate_store_stats_for_controlled_app_uses_local_response() {
+        let body = ClientStoreUserStatsRequest {
+            game_id: Some(736_260),
+            explicit_reset: Some(false),
+            stats_to_store: Vec::new(),
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_STORE_USERSTATS | K_MSG_HDR_PROTO_FLAG,
+            &CMsgProtoBufHeader::default().encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let result = simulate_send(&packet, &controlled_config(736_260));
+        assert_eq!(result.decision, SimDecision::Drop);
+        assert_eq!(result.handler, "store-stats-privacy");
+    }
+
+    #[test]
+    fn simulate_games_played_removes_controlled_app_without_avatar() {
+        let body = CMsgClientGamesPlayed {
+            games_played: vec![vapor_forge_abi::GamePlayed {
+                game_id: Some(736_260),
+                ..Default::default()
+            }],
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_GAMESPLAYED | K_MSG_HDR_PROTO_FLAG,
+            &CMsgProtoBufHeader::default().encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let result = simulate_send(&packet, &controlled_config(736_260));
+        assert_eq!(result.decision, SimDecision::Rewrite);
+        assert_eq!(result.handler, "games-played-privacy");
+        assert!(result.reason.contains("736260"));
     }
 }

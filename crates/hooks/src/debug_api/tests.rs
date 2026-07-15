@@ -387,6 +387,13 @@ fn packet_capture_status_and_filter_are_exposed() {
     assert!(response.contains("\"type\":\"persona\""));
     assert!(response.contains("\"changed\":\"rewritten\""));
 
+    for packet_type in ["ownership-ticket", "metrics", "cloud", "app-metadata"] {
+        assert_eq!(
+            dispatch(&format!("packet capture on summary type={packet_type}")),
+            format!("ok packet capture mode=summary filter=type={packet_type}")
+        );
+    }
+
     let response = dispatch("packet capture limit 64 --json");
     assert_eq!(response, "ok {\"limit\":64}");
     let response = dispatch("packet capture off --json");

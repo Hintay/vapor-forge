@@ -208,7 +208,7 @@ impl Default for PendingQueue {
 /// Returns `true` if this app's request should be intercepted (dropped from
 /// the outgoing wire and fetched from an external provider instead).
 pub fn should_intercept(app_id: AppId, config: &RuntimeConfig) -> bool {
-    config.is_controlled_app(app_id)
+    crate::apps::classify_app(config, app_id).requires_injected_ownership()
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn should_intercept_controlled_app() {
+    fn should_intercept_only_when_injected_ownership_is_required() {
         let config = RuntimeConfig {
             apps: vapor_forge_config::AppsSection {
                 inject: vec![vapor_forge_config::InjectApp {
@@ -422,6 +422,22 @@ mod tests {
         };
         assert!(should_intercept(AppId(480), &config));
         assert!(!should_intercept(AppId(999), &config));
+
+        let owned_app = AppId(246_813_583);
+        let owned_config = RuntimeConfig {
+            apps: vapor_forge_config::AppsSection {
+                inject: vec![vapor_forge_config::InjectApp {
+                    id: owned_app,
+                    dlc: Vec::new(),
+                    ticket: Default::default(),
+                    purchase_time: 0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        crate::apps::record_actual_ownership(owned_app, true);
+        assert!(!should_intercept(owned_app, &owned_config));
     }
 
     #[test]

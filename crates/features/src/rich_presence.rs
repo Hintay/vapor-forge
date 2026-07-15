@@ -37,7 +37,8 @@ static SELF_CACHE: Mutex<Option<SelfPersonaCache>> = Mutex::new(None);
 // AppId currently being played through an avatar mapping. Zero means none.
 static TRACKED_APP: AtomicU32 = AtomicU32::new(0);
 
-// Local SteamID, captured from outgoing packet headers the first time we see one.
+// Current local SteamID, refreshed from outgoing packet headers so an account
+// switch inside the same Steam process cannot retain the previous identity.
 static LOCAL_STEAMID: AtomicU64 = AtomicU64::new(0);
 
 // Set whenever tracking changes or new rich presence KVs arrive, so try_inject
@@ -50,9 +51,9 @@ struct SelfPersonaCache {
     body: Vec<u8>,
 }
 
-/// Record the local SteamID the first time it is observed on an outgoing packet.
+/// Record the current local SteamID observed on an outgoing packet.
 pub fn set_local_steamid(steamid: u64) {
-    if steamid != 0 && LOCAL_STEAMID.load(Ordering::Acquire) == 0 {
+    if steamid != 0 {
         LOCAL_STEAMID.store(steamid, Ordering::Release);
     }
 }

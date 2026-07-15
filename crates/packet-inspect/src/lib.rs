@@ -1,10 +1,15 @@
 use prost::Message;
 use vapor_forge_abi::{
-    CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientPersonaState, EncryptedAppTicketResponse,
-    GetManifestRequestCodeRequest, PicsProductInfoRequest, PlayerGetUserStatsRequest,
-    EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_ENCRYPTED_APPTICKET_RESPONSE,
-    EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_PICS_PRODUCT_INFO_REQUEST,
-    EMSG_REQUEST_USERSTATS, EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
+    CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientPersonaState, ClientStatsUpdated,
+    ClientStoreUserStats2Request, ClientStoreUserStatsRequest, ClientStoreUserStatsResponse,
+    EncryptedAppTicketRequest, EncryptedAppTicketResponse, GetAppOwnershipTicketRequest,
+    GetAppOwnershipTicketResponse, GetManifestRequestCodeRequest, PicsProductInfoRequest,
+    PlayerGetUserStatsRequest, EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
+    EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
+    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET,
+    EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
+    EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_STATS_UPDATED,
+    EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, EMSG_STORE_USERSTATS_RESPONSE,
     K_MSG_HDR_PROTO_FLAG,
 };
 
@@ -29,9 +34,13 @@ impl PacketDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketType {
     EncryptedTicket,
+    OwnershipTicket,
     Pics,
     ManifestCode,
     Stats,
+    Metrics,
+    Cloud,
+    AppMetadata,
     RichPresence,
     GamesPlayed,
     Persona,
@@ -42,15 +51,43 @@ impl PacketType {
     pub fn label(self) -> &'static str {
         match self {
             Self::EncryptedTicket => "encrypted-ticket",
+            Self::OwnershipTicket => "ownership-ticket",
             Self::Pics => "pics",
             Self::ManifestCode => "manifest-code",
             Self::Stats => "stats",
+            Self::Metrics => "metrics",
+            Self::Cloud => "cloud",
+            Self::AppMetadata => "app-metadata",
             Self::RichPresence => "rich-presence",
             Self::GamesPlayed => "games-played",
             Self::Persona => "persona",
             Self::Unknown => "unknown",
         }
     }
+}
+
+#[derive(Clone, prost::Message)]
+struct AppIdField1 {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct GameIdField1 {
+    #[prost(uint64, optional, tag = "1")]
+    game_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+struct AppIdField2 {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct AppIdField6 {
+    #[prost(uint32, optional, tag = "6")]
+    app_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +193,11 @@ pub fn summarize_packet(
     }
 
     match emsg {
+        EMSG_ENCRYPTED_APPTICKET_REQUEST => {
+            if let Ok(req) = EncryptedAppTicketRequest::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, req.app_id);
+            }
+        }
         EMSG_ENCRYPTED_APPTICKET_RESPONSE => {
             if let Ok(resp) = EncryptedAppTicketResponse::decode(body_bytes) {
                 push_app_id(&mut summary.app_ids, resp.app_id);
@@ -181,6 +223,41 @@ pub fn summarize_packet(
                         summary.steamid = req.steamid;
                     }
                 }
+            } else if let Some(job) = summary.job.as_deref() {
+                let app_id = match job {
+                    "ClientMetrics.ClientAppInterfaceStatsReport#1" => {
+                        GameIdField1::decode(body_bytes)
+                            .ok()
+                            .and_then(|message| message.game_id)
+                            .map(|app_id| app_id as u32)
+                    }
+                    "PublishedFile.GetUserFiles#1" => AppIdField2::decode(body_bytes)
+                        .ok()
+                        .and_then(|message| message.app_id),
+                    "ClientMetrics.ClientCloudAppSyncStats#1"
+                    | "Player.GetGameBadgeLevels#1"
+                    | "Store.ShouldPromptForCompatibilityFeedback#1" => {
+                        AppIdField1::decode(body_bytes)
+                            .ok()
+                            .and_then(|message| message.app_id)
+                    }
+                    "UserNews.GetUserNews#1" => AppIdField6::decode(body_bytes)
+                        .ok()
+                        .and_then(|message| message.app_id),
+                    // GetActivity is account-scoped; its field 1 is a fixed64 SteamID.
+                    "UserGameActivity.GetActivity#1" => None,
+                    "Cloud.CommitHTTPUpload#1"
+                    | "Cloud.CommitUGCUpload#1"
+                    | "Cloud.GetFileDetails#1"
+                    | "Cloud.Delete#1" => AppIdField2::decode(body_bytes)
+                        .ok()
+                        .and_then(|message| message.app_id),
+                    job if job.starts_with("Cloud.") => AppIdField1::decode(body_bytes)
+                        .ok()
+                        .and_then(|message| message.app_id),
+                    _ => None,
+                };
+                push_app_id(&mut summary.app_ids, app_id);
             }
         }
         EMSG_GAMESPLAYED | EMSG_GAMESPLAYED_WITH_DATABLOB => {
@@ -211,6 +288,38 @@ pub fn summarize_packet(
                 summary.eresult = resp.eresult;
             }
         }
+        EMSG_STORE_USERSTATS => {
+            if let Ok(request) = ClientStoreUserStatsRequest::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, request.game_id.map(|id| id as u32));
+            }
+        }
+        EMSG_STORE_USERSTATS_RESPONSE => {
+            if let Ok(response) = ClientStoreUserStatsResponse::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, response.game_id.map(|id| id as u32));
+                summary.eresult = response.eresult;
+            }
+        }
+        EMSG_STORE_USERSTATS2 => {
+            if let Ok(request) = ClientStoreUserStats2Request::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, request.game_id.map(|id| id as u32));
+            }
+        }
+        EMSG_STATS_UPDATED => {
+            if let Ok(response) = ClientStatsUpdated::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, response.game_id.map(|id| id as u32));
+            }
+        }
+        EMSG_GET_APP_OWNERSHIP_TICKET => {
+            if let Ok(request) = GetAppOwnershipTicketRequest::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, request.app_id);
+            }
+        }
+        EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE => {
+            if let Ok(response) = GetAppOwnershipTicketResponse::decode(body_bytes) {
+                push_app_id(&mut summary.app_ids, response.app_id);
+                summary.eresult = response.eresult.map(|result| result as i32);
+            }
+        }
         _ => {}
     }
 
@@ -221,12 +330,22 @@ pub fn summarize_packet(
 
 fn classify_by_emsg(emsg: u32) -> PacketType {
     match emsg {
-        EMSG_ENCRYPTED_APPTICKET_RESPONSE => PacketType::EncryptedTicket,
+        EMSG_ENCRYPTED_APPTICKET_REQUEST | EMSG_ENCRYPTED_APPTICKET_RESPONSE => {
+            PacketType::EncryptedTicket
+        }
+        EMSG_GET_APP_OWNERSHIP_TICKET | EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE => {
+            PacketType::OwnershipTicket
+        }
         EMSG_PICS_PRODUCT_INFO_REQUEST => PacketType::Pics,
         EMSG_CLIENT_RICH_PRESENCE_UPLOAD => PacketType::RichPresence,
         EMSG_GAMESPLAYED | EMSG_GAMESPLAYED_WITH_DATABLOB => PacketType::GamesPlayed,
         EMSG_CLIENT_PERSONA_STATE => PacketType::Persona,
-        EMSG_REQUEST_USERSTATS | EMSG_REQUEST_USERSTATS_RESPONSE => PacketType::Stats,
+        EMSG_REQUEST_USERSTATS
+        | EMSG_REQUEST_USERSTATS_RESPONSE
+        | EMSG_STORE_USERSTATS
+        | EMSG_STORE_USERSTATS_RESPONSE
+        | EMSG_STORE_USERSTATS2
+        | EMSG_STATS_UPDATED => PacketType::Stats,
         _ => PacketType::Unknown,
     }
 }
@@ -235,6 +354,14 @@ fn classify_by_job(job: Option<&str>) -> PacketType {
     match job {
         Some(MANIFEST_REQUEST_CODE_JOB_NAME) => PacketType::ManifestCode,
         Some(STATS_JOB_NAME) => PacketType::Stats,
+        Some("ClientMetrics.ClientAppInterfaceStatsReport#1")
+        | Some("ClientMetrics.ClientCloudAppSyncStats#1") => PacketType::Metrics,
+        Some(job) if job.starts_with("Cloud.") => PacketType::Cloud,
+        Some("Player.GetGameBadgeLevels#1")
+        | Some("PublishedFile.GetUserFiles#1")
+        | Some("UserNews.GetUserNews#1")
+        | Some("UserGameActivity.GetActivity#1")
+        | Some("Store.ShouldPromptForCompatibilityFeedback#1") => PacketType::AppMetadata,
         _ => PacketType::Unknown,
     }
 }
@@ -330,5 +457,116 @@ mod tests {
         assert_eq!(summary.packet_type, PacketType::Stats);
         assert_eq!(summary.app_ids, vec![570]);
         assert_eq!(summary.steamid, body.steamid);
+    }
+
+    #[test]
+    fn summarizes_store_stats_request() {
+        let header = CMsgProtoBufHeader {
+            jobid_source: Some(9),
+            ..Default::default()
+        };
+        let body = ClientStoreUserStatsRequest {
+            game_id: Some(736_260),
+            explicit_reset: Some(false),
+            stats_to_store: Vec::new(),
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_STORE_USERSTATS | K_MSG_HDR_PROTO_FLAG,
+            &header.encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let summary = summarize_packet(
+            10,
+            PacketDirection::Send,
+            &packet,
+            PacketChange::Dropped,
+            Some(0),
+        );
+        assert_eq!(summary.packet_type, PacketType::Stats);
+        assert_eq!(summary.app_ids, vec![736_260]);
+    }
+
+    #[test]
+    fn summarizes_app_interface_metrics() {
+        let header = CMsgProtoBufHeader {
+            target_job_name: Some("ClientMetrics.ClientAppInterfaceStatsReport#1".into()),
+            ..Default::default()
+        };
+        let body = GameIdField1 {
+            game_id: Some(736_260),
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
+            &header.encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let summary = summarize_packet(
+            11,
+            PacketDirection::Send,
+            &packet,
+            PacketChange::Dropped,
+            Some(0),
+        );
+        assert_eq!(summary.packet_type, PacketType::Metrics);
+        assert_eq!(summary.app_ids, vec![736_260]);
+    }
+
+    #[test]
+    fn summarizes_user_news_app_id_from_field_six() {
+        #[derive(Clone, prost::Message)]
+        struct UserNewsRequest {
+            #[prost(uint32, optional, tag = "1")]
+            count: Option<u32>,
+            #[prost(uint32, optional, tag = "6")]
+            app_id: Option<u32>,
+        }
+
+        let header = CMsgProtoBufHeader {
+            target_job_name: Some("UserNews.GetUserNews#1".into()),
+            ..Default::default()
+        };
+        let body = UserNewsRequest {
+            count: Some(100),
+            app_id: Some(736_260),
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
+            &header.encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let summary = summarize_packet(
+            12,
+            PacketDirection::Send,
+            &packet,
+            PacketChange::Unchanged,
+            None,
+        );
+        assert_eq!(summary.packet_type, PacketType::AppMetadata);
+        assert_eq!(summary.app_ids, vec![736_260]);
+    }
+
+    #[test]
+    fn summarizes_field_two_legacy_cloud_app_id() {
+        let header = CMsgProtoBufHeader {
+            target_job_name: Some("Cloud.CommitHTTPUpload#1".into()),
+            ..Default::default()
+        };
+        let body = AppIdField2 {
+            app_id: Some(736_260),
+        };
+        let packet = vapor_forge_abi::assemble_raw(
+            EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
+            &header.encode_to_vec(),
+            &body.encode_to_vec(),
+        );
+        let summary = summarize_packet(
+            13,
+            PacketDirection::Send,
+            &packet,
+            PacketChange::Dropped,
+            Some(0),
+        );
+        assert_eq!(summary.packet_type, PacketType::Cloud);
+        assert_eq!(summary.app_ids, vec![736_260]);
     }
 }

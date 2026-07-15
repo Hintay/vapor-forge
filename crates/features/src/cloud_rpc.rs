@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,9 +25,22 @@ use vapor_forge_abi::{
     CloudGetAppFileChangelistRequest, CloudGetAppFileChangelistResponse, CloudHttpHeader,
     CloudPendingRemoteOperation, EMSG_SERVICE_METHOD_RESPONSE, K_MSG_HDR_PROTO_FLAG,
 };
+use vapor_forge_achievement_sync::{
+    default_outbox_path, device_descriptor, new_conflict_event_id, Outbox,
+    QueuedConflictResolution, STEAM_CLIENT_ID_HEADER,
+};
 use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub const GET_CHANGELIST: &str = "Cloud.GetAppFileChangelist#1";
+pub const BEGIN_HTTP_UPLOAD: &str = "Cloud.BeginHTTPUpload#1";
+pub const COMMIT_HTTP_UPLOAD: &str = "Cloud.CommitHTTPUpload#1";
+pub const BEGIN_UGC_UPLOAD: &str = "Cloud.BeginUGCUpload#1";
+pub const COMMIT_UGC_UPLOAD: &str = "Cloud.CommitUGCUpload#1";
+pub const GET_FILE_DETAILS: &str = "Cloud.GetFileDetails#1";
+pub const GET_SINGLE_FILE_INFO: &str = "Cloud.GetSingleFileInfo#1";
+pub const SHARE_FILE: &str = "Cloud.ShareFile#1";
+pub const ENUMERATE_USER_FILES: &str = "Cloud.EnumerateUserFiles#1";
+pub const LEGACY_DELETE: &str = "Cloud.Delete#1";
 pub const BEGIN_BATCH: &str = "Cloud.BeginAppUploadBatch#1";
 pub const BEGIN_FILE_UPLOAD: &str = "Cloud.ClientBeginFileUpload#1";
 pub const COMMIT_FILE_UPLOAD: &str = "Cloud.ClientCommitFileUpload#1";
@@ -49,6 +63,20 @@ const ERESULT_TOO_MANY_PENDING: i32 = 108;
 const HTTP_METHOD_PUT: i32 = 4;
 const TRANSFER_TARGET_CAPACITY: usize = 4096;
 const TRANSFER_TARGET_TTL: Duration = Duration::from_secs(15 * 60);
+const RPC_WORKER_SHARDS: usize = 4;
+const RPC_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Clone, prost::Message)]
+struct AppIdField1Request {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct AppIdField2Request {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
 
 struct PendingResponse {
     receiver: mpsc::Receiver<Vec<u8>>,
@@ -63,31 +91,57 @@ struct QueuedRequest {
     response: Option<mpsc::Sender<Vec<u8>>>,
 }
 
+struct RpcWorker {
+    sender: mpsc::Sender<QueuedRequest>,
+    queued_responses: Arc<AtomicUsize>,
+}
+
+impl RpcWorker {
+    fn try_reserve_response(&self) -> bool {
+        self.queued_responses
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < RPC_QUEUE_CAPACITY).then_some(queued + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_response(&self) {
+        self.queued_responses.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct AdapterState {
     current_change_numbers: HashMap<u32, u64>,
     client_change_numbers: HashMap<u32, u64>,
     active_batches: HashMap<u32, u64>,
     batches: HashMap<u64, BatchState>,
     files: HashMap<(u32, String), CumulusFile>,
-    conflict_resolutions: HashMap<u32, PendingResolution>,
+    conflict_outbox_path: Option<PathBuf>,
     transfer_targets: Arc<TransferTargetRegistry>,
 }
 
 impl Default for AdapterState {
     fn default() -> Self {
-        Self::with_transfer_targets(Arc::new(TransferTargetRegistry::default()))
+        Self::with_transfer_targets_and_outbox(Arc::new(TransferTargetRegistry::default()), None)
     }
 }
 
 impl AdapterState {
     fn with_transfer_targets(transfer_targets: Arc<TransferTargetRegistry>) -> Self {
+        Self::with_transfer_targets_and_outbox(transfer_targets, default_outbox_path())
+    }
+
+    fn with_transfer_targets_and_outbox(
+        transfer_targets: Arc<TransferTargetRegistry>,
+        conflict_outbox_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             current_change_numbers: HashMap::new(),
             client_change_numbers: HashMap::new(),
             active_batches: HashMap::new(),
             batches: HashMap::new(),
             files: HashMap::new(),
-            conflict_resolutions: HashMap::new(),
+            conflict_outbox_path,
             transfer_targets,
         }
     }
@@ -144,11 +198,7 @@ struct BatchState {
     upload_paths: BTreeSet<String>,
     delete_paths: BTreeSet<String>,
     files: HashMap<String, String>,
-}
-
-struct PendingResolution {
-    base_change_number: u64,
-    resolution: &'static str,
+    conflict_resolution: Option<QueuedConflictResolution>,
 }
 
 /// Thread-safe queue used by the network hook. HTTP never runs on Steam's
@@ -156,7 +206,7 @@ struct PendingResolution {
 pub struct CloudRpcQueue {
     pending: Mutex<Vec<PendingResponse>>,
     count: AtomicUsize,
-    worker: mpsc::Sender<QueuedRequest>,
+    workers: Box<[RpcWorker]>,
     report_worker: mpsc::SyncSender<QueuedRequest>,
     transfer_targets: Arc<TransferTargetRegistry>,
 }
@@ -164,30 +214,44 @@ pub struct CloudRpcQueue {
 impl CloudRpcQueue {
     pub fn new() -> Self {
         let transfer_targets = Arc::new(TransferTargetRegistry::default());
-        let worker_transfer_targets = Arc::clone(&transfer_targets);
-        let (worker, receiver) = mpsc::channel::<QueuedRequest>();
-        std::thread::spawn(move || {
-            let mut state = AdapterState::with_transfer_targets(worker_transfer_targets);
-            while let Ok(request) = receiver.recv() {
-                let result = execute_rpc(
-                    &mut state,
-                    &request.settings,
-                    &request.method,
-                    &request.body,
-                );
-                if let Some(response) = request.response {
-                    let packet = build_response_packet(&request.header, result);
-                    let _ = response.send(packet);
-                } else if let Err(error) = result {
-                    warn!(
-                        app_id = request.app_id,
-                        method = request.method,
-                        %error,
-                        "cloud-rpc: notification failed"
-                    );
+        let workers = (0..RPC_WORKER_SHARDS)
+            .map(|_| {
+                let worker_transfer_targets = Arc::clone(&transfer_targets);
+                let (sender, receiver) = mpsc::channel::<QueuedRequest>();
+                let queued_responses = Arc::new(AtomicUsize::new(0));
+                let worker_queued_responses = Arc::clone(&queued_responses);
+                std::thread::spawn(move || {
+                    let mut state = AdapterState::with_transfer_targets(worker_transfer_targets);
+                    while let Ok(request) = receiver.recv() {
+                        if request.response.is_some() {
+                            worker_queued_responses.fetch_sub(1, Ordering::AcqRel);
+                        }
+                        let result = execute_rpc(
+                            &mut state,
+                            &request.settings,
+                            &request.method,
+                            &request.body,
+                        );
+                        if let Some(response) = request.response {
+                            let packet = build_response_packet(&request.header, result);
+                            let _ = response.send(packet);
+                        } else if let Err(error) = result {
+                            warn!(
+                                app_id = request.app_id,
+                                method = request.method,
+                                %error,
+                                "cloud-rpc: notification failed"
+                            );
+                        }
+                    }
+                });
+                RpcWorker {
+                    sender,
+                    queued_responses,
                 }
-            }
-        });
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let (report_worker, report_receiver) = mpsc::sync_channel::<QueuedRequest>(128);
         std::thread::spawn(move || {
             let mut state = AdapterState::default();
@@ -209,7 +273,7 @@ impl CloudRpcQueue {
         Self {
             pending: Mutex::new(Vec::new()),
             count: AtomicUsize::new(0),
-            worker,
+            workers,
             report_worker,
             transfer_targets,
         }
@@ -217,6 +281,18 @@ impl CloudRpcQueue {
 
     pub fn is_empty(&self) -> bool {
         self.count.load(Ordering::Acquire) == 0
+    }
+
+    fn worker(&self, app_id: u32) -> &RpcWorker {
+        &self.workers[app_id as usize % self.workers.len()]
+    }
+
+    fn track_response(&self, receiver: mpsc::Receiver<Vec<u8>>) {
+        self.pending
+            .lock()
+            .unwrap()
+            .push(PendingResponse { receiver });
+        self.count.fetch_add(1, Ordering::Release);
     }
 
     /// Queue a supported Cumulus-backed RPC. Returns false when the packet
@@ -229,6 +305,9 @@ impl CloudRpcQueue {
         body: &[u8],
         config: &RuntimeConfig,
     ) -> bool {
+        if config.cumulus_configured() && method == LAUNCH_INTENT {
+            capture_device_descriptor(body);
+        }
         if is_cumulus_transfer_report(method, body, config, &self.transfer_targets) {
             if self
                 .report_worker
@@ -264,40 +343,42 @@ impl CloudRpcQueue {
         let settings = CloudSettings::from_config(config);
         if expects_response {
             let (sender, receiver) = mpsc::channel();
-            if self
-                .worker
-                .send(QueuedRequest {
-                    app_id,
-                    method: method.to_string(),
-                    header: request_header_bytes.to_vec(),
-                    body: body.to_vec(),
-                    settings,
-                    response: Some(sender),
-                })
-                .is_err()
-            {
-                warn!(app_id, method, "cloud-rpc: request worker stopped");
-                return false;
+            let mut request = Some(QueuedRequest {
+                app_id,
+                method: method.to_string(),
+                header: request_header_bytes.to_vec(),
+                body: body.to_vec(),
+                settings,
+                response: Some(sender.clone()),
+            });
+            let worker = self.worker(app_id);
+            let reserved = worker.try_reserve_response();
+            let sent = reserved
+                && worker
+                    .sender
+                    .send(request.take().expect("reserved request"))
+                    .is_ok();
+            if !sent {
+                if reserved {
+                    worker.release_response();
+                }
+                warn!(app_id, method, "cloud-rpc: request queue unavailable");
+                let packet =
+                    build_response_packet(request_header_bytes, Err(AdapterError::Overloaded));
+                let _ = sender.send(packet);
             }
-            self.pending
-                .lock()
-                .unwrap()
-                .push(PendingResponse { receiver });
-            self.count.fetch_add(1, Ordering::Release);
+            self.track_response(receiver);
         } else {
-            if self
-                .worker
-                .send(QueuedRequest {
-                    app_id,
-                    method: method.to_string(),
-                    header: Vec::new(),
-                    body: body.to_vec(),
-                    settings,
-                    response: None,
-                })
-                .is_err()
-            {
-                warn!(app_id, method, "cloud-rpc: notification worker stopped");
+            let request = QueuedRequest {
+                app_id,
+                method: method.to_string(),
+                header: Vec::new(),
+                body: body.to_vec(),
+                settings,
+                response: None,
+            };
+            if self.worker(app_id).sender.send(request).is_err() {
+                warn!(app_id, method, "cloud-rpc: notification queue unavailable");
                 return false;
             }
         }
@@ -326,6 +407,23 @@ impl CloudRpcQueue {
     }
 }
 
+fn capture_device_descriptor(body: &[u8]) {
+    let Ok(request) = CloudAppLaunchIntentRequest::decode(body) else {
+        return;
+    };
+    let Some(client_id) = request.client_id.filter(|client_id| *client_id != 0) else {
+        return;
+    };
+    vapor_forge_achievement_sync::record_device_descriptor(
+        vapor_forge_achievement_sync::DeviceDescriptor {
+            client_id,
+            machine_name: request.machine_name.unwrap_or_else(|| "unknown".into()),
+            os_type: request.os_type.map(i64::from),
+            device_type: request.device_type.map(i64::from),
+        },
+    );
+}
+
 impl Default for CloudRpcQueue {
     fn default() -> Self {
         Self::new()
@@ -338,10 +436,27 @@ fn execute_rpc(
     method: &str,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
+    if settings.bind_device {
+        let descriptor = device_descriptor().ok_or_else(|| {
+            AdapterError::Protocol("Steam ClientID is not available for device binding".into())
+        })?;
+        let binding_settings = vapor_forge_achievement_sync::CumulusSettings {
+            server_url: settings.server_url.clone(),
+            token: settings.token.clone(),
+            timeout_connect_ms: settings.timeout_connect_ms,
+            timeout_ms: settings.timeout_ms,
+        };
+        vapor_forge_achievement_sync::ensure_device_bound(&binding_settings, &descriptor)?;
+    }
     let client = CumulusClient::new(settings)?;
+    let conflict_scope =
+        vapor_forge_achievement_sync::credential_scope(&settings.server_url, &settings.token);
+    if let Err(error) = deliver_ready_conflicts(state, &client, &conflict_scope) {
+        warn!(%error, "cloud-rpc: deferred conflict report failed");
+    }
     match method {
         GET_CHANGELIST => handle_changelist(state, &client, body),
-        BEGIN_BATCH => handle_begin_batch(state, &client, body),
+        BEGIN_BATCH => handle_begin_batch(state, &client, &conflict_scope, body),
         BEGIN_FILE_UPLOAD => handle_begin_file_upload(state, &client, body),
         COMMIT_FILE_UPLOAD => handle_commit_file_upload(state, &client, body),
         COMPLETE_BATCH | COMPLETE_BATCH_BLOCKING => handle_complete_batch(state, &client, body),
@@ -352,7 +467,7 @@ fn execute_rpc(
         SUSPEND_SESSION => handle_suspend(&client, body),
         RESUME_SESSION => handle_resume(&client, body),
         EXIT_SYNC_DONE => handle_exit(&client, body),
-        CONFLICT_RESOLUTION => handle_conflict_resolution(state, body),
+        CONFLICT_RESOLUTION => handle_conflict_resolution(state, &client, &conflict_scope, body),
         CDN_REPORT => handle_cdn_report(&client, body),
         EXTERNAL_TRANSFER_REPORT => handle_external_transfer_report(&client, body),
         _ => Err(AdapterError::Protocol("unsupported cloud method".into())),
@@ -430,6 +545,7 @@ fn handle_changelist(
 fn handle_begin_batch(
     state: &mut AdapterState,
     client: &CumulusClient,
+    conflict_scope: &str,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     let request = CloudBeginAppUploadBatchRequest::decode(body)?;
@@ -441,6 +557,11 @@ fn handle_begin_batch(
         .ok_or_else(|| {
             AdapterError::Protocol("upload started before a verified changelist".into())
         })?;
+    if let Some(previous) = state.active_batches.get(&app_id).copied() {
+        client.delete_allow_not_found(&format!("/api/v1/upload-batches/{previous}"))?;
+        state.active_batches.remove(&app_id);
+        state.batches.remove(&previous);
+    }
     let response: CumulusBeginBatch = client.post_json(
         &format!("/api/v1/steam/apps/{app_id}/upload-batches"),
         &json!({
@@ -452,15 +573,18 @@ fn handle_begin_batch(
         }),
     )?;
     let batch_id = parse_batch_id(&response.batch_id)?;
+    let conflict_resolution = match state.conflict_outbox_path.as_deref() {
+        Some(path) => Outbox::open(path)?.pending_local_conflict(conflict_scope, app_id, base)?,
+        None => None,
+    };
     let batch = BatchState {
         app_id,
         upload_paths: request.files_to_upload.into_iter().collect(),
         delete_paths: request.files_to_delete.into_iter().collect(),
         files: HashMap::new(),
+        conflict_resolution,
     };
-    if let Some(previous) = state.active_batches.insert(app_id, batch_id) {
-        state.batches.remove(&previous);
-    }
+    state.active_batches.insert(app_id, batch_id);
     state.batches.insert(batch_id, batch);
     let reply = CloudBeginAppUploadBatchResponse {
         batch_id: Some(batch_id),
@@ -649,12 +773,17 @@ fn handle_complete_batch(
     if request.batch_eresult.unwrap_or(ERESULT_OK as u32) != ERESULT_OK as u32 {
         client.delete(&format!("/api/v1/upload-batches/{batch_id}"))?;
     } else {
-        let resolution = state.conflict_resolutions.get(&app_id).map(|resolution| {
-            json!({
-                "base_change_number": signed_bits(resolution.base_change_number),
-                "resolution": resolution.resolution,
-            })
-        });
+        let resolution = state
+            .batches
+            .get(&batch_id)
+            .and_then(|batch| batch.conflict_resolution.as_ref())
+            .map(|resolution| {
+                json!({
+                    "event_id": resolution.event_id,
+                    "base_change_number": signed_bits(resolution.base_change_number),
+                    "resolution": resolution.resolution,
+                })
+            });
         let commit: CumulusCommit = client.post_json(
             &format!("/api/v1/upload-batches/{batch_id}/commit"),
             &json!({ "conflict_resolution": resolution }),
@@ -663,10 +792,18 @@ fn handle_complete_batch(
             app_id,
             nonnegative_u64(commit.change_number, "change_number")?,
         );
-        state.conflict_resolutions.remove(&app_id);
         state
             .files
             .retain(|(cached_app, _), _| *cached_app != app_id);
+        if let Some(resolution) = state
+            .batches
+            .get(&batch_id)
+            .and_then(|batch| batch.conflict_resolution.as_ref())
+        {
+            if let Some(path) = state.conflict_outbox_path.as_deref() {
+                Outbox::open(path)?.mark_conflict_delivered(resolution)?;
+            }
+        }
     }
     state.active_batches.remove(&app_id);
     state.batches.remove(&batch_id);
@@ -757,7 +894,7 @@ fn handle_launch(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, Adapte
     let response: CumulusLaunch = client.post_json(
         &format!("/api/v1/apps/{app_id}/session/launch"),
         &json!({
-            "client_id": signed_bits(required(request.client_id, "client_id")?),
+            "client_id": required(request.client_id, "client_id")?.to_string(),
             "machine_name": request.machine_name.unwrap_or_else(|| "unknown".into()),
             "ignore_pending": request.ignore_pending_operations.unwrap_or(false),
             "os_type": request.os_type,
@@ -767,15 +904,19 @@ fn handle_launch(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, Adapte
     let pending_remote_operations = response
         .pending_operations
         .into_iter()
-        .map(|operation| CloudPendingRemoteOperation {
-            operation: Some(operation.operation as i32),
-            machine_name: Some(operation.machine_name),
-            client_id: Some(operation.client_id as u64),
-            time_last_updated: Some(clamp_u32(operation.time_last_updated)),
-            os_type: operation.os_type.map(|value| value as i32),
-            device_type: operation.device_type.map(|value| value as i32),
+        .map(|operation| {
+            Ok(CloudPendingRemoteOperation {
+                operation: Some(operation.operation as i32),
+                machine_name: Some(operation.machine_name),
+                client_id: Some(operation.client_id.parse().map_err(|_| {
+                    AdapterError::Protocol("Cumulus returned an invalid Steam ClientID".into())
+                })?),
+                time_last_updated: Some(clamp_u32(operation.time_last_updated)),
+                os_type: operation.os_type.map(|value| value as i32),
+                device_type: operation.device_type.map(|value| value as i32),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, AdapterError>>()?;
     let eresult = if pending_remote_operations.is_empty() {
         ERESULT_OK
     } else {
@@ -796,7 +937,7 @@ fn handle_suspend(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, Adapt
     client.post_json_unit(
         &format!("/api/v1/apps/{app_id}/session/suspend"),
         &json!({
-            "client_id": signed_bits(required(request.client_id, "client_id")?),
+            "client_id": required(request.client_id, "client_id")?.to_string(),
             "cloud_sync_completed": request.cloud_sync_completed,
         }),
     )?;
@@ -811,7 +952,7 @@ fn handle_resume(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, Adapte
     client.post_json_unit(
         &format!("/api/v1/apps/{app_id}/session/resume"),
         &json!({
-            "client_id": signed_bits(required(request.client_id, "client_id")?),
+            "client_id": required(request.client_id, "client_id")?.to_string(),
         }),
     )?;
     Ok(RpcReply::ok(
@@ -825,7 +966,7 @@ fn handle_exit(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, AdapterE
     client.post_json_unit(
         &format!("/api/v1/apps/{app_id}/session/exit"),
         &json!({
-            "client_id": signed_bits(required(request.client_id, "client_id")?),
+            "client_id": required(request.client_id, "client_id")?.to_string(),
             "uploads_completed": request.uploads_completed,
             "uploads_required": request.uploads_required,
         }),
@@ -835,27 +976,88 @@ fn handle_exit(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, AdapterE
 
 fn handle_conflict_resolution(
     state: &mut AdapterState,
+    client: &CumulusClient,
+    conflict_scope: &str,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     let request = CloudClientConflictResolutionNotification::decode(body)?;
     let app_id = required(request.app_id, "appid")?;
-    if request.chose_local_files.unwrap_or(false) {
-        let base_change_number = state
-            .client_change_numbers
-            .get(&app_id)
-            .copied()
-            .unwrap_or(0);
-        state.conflict_resolutions.insert(
-            app_id,
-            PendingResolution {
-                base_change_number,
-                resolution: "kept_local",
-            },
-        );
-    } else {
-        state.conflict_resolutions.remove(&app_id);
+    let base_change_number = state
+        .client_change_numbers
+        .get(&app_id)
+        .copied()
+        .ok_or_else(|| {
+            AdapterError::Protocol("conflict reported before a verified changelist".into())
+        })?;
+    let remote_change_number = state
+        .current_change_numbers
+        .get(&app_id)
+        .copied()
+        .ok_or_else(|| {
+            AdapterError::Protocol("conflict reported before a verified changelist".into())
+        })?;
+    let resolution = QueuedConflictResolution {
+        owner_scope: conflict_scope.to_string(),
+        event_id: new_conflict_event_id(),
+        app_id,
+        base_change_number,
+        remote_change_number,
+        resolution: if request.chose_local_files.unwrap_or(false) {
+            "kept_local".into()
+        } else {
+            "kept_cloud".into()
+        },
+        machine_name: device_descriptor().map(|descriptor| descriptor.machine_name),
+    };
+    let path = state
+        .conflict_outbox_path
+        .as_deref()
+        .ok_or_else(|| AdapterError::Protocol("conflict outbox path is unavailable".into()))?;
+    Outbox::open(path)?.enqueue_conflict(&resolution, unix_time())?;
+    if resolution.resolution == "kept_cloud" {
+        if let Err(error) = deliver_ready_conflicts(state, client, conflict_scope) {
+            warn!(app_id, %error, "cloud-rpc: kept-cloud report queued for retry");
+        }
     }
     Ok(RpcReply::ok(Vec::new()))
+}
+
+fn deliver_ready_conflicts(
+    state: &AdapterState,
+    client: &CumulusClient,
+    conflict_scope: &str,
+) -> Result<(), AdapterError> {
+    let Some(path) = state.conflict_outbox_path.as_deref() else {
+        return Ok(());
+    };
+    let outbox = Outbox::open(path)?;
+    let now = unix_time();
+    for resolution in outbox.pending_cloud_conflicts(now, conflict_scope)? {
+        let result = client.post_json_unit(
+            &format!("/api/v1/apps/{}/conflicts/kept-cloud", resolution.app_id),
+            &json!({
+                "event_id": resolution.event_id,
+                "base_change_number": signed_bits(resolution.base_change_number),
+                "machine_name": resolution.machine_name,
+            }),
+        );
+        match result {
+            Ok(()) => outbox.mark_conflict_delivered(&resolution)?,
+            Err(error) => {
+                outbox.mark_conflict_failed(&resolution, now)?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unix_time() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
 fn handle_cdn_report(client: &CumulusClient, body: &[u8]) -> Result<RpcReply, AdapterError> {
@@ -967,6 +1169,11 @@ fn find_batch_id(
 
 fn request_app_id(method: &str, body: &[u8]) -> Option<u32> {
     let app_id = match method {
+        BEGIN_HTTP_UPLOAD | BEGIN_UGC_UPLOAD | GET_SINGLE_FILE_INFO | SHARE_FILE
+        | ENUMERATE_USER_FILES => AppIdField1Request::decode(body).ok()?.app_id,
+        COMMIT_HTTP_UPLOAD | COMMIT_UGC_UPLOAD | GET_FILE_DETAILS | LEGACY_DELETE => {
+            AppIdField2Request::decode(body).ok()?.app_id
+        }
         GET_CHANGELIST => CloudGetAppFileChangelistRequest::decode(body).ok()?.app_id,
         BEGIN_BATCH => CloudBeginAppUploadBatchRequest::decode(body).ok()?.app_id,
         BEGIN_FILE_UPLOAD => CloudClientBeginFileUploadRequest::decode(body).ok()?.app_id,
@@ -999,6 +1206,18 @@ fn request_app_id(method: &str, body: &[u8]) -> Option<u32> {
         _ => None,
     }?;
     (app_id != 0).then_some(app_id)
+}
+
+/// Identify a controlled Cloud request that must not fall through to Valve.
+///
+/// This is called after the Cumulus adapter declines the request. Unknown and
+/// explicitly unowned apps are both protected so startup races cannot expose
+/// an AppID before the ownership snapshot is ready.
+pub fn privacy_fallback(method: &str, body: &[u8], config: &RuntimeConfig) -> Option<(u32, bool)> {
+    let app_id = request_app_id(method, body)?;
+    crate::apps::classify_app(config, AppId(app_id))
+        .requires_injected_ownership()
+        .then_some((app_id, method_expects_response(method)))
 }
 
 fn is_cumulus_transfer_report(
@@ -1039,7 +1258,16 @@ fn is_cumulus_transfer_report(
 fn method_expects_response(method: &str) -> bool {
     matches!(
         method,
-        GET_CHANGELIST
+        BEGIN_HTTP_UPLOAD
+            | COMMIT_HTTP_UPLOAD
+            | BEGIN_UGC_UPLOAD
+            | COMMIT_UGC_UPLOAD
+            | GET_FILE_DETAILS
+            | GET_SINGLE_FILE_INFO
+            | SHARE_FILE
+            | ENUMERATE_USER_FILES
+            | LEGACY_DELETE
+            | GET_CHANGELIST
             | BEGIN_BATCH
             | BEGIN_FILE_UPLOAD
             | COMMIT_FILE_UPLOAD
@@ -1099,6 +1327,8 @@ fn build_response_packet(
 struct CloudSettings {
     server_url: String,
     token: String,
+    steam_client_id: Option<u64>,
+    bind_device: bool,
     timeout_connect_ms: u64,
     timeout_ms: u64,
 }
@@ -1108,6 +1338,8 @@ impl CloudSettings {
         Self {
             server_url: config.cloud.server_url.trim().to_string(),
             token: config.cloud.token.trim().to_string(),
+            steam_client_id: device_descriptor().map(|descriptor| descriptor.client_id),
+            bind_device: true,
             timeout_connect_ms: config.cloud.timeout_connect_ms,
             timeout_ms: config.cloud.timeout_ms,
         }
@@ -1236,7 +1468,7 @@ fn resolve_transfer_target(
                     "relative transfer target supplied use_https".into(),
                 ));
             }
-            headers.push(client.auth_header());
+            headers.extend(client.auth_headers());
             (
                 client.endpoint.authority.clone(),
                 client.endpoint.resolve_path(&target.url_path),
@@ -1256,6 +1488,7 @@ struct CumulusClient {
     agent: ureq::Agent,
     endpoint: Endpoint,
     token: String,
+    steam_client_id: Option<String>,
 }
 
 impl CumulusClient {
@@ -1271,14 +1504,24 @@ impl CumulusClient {
             agent,
             endpoint,
             token: settings.token.clone(),
+            steam_client_id: settings
+                .steam_client_id
+                .map(|client_id| client_id.to_string()),
         })
     }
 
-    fn auth_header(&self) -> CloudHttpHeader {
-        CloudHttpHeader {
+    fn auth_headers(&self) -> Vec<CloudHttpHeader> {
+        let mut headers = vec![CloudHttpHeader {
             name: Some("Authorization".into()),
             value: Some(format!("Bearer {}", self.token)),
+        }];
+        if let Some(client_id) = &self.steam_client_id {
+            headers.push(CloudHttpHeader {
+                name: Some(STEAM_CLIENT_ID_HEADER.into()),
+                value: Some(client_id.clone()),
+            });
         }
+        headers
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -1286,11 +1529,16 @@ impl CumulusClient {
     }
 
     fn get_json<T: DeserializeOwned>(&self, suffix: &str) -> Result<T, AdapterError> {
-        let response = self
+        let request = self
             .agent
             .get(&self.url(suffix))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .call()?;
+            .header("Authorization", &format!("Bearer {}", self.token));
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.call()?;
         decode_json_response(response)
     }
 
@@ -1300,42 +1548,81 @@ impl CumulusClient {
         body: &Value,
     ) -> Result<T, AdapterError> {
         let encoded = serde_json::to_vec(body)?;
-        let response = self
+        let request = self
             .agent
             .post(&self.url(suffix))
             .header("Authorization", &format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .send(encoded.as_slice())?;
+            .header("Content-Type", "application/json");
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.send(encoded.as_slice())?;
         decode_json_response(response)
     }
 
     fn post_unit(&self, suffix: &str) -> Result<(), AdapterError> {
-        let response = self
+        let request = self
             .agent
             .post(&self.url(suffix))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .send_empty()?;
+            .header("Authorization", &format!("Bearer {}", self.token));
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.send_empty()?;
         ensure_success(response.status().as_u16())
     }
 
     fn post_json_unit(&self, suffix: &str, body: &Value) -> Result<(), AdapterError> {
         let encoded = serde_json::to_vec(body)?;
-        let response = self
+        let request = self
             .agent
             .post(&self.url(suffix))
             .header("Authorization", &format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .send(encoded.as_slice())?;
+            .header("Content-Type", "application/json");
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.send(encoded.as_slice())?;
         ensure_success(response.status().as_u16())
     }
 
     fn delete(&self, suffix: &str) -> Result<(), AdapterError> {
-        let response = self
+        let request = self
             .agent
             .delete(&self.url(suffix))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .call()?;
+            .header("Authorization", &format!("Bearer {}", self.token));
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.call()?;
         ensure_success(response.status().as_u16())
+    }
+
+    fn delete_allow_not_found(&self, suffix: &str) -> Result<(), AdapterError> {
+        let request = self
+            .agent
+            .delete(&self.url(suffix))
+            .header("Authorization", &format!("Bearer {}", self.token));
+        let request = if let Some(client_id) = &self.steam_client_id {
+            request.header(STEAM_CLIENT_ID_HEADER, client_id)
+        } else {
+            request
+        };
+        let response = request.call()?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            Ok(())
+        } else {
+            ensure_success(status)
+        }
     }
 }
 
@@ -1446,7 +1733,7 @@ struct CumulusLaunch {
 struct CumulusPendingOperation {
     operation: i64,
     machine_name: String,
-    client_id: i64,
+    client_id: String,
     time_last_updated: i64,
     os_type: Option<i64>,
     device_type: Option<i64>,
@@ -1458,12 +1745,18 @@ enum AdapterError {
     Protocol(String),
     #[error("Cumulus returned HTTP {0}")]
     HttpStatus(u16),
+    #[error("Cumulus request queue is overloaded")]
+    Overloaded,
     #[error("Cumulus transport failed: {0}")]
     Http(#[from] ureq::Error),
     #[error("invalid Cumulus JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid protobuf: {0}")]
     Protobuf(#[from] prost::DecodeError),
+    #[error("conflict outbox failed: {0}")]
+    Outbox(#[from] vapor_forge_achievement_sync::OutboxError),
+    #[error("Cumulus device binding failed: {0}")]
+    DeviceBinding(#[from] vapor_forge_achievement_sync::UploadError),
 }
 
 fn required<T>(value: Option<T>, field: &str) -> Result<T, AdapterError> {
@@ -1624,16 +1917,20 @@ mod tests {
         assert_eq!(block.http_method, Some(HTTP_METHOD_PUT));
         let host = block.url_host.as_deref().unwrap();
         let path = block.url_path.as_deref().unwrap();
-        let authorization = block
-            .request_headers
-            .iter()
-            .find(|header| header.name.as_deref() == Some("Authorization"))
-            .and_then(|header| header.value.as_deref())
-            .unwrap();
         let mut stream = std::net::TcpStream::connect(host).unwrap();
+        write!(stream, "PUT {path} HTTP/1.1\r\nHost: {host}\r\n").unwrap();
+        for header in &block.request_headers {
+            writeln!(
+                stream,
+                "{}: {}\r",
+                header.name.as_deref().unwrap(),
+                header.value.as_deref().unwrap()
+            )
+            .unwrap();
+        }
         write!(
             stream,
-            "PUT {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len(),
         )
         .unwrap();
@@ -1710,6 +2007,32 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_legacy_app_cloud_methods() {
+        let field_one = AppIdField1Request { app_id: Some(480) }.encode_to_vec();
+        for method in [
+            BEGIN_HTTP_UPLOAD,
+            BEGIN_UGC_UPLOAD,
+            GET_SINGLE_FILE_INFO,
+            SHARE_FILE,
+            ENUMERATE_USER_FILES,
+        ] {
+            assert_eq!(request_app_id(method, &field_one), Some(480), "{method}");
+        }
+
+        let field_two = AppIdField2Request { app_id: Some(480) }.encode_to_vec();
+        for method in [
+            COMMIT_HTTP_UPLOAD,
+            COMMIT_UGC_UPLOAD,
+            GET_FILE_DETAILS,
+            LEGACY_DELETE,
+        ] {
+            assert_eq!(request_app_id(method, &field_two), Some(480), "{method}");
+        }
+
+        assert_eq!(request_app_id("Cloud.GetClientEncryptionKey#1", &[]), None);
+    }
+
+    #[test]
     fn preserves_cloud_rpc_response_semantics() {
         assert!(!method_expects_response(COMPLETE_BATCH));
         assert!(!method_expects_response(EXIT_SYNC_DONE));
@@ -1718,6 +2041,41 @@ mod tests {
         assert!(!method_expects_response(CONFLICT_RESOLUTION));
         assert!(method_expects_response(COMPLETE_BATCH_BLOCKING));
         assert!(method_expects_response(BEGIN_FILE_UPLOAD));
+        assert!(method_expects_response(GET_FILE_DETAILS));
+        assert!(method_expects_response(ENUMERATE_USER_FILES));
+    }
+
+    #[test]
+    fn critical_notifications_bypass_response_backpressure_without_blocking() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = RpcWorker {
+            sender,
+            queued_responses: Arc::new(AtomicUsize::new(0)),
+        };
+        for _ in 0..RPC_QUEUE_CAPACITY {
+            assert!(worker.try_reserve_response());
+        }
+        assert!(!worker.try_reserve_response());
+
+        worker
+            .sender
+            .send(QueuedRequest {
+                app_id: 480,
+                method: COMPLETE_BATCH.into(),
+                header: Vec::new(),
+                body: Vec::new(),
+                settings: CloudSettings {
+                    server_url: "http://127.0.0.1".into(),
+                    token: "token".into(),
+                    steam_client_id: Some(7),
+                    bind_device: false,
+                    timeout_connect_ms: 1,
+                    timeout_ms: 1,
+                },
+                response: None,
+            })
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().method, COMPLETE_BATCH);
     }
 
     #[test]
@@ -1802,6 +2160,8 @@ mod tests {
         let settings = CloudSettings {
             server_url,
             token: "report-token".into(),
+            steam_client_id: None,
+            bind_device: false,
             timeout_connect_ms: 1000,
             timeout_ms: 2000,
         };
@@ -1853,7 +2213,185 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ownership_stays_on_steam_until_sampled() {
+    fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
+        let (server_url, captured) = scripted_server(&[
+            (
+                200,
+                r#"{"current_change_number":0,"app_buildid_hwm":0,"basis":"full","changed":[],"deleted":[]}"#,
+            ),
+            (200, r#"{"batch_id":"42","app_change_number":1}"#),
+            (204, ""),
+            (200, r#"{"batch_id":"43","app_change_number":1}"#),
+        ]);
+        let settings = CloudSettings {
+            server_url,
+            token: "batch-token".into(),
+            steam_client_id: None,
+            bind_device: false,
+            timeout_connect_ms: 1000,
+            timeout_ms: 2000,
+        };
+        let mut state = AdapterState::default();
+        let changelist = CloudGetAppFileChangelistRequest {
+            app_id: Some(480),
+            synced_change_number: Some(0),
+        };
+        execute_rpc(
+            &mut state,
+            &settings,
+            GET_CHANGELIST,
+            &changelist.encode_to_vec(),
+        )
+        .unwrap();
+        let begin = CloudBeginAppUploadBatchRequest {
+            app_id: Some(480),
+            machine_name: Some("deck".into()),
+            ..Default::default()
+        };
+        execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+        execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+
+        let lines = (0..4)
+            .map(|_| {
+                captured
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "GET /api/v1/apps/480/changelist?synced_change_number=0 HTTP/1.1",
+                "POST /api/v1/steam/apps/480/upload-batches HTTP/1.1",
+                "DELETE /api/v1/upload-batches/42 HTTP/1.1",
+                "POST /api/v1/steam/apps/480/upload-batches HTTP/1.1",
+            ]
+        );
+        assert_eq!(state.active_batches.get(&480), Some(&43));
+        assert!(!state.batches.contains_key(&42));
+    }
+
+    #[test]
+    fn conflict_results_are_reported_or_bound_to_the_next_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox_path = directory.path().join("conflicts.db");
+        let (server_url, captured) = scripted_server(&[
+            (
+                200,
+                r#"{"current_change_number":2,"app_buildid_hwm":0,"basis":"delta","changed":[],"deleted":[]}"#,
+            ),
+            (200, "{}"),
+            (200, r#"{"batch_id":"42","app_change_number":3}"#),
+            (204, ""),
+            (200, r#"{"batch_id":"43","app_change_number":3}"#),
+        ]);
+        let settings = CloudSettings {
+            server_url,
+            token: "conflict-token".into(),
+            steam_client_id: None,
+            bind_device: false,
+            timeout_connect_ms: 1000,
+            timeout_ms: 2000,
+        };
+        let mut state = AdapterState {
+            conflict_outbox_path: Some(outbox_path.clone()),
+            ..Default::default()
+        };
+        let changelist = CloudGetAppFileChangelistRequest {
+            app_id: Some(480),
+            synced_change_number: Some(1),
+        };
+        execute_rpc(
+            &mut state,
+            &settings,
+            GET_CHANGELIST,
+            &changelist.encode_to_vec(),
+        )
+        .unwrap();
+        let changelist_request = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(changelist_request.starts_with("GET /api/v1/apps/480/changelist"));
+
+        let kept_cloud = CloudClientConflictResolutionNotification {
+            app_id: Some(480),
+            chose_local_files: Some(false),
+        };
+        execute_rpc(
+            &mut state,
+            &settings,
+            CONFLICT_RESOLUTION,
+            &kept_cloud.encode_to_vec(),
+        )
+        .unwrap();
+        let report = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(report.starts_with("POST /api/v1/apps/480/conflicts/kept-cloud HTTP/1.1"));
+        assert!(report.contains(r#""base_change_number":1"#));
+        assert!(report.contains(r#""event_id":"conflict-"#));
+
+        let kept_local = CloudClientConflictResolutionNotification {
+            app_id: Some(480),
+            chose_local_files: Some(true),
+        };
+        execute_rpc(
+            &mut state,
+            &settings,
+            CONFLICT_RESOLUTION,
+            &kept_local.encode_to_vec(),
+        )
+        .unwrap();
+        let begin = CloudBeginAppUploadBatchRequest {
+            app_id: Some(480),
+            machine_name: Some("deck".into()),
+            ..Default::default()
+        };
+        execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+        let begin_request = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(begin_request.starts_with("POST /api/v1/steam/apps/480/upload-batches"));
+        let resolution = state
+            .batches
+            .get(&42)
+            .and_then(|batch| batch.conflict_resolution.as_ref())
+            .unwrap();
+        assert_eq!(resolution.base_change_number, 1);
+        assert_eq!(resolution.remote_change_number, 2);
+        assert_eq!(resolution.resolution, "kept_local");
+        assert_eq!(
+            Outbox::open(&outbox_path).unwrap().conflict_len().unwrap(),
+            1,
+            "binding a local choice to a batch must not remove it"
+        );
+
+        let failed = CloudCompleteAppUploadBatchRequest {
+            app_id: Some(480),
+            batch_id: Some(42),
+            batch_eresult: Some(ERESULT_FAIL as u32),
+        };
+        execute_rpc(
+            &mut state,
+            &settings,
+            COMPLETE_BATCH,
+            &failed.encode_to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            Outbox::open(&outbox_path).unwrap().conflict_len().unwrap(),
+            1,
+            "an aborted batch must retain the local choice"
+        );
+
+        execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+        assert!(state
+            .batches
+            .get(&43)
+            .and_then(|batch| batch.conflict_resolution.as_ref())
+            .is_some());
+    }
+
+    #[test]
+    fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
         let app_id = AppId(246_813_579);
         let config = RuntimeConfig {
             apps: AppsSection {
@@ -1893,6 +2431,19 @@ mod tests {
             &request,
             &config,
         ));
+        assert_eq!(
+            privacy_fallback(QUOTA_USAGE, &request, &config),
+            Some((app_id.0, true))
+        );
+
+        let legacy_request = AppIdField2Request {
+            app_id: Some(app_id.0),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            privacy_fallback(GET_FILE_DETAILS, &legacy_request, &config),
+            Some((app_id.0, true))
+        );
     }
 
     #[test]
@@ -1933,6 +2484,15 @@ mod tests {
             &request,
             &config,
         ));
+
+        let legacy_request = AppIdField1Request {
+            app_id: Some(app_id.0),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            privacy_fallback(GET_SINGLE_FILE_INFO, &legacy_request, &config),
+            None
+        );
     }
 
     #[test]
@@ -1956,6 +2516,8 @@ mod tests {
         let settings = CloudSettings {
             server_url,
             token: "secret-token".into(),
+            steam_client_id: Some(11_047_413_376_560_171_870),
+            bind_device: false,
             timeout_connect_ms: 1000,
             timeout_ms: 2000,
         };
@@ -1988,6 +2550,9 @@ mod tests {
         assert!(request_text
             .to_ascii_lowercase()
             .contains("authorization: bearer secret-token"));
+        assert!(request_text
+            .to_ascii_lowercase()
+            .contains("x-cumulus-steam-client-id: 11047413376560171870"));
     }
 
     #[test]
@@ -2005,6 +2570,8 @@ mod tests {
         let settings = CloudSettings {
             server_url,
             token: "cumulus-secret".into(),
+            steam_client_id: None,
+            bind_device: false,
             timeout_connect_ms: 1000,
             timeout_ms: 2000,
         };
@@ -2074,6 +2641,8 @@ mod tests {
         let settings = CloudSettings {
             server_url,
             token: "lifecycle-token".into(),
+            steam_client_id: Some(7),
+            bind_device: false,
             timeout_connect_ms: 1000,
             timeout_ms: 2000,
         };
@@ -2189,5 +2758,8 @@ mod tests {
         assert!(requests.iter().all(|request| request
             .to_ascii_lowercase()
             .contains("authorization: bearer lifecycle-token")));
+        assert!(requests.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("x-cumulus-steam-client-id: 7")));
     }
 }

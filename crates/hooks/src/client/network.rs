@@ -29,6 +29,8 @@ pub(crate) extern "C" fn hk_send_frame(
     data: *mut u8,
     size: u32,
 ) -> bool {
+    super::client_id::refresh_device_descriptor();
+
     const WEBSOCKET_BINARY: i32 = 2;
     if opcode == WEBSOCKET_BINARY && !data.is_null() && size > 0 {
         // SAFETY: data is a valid buffer of `size` bytes, provided by Steam.
