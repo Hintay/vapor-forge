@@ -14,6 +14,7 @@ use crate::client::install::RuntimeSnapshot;
 struct WatchTarget {
     config_names: HashSet<OsString>,
     scripts: bool,
+    script_dir_names: HashSet<OsString>,
 }
 
 #[derive(Default)]
@@ -67,6 +68,7 @@ fn watch_loop(
 
         let mut config_changed = false;
         let mut lua_changed = false;
+        let mut script_dirs_changed = false;
         for event in events {
             classify_event(
                 &watches,
@@ -74,10 +76,11 @@ fn watch_loop(
                 event.name,
                 &mut config_changed,
                 &mut lua_changed,
+                &mut script_dirs_changed,
             );
         }
 
-        if config_changed || lua_changed {
+        if config_changed || lua_changed || script_dirs_changed {
             std::thread::sleep(std::time::Duration::from_millis(50));
             loop {
                 match inotify.read_events(&mut buf) {
@@ -89,6 +92,7 @@ fn watch_loop(
                                 event.name,
                                 &mut config_changed,
                                 &mut lua_changed,
+                                &mut script_dirs_changed,
                             );
                         }
                     }
@@ -104,6 +108,9 @@ fn watch_loop(
                     refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
                 }
             } else {
+                if script_dirs_changed {
+                    refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
+                }
                 reload_lua(base_config_store, runtime_store);
             }
         }
@@ -116,6 +123,7 @@ fn classify_event(
     name: Option<&OsStr>,
     config_changed: &mut bool,
     lua_changed: &mut bool,
+    script_dirs_changed: &mut bool,
 ) {
     let Some(target) = watches.targets.get(wd) else {
         return;
@@ -128,6 +136,9 @@ fn classify_event(
     }
     if target.scripts && Path::new(name).extension() == Some(OsStr::new("lua")) {
         *lua_changed = true;
+    }
+    if target.script_dir_names.contains(name) {
+        *script_dirs_changed = true;
     }
 }
 
@@ -151,29 +162,55 @@ fn register_config_watch(inotify: &mut Inotify, watches: &mut WatchSet, path: &P
 }
 
 fn refresh_script_watches(inotify: &mut Inotify, watches: &mut WatchSet, config: &RuntimeConfig) {
-    for target in watches.targets.values_mut() {
-        target.scripts = false;
-    }
-
     let desired = crate::client::install::build_script_dirs(config)
         .into_iter()
-        .map(|dir| expand_dir(&dir))
-        .filter(|path| path.is_dir())
+        .map(|dir| absolute_path(expand_dir(&dir)))
         .collect::<HashSet<_>>();
+    refresh_script_watches_for_paths(inotify, watches, desired);
+}
+
+fn refresh_script_watches_for_paths(
+    inotify: &mut Inotify,
+    watches: &mut WatchSet,
+    desired: impl IntoIterator<Item = PathBuf>,
+) {
+    for target in watches.targets.values_mut() {
+        target.scripts = false;
+        target.script_dir_names.clear();
+    }
+
     for path in desired {
-        if let Some(wd) = add_watch(inotify, watches, &path) {
-            let target = watches.targets.entry(wd).or_default();
-            if !target.scripts {
-                info!(path = %path.display(), "watcher: watching Lua scripts");
+        if let Some((parent, name)) = script_watch_anchor(&path) {
+            if let Some(wd) = add_watch(inotify, watches, &parent) {
+                let inserted = watches
+                    .targets
+                    .entry(wd)
+                    .or_default()
+                    .script_dir_names
+                    .insert(name);
+                if inserted {
+                    info!(path = %path.display(), parent = %parent.display(), "watcher: watching for Lua script directory");
+                }
             }
-            target.scripts = true;
+        }
+
+        if path.is_dir() {
+            if let Some(wd) = add_watch(inotify, watches, &path) {
+                let target = watches.targets.entry(wd).or_default();
+                if !target.scripts {
+                    info!(path = %path.display(), "watcher: watching Lua scripts");
+                }
+                target.scripts = true;
+            }
         }
     }
 
     let stale = watches
         .targets
         .iter()
-        .filter(|(_, target)| !target.scripts && target.config_names.is_empty())
+        .filter(|(_, target)| {
+            !target.scripts && target.config_names.is_empty() && target.script_dir_names.is_empty()
+        })
         .map(|(wd, _)| wd.clone())
         .collect::<Vec<_>>();
     for wd in stale {
@@ -182,6 +219,31 @@ fn refresh_script_watches(inotify: &mut Inotify, watches: &mut WatchSet, config:
         }
         watches.targets.remove(&wd);
         watches.paths.retain(|_, existing| existing != &wd);
+    }
+}
+
+fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(&path))
+            .unwrap_or(path)
+    }
+}
+
+/// Return the nearest existing parent to watch and the next path component
+/// whose creation or removal means script watches must be refreshed.
+fn script_watch_anchor(path: &Path) -> Option<(PathBuf, OsString)> {
+    let mut child = path.to_path_buf();
+    loop {
+        let parent = child.parent()?;
+        if parent.is_dir() {
+            return child
+                .file_name()
+                .map(|name| (parent.to_path_buf(), name.to_owned()));
+        }
+        child = parent.to_path_buf();
     }
 }
 
@@ -269,10 +331,88 @@ fn publish_runtime(
         vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
     base_config_store.store(Arc::new(base_config));
     let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
-    crate::client::install::ensure_ipc_server_for_config(&snapshot.config);
+    let service_config = Arc::clone(&snapshot.config);
     runtime_store.store(Arc::new(snapshot));
+    crate::client::install::ensure_runtime_services_for_config(&service_config);
 
     crate::client::package::queue_reload(controlled);
 
     info!(inject = inject_count, dlc = dlc_count, message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vapor-forge-watcher-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn wait_for_flags(inotify: &mut Inotify, watches: &WatchSet) -> (bool, bool, bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut buf = [0u8; 4096];
+        let mut config_changed = false;
+        let mut lua_changed = false;
+        let mut script_dirs_changed = false;
+
+        while Instant::now() < deadline {
+            match inotify.read_events(&mut buf) {
+                Ok(events) => {
+                    for event in events {
+                        classify_event(
+                            watches,
+                            &event.wd,
+                            event.name,
+                            &mut config_changed,
+                            &mut lua_changed,
+                            &mut script_dirs_changed,
+                        );
+                    }
+                    if config_changed || lua_changed || script_dirs_changed {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to read inotify events: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        (config_changed, lua_changed, script_dirs_changed)
+    }
+
+    #[test]
+    fn notices_script_directory_created_after_watcher_startup() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let scripts = root.join("missing").join("lua");
+        let mut inotify = Inotify::init().unwrap();
+        let mut watches = WatchSet::default();
+
+        refresh_script_watches_for_paths(&mut inotify, &mut watches, [scripts.clone()]);
+        fs::create_dir_all(&scripts).unwrap();
+
+        let (_, lua_changed, script_dirs_changed) = wait_for_flags(&mut inotify, &watches);
+        assert!(!lua_changed);
+        assert!(script_dirs_changed);
+
+        refresh_script_watches_for_paths(&mut inotify, &mut watches, [scripts.clone()]);
+        fs::write(scripts.join("736260.lua"), "addappid(736260)\n").unwrap();
+
+        let (_, lua_changed, _) = wait_for_flags(&mut inotify, &watches);
+        assert!(lua_changed);
+
+        drop(inotify);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

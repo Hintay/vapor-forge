@@ -15,6 +15,7 @@ const EARLY_SCAN: usize = 0x400;
 const INTERESTING_IFACES: &[&str] = &[
     "IClientAppManager",
     "IClientApps",
+    "IClientConfigStore",
     "IClientRemoteStorage",
     "IClientUser",
     "IClientUtils",

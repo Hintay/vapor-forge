@@ -142,6 +142,14 @@ optional = true
 [[steamclient."CConfigStore::WriteVdfFile".variants]]
 pattern = "65 8B 35 14 00 00 00 89 B4 24 DC 00 00 00 8B B4 24 14 01 00 00 8B 94 24 00 01 00 00 8B 84 24 0C 01 00 00"
 
+# This deliberately broad candidate starts at the stable ClientID buffer
+# initialization. The tools scanner and runtime parser validate the later
+# CConfigStore access, key reference, and SetUint64 call before using it.
+[steamclient."CConfigStore::ClientIDConfigAccess"]
+follow = "none"
+pattern = "C7 ? 80 02 00 00 00 00 00 00 8D ? 80 02 00 00 C7 ? 84 02 00 00 00 00 00 00 83 EC 08 6A 08 ? E8 ? ? ? ? 8B ? 84 02 00 00 83 C4 10 8B ? 80 02 00 00 89 ? 09 ? 74 ? 8D ? ? ? ? ? 80 ? 0E 06 00 00 00"
+optional = true
+
 [steamclient."CUser::SpawnProcess"]
 follow = "none"
 pattern = "55 89 E5 57 56 53 81 EC 9C 10 00 00 8B 75 18"

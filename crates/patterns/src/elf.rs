@@ -32,6 +32,7 @@ pub struct LoadSegment {
     pub offset: u64,
     pub vaddr: u64,
     pub filesz: u64,
+    pub memsz: u64,
     pub flags: u32,
 }
 
@@ -78,7 +79,7 @@ impl<'a> ElfImage<'a> {
     pub fn va_to_offset(&self, va: u64) -> Option<usize> {
         self.loads.iter().find_map(|load| {
             let end = load.vaddr.checked_add(load.filesz)?;
-            (va >= load.vaddr && va < end).then_some((load.offset + (va - load.vaddr)) as usize)
+            (va >= load.vaddr && va < end).then(|| (load.offset + (va - load.vaddr)) as usize)
         })
     }
 
@@ -91,7 +92,7 @@ impl<'a> ElfImage<'a> {
     pub fn in_module(&self, va: u64) -> bool {
         self.loads
             .iter()
-            .any(|load| va >= load.vaddr && va < load.vaddr.saturating_add(load.filesz))
+            .any(|load| va >= load.vaddr && va < load.vaddr.saturating_add(load.memsz))
     }
 
     pub fn read_word_va(&self, va: u64) -> Option<u64> {
@@ -176,6 +177,7 @@ fn parse_loads_elf32(data: &[u8]) -> Result<Vec<LoadSegment>, String> {
                 offset: read_u32(data, off + 4)? as u64,
                 vaddr: read_u32(data, off + 8)? as u64,
                 filesz: read_u32(data, off + 16)? as u64,
+                memsz: read_u32(data, off + 20)? as u64,
                 flags: read_u32(data, off + 24)?,
             });
         }
@@ -196,6 +198,7 @@ fn parse_loads_elf64(data: &[u8]) -> Result<Vec<LoadSegment>, String> {
                 offset: read_u64(data, off + 8)?,
                 vaddr: read_u64(data, off + 16)?,
                 filesz: read_u64(data, off + 32)?,
+                memsz: read_u64(data, off + 40)?,
             });
         }
     }
@@ -240,6 +243,7 @@ mod tests {
         data[72..80].copy_from_slice(&file_offset.to_le_bytes());
         data[80..88].copy_from_slice(&vaddr.to_le_bytes());
         data[96..104].copy_from_slice(&size.to_le_bytes());
+        data[104..112].copy_from_slice(&size.to_le_bytes());
         data
     }
 
@@ -251,6 +255,16 @@ mod tests {
         assert_eq!(segment.file_offset, 120);
         assert_eq!(segment.vaddr, 0x1000);
         assert_eq!(segment.bytes.len(), 8);
+    }
+
+    #[test]
+    fn treats_bss_as_module_memory_but_not_file_data() {
+        let mut data = elf64_with_load(0, 120, 0x1000, 8);
+        data[104..112].copy_from_slice(&0x20u64.to_le_bytes());
+        let image = ElfImage::parse(&data).unwrap();
+
+        assert!(image.in_module(0x1010));
+        assert_eq!(image.va_to_offset(0x1010), None);
     }
 
     #[test]

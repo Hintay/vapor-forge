@@ -90,8 +90,9 @@ pub fn ensure_runtime_initialized() {
 
         BASE_CONFIG.store(Arc::new(base_config));
         let snapshot = RuntimeSnapshot::new(config, script_runtime);
-        ensure_ipc_server_for_config(&snapshot.config);
+        let service_config = Arc::clone(&snapshot.config);
         RUNTIME.store(Arc::new(snapshot));
+        ensure_runtime_services_for_config(&service_config);
 
         crate::watcher::start(&BASE_CONFIG, &RUNTIME, config_path);
 
@@ -131,18 +132,21 @@ pub(crate) fn script_state() -> Arc<ScriptState> {
     RUNTIME.load().script_state.clone()
 }
 
-pub(crate) fn ensure_ipc_server_for_config(config: &RuntimeConfig) {
-    if !config.ticket.auto_delegate || IPC_SERVER.get().is_some() {
+pub(crate) fn ensure_runtime_services_for_config(config: &RuntimeConfig) {
+    if config.cumulus_configured() {
+        crate::achievement_worker::ensure_started();
+        crate::playtime_worker::ensure_started();
+    }
+    ensure_ipc_server_for_config(config);
+}
+
+fn ensure_ipc_server_for_config(config: &RuntimeConfig) {
+    if (!config.ticket.auto_delegate && !config.cumulus_configured()) || IPC_SERVER.get().is_some()
+    {
         return;
     }
-    let has_proton = config
-        .library_inject
-        .libs
-        .iter()
-        .any(|library| library.path.ends_with(".dll"))
-        || !config.library_inject.helper_path.is_empty();
-    if !has_proton {
-        warn!("hook-install: auto_delegate enabled but no proton helper configured");
+    if crate::client::env::resolve_helper_path(&config.library_inject.helper_path).is_none() {
+        warn!("hook-install: game bridge requested but no proton helper is available");
         return;
     }
     if let Some(server) = crate::ipc_server::IpcServer::start() {

@@ -302,6 +302,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         } else {
             scan_steamclient32_layouts(segment.bytes, segment.vaddr, &resolved)
         };
+        failed |= scan_client_id_config_behavior(path, &data, segment, &resolved);
     } else if module == "steamui" {
         failed |= if is_elf64 {
             scan_steamui64_layouts(segment.bytes, segment.vaddr, &resolved)

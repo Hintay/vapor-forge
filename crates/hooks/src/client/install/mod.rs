@@ -18,9 +18,9 @@ mod steamui;
 
 pub use runtime::ensure_runtime_initialized;
 pub(crate) use runtime::{
-    build_runtime, build_script_dirs, config, effective_ticket_mode, ensure_ipc_server_for_config,
-    package_state, runtime_snapshot, script_state, sync_config_template, RuntimeSnapshot,
-    IPC_SERVER, TICKET_CACHE,
+    build_runtime, build_script_dirs, config, effective_ticket_mode,
+    ensure_runtime_services_for_config, package_state, runtime_snapshot, script_state,
+    sync_config_template, RuntimeSnapshot, IPC_SERVER, TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
@@ -256,6 +256,8 @@ fn do_install() {
             "hook-install: pkg0 injection disabled on this architecture"
         );
     }
+
+    super::client_id::resolve(&registry, &code);
 
     // Phase 1: create all detours (retour allocates trampolines on a shared pool page).
     // Do NOT mprotect or PIC-repair yet. Modifying page permissions between allocations

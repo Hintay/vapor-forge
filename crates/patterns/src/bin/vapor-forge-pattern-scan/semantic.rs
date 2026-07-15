@@ -306,6 +306,7 @@ const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
 ];
 
 const STEAMCLIENT_SPECIAL_SEMANTIC_CHECKS: &[&str] = &[
+    "CConfigStore::ClientIDConfigAccess",
     "IClientUser::GetAppOwnershipTicketExtendedData",
     "IClientUser::BUpdateAppOwnershipTicket",
     "IClientUser::IsUserSubscribedAppInTicket",
@@ -384,6 +385,596 @@ fn print_evidence_failure(
         "  FAIL {:<58} va=0x{:x} required ({})",
         label, vaddr, detail
     );
+}
+
+const CLIENT_ID_ACCESS_NAME: &str = "CConfigStore::ClientIDConfigAccess";
+const CLIENT_ID_STREAMING_KEY: &str = "streaming/ClientID";
+const CLIENT_ID_SITE_LICENSE_KEY: &str = "sitelicense/ClientID";
+const CONFIG_GET_UINT64_SLOT: usize = 3;
+const CONFIG_SET_UINT64_SLOT: usize = 11;
+
+#[derive(Clone, Copy, Debug)]
+enum ClientIdKeyReference32 {
+    Direct(i32),
+    Indirect(i32),
+}
+
+#[derive(Debug)]
+struct ClientIdAccess32 {
+    pic_register: iced_x86::Register,
+    root_displacement: i32,
+    store_offset: u64,
+    key_references: Vec<(iced_x86::Register, ClientIdKeyReference32)>,
+    key_argument: iced_x86::Register,
+}
+
+#[derive(Debug)]
+struct ClientIdBehavior {
+    root_slot_va: u64,
+    store_offset: u64,
+    streaming_key_va: u64,
+    site_license_key_va: u64,
+    key_addressing: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StackArgument {
+    Register(iced_x86::Register),
+    Immediate(u64),
+}
+
+fn scan_client_id_config_behavior(
+    path: &Path,
+    data: &[u8],
+    segment: ExecutableSegment<'_>,
+    resolved: &HashMap<&str, usize>,
+) -> bool {
+    let Some(&candidate_offset) = resolved.get(CLIENT_ID_ACCESS_NAME) else {
+        return false;
+    };
+    let image = match ElfImage::parse(data) {
+        Ok(image) => image,
+        Err(error) => {
+            println!("  FAIL {:<58} {}", "ClientID config behavior", error);
+            return true;
+        }
+    };
+    let candidate_va = segment.vaddr + candidate_offset as u64;
+    let behavior = match image.class {
+        ElfClass::Elf32 => {
+            validate_client_id_behavior32(&image, &segment, candidate_offset)
+        }
+        ElfClass::Elf64 => {
+            validate_client_id_behavior64(&image, &segment, candidate_offset)
+        }
+    };
+    let behavior = match behavior {
+        Ok(behavior) => behavior,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} va=0x{:x} required ({})",
+                "ClientID config behavior", candidate_va, error
+            );
+            return true;
+        }
+    };
+    let (getter_va, setter_va) = match validate_config_store_vtable(path) {
+        Ok(methods) => methods,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} va=0x{:x} required ({})",
+                "ClientID config getter/setter", candidate_va, error
+            );
+            return true;
+        }
+    };
+
+    println!(
+        "  OK   {:<58} arch={} candidate=0x{:x} root=0x{:x} store=0x{:x} keys=0x{:x}/0x{:x} key_mode={}",
+        "ClientID config behavior",
+        image.class.label(),
+        candidate_va,
+        behavior.root_slot_va,
+        behavior.store_offset,
+        behavior.streaming_key_va,
+        behavior.site_license_key_va,
+        behavior.key_addressing,
+    );
+    println!(
+        "  OK   {:<58} GetUint64=slot{}@0x{:x} SetUint64=slot{}@0x{:x} store=InstallConfigStore",
+        "ClientID config getter/setter",
+        CONFIG_GET_UINT64_SLOT,
+        getter_va,
+        CONFIG_SET_UINT64_SLOT,
+        setter_va,
+    );
+    false
+}
+
+fn validate_config_store_vtable(path: &Path) -> Result<(u64, u64), String> {
+    let wanted = vec!["IClientConfigStore".to_owned()];
+    let report = vtable_scan::scan_file(path, Some(&wanted))?;
+    let interface = report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "IClientConfigStore")
+        .ok_or_else(|| "IClientConfigStore vtable was not found".to_owned())?;
+    let getter = interface
+        .methods
+        .get(CONFIG_GET_UINT64_SLOT)
+        .filter(|method| method.name == "GetUint64")
+        .ok_or_else(|| "slot 3 is not IClientConfigStore::GetUint64".to_owned())?;
+    let setter = interface
+        .methods
+        .get(CONFIG_SET_UINT64_SLOT)
+        .filter(|method| method.name == "SetUint64")
+        .ok_or_else(|| "slot 11 is not IClientConfigStore::SetUint64".to_owned())?;
+    Ok((getter.func_va, setter.func_va))
+}
+
+fn validate_client_id_behavior32(
+    image: &ElfImage<'_>,
+    segment: &ExecutableSegment<'_>,
+    candidate_offset: usize,
+) -> Result<ClientIdBehavior, String> {
+    let access = parse_client_id_access32(segment, candidate_offset)
+        .ok_or_else(|| "candidate does not contain the x86 CConfigStore setter flow".to_owned())?;
+    let pic_anchor = find_pic_anchor32(image, segment, candidate_offset, access.pic_register)
+        .ok_or_else(|| "matching __x86.get_pc_thunk/add PIC anchor was not found".to_owned())?;
+    let root_slot_va = add_x86_displacement(pic_anchor, access.root_displacement);
+    if !image.in_module(root_slot_va) || image.in_text(root_slot_va) {
+        return Err(format!(
+            "PIC root slot 0x{root_slot_va:x} is not module data"
+        ));
+    }
+
+    let mut streaming_key_va = None;
+    let mut site_license_key_va = None;
+    let mut saw_direct = false;
+    let mut saw_indirect = false;
+    let mut call_key_matches = false;
+    for (register, reference) in access.key_references {
+        let is_indirect = matches!(reference, ClientIdKeyReference32::Indirect(_));
+        let key_va = match reference {
+            ClientIdKeyReference32::Direct(displacement) => {
+                add_x86_displacement(pic_anchor, displacement)
+            }
+            ClientIdKeyReference32::Indirect(displacement) => {
+                let slot = add_x86_displacement(pic_anchor, displacement);
+                image
+                    .read_word_va(slot)
+                    .ok_or_else(|| format!("PIC key slot 0x{slot:x} is unreadable"))?
+            }
+        };
+        match image.read_cstring(key_va, 64).as_str() {
+            CLIENT_ID_STREAMING_KEY => streaming_key_va = Some(key_va),
+            CLIENT_ID_SITE_LICENSE_KEY => site_license_key_va = Some(key_va),
+            _ => continue,
+        }
+        if is_indirect {
+            saw_indirect = true;
+        } else {
+            saw_direct = true;
+        }
+        call_key_matches |= register == access.key_argument;
+    }
+    if !call_key_matches {
+        return Err("SetUint64 key argument is not a resolved ClientID string".to_owned());
+    }
+    let key_addressing = match (saw_direct, saw_indirect) {
+        (true, false) => "PIC-direct",
+        (false, true) => "PIC-data-pointer",
+        (true, true) => "PIC-mixed",
+        (false, false) => return Err("no PIC ClientID key references were found".to_owned()),
+    };
+    Ok(ClientIdBehavior {
+        root_slot_va,
+        store_offset: access.store_offset,
+        streaming_key_va: streaming_key_va
+            .ok_or_else(|| "streaming/ClientID reference was not resolved".to_owned())?,
+        site_license_key_va: site_license_key_va
+            .ok_or_else(|| "sitelicense/ClientID reference was not resolved".to_owned())?,
+        key_addressing,
+    })
+}
+
+fn parse_client_id_access32(
+    segment: &ExecutableSegment<'_>,
+    candidate_offset: usize,
+) -> Option<ClientIdAccess32> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
+
+    let bytes = segment
+        .bytes
+        .get(candidate_offset..candidate_offset.saturating_add(0xc0))?;
+    let mut decoder = Decoder::with_ip(
+        32,
+        bytes,
+        segment.vaddr + candidate_offset as u64,
+        DecoderOptions::NONE,
+    );
+    let mut address_candidates = Vec::new();
+    let mut root_register = None;
+    let mut pic_register = None;
+    let mut root_displacement = None;
+    let mut store_register = None;
+    let mut store_offset = None;
+    let mut vtable_register = None;
+    let mut setter_register = None;
+    let mut key_references = Vec::new();
+    let mut stack_arguments = Vec::new();
+    let mut key_argument = None;
+
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.memory_base() != Register::None
+            && instruction.memory_index() == Register::None
+        {
+            address_candidates.push((
+                instruction.op0_register(),
+                instruction.memory_base(),
+                instruction.memory_displacement32() as i32,
+            ));
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.memory_base()
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == 0
+        {
+            let register = instruction.op0_register();
+            if let Some((_, base, displacement)) = address_candidates
+                .iter()
+                .rev()
+                .find(|(destination, _, _)| *destination == register)
+                .copied()
+            {
+                root_register = Some(register);
+                pic_register = Some(base);
+                root_displacement = Some(displacement);
+            }
+            continue;
+        }
+        if let Some(root) = root_register {
+            if store_offset.is_none()
+                && instruction.mnemonic() == Mnemonic::Lea
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == root
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() <= 0x1_0000
+            {
+                store_register = Some(instruction.op0_register());
+                store_offset = Some(instruction.memory_displacement64());
+            }
+        }
+        if let (Some(root), Some(offset)) = (root_register, store_offset) {
+            if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == root
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == offset
+            {
+                vtable_register = Some(instruction.op0_register());
+            }
+        }
+        if let Some(vtable) = vtable_register {
+            if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == vtable
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == (CONFIG_SET_UINT64_SLOT * 4) as u64
+            {
+                setter_register = Some(instruction.op0_register());
+            }
+        }
+        if let Some(pic) = pic_register {
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == pic
+                && instruction.memory_index() == Register::None
+            {
+                let reference = match instruction.mnemonic() {
+                    Mnemonic::Lea => Some(ClientIdKeyReference32::Direct(
+                        instruction.memory_displacement32() as i32,
+                    )),
+                    Mnemonic::Mov => Some(ClientIdKeyReference32::Indirect(
+                        instruction.memory_displacement32() as i32,
+                    )),
+                    _ => None,
+                };
+                if let Some(reference) = reference {
+                    key_references.push((instruction.op0_register(), reference));
+                }
+            }
+        }
+        if instruction.mnemonic() == Mnemonic::Push {
+            if instruction.op0_kind() == OpKind::Register {
+                stack_arguments.push(StackArgument::Register(instruction.op0_register()));
+            } else if let Some(immediate) = instruction_immediate(&instruction) {
+                stack_arguments.push(StackArgument::Immediate(immediate));
+            }
+        }
+        if setter_register.is_some_and(|setter| {
+            instruction.flow_control() == FlowControl::IndirectCall
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register() == setter
+        }) {
+            let args = stack_arguments.get(stack_arguments.len().checked_sub(5)?..)?;
+            if !matches!(args[3], StackArgument::Immediate(1))
+                || !matches!(args[4], StackArgument::Register(register) if Some(register) == store_register)
+            {
+                return None;
+            }
+            let StackArgument::Register(register) = args[2] else {
+                return None;
+            };
+            key_argument = Some(register);
+        }
+    }
+
+    Some(ClientIdAccess32 {
+        pic_register: pic_register?,
+        root_displacement: root_displacement?,
+        store_offset: store_offset?,
+        key_references,
+        key_argument: key_argument?,
+    })
+}
+
+fn instruction_immediate(instruction: &iced_x86::Instruction) -> Option<u64> {
+    use iced_x86::OpKind;
+
+    match instruction.op0_kind() {
+        OpKind::Immediate8 => Some(u64::from(instruction.immediate8())),
+        OpKind::Immediate8to16 => Some(instruction.immediate8to16() as u64),
+        OpKind::Immediate8to32 => Some(instruction.immediate8to32() as u64),
+        OpKind::Immediate8to64 => Some(instruction.immediate8to64() as u64),
+        OpKind::Immediate16 => Some(u64::from(instruction.immediate16())),
+        OpKind::Immediate32 => Some(u64::from(instruction.immediate32())),
+        OpKind::Immediate32to64 => Some(instruction.immediate32to64() as u64),
+        OpKind::Immediate64 => Some(instruction.immediate64()),
+        _ => None,
+    }
+}
+
+fn find_pic_anchor32(
+    image: &ElfImage<'_>,
+    segment: &ExecutableSegment<'_>,
+    candidate_offset: usize,
+    pic_register: iced_x86::Register,
+) -> Option<u64> {
+    let register_code = x86_register_code(pic_register)?;
+    let start = candidate_offset.saturating_sub(0x200);
+    for call_offset in (start..candidate_offset).rev() {
+        if segment.bytes.get(call_offset) != Some(&0xe8) {
+            continue;
+        }
+        let relative = i32::from_le_bytes(
+            segment
+                .bytes
+                .get(call_offset + 1..call_offset + 5)?
+                .try_into()
+                .ok()?,
+        );
+        let after_call = segment.vaddr + call_offset as u64 + 5;
+        let target = add_x86_displacement(after_call, relative);
+        if image.read_u8_va(target) != Some(0x8b)
+            || image
+                .read_u8_va(target + 1)
+                .map_or(true, |modrm| {
+                    modrm & 0xc7 != 0x04 || (modrm >> 3) & 7 != register_code
+                })
+            || image.read_u8_va(target + 2) != Some(0x24)
+            || image.read_u8_va(target + 3) != Some(0xc3)
+        {
+            continue;
+        }
+        let add_offset = call_offset + 5;
+        let immediate = if register_code == 0 && segment.bytes.get(add_offset) == Some(&0x05) {
+            u32::from_le_bytes(
+                segment
+                    .bytes
+                    .get(add_offset + 1..add_offset + 5)?
+                    .try_into()
+                    .ok()?,
+            )
+        } else if segment.bytes.get(add_offset) == Some(&0x81)
+            && segment.bytes.get(add_offset + 1) == Some(&(0xc0 | register_code))
+        {
+            u32::from_le_bytes(
+                segment
+                    .bytes
+                    .get(add_offset + 2..add_offset + 6)?
+                    .try_into()
+                    .ok()?,
+            )
+        } else {
+            continue;
+        };
+        return Some(u64::from((after_call as u32).wrapping_add(immediate)));
+    }
+    None
+}
+
+fn x86_register_code(register: iced_x86::Register) -> Option<u8> {
+    use iced_x86::Register;
+
+    match register {
+        Register::EAX => Some(0),
+        Register::ECX => Some(1),
+        Register::EDX => Some(2),
+        Register::EBX => Some(3),
+        Register::ESP => Some(4),
+        Register::EBP => Some(5),
+        Register::ESI => Some(6),
+        Register::EDI => Some(7),
+        _ => None,
+    }
+}
+
+fn add_x86_displacement(address: u64, displacement: i32) -> u64 {
+    u64::from((address as u32).wrapping_add(displacement as u32))
+}
+
+fn validate_client_id_behavior64(
+    image: &ElfImage<'_>,
+    segment: &ExecutableSegment<'_>,
+    candidate_offset: usize,
+) -> Result<ClientIdBehavior, String> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
+
+    let bytes = segment
+        .bytes
+        .get(candidate_offset..candidate_offset.saturating_add(0xc0))
+        .ok_or_else(|| "x86_64 candidate window is truncated".to_owned())?;
+    let mut decoder = Decoder::with_ip(
+        64,
+        bytes,
+        segment.vaddr + candidate_offset as u64,
+        DecoderOptions::NONE,
+    );
+    let mut root_candidates = Vec::new();
+    let mut root_register = None;
+    let mut root_slot_va = None;
+    let mut store_register = None;
+    let mut store_offset = None;
+    let mut vtable_register = None;
+    let mut setter_register = None;
+    let mut streaming_key_va = None;
+    let mut site_license_key_va = None;
+    let mut key_registers = Vec::new();
+    let mut install_store = false;
+    let mut setter_called = false;
+
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        if instruction.is_ip_rel_memory_operand() && instruction.op0_kind() == OpKind::Register {
+            let target = instruction.ip_rel_memory_address();
+            let text = image.read_cstring(target, 64);
+            if matches!(instruction.mnemonic(), Mnemonic::Lea | Mnemonic::Mov) {
+                match text.as_str() {
+                    CLIENT_ID_STREAMING_KEY => {
+                        streaming_key_va = Some(target);
+                        key_registers.push(instruction.op0_register());
+                    }
+                    CLIENT_ID_SITE_LICENSE_KEY => {
+                        site_license_key_va = Some(target);
+                        key_registers.push(instruction.op0_register());
+                    }
+                    _ if image.in_module(target) && !image.in_text(target) => {
+                        root_candidates.push((
+                            instruction.op0_register(),
+                            target,
+                            instruction.mnemonic() == Mnemonic::Mov,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.memory_base()
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == 0
+        {
+            let register = instruction.op0_register();
+            if let Some((_, slot, _)) = root_candidates
+                .iter()
+                .rev()
+                .find(|(candidate, _, direct_load)| *candidate == register && !direct_load)
+                .copied()
+            {
+                root_register = Some(register);
+                root_slot_va = Some(slot);
+            }
+        }
+        let memory_base = instruction.memory_base();
+        let direct_root = root_candidates
+            .iter()
+            .rev()
+            .find(|(register, _, direct_load)| *direct_load && *register == memory_base)
+            .copied();
+        if (root_register == Some(memory_base) || direct_root.is_some())
+            && store_offset.is_none()
+            && instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() <= 0x1_0000
+        {
+            if let Some((register, slot, _)) = direct_root {
+                root_register = Some(register);
+                root_slot_va = Some(slot);
+            }
+            store_register = Some(instruction.op0_register());
+            store_offset = Some(instruction.memory_displacement64());
+        }
+        if let (Some(root), Some(offset)) = (root_register, store_offset) {
+            if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == root
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == offset
+            {
+                vtable_register = Some(instruction.op0_register());
+            }
+        }
+        if let Some(vtable) = vtable_register {
+            if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.memory_base() == vtable
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == (CONFIG_SET_UINT64_SLOT * 8) as u64
+            {
+                setter_register = Some(instruction.op0_register());
+            }
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_register() == Register::ESI
+            && instruction.op1_kind() == OpKind::Immediate32
+            && instruction.immediate32() == 1
+        {
+            install_store = true;
+        }
+        if setter_register.is_some_and(|setter| {
+            instruction.flow_control() == FlowControl::IndirectCall
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register() == setter
+        }) {
+            setter_called = store_register == Some(Register::RDI)
+                && key_registers.contains(&Register::RDX)
+                && install_store;
+        }
+    }
+
+    if !setter_called {
+        return Err(
+            "x86_64 SetUint64 call does not use rdi/store, esi=1, and rdx/ClientID key"
+                .to_owned(),
+        );
+    }
+    let root_slot_va = root_slot_va.ok_or_else(|| "RIP-relative config root was not found".to_owned())?;
+    if !image.in_module(root_slot_va) || image.in_text(root_slot_va) {
+        return Err(format!(
+            "RIP-relative root slot 0x{root_slot_va:x} is not module data"
+        ));
+    }
+    Ok(ClientIdBehavior {
+        root_slot_va,
+        store_offset: store_offset.ok_or_else(|| "embedded CConfigStore offset was not found".to_owned())?,
+        streaming_key_va: streaming_key_va
+            .ok_or_else(|| "streaming/ClientID RIP reference was not found".to_owned())?,
+        site_license_key_va: site_license_key_va
+            .ok_or_else(|| "sitelicense/ClientID RIP reference was not found".to_owned())?,
+        key_addressing: "RIP-relative",
+    })
 }
 
 fn scan_steamui64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, usize>) -> bool {
