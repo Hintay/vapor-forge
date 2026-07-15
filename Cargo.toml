@@ -1,15 +1,17 @@
 [workspace]
 members = [
     "crates/audit-loader",
+    "crates/achievement-sync",
     "crates/diagnostics",
     "crates/features",
     "crates/hook-boundary",
     "crates/hooks",
-    "crates/inject-protocol",
+    "crates/game-bridge",
     "crates/memory",
     "crates/packet-inspect",
     "crates/pe",
     "crates/patterns",
+    "crates/playtime-sync",
     "crates/config",
     "crates/runtime-core",
     "crates/scripting",
@@ -18,15 +20,17 @@ members = [
 ]
 default-members = [
     "crates/audit-loader",
+    "crates/achievement-sync",
     "crates/diagnostics",
     "crates/features",
     "crates/hook-boundary",
     "crates/hooks",
-    "crates/inject-protocol",
+    "crates/game-bridge",
     "crates/memory",
     "crates/packet-inspect",
     "crates/pe",
     "crates/patterns",
+    "crates/playtime-sync",
     "crates/config",
     "crates/runtime-core",
     "crates/scripting",
@@ -43,16 +47,18 @@ rust-version = "1.80"
 
 [workspace.dependencies]
 arc-swap = "1.9"
+base64 = "0.22"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "code_asm"] }
 inotify = "0.11"
 keyvalues-parser = "0.2.4"
 libc = "0.2"
-mlua = { version = "0.10", features = ["luajit", "vendored"] }
+mlua = { version = "0.10", features = ["luajit", "vendored", "send"] }
 memchr = "2"
 object = { version = "0.39.1", default-features = false, features = ["read"] }
 once_cell = "1"
 prost = "0.14"
 retour = "0.4.0-alpha.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 ureq = "3"
 serde = { version = "1", features = ["derive"] }

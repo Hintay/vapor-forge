@@ -560,6 +560,9 @@ pub const EMSG_SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
 /// EMsg for `ServiceMethodResponse`.
 pub const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 
+/// EMsg for server-initiated service notifications.
+pub const EMSG_SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
+
 /// Bit 31 indicates protobuf framing.
 pub const K_MSG_HDR_PROTO_FLAG: u32 = 0x8000_0000;
 
@@ -1017,6 +1020,30 @@ pub struct CloudClientGetAppQuotaUsageResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, prost::Message)]
+pub struct GetAppOwnershipTicketRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct GetAppOwnershipTicketResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub app_id: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub ticket: Option<Vec<u8>>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct EncryptedAppTicketRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub userdata: Option<Vec<u8>>,
+}
+
+#[derive(Clone, prost::Message)]
 pub struct EncryptedAppTicket {
     #[prost(uint32, optional, tag = "1")]
     pub ticket_version_no: Option<u32>,
@@ -1116,6 +1143,62 @@ pub struct PlayerStatsEntry {
     pub stat_value: Option<u32>,
 }
 
+// ---------------------------------------------------------------------------
+// Native Steam playtime snapshots
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, prost::Message)]
+pub struct PlayerGetLastPlayedTimesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub games: Vec<PlayerLastPlayedGame>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PlayerLastPlayedGame {
+    #[prost(int32, optional, tag = "1")]
+    pub app_id: Option<i32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub last_playtime: Option<u32>,
+    #[prost(int32, optional, tag = "3")]
+    pub playtime_2weeks: Option<i32>,
+    #[prost(int32, optional, tag = "4")]
+    pub playtime_forever: Option<i32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub first_playtime: Option<u32>,
+    #[prost(int32, optional, tag = "6")]
+    pub playtime_windows_forever: Option<i32>,
+    #[prost(int32, optional, tag = "7")]
+    pub playtime_mac_forever: Option<i32>,
+    #[prost(int32, optional, tag = "8")]
+    pub playtime_linux_forever: Option<i32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub first_windows_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "10")]
+    pub first_mac_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "11")]
+    pub first_linux_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "12")]
+    pub last_windows_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "13")]
+    pub last_mac_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "14")]
+    pub last_linux_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "15")]
+    pub playtime_disconnected: Option<u32>,
+    #[prost(int32, optional, tag = "16")]
+    pub playtime_deck_forever: Option<i32>,
+    #[prost(uint32, optional, tag = "17")]
+    pub first_deck_playtime: Option<u32>,
+    #[prost(uint32, optional, tag = "18")]
+    pub last_deck_playtime: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PlayerLastPlayedTimesNotification {
+    #[prost(message, repeated, tag = "1")]
+    pub games: Vec<PlayerLastPlayedGame>,
+}
+
 /// EMsg 818 outgoing: legacy CMsgClientGetUserStats
 #[derive(Clone, prost::Message)]
 pub struct ClientGetUserStatsRequest {
@@ -1162,15 +1245,87 @@ pub struct AchievementBlock {
     pub unlock_time: Vec<u32>,
 }
 
+/// EMsg 820 outgoing: commit local stats to Steam.
+#[derive(Clone, prost::Message)]
+pub struct ClientStoreUserStatsRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub game_id: Option<u64>,
+    #[prost(bool, optional, tag = "2")]
+    pub explicit_reset: Option<bool>,
+    #[prost(message, repeated, tag = "3")]
+    pub stats_to_store: Vec<StoreUserStatsEntry>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct StoreUserStatsEntry {
+    #[prost(uint32, optional, tag = "1")]
+    pub stat_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub stat_value: Option<u32>,
+}
+
+/// EMsg 821 local acknowledgement for EMsg 820.
+#[derive(Clone, prost::Message)]
+pub struct ClientStoreUserStatsResponse {
+    #[prost(fixed64, optional, tag = "1")]
+    pub game_id: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub eresult: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub crc_stats: Option<u32>,
+    #[prost(bool, optional, tag = "5")]
+    pub stats_out_of_date: Option<bool>,
+}
+
+/// EMsg 5466 outgoing: commit stats for a specific Steam user.
+#[derive(Clone, prost::Message)]
+pub struct ClientStoreUserStats2Request {
+    #[prost(fixed64, optional, tag = "1")]
+    pub game_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub settor_steam_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "3")]
+    pub settee_steam_id: Option<u64>,
+    #[prost(uint32, optional, tag = "4")]
+    pub crc_stats: Option<u32>,
+    #[prost(bool, optional, tag = "5")]
+    pub explicit_reset: Option<bool>,
+    #[prost(message, repeated, tag = "6")]
+    pub stats: Vec<StoreUserStatsEntry>,
+}
+
+/// EMsg 5467 local acknowledgement for EMsg 5466.
+#[derive(Clone, prost::Message)]
+pub struct ClientStatsUpdated {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steam_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub game_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub crc_stats: Option<u32>,
+    #[prost(message, repeated, tag = "4")]
+    pub updated_stats: Vec<StoreUserStatsEntry>,
+}
+
 /// EMsg for CMsgClientPICSProductInfoRequest
 pub const EMSG_PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
 
 /// EMsg for CMsgClientRequestEncryptedAppTicketResponse
 pub const EMSG_ENCRYPTED_APPTICKET_RESPONSE: u32 = 5527;
+/// EMsg for CMsgClientRequestEncryptedAppTicket.
+pub const EMSG_ENCRYPTED_APPTICKET_REQUEST: u32 = 5526;
+
+/// EMsg ownership ticket request and response.
+pub const EMSG_GET_APP_OWNERSHIP_TICKET: u32 = 857;
+pub const EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE: u32 = 858;
 
 /// EMsg constants for stats
 pub const EMSG_REQUEST_USERSTATS: u32 = 818;
 pub const EMSG_REQUEST_USERSTATS_RESPONSE: u32 = 819;
+pub const EMSG_STORE_USERSTATS: u32 = 820;
+pub const EMSG_STORE_USERSTATS_RESPONSE: u32 = 821;
+pub const EMSG_STORE_USERSTATS2: u32 = 5466;
+pub const EMSG_STATS_UPDATED: u32 = 5467;
 
 // ---------------------------------------------------------------------------
 // GamesPlayed messages

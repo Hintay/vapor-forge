@@ -35,6 +35,13 @@ pub fn find_module_with_path<'a>(
     Some((entry.base, &entry.path))
 }
 
+pub fn module_path_at(entries: &[MapEntry], address: usize) -> Option<&str> {
+    entries
+        .iter()
+        .find(|entry| address >= entry.base && address < entry.end)
+        .map(|entry| entry.path.as_str())
+}
+
 /// Return the size of the contiguous mapping containing `addr`.
 pub fn mapping_size_at(addr: usize) -> Option<usize> {
     let text = std::fs::read_to_string("/proc/self/maps").ok()?;

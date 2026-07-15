@@ -11,6 +11,6 @@ crate-type = ["cdylib"]
 
 [target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dependencies]
 iced-x86.workspace = true
-vapor-forge-inject-protocol = { path = "../inject-protocol" }
+vapor-forge-game-bridge = { path = "../game-bridge" }
 vapor-forge-pe = { path = "../pe" }
 libc.workspace = true

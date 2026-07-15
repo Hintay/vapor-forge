@@ -253,6 +253,19 @@ fn provider_scripts_execute_top_level_side_effects_once() {
 }
 
 #[test]
+fn scripts_without_manifest_callbacks_do_not_create_provider() {
+    let dir = std::env::temp_dir().join(format!("lua-no-provider-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("app.lua"), "addappid(736260)\n").unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    assert_eq!(runtime.state.apps, vec![AppId(736260)]);
+    assert!(runtime.manifest_code_provider.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn http_helpers_accept_headers_and_return_failure_status() {
     let dir = std::env::temp_dir().join(format!("lua-http-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);

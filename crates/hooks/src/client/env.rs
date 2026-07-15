@@ -96,7 +96,7 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
 
     let injection = vapor_forge_features::library_inject::take_pending(app_id);
     let cfg = config();
-    let ipc_server = cfg.ticket.auto_delegate.then(|| IPC_SERVER.get()).flatten();
+    let ipc_server = IPC_SERVER.get();
 
     if injection.is_none() && ipc_server.is_none() {
         return result;
@@ -128,17 +128,20 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
     // server is running, regardless of whether this game has a DLL to
     // inject. The helper may be loaded solely for PE scanning.
     if let Some(server) = ipc_server {
-        if let Ok(token) = vapor_forge_inject_protocol::generate_token() {
+        if let Ok(token) = vapor_forge_game_bridge::generate_token() {
             server.register_token(token, app_id.0);
-            let hex = vapor_forge_inject_protocol::token_to_hex(&token);
+            let hex = vapor_forge_game_bridge::token_to_hex(&token);
             if let (Ok(key), Ok(val)) = (
-                std::ffi::CString::new(vapor_forge_inject_protocol::ENV_IPC_TOKEN),
+                std::ffi::CString::new(vapor_forge_game_bridge::ENV_GAME_BRIDGE_TOKEN),
                 std::ffi::CString::new(hex.as_str()),
             ) {
                 set_env(env_map, key.as_ptr(), val.as_ptr());
             }
-            if let Ok(sock_val) = std::ffi::CString::new(server.socket_path()) {
-                set_env(env_map, c"VAPOR_FORGE_IPC_SOCK".as_ptr(), sock_val.as_ptr());
+            if let (Ok(key), Ok(val)) = (
+                std::ffi::CString::new(vapor_forge_game_bridge::ENV_GAME_BRIDGE_SOCK),
+                std::ffi::CString::new(server.socket_path()),
+            ) {
+                set_env(env_map, key.as_ptr(), val.as_ptr());
             }
             debug!(app = app_id.0, "library_inject: IPC token injected");
         }

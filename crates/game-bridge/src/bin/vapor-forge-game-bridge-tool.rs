@@ -1,12 +1,12 @@
 use std::io::{self, Cursor, Read};
 use std::path::PathBuf;
 
-use vapor_forge_inject_protocol as proto;
-use vapor_forge_inject_protocol::{Message, TOKEN_LEN};
+use vapor_forge_game_bridge as proto;
+use vapor_forge_game_bridge::{Message, TOKEN_LEN};
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("vapor-forge-ipc-tool: {error}");
+        eprintln!("vapor-forge-game-bridge-tool: {error}");
         std::process::exit(1);
     }
 }
@@ -41,8 +41,7 @@ fn decode_command(args: &[String]) -> Result<(), String> {
     let mut payload_only = false;
     let mut chunks = Vec::new();
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
+    for arg in args {
         match arg.as_str() {
             "--payload" => payload_only = true,
             "-h" | "--help" => return Err(decode_usage()),
@@ -203,6 +202,21 @@ fn parse_message(args: &[String]) -> Result<Message, String> {
             app_id: fields.app_id_required()?,
             section_name: fields.string_required("section", 1)?,
         }),
+        "achievement-unlocked" => Ok(Message::AchievementUnlocked {
+            app_id: fields.app_id_required()?,
+            event_id: parse_event_id(fields.positional_required("event id", 1)?)?,
+            achievement_key: fields.positional_required("achievement key", 2)?.to_owned(),
+            observed_at: parse_i64(fields.positional_required("observed timestamp", 3)?)?,
+            unlocked_at: parse_i64(fields.positional_required("unlock timestamp", 4)?)?,
+        }),
+        "achievement-progress" => Ok(Message::AchievementProgress {
+            app_id: fields.app_id_required()?,
+            event_id: parse_event_id(fields.positional_required("event id", 1)?)?,
+            achievement_key: fields.positional_required("achievement key", 2)?.to_owned(),
+            current: parse_u32(fields.positional_required("current progress", 3)?)?,
+            maximum: parse_u32(fields.positional_required("maximum progress", 4)?)?,
+            observed_at: parse_i64(fields.positional_required("observed timestamp", 5)?)?,
+        }),
         "ack" => Ok(Message::Ack),
         "set-delegate" => Ok(Message::SetDelegate {
             app_id: fields.app_id_required()?,
@@ -318,6 +332,13 @@ impl MessageFields {
         })
         .ok_or_else(|| format!("message requires --{name} true|false"))
     }
+
+    fn positional_required(&self, name: &str, index: usize) -> Result<&str, String> {
+        self.positional
+            .get(index)
+            .map(String::as_str)
+            .ok_or_else(|| format!("message requires {name}"))
+    }
 }
 
 fn message_app_id(message: &Message) -> Option<u32> {
@@ -327,6 +348,8 @@ fn message_app_id(message: &Message) -> Option<u32> {
         | Message::DllLoaded { app_id, .. }
         | Message::DllInjectResult { app_id, .. }
         | Message::PeSection { app_id, .. }
+        | Message::AchievementUnlocked { app_id, .. }
+        | Message::AchievementProgress { app_id, .. }
         | Message::SetDelegate { app_id, .. } => Some(*app_id),
         Message::Ack => None,
     }
@@ -352,6 +375,16 @@ fn parse_u32(value: &str) -> Result<u32, String> {
             .parse::<u32>()
             .map_err(|error| format!("invalid u32 {value:?}: {error}"))
     }
+}
+
+fn parse_i64(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid i64 {value:?}: {error}"))
+}
+
+fn parse_event_id(value: &str) -> Result<[u8; proto::EVENT_ID_LEN], String> {
+    proto::event_id_from_uuid(value).ok_or_else(|| format!("invalid event UUID {value:?}"))
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -467,6 +500,27 @@ fn format_message(message: &Message) -> String {
             app_id,
             section_name,
         } => format!("PeSection app_id={app_id} section={section_name:?}"),
+        Message::AchievementUnlocked {
+            event_id,
+            app_id,
+            achievement_key,
+            observed_at,
+            unlocked_at,
+        } => format!(
+            "AchievementUnlocked app_id={app_id} event_id={} key={achievement_key:?} observed_at={observed_at} unlocked_at={unlocked_at}",
+            proto::event_id_to_uuid(event_id)
+        ),
+        Message::AchievementProgress {
+            event_id,
+            app_id,
+            achievement_key,
+            current,
+            maximum,
+            observed_at,
+        } => format!(
+            "AchievementProgress app_id={app_id} event_id={} key={achievement_key:?} progress={current}/{maximum} observed_at={observed_at}",
+            proto::event_id_to_uuid(event_id)
+        ),
         Message::Ack => "Ack".to_owned(),
         Message::SetDelegate { app_id, enable } => {
             format!("SetDelegate app_id={app_id} enable={enable}")
@@ -477,7 +531,7 @@ fn format_message(message: &Message) -> String {
 fn usage() -> String {
     format!(
         "{}\n\n{}\n\n{}\n\n{}",
-        "usage: vapor-forge-ipc-tool <encode|decode|send> ...",
+        "usage: vapor-forge-game-bridge-tool <encode|decode|send> ...",
         message_usage(),
         decode_usage(),
         send_usage()
@@ -492,6 +546,8 @@ fn message_usage() -> String {
         "  dll-loaded APP_ID NAME\n",
         "  dll-inject-result APP_ID true|false\n",
         "  pe-section APP_ID SECTION\n",
+        "  achievement-unlocked APP_ID EVENT_UUID KEY OBSERVED_AT UNLOCKED_AT\n",
+        "  achievement-progress APP_ID EVENT_UUID KEY CURRENT MAXIMUM OBSERVED_AT\n",
         "  ack\n",
         "  set-delegate APP_ID true|false"
     )
@@ -499,12 +555,12 @@ fn message_usage() -> String {
 }
 
 fn decode_usage() -> String {
-    "decode: vapor-forge-ipc-tool decode [--payload] [HEX_OR_HEXDUMP]".to_owned()
+    "decode: vapor-forge-game-bridge-tool decode [--payload] [HEX_OR_HEXDUMP]".to_owned()
 }
 
 fn send_usage() -> String {
     concat!(
-        "send: vapor-forge-ipc-tool send [--socket PATH] --token HEX [--app-id APP_ID] ",
+        "send: vapor-forge-game-bridge-tool send [--socket PATH] --token HEX [--app-id APP_ID] ",
         "[--pid PID] [--raw] [--read-response] MESSAGE ..."
     )
     .to_owned()

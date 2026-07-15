@@ -96,6 +96,7 @@ pub fn install_trigger() -> bool {
         mark_pending();
         log("trigger already loaded, pending pickup armed");
     }
+    install_loaded_achievement_observer(&maps);
 
     true
 }
@@ -157,7 +158,16 @@ pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
     if trigger_seen || pending_pickup {
         // Connect IPC before loading the helper DLL.
         crate::ipc::try_connect();
+        crate::achievement_observer::install_for_module(&dll_name, base_address as usize);
+        let maps = maps::parse_self_maps();
+        install_loaded_achievement_observer(&maps);
         load_helper_now();
+    }
+}
+
+fn install_loaded_achievement_observer(entries: &[maps::MapEntry]) {
+    if let Some(entry) = maps::find_module(entries, "steam_api64.dll") {
+        crate::achievement_observer::install_for_module("steam_api64.dll", entry.base);
     }
 }
 

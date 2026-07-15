@@ -46,11 +46,13 @@ once_cell.workspace = true
 retour.workspace = true
 tracing.workspace = true
 vapor-forge-abi = { path = "../steam-abi" }
+vapor-forge-achievement-sync = { path = "../achievement-sync" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-features = { path = "../features" }
 vapor-forge-memory = { path = "../memory" }
 vapor-forge-patterns = { path = "../patterns" }
+vapor-forge-playtime-sync = { path = "../playtime-sync" }
 prost.workspace = true
 vapor-forge-scripting = { path = "../scripting" }
-vapor-forge-inject-protocol = { path = "../inject-protocol" }
+vapor-forge-game-bridge = { path = "../game-bridge" }

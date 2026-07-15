@@ -1,7 +1,6 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use mlua::prelude::*;
@@ -25,7 +24,11 @@ pub(crate) struct RuntimeState {
     access_tokens: HashMap<AppId, u64>,
 }
 
-type Shared<T> = Rc<RefCell<T>>;
+type Shared<T> = Arc<Mutex<T>>;
+
+fn lock_shared<T>(shared: &Shared<T>) -> MutexGuard<'_, T> {
+    shared.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 #[derive(Clone)]
 pub(crate) struct ScriptRunContext {
@@ -37,29 +40,29 @@ pub(crate) struct ScriptRunContext {
 impl ScriptRunContext {
     fn new(record_calls: bool) -> Self {
         Self {
-            path: Rc::new(RefCell::new(String::new())),
-            calls: Rc::new(RefCell::new(Vec::new())),
+            path: Arc::new(Mutex::new(String::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
             record_calls,
         }
     }
 
     pub(crate) fn set_path(&self, path: &str) {
-        path.clone_into(&mut self.path.borrow_mut());
+        path.clone_into(&mut lock_shared(&self.path));
     }
 
     fn push_call(&self, function: &'static str, detail: String) {
         if !self.record_calls {
             return;
         }
-        self.calls.borrow_mut().push(ScriptCallReport {
-            path: self.path.borrow().clone(),
+        lock_shared(&self.calls).push(ScriptCallReport {
+            path: lock_shared(&self.path).clone(),
             function,
             detail,
         });
     }
 
     pub(crate) fn drain_calls(&self) -> Vec<ScriptCallReport> {
-        self.calls.borrow_mut().drain(..).collect()
+        lock_shared(&self.calls).drain(..).collect()
     }
 }
 
@@ -67,7 +70,7 @@ pub(crate) fn create_runtime(
     options: &ScriptExecutionOptions,
 ) -> LuaResult<(Lua, Shared<RuntimeState>, ScriptRunContext)> {
     let lua = Lua::new();
-    let state = Rc::new(RefCell::new(RuntimeState::default()));
+    let state = Arc::new(Mutex::new(RuntimeState::default()));
     let ctx = ScriptRunContext::new(options.record_calls);
     install_lua_api(&lua, &state, &ctx, options)?;
     Ok((lua, state, ctx))
@@ -124,7 +127,7 @@ pub(crate) fn execute_source(
 }
 
 pub(crate) fn snapshot_state(state: &Shared<RuntimeState>) -> ScriptState {
-    let state = state.borrow();
+    let state = lock_shared(state);
     ScriptState {
         apps: state.apps.clone(),
         depot_keys: state.depot_keys.clone(),
@@ -219,7 +222,7 @@ fn install_addappid(
             };
 
             let mut detail = format!("app_id={id_raw}");
-            let mut state = state.borrow_mut();
+            let mut state = lock_shared(&state);
             let app_id = AppId(id_raw);
             if !state.apps.contains(&app_id) {
                 state.apps.push(app_id);
@@ -259,7 +262,7 @@ fn install_setmanifestid(
                 mlua::Error::RuntimeError("setmanifestid: gid must be decimal".into())
             })?;
             let depot_id = DepotId(depot_id_raw);
-            state.borrow_mut().manifests.insert(
+            lock_shared(&state).manifests.insert(
                 depot_id,
                 ManifestOverride {
                     depot_id,
@@ -328,7 +331,7 @@ fn install_hex_ticket_fn(
         lua.create_function(move |_, (app_id_raw, hex): (u32, String)| {
             let bytes = parse_hex_key(&hex)
                 .ok_or_else(|| mlua::Error::RuntimeError(format!("{name}: invalid hex string")))?;
-            store(&mut state.borrow_mut(), AppId(app_id_raw), bytes);
+            store(&mut lock_shared(&state), AppId(app_id_raw), bytes);
             ctx.push_call(name, format!("app_id={app_id_raw} bytes={}", hex.len() / 2));
             Ok(())
         })?,
@@ -352,8 +355,7 @@ fn install_setstat(
             let steamid: u64 = steamid_str.parse().map_err(|_| {
                 mlua::Error::RuntimeError("setstat: steamid must be decimal string".into())
             })?;
-            state
-                .borrow_mut()
+            lock_shared(&state)
                 .stat_steam_ids
                 .insert(AppId(app_id_raw), steamid);
             ctx.push_call("setstat", format!("app_id={app_id_raw} steamid={steamid}"));
@@ -376,8 +378,7 @@ fn install_setavatar(
         registry,
         "setavatar",
         lua.create_function(move |_, (app_id_raw, avatar_raw): (u32, u32)| {
-            state
-                .borrow_mut()
+            lock_shared(&state)
                 .avatars
                 .insert(AppId(app_id_raw), AppId(avatar_raw));
             ctx.push_call(
@@ -409,8 +410,7 @@ fn install_addtoken(
                         "addtoken: arg2 must be a decimal uint64 string".into(),
                     )
                 })?;
-                state
-                    .borrow_mut()
+                lock_shared(&state)
                     .access_tokens
                     .insert(AppId(app_id_raw), token);
                 ctx.push_call("addtoken", format!("app_id={app_id_raw} token={token}"));

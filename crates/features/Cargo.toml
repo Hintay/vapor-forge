@@ -21,8 +21,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 vapor-forge-abi = { path = "../steam-abi" }
+vapor-forge-achievement-sync = { path = "../achievement-sync" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }
 vapor-forge-packet-inspect = { path = "../packet-inspect" }
 tracing.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

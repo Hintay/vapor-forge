@@ -9,6 +9,8 @@
 compile_error!("vapor-forge-proton-inject only supports 64-bit Linux targets");
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod achievement_observer;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod detour;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod ipc;
@@ -51,7 +53,7 @@ pub extern "C" fn la_version(version: c_uint) -> c_uint {
 #[no_mangle]
 pub extern "C" fn la_preinit(_cookie: *mut usize) {
     let has_dll = std::env::var_os("VAPOR_FORGE_INJECT_DLL").is_some();
-    let has_ipc = std::env::var_os(vapor_forge_inject_protocol::ENV_IPC_SOCK).is_some();
+    let has_ipc = std::env::var_os(vapor_forge_game_bridge::ENV_GAME_BRIDGE_SOCK).is_some();
 
     if !has_dll && !has_ipc {
         return;

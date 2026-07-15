@@ -47,7 +47,7 @@ fn run() -> Result<(), String> {
 }
 
 fn print_text(args: &Args, dirs: &[String], report: &ScriptExecutionReport) {
-    print_list("script_dirs", &dirs);
+    print_list("script_dirs", dirs);
     println!("network_allowed={}", args.allow_network);
     print_list("allowed_hosts", &args.allowed_hosts);
     if let Some(timeout_ms) = args.network_timeout_ms {

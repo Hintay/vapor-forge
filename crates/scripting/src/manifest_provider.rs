@@ -47,14 +47,6 @@ struct ProviderRequest {
     response: mpsc::SyncSender<Result<Option<u64>, String>>,
 }
 
-struct ProviderReady {
-    state: ScriptState,
-    files: Vec<ScriptFileReport>,
-    calls: Vec<ScriptCallReport>,
-    has_basic: bool,
-    has_extended: bool,
-}
-
 impl ManifestCodeProvider {
     pub(crate) fn execute(
         sources: Vec<ScriptSource>,
@@ -69,25 +61,30 @@ impl ManifestCodeProvider {
             });
         }
 
-        let (request_tx, request_rx) = mpsc::sync_channel(MAX_PROVIDER_QUEUE);
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("lua-runtime".to_owned())
-            .spawn(move || runtime_loop(sources, options, request_rx, ready_tx))
-            .map_err(|error| format!("failed to start Lua runtime: {error}"))?;
+        let (lua, state, ctx) = create_runtime(&options).map_err(|error| error.to_string())?;
+        let files = execute_sources(&lua, &sources, &ctx);
+        let (has_basic, has_extended) = provider_functions(&lua);
+        let state = snapshot_state(&state);
+        let calls = ctx.drain_calls();
 
-        let ready = ready_rx
-            .recv()
-            .map_err(|_| "Lua runtime stopped during initialization".to_owned())??;
-        let provider = (ready.has_basic || ready.has_extended).then_some(Self {
-            sender: request_tx,
-            has_basic: ready.has_basic,
-            has_extended: ready.has_extended,
-        });
+        let provider = if has_basic || has_extended {
+            let (request_tx, request_rx) = mpsc::sync_channel(MAX_PROVIDER_QUEUE);
+            std::thread::Builder::new()
+                .name("lua-runtime".to_owned())
+                .spawn(move || runtime_loop(lua, has_basic, has_extended, request_rx))
+                .map_err(|error| format!("failed to start Lua runtime: {error}"))?;
+            Some(Self {
+                sender: request_tx,
+                has_basic,
+                has_extended,
+            })
+        } else {
+            None
+        };
         Ok(ProviderExecution {
-            state: ready.state,
-            files: ready.files,
-            calls: ready.calls,
+            state,
+            files,
+            calls,
             provider,
         })
     }
@@ -142,23 +139,26 @@ impl ManifestCodeProvider {
 }
 
 fn runtime_loop(
-    sources: Vec<ScriptSource>,
-    options: ScriptExecutionOptions,
+    lua: Lua,
+    has_basic: bool,
+    has_extended: bool,
     requests: mpsc::Receiver<ProviderRequest>,
-    ready: mpsc::SyncSender<Result<ProviderReady, String>>,
 ) {
-    let (lua, state, ctx) = match create_runtime(&options) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
-            return;
-        }
-    };
+    while let Ok(request) = requests.recv() {
+        let result = invoke_provider(&lua, has_basic, has_extended, &request);
+        let _ = request.response.send(Ok(result));
+    }
+}
 
-    let files = sources
+fn execute_sources(
+    lua: &Lua,
+    sources: &[ScriptSource],
+    ctx: &crate::bindings::ScriptRunContext,
+) -> Vec<ScriptFileReport> {
+    sources
         .iter()
         .map(|source| {
-            let errors = execute_source(&lua, &source.path, &source.source, &ctx);
+            let errors = execute_source(lua, &source.path, &source.source, ctx);
             ScriptFileReport {
                 path: source.path.display().to_string(),
                 result: if errors.is_empty() {
@@ -168,8 +168,10 @@ fn runtime_loop(
                 },
             }
         })
-        .collect();
+        .collect()
+}
 
+fn provider_functions(lua: &Lua) -> (bool, bool) {
     let globals = lua.globals();
     let has_basic = matches!(
         globals.raw_get::<LuaValue>("fetch_manifest_code"),
@@ -179,28 +181,7 @@ fn runtime_loop(
         globals.raw_get::<LuaValue>("fetch_manifest_code_ex"),
         Ok(LuaValue::Function(_))
     );
-    drop(globals);
-
-    if ready
-        .send(Ok(ProviderReady {
-            state: snapshot_state(&state),
-            files,
-            calls: ctx.drain_calls(),
-            has_basic,
-            has_extended,
-        }))
-        .is_err()
-    {
-        return;
-    }
-
-    if !has_basic && !has_extended {
-        return;
-    }
-    while let Ok(request) = requests.recv() {
-        let result = invoke_provider(&lua, has_basic, has_extended, &request);
-        let _ = request.response.send(Ok(result));
-    }
+    (has_basic, has_extended)
 }
 
 fn invoke_provider(

@@ -2,6 +2,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(target_os = "linux")]
+pub(crate) mod achievement_worker;
+#[cfg(target_os = "linux")]
 pub mod client;
 #[cfg(any(
     all(target_os = "linux", debug_assertions),
@@ -12,6 +14,8 @@ pub mod debug_api;
 pub mod detour;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
+#[cfg(target_os = "linux")]
+pub(crate) mod playtime_worker;
 #[cfg(target_os = "linux")]
 pub use client::install;
 #[cfg(target_os = "linux")]

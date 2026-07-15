@@ -1,6 +1,7 @@
 // IPC server: accepts connections from vapor-forge-proton-inject helper processes
 // running inside Wine/Proton game instances. Validates per-launch tokens
-// and dispatches messages (Denuvo detection, DLL load events).
+// and dispatches game-bridge messages. Achievement persistence and upload are
+// delegated to the independent achievement worker.
 
 use std::collections::HashMap;
 use std::io;
@@ -9,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracing::{debug, info, warn};
-use vapor_forge_inject_protocol::{self as proto, Message};
+use vapor_forge_achievement_sync::QueuedAchievementEvent;
+use vapor_forge_game_bridge::{self as proto, Message};
 
 struct TokenEntry {
     app_id: u32,
+    owner_steam_id64: String,
     // Token stays valid for the entire game session. Multiple Wine child
     // processes (launcher, game, overlay) may connect with the same token.
 }
@@ -69,7 +72,19 @@ impl IpcServer {
             warn!("ipc-server: token map lock poisoned");
             return;
         };
-        tokens.insert(token, TokenEntry { app_id });
+        let steam_id = vapor_forge_features::rich_presence::local_steamid();
+        let owner_steam_id64 = if steam_id != 0 {
+            steam_id.to_string()
+        } else {
+            String::new()
+        };
+        tokens.insert(
+            token,
+            TokenEntry {
+                app_id,
+                owner_steam_id64,
+            },
+        );
         debug!(app_id, "ipc-server: token registered");
     }
 
@@ -80,6 +95,14 @@ impl IpcServer {
             return;
         };
         tokens.retain(|_, e| e.app_id != app_id);
+    }
+
+    pub fn revoke_stopped_app_tokens(&self, active_app_ids: &[u32]) {
+        let Ok(mut tokens) = self.tokens.lock() else {
+            warn!("ipc-server: token map lock poisoned");
+            return;
+        };
+        tokens.retain(|_, entry| active_app_ids.contains(&entry.app_id));
     }
 
     pub fn socket_path(&self) -> &str {
@@ -127,7 +150,7 @@ fn handle_connection(
         }
     };
 
-    let (app_id, pid) = match hello {
+    let (app_id, pid, owner_steam_id64) = match hello {
         Message::Hello { token, app_id, pid } => {
             // Validate the session token. Don't remove it: multiple Wine
             // child processes (launcher, game, overlay) share the same
@@ -140,6 +163,7 @@ fn handle_connection(
             match guard.get(&token) {
                 Some(e) if e.app_id == app_id => {
                     info!(app_id, pid, "ipc-server: client authenticated");
+                    (app_id, pid, e.owner_steam_id64.clone())
                 }
                 Some(e) => {
                     warn!(
@@ -154,8 +178,6 @@ fn handle_connection(
                     return;
                 }
             }
-            drop(guard);
-            (app_id, pid)
         }
         _ => {
             warn!("ipc-server: first message was not HELLO");
@@ -217,10 +239,55 @@ fn handle_connection(
                     "ipc-server: PE section reported"
                 );
             }
+            Message::AchievementUnlocked {
+                event_id,
+                app_id: aid,
+                achievement_key,
+                observed_at,
+                unlocked_at,
+            } if aid == app_id => {
+                crate::achievement_worker::queue_event(QueuedAchievementEvent {
+                    owner_scope: String::new(),
+                    owner_steam_id64: owner_steam_id64.clone(),
+                    event_id: proto::event_id_to_uuid(&event_id),
+                    app_id,
+                    achievement_key,
+                    kind: "unlock".into(),
+                    progress_current: None,
+                    progress_max: None,
+                    observed_at,
+                    unlocked_at: (unlocked_at > 0).then_some(unlocked_at),
+                });
+            }
+            Message::AchievementProgress {
+                event_id,
+                app_id: aid,
+                achievement_key,
+                current,
+                maximum,
+                observed_at,
+            } if aid == app_id => {
+                if maximum > 0 && current <= maximum {
+                    crate::achievement_worker::queue_event(QueuedAchievementEvent {
+                        owner_scope: String::new(),
+                        owner_steam_id64: owner_steam_id64.clone(),
+                        event_id: proto::event_id_to_uuid(&event_id),
+                        app_id,
+                        achievement_key,
+                        kind: "progress".into(),
+                        progress_current: Some(current),
+                        progress_max: Some(maximum),
+                        observed_at,
+                        unlocked_at: None,
+                    });
+                }
+            }
             Message::DenuvoDetected { app_id: aid }
             | Message::DllLoaded { app_id: aid, .. }
             | Message::DllInjectResult { app_id: aid, .. }
-            | Message::PeSection { app_id: aid, .. } => {
+            | Message::PeSection { app_id: aid, .. }
+            | Message::AchievementUnlocked { app_id: aid, .. }
+            | Message::AchievementProgress { app_id: aid, .. } => {
                 warn!(
                     authenticated = app_id,
                     claimed = aid,

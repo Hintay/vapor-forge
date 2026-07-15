@@ -7,45 +7,49 @@
 // without IPC.
 
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{mpsc, OnceLock};
 
-use vapor_forge_inject_protocol::{self as proto, Message};
+use vapor_forge_game_bridge::{self as proto, Message};
 
 use crate::loader::log;
 
-static CLIENT: Mutex<Option<UnixStream>> = Mutex::new(None);
 static APP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static OUTBOUND: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
+const OUTBOUND_CAPACITY: usize = 1024;
 
-/// Try to establish an IPC connection. Called once during initialization.
-/// Returns silently if env vars are missing or the socket is unreachable.
+/// Start the non-blocking IPC transport. The transport thread establishes the socket
+/// connection when the first message arrives.
 pub fn try_connect() {
-    let sock_path = match std::env::var(proto::ENV_IPC_SOCK) {
+    let _ = outbound();
+}
+
+fn connect() -> Option<UnixStream> {
+    let sock_path = match std::env::var(proto::ENV_GAME_BRIDGE_SOCK) {
         Ok(p) if !p.is_empty() => p,
-        _ => return,
+        _ => return None,
     };
-    let token_hex = match std::env::var(proto::ENV_IPC_TOKEN) {
+    let token_hex = match std::env::var(proto::ENV_GAME_BRIDGE_TOKEN) {
         Ok(t) if !t.is_empty() => t,
         _ => {
             log("ipc: no token, skipping");
-            return;
+            return None;
         }
     };
     let token = match proto::token_from_hex(&token_hex) {
         Some(t) => t,
         None => {
             log("ipc: invalid token hex");
-            return;
+            return None;
         }
     };
 
-    let app_id = parse_app_id_from_env();
-    APP_ID.store(app_id, std::sync::atomic::Ordering::Release);
+    let app_id = APP_ID.load(std::sync::atomic::Ordering::Acquire);
 
     let mut stream = match UnixStream::connect(&sock_path) {
         Ok(s) => s,
         Err(e) => {
             log(&format!("ipc: connect failed: {e}"));
-            return;
+            return None;
         }
     };
 
@@ -59,7 +63,7 @@ pub fn try_connect() {
     let hello = Message::Hello { token, app_id, pid };
     if let Err(e) = proto::write_message(&mut stream, &hello) {
         log(&format!("ipc: hello send failed: {e}"));
-        return;
+        return None;
     }
 
     // Wait for ACK
@@ -69,15 +73,15 @@ pub fn try_connect() {
         }
         Ok(other) => {
             log(&format!("ipc: unexpected response: {other:?}"));
-            return;
+            return None;
         }
         Err(e) => {
             log(&format!("ipc: ack read failed: {e}"));
-            return;
+            return None;
         }
     }
 
-    *CLIENT.lock().unwrap() = Some(stream);
+    Some(stream)
 }
 
 /// Report that a Denuvo indicator was found.
@@ -110,15 +114,95 @@ pub fn send_pe_section(section_name: &str) {
     });
 }
 
-fn send(msg: Message) {
-    let mut guard = CLIENT.lock().unwrap();
-    let Some(stream) = guard.as_mut() else {
-        return;
+pub fn send_achievement_unlocked(achievement_key: &str, unlocked_at: i64) -> bool {
+    let app_id = APP_ID.load(std::sync::atomic::Ordering::Acquire);
+    let Ok(event_id) = proto::generate_event_id() else {
+        return false;
     };
-    if let Err(e) = proto::write_message(stream, &msg) {
-        log(&format!("ipc: send failed: {e}"));
-        // Drop the broken connection.
-        *guard = None;
+    let observed_at = unix_now();
+    send(Message::AchievementUnlocked {
+        event_id,
+        app_id,
+        achievement_key: achievement_key.to_owned(),
+        observed_at,
+        unlocked_at: if unlocked_at > 0 {
+            unlocked_at
+        } else {
+            observed_at
+        },
+    })
+}
+
+pub fn send_achievement_progress(achievement_key: &str, current: u32, maximum: u32) -> bool {
+    let app_id = APP_ID.load(std::sync::atomic::Ordering::Acquire);
+    let Ok(event_id) = proto::generate_event_id() else {
+        return false;
+    };
+    send(Message::AchievementProgress {
+        event_id,
+        app_id,
+        achievement_key: achievement_key.to_owned(),
+        current,
+        maximum,
+        observed_at: unix_now(),
+    })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn send(msg: Message) -> bool {
+    match outbound().try_send(msg) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(_)) => {
+            log("ipc: outbound queue full, dropping message");
+            false
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            log("ipc: outbound transport unavailable");
+            false
+        }
+    }
+}
+
+fn outbound() -> &'static mpsc::SyncSender<Message> {
+    OUTBOUND.get_or_init(|| {
+        APP_ID.store(
+            parse_app_id_from_env(),
+            std::sync::atomic::Ordering::Release,
+        );
+        let (sender, receiver) = mpsc::sync_channel(OUTBOUND_CAPACITY);
+        if std::thread::Builder::new()
+            .name("vapor-forge-game-bridge".into())
+            .spawn(move || outbound_loop(receiver))
+            .is_err()
+        {
+            log("ipc: failed to start outbound transport");
+        }
+        sender
+    })
+}
+
+fn outbound_loop(receiver: mpsc::Receiver<Message>) {
+    let mut stream = None;
+    while let Ok(message) = receiver.recv() {
+        loop {
+            if stream.is_none() {
+                stream = connect();
+            }
+            if stream
+                .as_mut()
+                .is_some_and(|current| proto::write_message(current, &message).is_ok())
+            {
+                break;
+            }
+            stream = None;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 }
 
