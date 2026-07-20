@@ -1,20 +1,19 @@
-// IPC protocol between the 64-bit Wine child helper and the main 32-bit Steam
-// process.
-//
-// Wire format: [u32 len][u8 msg_type][payload...]
-// len = size of msg_type + payload (does NOT include the 4-byte len field).
-// All multi-byte integers are little-endian.
+//! Framed IPC protocol shared by Proton game-process helpers and the Steam
+//! runtime hook.
+//!
+//! The bridge authenticates each connection with a per-launch token and carries
+//! runtime diagnostics, injection results, and Denuvo signals. Wire format:
+//! `[u32 len][u8 msg_type][payload...]`. `len` covers the
+//! message type and payload, but not its own four-byte field. Multi-byte integers
+//! are little-endian.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
 pub const TOKEN_LEN: usize = 32;
-pub const EVENT_ID_LEN: usize = 16;
 pub const MAX_MSG_SIZE: usize = 4096;
 pub const MAX_NAME_LEN: usize = 260;
-pub const MAX_ACHIEVEMENT_KEY_LEN: usize = 255;
 
 // Socket path environment variable name.
 pub const ENV_GAME_BRIDGE_SOCK: &str = "VAPOR_FORGE_GAME_BRIDGE_SOCK";
@@ -35,8 +34,6 @@ const MSG_DENUVO_DETECTED: u8 = 0x02;
 const MSG_DLL_LOADED: u8 = 0x03;
 const MSG_DLL_INJECT_RESULT: u8 = 0x04;
 const MSG_PE_SECTION: u8 = 0x05;
-const MSG_ACHIEVEMENT_UNLOCKED: u8 = 0x06;
-const MSG_ACHIEVEMENT_PROGRESS: u8 = 0x07;
 const MSG_ACK: u8 = 0x80;
 const MSG_SET_DELEGATE: u8 = 0x81;
 
@@ -63,145 +60,12 @@ pub enum Message {
         app_id: u32,
         section_name: String,
     },
-    AchievementUnlocked {
-        event_id: [u8; EVENT_ID_LEN],
-        app_id: u32,
-        achievement_key: String,
-        observed_at: i64,
-        unlocked_at: i64,
-    },
-    AchievementProgress {
-        event_id: [u8; EVENT_ID_LEN],
-        app_id: u32,
-        achievement_key: String,
-        current: u32,
-        maximum: u32,
-        observed_at: i64,
-    },
     // Server -> Client
     Ack,
     SetDelegate {
         app_id: u32,
         enable: bool,
     },
-}
-
-#[derive(Default)]
-pub struct AchievementDeduplicator {
-    unlocked: HashSet<String>,
-    progress: HashMap<String, (u32, u32)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PendingAchievement {
-    Unlock {
-        key: String,
-    },
-    Progress {
-        key: String,
-        current: u32,
-        maximum: u32,
-    },
-}
-
-#[derive(Default)]
-pub struct AchievementCommitBuffer {
-    deduplicator: AchievementDeduplicator,
-    pending_unlocks: HashSet<String>,
-    pending_progress: HashMap<String, (u32, u32)>,
-}
-
-impl AchievementCommitBuffer {
-    pub fn stage_unlock(&mut self, key: &str) -> bool {
-        if !self.deduplicator.accept_unlock(key) {
-            return false;
-        }
-        self.pending_progress.remove(key);
-        self.pending_unlocks.insert(key.to_owned());
-        true
-    }
-
-    pub fn stage_progress(&mut self, key: &str, current: u32, maximum: u32) -> bool {
-        if !self.deduplicator.accept_progress(key, current, maximum) {
-            return false;
-        }
-        self.pending_progress
-            .insert(key.to_owned(), (current, maximum));
-        true
-    }
-
-    pub fn pending(&self) -> Vec<PendingAchievement> {
-        let mut values = self
-            .pending_unlocks
-            .iter()
-            .cloned()
-            .map(|key| PendingAchievement::Unlock { key })
-            .collect::<Vec<_>>();
-        values.extend(
-            self.pending_progress
-                .iter()
-                .map(|(key, &(current, maximum))| PendingAchievement::Progress {
-                    key: key.clone(),
-                    current,
-                    maximum,
-                }),
-        );
-        values
-    }
-
-    pub fn mark_sent(&mut self, pending: &PendingAchievement) {
-        match pending {
-            PendingAchievement::Unlock { key } => {
-                self.pending_unlocks.remove(key);
-            }
-            PendingAchievement::Progress {
-                key,
-                current,
-                maximum,
-            } => {
-                if self.pending_progress.get(key) == Some(&(*current, *maximum)) {
-                    self.pending_progress.remove(key);
-                }
-            }
-        }
-    }
-
-    pub fn clear(&mut self, key: &str) {
-        self.deduplicator.forget_unlock(key);
-        self.deduplicator.forget_progress(key);
-        self.pending_unlocks.remove(key);
-        self.pending_progress.remove(key);
-    }
-}
-
-impl AchievementDeduplicator {
-    pub fn accept_unlock(&mut self, key: &str) -> bool {
-        if key.is_empty() || !self.unlocked.insert(key.to_owned()) {
-            return false;
-        }
-        self.progress.remove(key);
-        true
-    }
-
-    pub fn accept_progress(&mut self, key: &str, current: u32, maximum: u32) -> bool {
-        if key.is_empty() || maximum == 0 || current > maximum || self.unlocked.contains(key) {
-            return false;
-        }
-        let value = (current, maximum);
-        if self.progress.get(key) == Some(&value) {
-            return false;
-        }
-        self.progress.insert(key.to_owned(), value);
-        true
-    }
-
-    pub fn forget_unlock(&mut self, key: &str) {
-        self.unlocked.remove(key);
-    }
-
-    pub fn forget_progress(&mut self, key: &str) {
-        self.progress.remove(key);
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -246,36 +110,6 @@ impl Message {
                 payload.extend_from_slice(&len.to_le_bytes());
                 payload.extend_from_slice(&name_bytes[..len as usize]);
             }
-            Message::AchievementUnlocked {
-                event_id,
-                app_id,
-                achievement_key,
-                observed_at,
-                unlocked_at,
-            } => {
-                payload.push(MSG_ACHIEVEMENT_UNLOCKED);
-                payload.extend_from_slice(event_id);
-                payload.extend_from_slice(&app_id.to_le_bytes());
-                push_bounded_string(&mut payload, achievement_key, MAX_ACHIEVEMENT_KEY_LEN);
-                payload.extend_from_slice(&observed_at.to_le_bytes());
-                payload.extend_from_slice(&unlocked_at.to_le_bytes());
-            }
-            Message::AchievementProgress {
-                event_id,
-                app_id,
-                achievement_key,
-                current,
-                maximum,
-                observed_at,
-            } => {
-                payload.push(MSG_ACHIEVEMENT_PROGRESS);
-                payload.extend_from_slice(event_id);
-                payload.extend_from_slice(&app_id.to_le_bytes());
-                push_bounded_string(&mut payload, achievement_key, MAX_ACHIEVEMENT_KEY_LEN);
-                payload.extend_from_slice(&current.to_le_bytes());
-                payload.extend_from_slice(&maximum.to_le_bytes());
-                payload.extend_from_slice(&observed_at.to_le_bytes());
-            }
             Message::Ack => {
                 payload.push(MSG_ACK);
             }
@@ -291,13 +125,6 @@ impl Message {
         buf.extend_from_slice(&payload);
         buf
     }
-}
-
-fn push_bounded_string(payload: &mut Vec<u8>, value: &str, maximum: usize) {
-    let bytes = value.as_bytes();
-    let len = bytes.len().min(maximum) as u16;
-    payload.extend_from_slice(&len.to_le_bytes());
-    payload.extend_from_slice(&bytes[..len as usize]);
 }
 
 // -----------------------------------------------------------------------
@@ -421,38 +248,6 @@ pub fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
                 section_name,
             })
         }
-        MSG_ACHIEVEMENT_UNLOCKED => {
-            let (event_id, app_id, achievement_key, tail) = decode_achievement_prefix(data)?;
-            if tail.len() < 16 {
-                return Err(DecodeError::TooShort);
-            }
-            let observed_at = i64::from_le_bytes(tail[..8].try_into().unwrap());
-            let unlocked_at = i64::from_le_bytes(tail[8..16].try_into().unwrap());
-            Ok(Message::AchievementUnlocked {
-                event_id,
-                app_id,
-                achievement_key,
-                observed_at,
-                unlocked_at,
-            })
-        }
-        MSG_ACHIEVEMENT_PROGRESS => {
-            let (event_id, app_id, achievement_key, tail) = decode_achievement_prefix(data)?;
-            if tail.len() < 16 {
-                return Err(DecodeError::TooShort);
-            }
-            let current = u32::from_le_bytes(tail[..4].try_into().unwrap());
-            let maximum = u32::from_le_bytes(tail[4..8].try_into().unwrap());
-            let observed_at = i64::from_le_bytes(tail[8..16].try_into().unwrap());
-            Ok(Message::AchievementProgress {
-                event_id,
-                app_id,
-                achievement_key,
-                current,
-                maximum,
-                observed_at,
-            })
-        }
         MSG_ACK => Ok(Message::Ack),
         MSG_SET_DELEGATE => {
             if data.len() < 5 {
@@ -466,31 +261,6 @@ pub fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
     }
 }
 
-type AchievementPrefix<'a> = ([u8; EVENT_ID_LEN], u32, String, &'a [u8]);
-
-fn decode_achievement_prefix(data: &[u8]) -> Result<AchievementPrefix<'_>, DecodeError> {
-    if data.len() < EVENT_ID_LEN + 6 {
-        return Err(DecodeError::TooShort);
-    }
-    let mut event_id = [0u8; EVENT_ID_LEN];
-    event_id.copy_from_slice(&data[..EVENT_ID_LEN]);
-    let app_offset = EVENT_ID_LEN;
-    let app_id = u32::from_le_bytes(data[app_offset..app_offset + 4].try_into().unwrap());
-    let len_offset = app_offset + 4;
-    let key_len = u16::from_le_bytes(data[len_offset..len_offset + 2].try_into().unwrap()) as usize;
-    let key_offset = len_offset + 2;
-    if key_len > MAX_ACHIEVEMENT_KEY_LEN || data.len() < key_offset + key_len {
-        return Err(DecodeError::TooShort);
-    }
-    let achievement_key = String::from_utf8_lossy(&data[key_offset..key_offset + key_len]).into();
-    Ok((
-        event_id,
-        app_id,
-        achievement_key,
-        &data[key_offset + key_len..],
-    ))
-}
-
 // -----------------------------------------------------------------------
 // Token helpers
 // -----------------------------------------------------------------------
@@ -500,40 +270,6 @@ pub fn generate_token() -> io::Result<[u8; TOKEN_LEN]> {
     let mut f = std::fs::File::open("/dev/urandom")?;
     f.read_exact(&mut token)?;
     Ok(token)
-}
-
-pub fn generate_event_id() -> io::Result<[u8; EVENT_ID_LEN]> {
-    let mut event_id = [0u8; EVENT_ID_LEN];
-    let mut file = std::fs::File::open("/dev/urandom")?;
-    file.read_exact(&mut event_id)?;
-    event_id[6] = (event_id[6] & 0x0f) | 0x40;
-    event_id[8] = (event_id[8] & 0x3f) | 0x80;
-    Ok(event_id)
-}
-
-pub fn event_id_to_uuid(event_id: &[u8; EVENT_ID_LEN]) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        event_id[0], event_id[1], event_id[2], event_id[3],
-        event_id[4], event_id[5], event_id[6], event_id[7],
-        event_id[8], event_id[9], event_id[10], event_id[11],
-        event_id[12], event_id[13], event_id[14], event_id[15]
-    )
-}
-
-pub fn event_id_from_uuid(value: &str) -> Option<[u8; EVENT_ID_LEN]> {
-    let compact: String = value
-        .chars()
-        .filter(|character| *character != '-')
-        .collect();
-    if compact.len() != EVENT_ID_LEN * 2 {
-        return None;
-    }
-    let mut event_id = [0u8; EVENT_ID_LEN];
-    for (index, chunk) in compact.as_bytes().chunks(2).enumerate() {
-        event_id[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
-    }
-    Some(event_id)
 }
 
 pub fn token_to_hex(token: &[u8; TOKEN_LEN]) -> String {
@@ -631,44 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn achievement_unlocked_round_trip() {
-        let msg = Message::AchievementUnlocked {
-            event_id: [0x11; EVENT_ID_LEN],
-            app_id: 620,
-            achievement_key: "WAKE_UP".into(),
-            observed_at: 1_800_000_002,
-            unlocked_at: 1_800_000_000,
-        };
-        let bytes = msg.encode();
-        assert_eq!(decode_payload(&bytes[4..]).unwrap(), msg);
-    }
-
-    #[test]
-    fn achievement_progress_round_trip() {
-        let msg = Message::AchievementProgress {
-            event_id: [0x22; EVENT_ID_LEN],
-            app_id: 620,
-            achievement_key: "COLLECT".into(),
-            current: 3,
-            maximum: 10,
-            observed_at: 1_800_000_001,
-        };
-        let bytes = msg.encode();
-        assert_eq!(decode_payload(&bytes[4..]).unwrap(), msg);
-    }
-
-    #[test]
-    fn event_id_uuid_round_trip() {
-        let id = [
-            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
-            0x55, 0x55,
-        ];
-        let encoded = event_id_to_uuid(&id);
-        assert_eq!(encoded, "11111111-2222-4333-8444-555555555555");
-        assert_eq!(event_id_from_uuid(&encoded), Some(id));
-    }
-
-    #[test]
     fn ack_round_trip() {
         let msg = Message::Ack;
         let bytes = msg.encode();
@@ -698,49 +396,6 @@ mod tests {
         assert_eq!(hex.len(), 64);
         let back = token_from_hex(&hex).unwrap();
         assert_eq!(token, back);
-    }
-
-    #[test]
-    fn achievement_deduplicator_tracks_semantic_state() {
-        let mut state = AchievementDeduplicator::default();
-        assert!(state.accept_progress("COLLECT", 1, 10));
-        assert!(!state.accept_progress("COLLECT", 1, 10));
-        assert!(state.accept_progress("COLLECT", 2, 10));
-        assert!(state.accept_unlock("COLLECT"));
-        assert!(!state.accept_unlock("COLLECT"));
-        assert!(!state.accept_progress("COLLECT", 3, 10));
-        assert!(!state.accept_progress("", 1, 10));
-        assert!(!state.accept_progress("BROKEN", 11, 10));
-        state.forget_unlock("COLLECT");
-        assert!(state.accept_unlock("COLLECT"));
-        state.forget_progress("OTHER");
-    }
-
-    #[test]
-    fn achievement_commit_buffer_waits_for_store_boundary() {
-        let mut buffer = AchievementCommitBuffer::default();
-        assert!(buffer.stage_progress("FIRST", 2, 10));
-        assert!(buffer.stage_progress("FIRST", 7, 10));
-        assert!(buffer.stage_unlock("SECOND"));
-        assert!(!buffer.stage_unlock("SECOND"));
-
-        let pending = buffer.pending();
-        assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&PendingAchievement::Progress {
-            key: "FIRST".into(),
-            current: 7,
-            maximum: 10,
-        }));
-        let unlock = PendingAchievement::Unlock {
-            key: "SECOND".into(),
-        };
-        assert!(pending.contains(&unlock));
-
-        buffer.mark_sent(&unlock);
-        assert_eq!(buffer.pending().len(), 1);
-        buffer.clear("FIRST");
-        assert!(buffer.pending().is_empty());
-        assert!(buffer.stage_progress("FIRST", 1, 10));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-// Proton DLL inject helper.
-// 64-bit LD_AUDIT library loaded into Wine/Proton game processes.
-// Detours Wine's LdrLoadDll to inject a user DLL when steam_api64.dll loads.
+// 64-bit LD_AUDIT helper for Wine/Proton game processes. It observes PE module
+// loads, reports runtime events, and can inject a configured Windows DLL when
+// a Steam trigger module loads.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -8,8 +8,6 @@
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("vapor-forge-proton-inject only supports 64-bit Linux targets");
 
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-mod achievement_observer;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod detour;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -59,11 +57,9 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
         return;
     }
 
-    // Do NOT connect IPC here. Wine spawns multiple child processes
-    // (wineboot, wineserver, services.exe) that all inherit the same
-    // env vars. Connecting here would authenticate a non-game process
-    // before the trigger path is active. IPC connects later when the
-    // trigger fires, ensuring only the game process reports events.
+    // Do not perform socket I/O in the audit callback. The loader detour queues
+    // reports, and the game-bridge worker connects asynchronously on demand.
+    // Per-launch tokens may authenticate multiple Wine child processes.
 
     if loader::install_trigger() {
         return;

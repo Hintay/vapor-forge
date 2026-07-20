@@ -4,6 +4,8 @@
 pub struct MapEntry {
     pub base: usize,
     pub end: usize,
+    pub perms: String,
+    pub offset: usize,
     pub path: String,
 }
 
@@ -35,20 +37,20 @@ pub fn find_module_with_path<'a>(
     Some((entry.base, &entry.path))
 }
 
-pub fn module_path_at(entries: &[MapEntry], address: usize) -> Option<&str> {
-    entries
-        .iter()
-        .find(|entry| address >= entry.base && address < entry.end)
-        .map(|entry| entry.path.as_str())
+pub fn readable_span_at(addr: usize) -> Option<usize> {
+    mapping_span_at(addr, 'r')
 }
 
-/// Return the size of the contiguous mapping containing `addr`.
-pub fn mapping_size_at(addr: usize) -> Option<usize> {
+pub fn executable_span_at(addr: usize) -> Option<usize> {
+    mapping_span_at(addr, 'x')
+}
+
+fn mapping_span_at(addr: usize, required_permission: char) -> Option<usize> {
     let text = std::fs::read_to_string("/proc/self/maps").ok()?;
     for line in text.lines() {
-        let Some((range, _)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let perms = fields.next()?;
         let Some((start_hex, end_hex)) = range.split_once('-') else {
             continue;
         };
@@ -58,7 +60,7 @@ pub fn mapping_size_at(addr: usize) -> Option<usize> {
         ) else {
             continue;
         };
-        if addr >= base && addr < end {
+        if addr >= base && addr < end && perms.contains(required_permission) {
             return Some(end - addr);
         }
     }
@@ -69,8 +71,8 @@ fn parse_line(line: &str) -> Option<MapEntry> {
     // Format: addr_start-addr_end perms offset dev inode path
     let mut parts = line.splitn(6, char::is_whitespace);
     let range = parts.next()?;
-    let _perms = parts.next()?;
-    let _offset = parts.next()?;
+    let perms = parts.next()?.to_owned();
+    let offset = usize::from_str_radix(parts.next()?, 16).ok()?;
     let _dev = parts.next()?;
     let _inode = parts.next()?;
     let path = parts.next().unwrap_or("").trim();
@@ -86,6 +88,8 @@ fn parse_line(line: &str) -> Option<MapEntry> {
     Some(MapEntry {
         base,
         end,
+        perms,
+        offset,
         path: path.to_owned(),
     })
 }
@@ -100,6 +104,8 @@ mod tests {
         let entry = parse_line(line).unwrap();
         assert_eq!(entry.base, 0x7f000000);
         assert_eq!(entry.end, 0x7f001000);
+        assert_eq!(entry.perms, "r-xp");
+        assert_eq!(entry.offset, 0);
         assert_eq!(entry.path, "/usr/lib/libfoo.so");
     }
 
@@ -115,11 +121,15 @@ mod tests {
             MapEntry {
                 base: 0x1000,
                 end: 0x2000,
+                perms: "r-xp".into(),
+                offset: 0,
                 path: "/usr/lib/wine/x86_64-windows/ntdll.dll".into(),
             },
             MapEntry {
                 base: 0x3000,
                 end: 0x4000,
+                perms: "r-xp".into(),
+                offset: 0,
                 path: "/usr/lib/libfoo.so".into(),
             },
         ];

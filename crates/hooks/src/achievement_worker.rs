@@ -1,11 +1,14 @@
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
-use vapor_forge_achievement_sync::{
-    CumulusSettings, Outbox, QueuedAchievementEvent, QueuedAchievementSchema, SchemaUploadOutcome,
-    UploadIdentity,
+use vapor_forge_cloud_cumulus::achievement::SchemaUploadOutcome;
+use vapor_forge_cloud_cumulus::CumulusSettings;
+use vapor_forge_sync_state::{
+    Outbox, QueuedAchievementEvent, QueuedAchievementSchema, UploadIdentity,
 };
 
 const MAX_UNATTRIBUTED_UPLOADS: usize = 4096;
@@ -24,36 +27,46 @@ pub fn ensure_started() {
     let _ = worker();
 }
 
-pub fn queue_event(mut event: QueuedAchievementEvent) {
+pub fn queue_event(mut event: QueuedAchievementEvent) -> bool {
     if event.achievement_key.is_empty() || event.observed_at <= 0 {
-        return;
+        return false;
     }
     let Some(worker) = worker() else {
-        return;
+        return false;
     };
     if let Some((settings, identity)) = upload_context() {
         if owner_matches(&event.owner_steam_id64, &identity) {
             attribute_event(&mut event, &settings, &identity);
             match worker.outbox.lock() {
                 Ok(outbox) => match outbox.enqueue(&event, unix_now()) {
-                    Ok(true) => worker.wake(),
-                    Ok(false) => {}
-                    Err(error) => warn!(%error, "achievement-sync: failed to persist event"),
+                    Ok(inserted) => {
+                        if inserted {
+                            worker.wake();
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        warn!(%error, "achievement-sync: failed to persist event");
+                        false
+                    }
                 },
-                Err(_) => warn!("achievement-sync: outbox lock poisoned"),
+                Err(_) => {
+                    warn!("achievement-sync: outbox lock poisoned");
+                    false
+                }
             }
         } else {
             event.owner_scope.clear();
-            persist_pending_event(worker, &event);
+            persist_pending_event(worker, &event)
         }
     } else {
         if event.owner_steam_id64.is_empty() {
             remember_current_steam_id(&mut event.owner_steam_id64);
         }
         if event.owner_steam_id64.is_empty() {
-            defer(worker, event);
+            defer(worker, event)
         } else {
-            persist_pending_event(worker, &event);
+            persist_pending_event(worker, &event)
         }
     }
 }
@@ -68,7 +81,7 @@ pub fn queue_schema(app_id: u32, schema_version: Option<String>, content: Vec<u8
     let schema = QueuedAchievementSchema {
         owner_scope: settings_context()
             .as_ref()
-            .map(vapor_forge_achievement_sync::upload_scope)
+            .map(|settings| vapor_forge_sync_state::endpoint_scope(&settings.server_url))
             .unwrap_or_default(),
         app_id,
         language: "english".into(),
@@ -92,7 +105,7 @@ fn worker() -> Option<&'static AchievementWorker> {
     if let Some(worker) = WORKER.get() {
         return Some(worker);
     }
-    let path = vapor_forge_achievement_sync::default_outbox_path()?;
+    let path = vapor_forge_sync_state::default_outbox_path()?;
     let outbox = match Outbox::open(&path) {
         Ok(outbox) => {
             let stored_descriptor = match outbox.load_device_descriptor() {
@@ -103,7 +116,7 @@ fn worker() -> Option<&'static AchievementWorker> {
                 }
             };
             if let Some(descriptor) = stored_descriptor {
-                vapor_forge_achievement_sync::restore_device_descriptor(descriptor);
+                vapor_forge_cloud_core::restore_device_descriptor(descriptor);
             }
             Arc::new(Mutex::new(outbox))
         }
@@ -133,14 +146,24 @@ fn worker() -> Option<&'static AchievementWorker> {
     WORKER.get()
 }
 
-fn persist_pending_event(worker: &AchievementWorker, event: &QueuedAchievementEvent) {
+fn persist_pending_event(worker: &AchievementWorker, event: &QueuedAchievementEvent) -> bool {
     match worker.outbox.lock() {
         Ok(outbox) => match outbox.enqueue(event, unix_now()) {
-            Ok(true) => worker.wake(),
-            Ok(false) => {}
-            Err(error) => warn!(%error, "achievement-sync: failed to persist pending event"),
+            Ok(inserted) => {
+                if inserted {
+                    worker.wake();
+                }
+                true
+            }
+            Err(error) => {
+                warn!(%error, "achievement-sync: failed to persist pending event");
+                false
+            }
         },
-        Err(_) => warn!("achievement-sync: outbox lock poisoned"),
+        Err(_) => {
+            warn!("achievement-sync: outbox lock poisoned");
+            false
+        }
     }
 }
 
@@ -157,10 +180,10 @@ fn persist_pending_schema(worker: &AchievementWorker, schema: &QueuedAchievement
     }
 }
 
-fn defer(worker: &AchievementWorker, event: QueuedAchievementEvent) {
+fn defer(worker: &AchievementWorker, event: QueuedAchievementEvent) -> bool {
     let Ok(mut pending) = worker.unattributed.lock() else {
         warn!("achievement-sync: unattributed queue lock poisoned");
-        return;
+        return false;
     };
     if event.kind == "progress" {
         pending.retain(|existing| {
@@ -176,6 +199,7 @@ fn defer(worker: &AchievementWorker, event: QueuedAchievementEvent) {
     pending.push_back(event);
     drop(pending);
     worker.wake();
+    true
 }
 
 fn flush_unattributed(
@@ -183,14 +207,21 @@ fn flush_unattributed(
     unattributed: &Arc<Mutex<VecDeque<QueuedAchievementEvent>>>,
     settings: &CumulusSettings,
     identity: &UploadIdentity,
-) -> Result<(), vapor_forge_achievement_sync::OutboxError> {
-    let mut uploads = match unattributed.lock() {
-        Ok(mut pending) => std::mem::take(&mut *pending),
-        Err(_) => return Ok(()),
-    };
+) -> Result<(), vapor_forge_sync_state::OutboxError> {
     let guard = match outbox.lock() {
         Ok(guard) => guard,
-        Err(_) => return Ok(()),
+        Err(poisoned) => {
+            warn!("achievement-sync: recovering poisoned outbox lock");
+            poisoned.into_inner()
+        }
+    };
+    let mut uploads = match unattributed.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(poisoned) => {
+            warn!("achievement-sync: recovering poisoned unattributed queue lock");
+            let mut pending = poisoned.into_inner();
+            std::mem::take(&mut *pending)
+        }
     };
     let mut unmatched = VecDeque::new();
     while let Some(mut event) = uploads.pop_front() {
@@ -217,18 +248,23 @@ fn restore_pending(
     unattributed: &Arc<Mutex<VecDeque<QueuedAchievementEvent>>>,
     mut restored: VecDeque<QueuedAchievementEvent>,
 ) {
-    if let Ok(mut pending) = unattributed.lock() {
-        restored.append(&mut pending);
-        *pending = restored;
-    }
+    let mut pending = match unattributed.lock() {
+        Ok(pending) => pending,
+        Err(poisoned) => {
+            warn!("achievement-sync: recovering poisoned unattributed queue lock");
+            poisoned.into_inner()
+        }
+    };
+    restored.append(&mut pending);
+    *pending = restored;
 }
 
 fn owner_matches(recorded: &str, identity: &UploadIdentity) -> bool {
-    recorded.is_empty() || recorded == identity.steam_id64
+    !recorded.is_empty() && recorded == identity.steam_id64
 }
 
 fn remember_current_steam_id(destination: &mut String) {
-    let steam_id = vapor_forge_features::rich_presence::local_steamid();
+    let steam_id = vapor_forge_features::identity::steam_id();
     if steam_id != 0 {
         *destination = steam_id.to_string();
     }
@@ -247,16 +283,16 @@ fn upload_loop(
             let Some(settings) = settings_context() else {
                 break;
             };
-            let Some(descriptor) = vapor_forge_achievement_sync::device_descriptor() else {
+            let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
                 break;
             };
             if let Err(error) =
-                vapor_forge_achievement_sync::ensure_device_bound(&settings, &descriptor)
+                vapor_forge_cloud_cumulus::ensure_device_bound(&settings, &descriptor)
             {
                 warn!(%error, "achievement-sync: device binding deferred");
                 break;
             }
-            let scope = vapor_forge_achievement_sync::upload_scope(&settings);
+            let scope = vapor_forge_sync_state::endpoint_scope(&settings.server_url);
             let mut attempted = false;
             match outbox.lock() {
                 Ok(outbox) => {
@@ -280,7 +316,8 @@ fn upload_loop(
             };
             for schema in &schemas {
                 attempted = true;
-                let result = vapor_forge_achievement_sync::upload_schema(&settings, schema);
+                let result =
+                    vapor_forge_cloud_cumulus::achievement::upload_schema(&settings, schema);
                 let guard = match outbox.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
@@ -337,8 +374,9 @@ fn upload_loop(
             };
             if !events.is_empty() {
                 attempted = true;
-                let result =
-                    vapor_forge_achievement_sync::upload_events(&settings, &identity, &events);
+                let result = vapor_forge_cloud_cumulus::achievement::upload_events(
+                    &settings, &identity, &events,
+                );
                 let mut guard = match outbox.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
@@ -378,7 +416,7 @@ fn upload_loop(
 }
 
 fn persist_current_device_descriptor(outbox: &Arc<Mutex<Outbox>>) {
-    let Some(descriptor) = vapor_forge_achievement_sync::device_descriptor() else {
+    let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
         return;
     };
     match outbox.lock() {
@@ -398,7 +436,7 @@ fn attribute_event(
     settings: &CumulusSettings,
     identity: &UploadIdentity,
 ) {
-    event.owner_scope = vapor_forge_achievement_sync::upload_scope(settings);
+    event.owner_scope = vapor_forge_sync_state::endpoint_scope(&settings.server_url);
     event.owner_steam_id64.clone_from(&identity.steam_id64);
 }
 
@@ -416,13 +454,13 @@ fn settings_context() -> Option<CumulusSettings> {
 }
 
 fn upload_identity() -> Option<UploadIdentity> {
-    let steam_id = vapor_forge_features::rich_presence::local_steamid();
+    let steam_id = vapor_forge_features::identity::steam_id();
     if steam_id == 0 {
         return None;
     }
-    let descriptor = vapor_forge_achievement_sync::device_descriptor()?;
+    let descriptor = vapor_forge_cloud_core::device_descriptor()?;
     Some(UploadIdentity {
-        client_id: Some(descriptor.client_id),
+        client_id: descriptor.client_id,
         machine_name: descriptor.machine_name,
         os_type: descriptor.os_type,
         device_type: descriptor.device_type,
@@ -440,4 +478,63 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(steam_id64: &str) -> UploadIdentity {
+        UploadIdentity {
+            client_id: 7,
+            machine_name: "deck".into(),
+            os_type: None,
+            device_type: None,
+            steam_id64: steam_id64.into(),
+            persona_name: None,
+        }
+    }
+
+    fn event(event_id: &str) -> QueuedAchievementEvent {
+        QueuedAchievementEvent {
+            owner_scope: String::new(),
+            owner_steam_id64: "76561198000000001".into(),
+            event_id: event_id.into(),
+            app_id: 480,
+            achievement_key: "ACH_TEST".into(),
+            kind: "unlock".into(),
+            progress_current: None,
+            progress_max: None,
+            observed_at: 1,
+            unlocked_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn unattributed_events_do_not_match_the_current_account() {
+        let current = identity("76561198000000001");
+        assert!(!owner_matches("", &current));
+        assert!(owner_matches("76561198000000001", &current));
+        assert!(!owner_matches("76561198000000002", &current));
+    }
+
+    #[test]
+    fn restore_pending_recovers_a_poisoned_queue_without_losing_events() {
+        let pending = Arc::new(Mutex::new(VecDeque::from([event("existing")])));
+        let poisoned = Arc::clone(&pending);
+        let panic = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison queue for test");
+        });
+        assert!(panic.is_err());
+
+        restore_pending(&pending, VecDeque::from([event("restored")]));
+
+        let pending = pending.lock().unwrap_or_else(|error| error.into_inner());
+        let ids = pending
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["restored", "existing"]);
+    }
 }

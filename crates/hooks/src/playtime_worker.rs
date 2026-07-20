@@ -1,10 +1,13 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
+use vapor_forge_cloud_cumulus::CumulusSettings;
 use vapor_forge_features::playtime::{PlaytimeGame, PlaytimeSnapshot};
-use vapor_forge_playtime_sync::{CumulusSettings, Outbox, PlaytimeEntry};
+use vapor_forge_sync_state::playtime::{Outbox, PlaytimeEntry};
 
 #[derive(Clone)]
 struct PlaytimeWorker {
@@ -64,7 +67,7 @@ fn worker() -> Option<&'static PlaytimeWorker> {
     if let Some(worker) = WORKER.get() {
         return Some(worker);
     }
-    let path = vapor_forge_playtime_sync::default_outbox_path()?;
+    let path = vapor_forge_sync_state::playtime::default_outbox_path()?;
     let outbox = match Outbox::open(&path) {
         Ok(outbox) => Arc::new(Mutex::new(outbox)),
         Err(error) => {
@@ -113,7 +116,7 @@ fn persist_pending(
         return;
     };
     let owner_scope =
-        vapor_forge_playtime_sync::credential_scope(&settings.server_url, &settings.token);
+        vapor_forge_cloud_core::credential_scope(&settings.server_url, &settings.token);
     let observed_at = unix_now();
     let games = match pending.lock() {
         Ok(mut pending) => pending.drain().collect::<Vec<_>>(),
@@ -188,22 +191,14 @@ fn flush(outbox: &Arc<Mutex<Outbox>>) {
     let Some(settings) = settings_context() else {
         return;
     };
-    let Some(descriptor) = vapor_forge_achievement_sync::device_descriptor() else {
+    let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
         return;
     };
-    let binding_settings = vapor_forge_achievement_sync::CumulusSettings {
-        server_url: settings.server_url.clone(),
-        token: settings.token.clone(),
-        timeout_connect_ms: settings.timeout_connect_ms,
-        timeout_ms: settings.timeout_ms,
-    };
-    if let Err(error) =
-        vapor_forge_achievement_sync::ensure_device_bound(&binding_settings, &descriptor)
-    {
+    if let Err(error) = vapor_forge_cloud_cumulus::ensure_device_bound(&settings, &descriptor) {
         warn!(%error, "playtime-sync: device binding deferred");
         return;
     }
-    let scope = vapor_forge_playtime_sync::credential_scope(&settings.server_url, &settings.token);
+    let scope = vapor_forge_cloud_core::credential_scope(&settings.server_url, &settings.token);
 
     for _ in 0..20 {
         let accounts = match outbox.lock() {
@@ -235,7 +230,7 @@ fn flush(outbox: &Arc<Mutex<Outbox>>) {
                 continue;
             }
             attempted = true;
-            let result = vapor_forge_playtime_sync::upload(
+            let result = vapor_forge_cloud_cumulus::playtime::upload(
                 &settings,
                 descriptor.client_id,
                 &steam_id64,

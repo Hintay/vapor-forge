@@ -16,10 +16,10 @@ use std::sync::Mutex;
 
 use prost::Message;
 use tracing::{debug, info};
-use vapor_forge_abi::*;
 use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_steam_protocol::*;
 
-pub use vapor_forge_packet_inspect::STATS_JOB_NAME;
+pub const STATS_JOB_NAME: &str = vapor_forge_steam_protocol::PLAYER_GET_USER_STATS_JOB_NAME;
 const DEFAULT_REF_STEAMID: u64 = 76561198028121353;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,8 +168,103 @@ pub fn drain_offline_responses() -> Vec<OfflineResponse> {
 // Outgoing request processing (called from send hook)
 // ---------------------------------------------------------------------------
 
-fn should_redirect(app_id: u32, config: &RuntimeConfig) -> bool {
-    crate::apps::classify_app(config, AppId(app_id)).requires_injected_ownership()
+fn should_redirect_with_ownership(
+    app_id: AppId,
+    config: &RuntimeConfig,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> bool {
+    crate::apps::classify_app_with_ownership(config, app_id, ownership)
+        .requires_injected_ownership()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatsSendPlan {
+    Pass,
+    DropOffline {
+        app_id: AppId,
+        job_id: Option<u64>,
+    },
+    Rewrite {
+        app_id: AppId,
+        body: Vec<u8>,
+        donor_steam_id: u64,
+        job_id: Option<u64>,
+        was_probe: bool,
+    },
+}
+
+pub fn plan_send_service_stats(
+    hdr: &CMsgProtoBufHeader,
+    body_bytes: &[u8],
+    config: &RuntimeConfig,
+    stat_steam_ids: &HashMap<AppId, u64>,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> StatsSendPlan {
+    let Ok(mut req) = PlayerGetUserStatsRequest::decode(body_bytes) else {
+        return StatsSendPlan::Pass;
+    };
+    let Some(app_id) = req.appid.map(AppId) else {
+        return StatsSendPlan::Pass;
+    };
+    if !should_redirect_with_ownership(app_id, config, ownership) {
+        return StatsSendPlan::Pass;
+    }
+
+    let Some(job_id) = hdr.jobid_source.filter(|job_id| *job_id != 0) else {
+        return StatsSendPlan::Pass;
+    };
+    if config.achievements.offline_schema {
+        return StatsSendPlan::DropOffline {
+            app_id,
+            job_id: Some(job_id),
+        };
+    }
+
+    let was_probe = req.sha_schema.take().is_some();
+    let donor_steam_id = get_ref_steamid(stat_steam_ids, app_id);
+    req.steamid = Some(donor_steam_id);
+    StatsSendPlan::Rewrite {
+        app_id,
+        body: req.encode_to_vec(),
+        donor_steam_id,
+        job_id: Some(job_id),
+        was_probe,
+    }
+}
+
+pub fn plan_send_legacy_stats(
+    body_bytes: &[u8],
+    config: &RuntimeConfig,
+    stat_steam_ids: &HashMap<AppId, u64>,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> StatsSendPlan {
+    let Ok(mut req) = ClientGetUserStatsRequest::decode(body_bytes) else {
+        return StatsSendPlan::Pass;
+    };
+    let Some(app_id) = req.game_id.map(|game_id| AppId(game_id as u32)) else {
+        return StatsSendPlan::Pass;
+    };
+    if !should_redirect_with_ownership(app_id, config, ownership) {
+        return StatsSendPlan::Pass;
+    }
+    if config.achievements.offline_schema {
+        return StatsSendPlan::DropOffline {
+            app_id,
+            job_id: None,
+        };
+    }
+
+    let was_probe = req.crc_stats.take().is_some() || req.schema_local_version != Some(-1);
+    req.schema_local_version = Some(-1);
+    let donor_steam_id = get_ref_steamid(stat_steam_ids, app_id);
+    req.steam_id_for_user = Some(donor_steam_id);
+    StatsSendPlan::Rewrite {
+        app_id,
+        body: req.encode_to_vec(),
+        donor_steam_id,
+        job_id: None,
+        was_probe,
+    }
 }
 
 /// Process an outgoing ServiceMethod (EMsg 151) Player.GetUserStats#1 request.
@@ -180,39 +275,40 @@ pub fn on_send_service_stats(
     config: &RuntimeConfig,
     stat_steam_ids: &HashMap<AppId, u64>,
 ) -> Option<Vec<u8>> {
-    let mut req = PlayerGetUserStatsRequest::decode(body_bytes).ok()?;
-    let app_id = req.appid?;
-    if !should_redirect(app_id, config) {
-        return None;
+    match plan_send_service_stats(
+        hdr,
+        body_bytes,
+        config,
+        stat_steam_ids,
+        crate::apps::actual_ownership,
+    ) {
+        StatsSendPlan::Pass => None,
+        StatsSendPlan::DropOffline {
+            app_id,
+            job_id: Some(job_id),
+        } => {
+            queue_offline_response(app_id, job_id, hdr);
+            Some(Vec::new())
+        }
+        StatsSendPlan::Rewrite {
+            app_id,
+            body,
+            donor_steam_id,
+            job_id: Some(job_id),
+            was_probe,
+        } => {
+            add_pending(job_id, app_id);
+            info!(
+                app_id = app_id.0,
+                ref_id = donor_steam_id,
+                probe = was_probe,
+                "achievements: redirected stats request"
+            );
+            Some(body)
+        }
+        StatsSendPlan::DropOffline { job_id: None, .. }
+        | StatsSendPlan::Rewrite { job_id: None, .. } => unreachable!("service plan has a job id"),
     }
-
-    let job_id = hdr.jobid_source?;
-    if job_id == 0 {
-        return None;
-    }
-
-    if config.achievements.offline_schema {
-        queue_offline_response(AppId(app_id), job_id, hdr);
-        return Some(Vec::new()); // empty = drop frame
-    }
-
-    let is_probe = req.sha_schema.is_some();
-    if is_probe {
-        req.sha_schema = None;
-    }
-
-    let ref_id = get_ref_steamid(stat_steam_ids, AppId(app_id));
-    req.steamid = Some(ref_id);
-
-    add_pending(job_id, AppId(app_id));
-    info!(
-        app_id,
-        ref_id,
-        probe = is_probe,
-        "achievements: redirected stats request"
-    );
-
-    Some(req.encode_to_vec())
 }
 
 /// Process an outgoing Legacy (EMsg 818) CMsgClientGetUserStats request.
@@ -222,32 +318,40 @@ pub fn on_send_legacy_stats(
     config: &RuntimeConfig,
     stat_steam_ids: &HashMap<AppId, u64>,
 ) -> Option<Vec<u8>> {
-    let mut req = ClientGetUserStatsRequest::decode(body_bytes).ok()?;
-    let game_id = req.game_id?;
-    let app_id = game_id as u32;
-
-    if !should_redirect(app_id, config) {
-        return None;
+    match plan_send_legacy_stats(
+        body_bytes,
+        config,
+        stat_steam_ids,
+        crate::apps::actual_ownership,
+    ) {
+        StatsSendPlan::Pass => None,
+        StatsSendPlan::DropOffline {
+            app_id: _,
+            job_id: None,
+        } => Some(Vec::new()),
+        StatsSendPlan::Rewrite {
+            app_id,
+            body,
+            donor_steam_id,
+            job_id: None,
+            was_probe,
+        } => {
+            add_legacy_pending(app_id);
+            debug!(
+                app_id = app_id.0,
+                ref_id = donor_steam_id,
+                probe = was_probe,
+                "achievements: redirected legacy full-schema request"
+            );
+            Some(body)
+        }
+        StatsSendPlan::DropOffline {
+            job_id: Some(_), ..
+        }
+        | StatsSendPlan::Rewrite {
+            job_id: Some(_), ..
+        } => unreachable!("legacy plan has no job id"),
     }
-
-    if config.achievements.offline_schema {
-        return Some(Vec::new());
-    }
-
-    let is_probe = req.crc_stats.is_some() || req.schema_local_version != Some(-1);
-    req.crc_stats = None;
-    req.schema_local_version = Some(-1);
-
-    let ref_id = get_ref_steamid(stat_steam_ids, AppId(app_id));
-    req.steam_id_for_user = Some(ref_id);
-    add_legacy_pending(AppId(app_id));
-    debug!(
-        app_id,
-        ref_id,
-        probe = is_probe,
-        "achievements: redirected legacy full-schema request"
-    );
-    Some(req.encode_to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +396,7 @@ pub fn on_recv_legacy_stats(
 ) -> Option<(Vec<u8>, Option<CapturedAchievementSchema>)> {
     let mut response = ClientGetUserStatsResponse::decode(body_bytes).ok()?;
     let app_id = AppId(response.game_id? as u32);
-    if !should_redirect(app_id.0, config) {
+    if !should_redirect_with_ownership(app_id, config, crate::apps::actual_ownership) {
         return None;
     }
 
@@ -449,5 +553,66 @@ mod tests {
         assert_eq!(rewritten.crc_stats, None);
         assert_eq!(rewritten.schema_local_version, Some(-1));
         assert_eq!(rewritten.steam_id_for_user, Some(DEFAULT_REF_STEAMID));
+    }
+
+    #[test]
+    fn service_plan_uses_explicit_ownership_and_lua_donor() {
+        let app_id = AppId(3_456_784);
+        let donor = 76561199000000001;
+        let header = CMsgProtoBufHeader {
+            jobid_source: Some(91),
+            ..Default::default()
+        };
+        let request = PlayerGetUserStatsRequest {
+            appid: Some(app_id.0),
+            steamid: Some(76561198000000001),
+            sha_schema: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        let donors = HashMap::from([(app_id, donor)]);
+
+        let StatsSendPlan::Rewrite {
+            body,
+            donor_steam_id,
+            job_id,
+            ..
+        } = plan_send_service_stats(
+            &header,
+            &request.encode_to_vec(),
+            &controlled_config(app_id.0),
+            &donors,
+            |_| crate::apps::OwnershipState::Unowned,
+        )
+        else {
+            panic!("expected a rewrite plan");
+        };
+        let rewritten = PlayerGetUserStatsRequest::decode(body.as_slice()).unwrap();
+        assert_eq!(donor_steam_id, donor);
+        assert_eq!(job_id, Some(91));
+        assert_eq!(rewritten.steamid, Some(donor));
+        assert_eq!(rewritten.sha_schema, None);
+    }
+
+    #[test]
+    fn stats_plans_pass_genuinely_owned_apps() {
+        let app_id = AppId(3_456_785);
+        let header = CMsgProtoBufHeader {
+            jobid_source: Some(92),
+            ..Default::default()
+        };
+        let request = PlayerGetUserStatsRequest {
+            appid: Some(app_id.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_send_service_stats(
+                &header,
+                &request.encode_to_vec(),
+                &controlled_config(app_id.0),
+                &HashMap::new(),
+                |_| crate::apps::OwnershipState::Owned,
+            ),
+            StatsSendPlan::Pass
+        );
     }
 }

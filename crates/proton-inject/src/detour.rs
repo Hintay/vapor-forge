@@ -25,11 +25,11 @@ impl PreparedDetour {
     /// # Safety
     /// `target` must be a mapped executable function address.
     pub unsafe fn prepare(target: usize, hook: usize) -> Option<Self> {
-        let readable = crate::maps::mapping_size_at(target)?.min(MAX_PROLOGUE_SCAN);
+        let readable = crate::maps::executable_span_at(target)?.min(MAX_PROLOGUE_SCAN);
         if readable < ABS_JMP_LEN {
             return None;
         }
-        // SAFETY: mapping_size_at verified that this range is inside one mapping.
+        // SAFETY: executable_span_at verified that this range is inside an executable mapping.
         let prologue = unsafe { std::slice::from_raw_parts(target as *const u8, readable) };
         let (instructions, stolen) = decode_stolen(prologue, target as u64)?;
 

@@ -1,46 +1,66 @@
-// IPC server: accepts connections from vapor-forge-proton-inject helper processes
-// running inside Wine/Proton game instances. Validates per-launch tokens
-// and dispatches game-bridge messages. Achievement persistence and upload are
-// delegated to the independent achievement worker.
+#![forbid(unsafe_code)]
+
+// IPC server for vapor-forge-proton-inject helpers in Wine/Proton processes.
+// It validates reusable per-launch tokens and dispatches diagnostics, Denuvo
+// signals, and DLL injection results.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
-use vapor_forge_achievement_sync::QueuedAchievementEvent;
 use vapor_forge_game_bridge::{self as proto, Message};
 
 struct TokenEntry {
     app_id: u32,
-    owner_steam_id64: String,
-    // Token stays valid for the entire game session. Multiple Wine child
-    // processes (launcher, game, overlay) may connect with the same token.
+    registered_at: Instant,
+    seen_active: bool,
+    // Multiple Wine child processes may share a token. An unused token expires
+    // after startup grace; an active token remains valid until the app stops.
 }
 
 pub struct IpcServer {
     socket_path: String,
     tokens: Arc<Mutex<HashMap<[u8; proto::TOKEN_LEN], TokenEntry>>>,
+    active_connections: Arc<AtomicUsize>,
 }
+
+const TOKEN_STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
+const MAX_SESSION_TOKENS: usize = 1024;
+const MAX_IPC_CONNECTIONS: usize = 128;
 
 impl IpcServer {
     pub fn start() -> Option<Arc<Self>> {
         let socket_path = proto::default_socket_path()?;
 
         let dir = std::path::Path::new(&socket_path).parent()?;
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            warn!(%error, path = %dir.display(), "ipc-server: failed to create socket directory");
+            return None;
+        }
 
         // Set directory permissions to 0700.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(error) =
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            {
+                warn!(%error, path = %dir.display(), "ipc-server: failed to secure socket directory");
+                return None;
+            }
         }
 
         // Remove stale socket from a previous run.
-        let _ = std::fs::remove_file(&socket_path);
+        if let Err(error) = std::fs::remove_file(&socket_path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                warn!(%error, path = %socket_path, "ipc-server: failed to remove stale socket");
+                return None;
+            }
+        }
 
         let listener = match UnixListener::bind(&socket_path) {
             Ok(l) => l,
@@ -49,19 +69,35 @@ impl IpcServer {
                 return None;
             }
         };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!(%error, path = %socket_path, "ipc-server: failed to secure socket");
+                drop(listener);
+                let _ = std::fs::remove_file(&socket_path);
+                return None;
+            }
+        }
 
         info!(path = %socket_path, "ipc-server: listening");
 
         let server = Arc::new(Self {
             socket_path,
             tokens: Arc::new(Mutex::new(HashMap::new())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
         });
 
         let srv = Arc::clone(&server);
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("ipc-server".into())
             .spawn(move || srv.accept_loop(listener))
-            .ok()?;
+        {
+            warn!(%error, "ipc-server: failed to start accept thread");
+            return None;
+        }
 
         Some(server)
     }
@@ -72,29 +108,30 @@ impl IpcServer {
             warn!("ipc-server: token map lock poisoned");
             return;
         };
-        let steam_id = vapor_forge_features::rich_presence::local_steamid();
-        let owner_steam_id64 = if steam_id != 0 {
-            steam_id.to_string()
-        } else {
-            String::new()
-        };
+        let now = Instant::now();
+        tokens.retain(|_, entry| {
+            entry.seen_active
+                || now.saturating_duration_since(entry.registered_at) < TOKEN_STARTUP_GRACE
+        });
+        if tokens.len() == MAX_SESSION_TOKENS {
+            if let Some(oldest) = tokens
+                .iter()
+                .min_by_key(|(_, entry)| entry.registered_at)
+                .map(|(token, _)| *token)
+            {
+                tokens.remove(&oldest);
+            }
+            warn!("ipc-server: token capacity reached, discarded oldest launch token");
+        }
         tokens.insert(
             token,
             TokenEntry {
                 app_id,
-                owner_steam_id64,
+                registered_at: now,
+                seen_active: false,
             },
         );
         debug!(app_id, "ipc-server: token registered");
-    }
-
-    /// Remove a token when the game exits (called from CMsgClientGamesPlayed).
-    pub fn revoke_app_tokens(&self, app_id: u32) {
-        let Ok(mut tokens) = self.tokens.lock() else {
-            warn!("ipc-server: token map lock poisoned");
-            return;
-        };
-        tokens.retain(|_, e| e.app_id != app_id);
     }
 
     pub fn revoke_stopped_app_tokens(&self, active_app_ids: &[u32]) {
@@ -102,7 +139,7 @@ impl IpcServer {
             warn!("ipc-server: token map lock poisoned");
             return;
         };
-        tokens.retain(|_, entry| active_app_ids.contains(&entry.app_id));
+        update_session_tokens(&mut tokens, active_app_ids, Instant::now());
     }
 
     pub fn socket_path(&self) -> &str {
@@ -113,17 +150,66 @@ impl IpcServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
+                    let Some(permit) =
+                        ConnectionPermit::acquire(Arc::clone(&self.active_connections))
+                    else {
+                        warn!(
+                            limit = MAX_IPC_CONNECTIONS,
+                            "ipc-server: connection limit reached"
+                        );
+                        continue;
+                    };
                     let tokens = Arc::clone(&self.tokens);
-                    std::thread::Builder::new()
+                    if let Err(error) = std::thread::Builder::new()
                         .name("ipc-conn".into())
-                        .spawn(move || handle_connection(s, tokens))
-                        .ok();
+                        .spawn(move || handle_connection(s, tokens, permit))
+                    {
+                        warn!(%error, "ipc-server: failed to spawn connection worker");
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "ipc-server: accept error");
                 }
             }
         }
+    }
+}
+
+fn update_session_tokens(
+    tokens: &mut HashMap<[u8; proto::TOKEN_LEN], TokenEntry>,
+    active_app_ids: &[u32],
+    now: Instant,
+) {
+    tokens.retain(|_, entry| {
+        if active_app_ids.contains(&entry.app_id) {
+            entry.seen_active = true;
+            return true;
+        }
+        if entry.seen_active {
+            return false;
+        }
+        now.saturating_duration_since(entry.registered_at) < TOKEN_STARTUP_GRACE
+    });
+}
+
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl ConnectionPermit {
+    fn acquire(active: Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_IPC_CONNECTIONS).then_some(current + 1)
+            })
+            .ok()?;
+        Some(Self { active })
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -136,6 +222,7 @@ impl Drop for IpcServer {
 fn handle_connection(
     mut stream: UnixStream,
     tokens: Arc<Mutex<HashMap<[u8; proto::TOKEN_LEN], TokenEntry>>>,
+    _permit: ConnectionPermit,
 ) {
     let timeout = Duration::from_secs(5);
     let _ = stream.set_read_timeout(Some(timeout));
@@ -150,7 +237,7 @@ fn handle_connection(
         }
     };
 
-    let (app_id, pid, owner_steam_id64) = match hello {
+    let (app_id, pid) = match hello {
         Message::Hello { token, app_id, pid } => {
             // Validate the session token. Don't remove it: multiple Wine
             // child processes (launcher, game, overlay) share the same
@@ -163,7 +250,7 @@ fn handle_connection(
             match guard.get(&token) {
                 Some(e) if e.app_id == app_id => {
                     info!(app_id, pid, "ipc-server: client authenticated");
-                    (app_id, pid, e.owner_steam_id64.clone())
+                    (app_id, pid)
                 }
                 Some(e) => {
                     warn!(
@@ -239,55 +326,10 @@ fn handle_connection(
                     "ipc-server: PE section reported"
                 );
             }
-            Message::AchievementUnlocked {
-                event_id,
-                app_id: aid,
-                achievement_key,
-                observed_at,
-                unlocked_at,
-            } if aid == app_id => {
-                crate::achievement_worker::queue_event(QueuedAchievementEvent {
-                    owner_scope: String::new(),
-                    owner_steam_id64: owner_steam_id64.clone(),
-                    event_id: proto::event_id_to_uuid(&event_id),
-                    app_id,
-                    achievement_key,
-                    kind: "unlock".into(),
-                    progress_current: None,
-                    progress_max: None,
-                    observed_at,
-                    unlocked_at: (unlocked_at > 0).then_some(unlocked_at),
-                });
-            }
-            Message::AchievementProgress {
-                event_id,
-                app_id: aid,
-                achievement_key,
-                current,
-                maximum,
-                observed_at,
-            } if aid == app_id => {
-                if maximum > 0 && current <= maximum {
-                    crate::achievement_worker::queue_event(QueuedAchievementEvent {
-                        owner_scope: String::new(),
-                        owner_steam_id64: owner_steam_id64.clone(),
-                        event_id: proto::event_id_to_uuid(&event_id),
-                        app_id,
-                        achievement_key,
-                        kind: "progress".into(),
-                        progress_current: Some(current),
-                        progress_max: Some(maximum),
-                        observed_at,
-                        unlocked_at: None,
-                    });
-                }
-            }
             Message::DenuvoDetected { app_id: aid }
             | Message::DllLoaded { app_id: aid, .. }
             | Message::DllInjectResult { app_id: aid, .. }
-            | Message::PeSection { app_id: aid, .. }
-            | Message::AchievementUnlocked { app_id: aid, .. }
-            | Message::AchievementProgress { app_id: aid, .. } => {
+            | Message::PeSection { app_id: aid, .. } => {
                 warn!(
                     authenticated = app_id,
                     claimed = aid,
@@ -322,4 +364,52 @@ fn on_denuvo_detected(app_id: u32) {
 
     vapor_forge_features::ticket::add_auto_delegate(aid);
     info!(app_id, "ipc-server: Denuvo detected, auto-delegate enabled");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(app_id: u32, registered_at: Instant) -> TokenEntry {
+        TokenEntry {
+            app_id,
+            registered_at,
+            seen_active: false,
+        }
+    }
+
+    #[test]
+    fn launch_token_survives_until_first_active_update() {
+        let now = Instant::now();
+        let mut tokens = HashMap::from([([1; proto::TOKEN_LEN], entry(480, now))]);
+
+        update_session_tokens(&mut tokens, &[], now);
+        assert_eq!(tokens.len(), 1);
+
+        update_session_tokens(&mut tokens, &[480], now);
+        let token = tokens.values().next().unwrap();
+        assert!(token.seen_active);
+
+        update_session_tokens(&mut tokens, &[], now);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn launch_token_expires_if_game_never_becomes_active() {
+        let now = Instant::now();
+        let registered_at = now.checked_sub(TOKEN_STARTUP_GRACE).unwrap();
+        let mut tokens = HashMap::from([([1; proto::TOKEN_LEN], entry(480, registered_at))]);
+
+        update_session_tokens(&mut tokens, &[], now);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn connection_permits_enforce_and_release_the_limit() {
+        let active = Arc::new(AtomicUsize::new(MAX_IPC_CONNECTIONS - 1));
+        let permit = ConnectionPermit::acquire(Arc::clone(&active)).unwrap();
+        assert!(ConnectionPermit::acquire(Arc::clone(&active)).is_none());
+        drop(permit);
+        assert_eq!(active.load(Ordering::Acquire), MAX_IPC_CONNECTIONS - 1);
+    }
 }

@@ -103,6 +103,8 @@ mod tests {
         let maps = vec![MapEntry {
             base: 0x1000,
             end: 0x2000,
+            perms: "r-xp".into(),
+            offset: 0,
             path: "/some/path/steam_api64.dll".into(),
         }];
         assert!(trigger_already_loaded(&maps));
@@ -110,6 +112,8 @@ mod tests {
         let maps = vec![MapEntry {
             base: 0x1000,
             end: 0x2000,
+            perms: "r-xp".into(),
+            offset: 0,
             path: "/usr/lib/libc.so.6".into(),
         }];
         assert!(!trigger_already_loaded(&maps));

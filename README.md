@@ -7,7 +7,7 @@ Yet another mod for the Linux Steam client, built with Rust.
 - SteamUI library management, purchase time stamps, and app removal
 - Cloud save redirection and sync control
 - Rich presence spoofing and app avatar override
-- Achievement unlock and progress modification
+- Achievement unlock, clear, and progress synchronization
 - In-game toast notifications through CEF injection
 - Proton/Wine per-game native library injection
 - Lua scripting and config hot-reload

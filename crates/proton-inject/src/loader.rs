@@ -96,8 +96,6 @@ pub fn install_trigger() -> bool {
         mark_pending();
         log("trigger already loaded, pending pickup armed");
     }
-    install_loaded_achievement_observer(&maps);
-
     true
 }
 
@@ -133,8 +131,8 @@ pub fn mark_pending() {
     PENDING.store(true, Ordering::Release);
 }
 
-/// Called from the LdrLoadDll hook. Checks if this DLL load is a trigger
-/// and reports PE analysis via IPC.
+/// Called from the LdrLoadDll hook. Reports module observations and activates
+/// injection when a Steam trigger module appears.
 pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
     let dll_name = dll_name_to_string(name);
     if !dll_name.is_empty() {
@@ -156,18 +154,9 @@ pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
     let pending_pickup = PENDING.swap(false, Ordering::AcqRel);
 
     if trigger_seen || pending_pickup {
-        // Connect IPC before loading the helper DLL.
+        // Ensure the asynchronous bridge transport exists before loading the DLL.
         crate::ipc::try_connect();
-        crate::achievement_observer::install_for_module(&dll_name, base_address as usize);
-        let maps = maps::parse_self_maps();
-        install_loaded_achievement_observer(&maps);
         load_helper_now();
-    }
-}
-
-fn install_loaded_achievement_observer(entries: &[maps::MapEntry]) {
-    if let Some(entry) = maps::find_module(entries, "steam_api64.dll") {
-        crate::achievement_observer::install_for_module("steam_api64.dll", entry.base);
     }
 }
 
@@ -180,7 +169,7 @@ fn dll_name_to_string(name: &[u16]) -> String {
 fn scan_loaded_pe(base: *mut core::ffi::c_void) {
     const MAX_HEADER_READ: usize = 4096;
     let addr = base as usize;
-    let readable = crate::maps::mapping_size_at(addr).unwrap_or(0);
+    let readable = crate::maps::readable_span_at(addr).unwrap_or(0);
     if readable == 0 {
         return;
     }

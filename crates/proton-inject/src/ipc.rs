@@ -1,10 +1,8 @@
-// IPC client for communicating with the main vapor-forge process.
-// Connects to a Unix domain socket, authenticates with a per-launch token,
-// then sends PE analysis results and DLL injection status.
-//
-// Gracefully degrades: if the socket is unavailable or the env vars are
-// missing, all operations are silent no-ops. DLL injection still works
-// without IPC.
+// Asynchronous game-bridge client for the Steam runtime hook. A background
+// worker authenticates with the per-launch token, sends diagnostics, and
+// reconnects when transport fails. The bounded queue
+// keeps socket failures off Wine loader threads; DLL injection remains
+// independent of bridge availability.
 
 use std::os::unix::net::UnixStream;
 use std::sync::{mpsc, OnceLock};
@@ -17,8 +15,7 @@ static APP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 static OUTBOUND: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
 const OUTBOUND_CAPACITY: usize = 1024;
 
-/// Start the non-blocking IPC transport. The transport thread establishes the socket
-/// connection when the first message arrives.
+/// Ensure the non-blocking transport exists. It connects when data is queued.
 pub fn try_connect() {
     let _ = outbound();
 }
@@ -112,47 +109,6 @@ pub fn send_pe_section(section_name: &str) {
         app_id,
         section_name: section_name.to_owned(),
     });
-}
-
-pub fn send_achievement_unlocked(achievement_key: &str, unlocked_at: i64) -> bool {
-    let app_id = APP_ID.load(std::sync::atomic::Ordering::Acquire);
-    let Ok(event_id) = proto::generate_event_id() else {
-        return false;
-    };
-    let observed_at = unix_now();
-    send(Message::AchievementUnlocked {
-        event_id,
-        app_id,
-        achievement_key: achievement_key.to_owned(),
-        observed_at,
-        unlocked_at: if unlocked_at > 0 {
-            unlocked_at
-        } else {
-            observed_at
-        },
-    })
-}
-
-pub fn send_achievement_progress(achievement_key: &str, current: u32, maximum: u32) -> bool {
-    let app_id = APP_ID.load(std::sync::atomic::Ordering::Acquire);
-    let Ok(event_id) = proto::generate_event_id() else {
-        return false;
-    };
-    send(Message::AchievementProgress {
-        event_id,
-        app_id,
-        achievement_key: achievement_key.to_owned(),
-        current,
-        maximum,
-        observed_at: unix_now(),
-    })
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 fn send(msg: Message) -> bool {
