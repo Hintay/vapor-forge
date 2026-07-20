@@ -1,7 +1,8 @@
-//! Thin unsafe shell for network packet interception.
+#![forbid(unsafe_code)]
+
+//! Safe routing and state coordination for intercepted Steam network packets.
 //!
-//! Handles manifest request codes and achievement stats at the raw packet layer.
-//! Business logic lives in `vapor_forge_features::{request_code, achievements}`.
+//! Feature decisions live in `vapor_forge_features`.
 
 use prost::Message;
 use std::collections::VecDeque;
@@ -9,22 +10,24 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
-use vapor_forge_abi::{
-    cnet_packet, CMsgProtoBufHeader, EncryptedAppTicket, EncryptedAppTicketRequest,
-    EncryptedAppTicketResponse, GetAppOwnershipTicketRequest, GetAppOwnershipTicketResponse,
-    GetManifestRequestCodeRequest, EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
-    EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
-    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET,
-    EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
-    EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
-    EMSG_SERVICE_METHOD_RESPONSE, EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS,
-    EMSG_STORE_USERSTATS2, ERESULT_OK, K_MSG_HDR_PROTO_FLAG,
-};
 use vapor_forge_features::achievements;
+use vapor_forge_features::identity;
 use vapor_forge_features::request_code::{self, PendingQueue};
 use vapor_forge_features::rich_presence;
 use vapor_forge_features::valve_filter::{self, PrivacyAction};
-use vapor_forge_packet_inspect::{PacketChange, PacketDirection};
+use vapor_forge_packet_capture::{PacketChange, PacketDirection};
+use vapor_forge_steam_protocol::{
+    CMsgProtoBufHeader, EncryptedAppTicketRequest, GetAppOwnershipTicketRequest,
+    GetAppOwnershipTicketResponse, PlayerGetUserStatsRequest, PlayerGetUserStatsResponse,
+    EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
+    EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING, EMSG_ENCRYPTED_APPTICKET_REQUEST,
+    EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB,
+    EMSG_GET_APP_OWNERSHIP_TICKET, EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE,
+    EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS, EMSG_REQUEST_USERSTATS_RESPONSE,
+    EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_SERVICE_METHOD_RESPONSE,
+    EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, ERESULT_OK,
+    FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB, K_MSG_HDR_PROTO_FLAG,
+};
 
 use vapor_forge_config::AppId;
 
@@ -32,11 +35,16 @@ use vapor_forge_config::AppId;
 // Singleton pending queue (manifest request codes)
 // ---------------------------------------------------------------------------
 
-static PENDING: once_cell::sync::Lazy<PendingQueue> = once_cell::sync::Lazy::new(PendingQueue::new);
-static CLOUD_PENDING: once_cell::sync::Lazy<vapor_forge_features::cloud_rpc::CloudRpcQueue> =
-    once_cell::sync::Lazy::new(vapor_forge_features::cloud_rpc::CloudRpcQueue::new);
+pub(super) static PENDING: once_cell::sync::Lazy<PendingQueue> =
+    once_cell::sync::Lazy::new(PendingQueue::new);
+pub(super) static CLOUD_PENDING: once_cell::sync::Lazy<
+    vapor_forge_features::cloud_rpc::CloudRpcQueue,
+> = once_cell::sync::Lazy::new(vapor_forge_features::cloud_rpc::CloudRpcQueue::new);
 const MAX_LOCAL_RESPONSES: usize = 256;
-static LOCAL_RESPONSES: once_cell::sync::Lazy<Mutex<VecDeque<Vec<u8>>>> =
+const MAX_STATS_REQUESTS: usize = 4096;
+pub(super) static LOCAL_RESPONSES: once_cell::sync::Lazy<Mutex<VecDeque<Vec<u8>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
+static STATS_REQUESTS: once_cell::sync::Lazy<Mutex<VecDeque<(u64, u32)>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
 
 // A protected app without AppAvatar must not upload unscoped Rich Presence.
@@ -55,7 +63,7 @@ pub enum SendFrameDecision {
 /// Inspect an outgoing frame and decide whether to pass, drop, or rewrite it.
 pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     let mut decision = SendFrameDecision::Pass;
-    let (emsg_raw, header_bytes, body_bytes) = match vapor_forge_abi::unpack_raw(data) {
+    let (emsg_raw, header_bytes, body_bytes) = match vapor_forge_steam_protocol::unpack_raw(data) {
         Some(v) => v,
         None => {
             crate::packet_capture::capture(
@@ -101,11 +109,7 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             }
         };
 
-        vapor_forge_features::playtime::observe_request(
-            method,
-            &hdr,
-            rich_presence::local_steamid(),
-        );
+        vapor_forge_features::playtime::observe_request(method, &hdr, identity::steam_id());
 
         if method == request_code::TARGET_JOB_NAME {
             if handle_manifest_send(&hdr, header_bytes, body_bytes) {
@@ -172,6 +176,7 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         }
 
         if method == achievements::STATS_JOB_NAME {
+            track_stats_request(&hdr, body_bytes);
             if let Some(new_body) = achievements::on_send_service_stats(
                 &hdr,
                 body_bytes,
@@ -188,7 +193,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                     );
                     return decision;
                 }
-                let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+                let replacement =
+                    vapor_forge_steam_protocol::assemble_raw(emsg_raw, header_bytes, &new_body);
                 crate::packet_capture::capture(
                     PacketDirection::Send,
                     data,
@@ -219,7 +225,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 );
                 return SendFrameDecision::Drop;
             }
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+            let replacement =
+                vapor_forge_steam_protocol::assemble_raw(emsg_raw, header_bytes, &new_body);
             crate::packet_capture::capture(
                 PacketDirection::Send,
                 data,
@@ -260,16 +267,10 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         }
     }
 
-    if emsg == EMSG_ENCRYPTED_APPTICKET_REQUEST {
-        if let Some((app_id, packet)) = local_encrypted_ticket_response(header_bytes, body_bytes) {
-            info!(
-                app_id,
-                "netpacket: answered encrypted ticket request locally"
-            );
-            queue_local_response(packet);
-            capture_dropped(data);
-            return SendFrameDecision::Drop;
-        }
+    if emsg == EMSG_ENCRYPTED_APPTICKET_REQUEST && should_drop_encrypted_ticket_request(body_bytes)
+    {
+        capture_dropped(data);
+        return SendFrameDecision::Drop;
     }
 
     // Rewrite CMsgClientGamesPlayed to substitute avatar AppIds, and track
@@ -297,7 +298,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 );
                 return SendFrameDecision::Pass;
             };
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+            let replacement =
+                vapor_forge_steam_protocol::assemble_raw(emsg_raw, header_bytes, &new_body);
             crate::packet_capture::capture(
                 PacketDirection::Send,
                 data,
@@ -311,7 +313,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     // Capture rich presence KVs for the currently tracked (avatared) AppId.
     if emsg == EMSG_CLIENT_RICH_PRESENCE_UPLOAD {
         capture_local_steamid(header_bytes);
-        if let Ok(upload) = vapor_forge_abi::ClientRichPresenceUpload::decode(body_bytes) {
+        if let Ok(upload) = vapor_forge_steam_protocol::ClientRichPresenceUpload::decode(body_bytes)
+        {
             if let Some(kv_data) = &upload.rich_presence_kv {
                 rich_presence::on_rich_presence_upload(kv_data);
             }
@@ -333,7 +336,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         let ss = &runtime.script_state;
         if !ss.access_tokens.is_empty() {
             if let Some(new_body) = inject_access_tokens(body_bytes, &ss.access_tokens, &ss.apps) {
-                let replacement = vapor_forge_abi::assemble_raw(emsg_raw, header_bytes, &new_body);
+                let replacement =
+                    vapor_forge_steam_protocol::assemble_raw(emsg_raw, header_bytes, &new_body);
                 crate::packet_capture::capture(
                     PacketDirection::Send,
                     data,
@@ -353,8 +357,14 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 fn capture_local_steamid(header_bytes: &[u8]) {
     if let Ok(hdr) = CMsgProtoBufHeader::decode(header_bytes) {
         if let Some(steamid) = hdr.steamid {
-            rich_presence::set_local_steamid(steamid);
+            observe_local_steamid(steamid);
         }
+    }
+}
+
+fn observe_local_steamid(steamid: u64) {
+    if identity::observe_steam_id(steamid) {
+        rich_presence::reset_account_state();
     }
 }
 
@@ -404,47 +414,27 @@ fn local_ownership_ticket_response(
     ))
 }
 
-fn local_encrypted_ticket_response(
-    header_bytes: &[u8],
-    body_bytes: &[u8],
-) -> Option<(u32, Vec<u8>)> {
-    let request = EncryptedAppTicketRequest::decode(body_bytes).ok()?;
-    let app_id = request.app_id.filter(|app_id| *app_id != 0)?;
-    let runtime = crate::client::install::runtime_snapshot();
-    if !vapor_forge_features::apps::classify_app(&runtime.config, AppId(app_id))
-        .requires_injected_ownership()
-    {
-        return None;
-    }
-    let encrypted_ticket = crate::client::install::TICKET_CACHE
-        .get_enc_ticket(AppId(app_id), &runtime.script_state.enc_tickets)
-        .map(|data| EncryptedAppTicket {
-            encrypted_ticket: Some(data),
-            ..Default::default()
-        });
-    let response = EncryptedAppTicketResponse {
-        app_id: Some(app_id),
-        eresult: Some(if encrypted_ticket.is_some() {
-            ERESULT_OK
-        } else {
-            2
-        }),
-        encrypted_app_ticket: encrypted_ticket,
+fn should_drop_encrypted_ticket_request(body_bytes: &[u8]) -> bool {
+    let Ok(request) = EncryptedAppTicketRequest::decode(body_bytes) else {
+        return false;
     };
-    Some((
-        app_id,
-        valve_filter::emsg_response(
-            EMSG_ENCRYPTED_APPTICKET_RESPONSE,
-            header_bytes,
-            response.encode_to_vec(),
-        ),
-    ))
+    let Some(app_id) = request.app_id.filter(|id| *id != 0) else {
+        return false;
+    };
+    let drop = crate::client::eticket::take_local_eticket_request(AppId(app_id));
+    if drop {
+        info!(
+            app_id,
+            "netpacket: dropping encrypted ticket request (local completion reserved)"
+        );
+    }
+    drop
 }
 
 /// Feed the outgoing CMsgClientGamesPlayed body to rich_presence so it can
 /// track which real AppId (pre-avatar-rewrite) is currently being played.
 fn track_games_played(body_bytes: &[u8], runtime: &crate::client::install::RuntimeSnapshot) {
-    let Ok(msg) = vapor_forge_abi::CMsgClientGamesPlayed::decode(body_bytes) else {
+    let Ok(msg) = vapor_forge_steam_protocol::CMsgClientGamesPlayed::decode(body_bytes) else {
         return;
     };
     let app_ids: Vec<AppId> = msg
@@ -486,9 +476,9 @@ fn reset_stopped_delegate_windows(
 fn inject_access_tokens(
     body_bytes: &[u8],
     tokens: &std::collections::HashMap<AppId, u64>,
-    controlled_apps: &[AppId],
+    controlled_apps: &std::collections::HashSet<AppId>,
 ) -> Option<Vec<u8>> {
-    let mut req = vapor_forge_abi::PicsProductInfoRequest::decode(body_bytes).ok()?;
+    let mut req = vapor_forge_steam_protocol::PicsProductInfoRequest::decode(body_bytes).ok()?;
     let mut changed = false;
     for app in &mut req.apps {
         let app_id = AppId(app.appid.unwrap_or(0));
@@ -510,24 +500,24 @@ fn inject_access_tokens(
 }
 
 fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_bytes: &[u8]) -> bool {
-    let req = match GetManifestRequestCodeRequest::decode(body_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("netpacket: failed to decode manifest request: {}", e);
+    let fetch = match request_code::plan_fetch(hdr, header_bytes, body_bytes) {
+        Ok(fetch) => fetch,
+        Err(request_code::ManifestFetchError::Decode(error)) => {
+            warn!(%error, "netpacket: failed to decode manifest request");
             return false;
         }
-    };
-
-    let app_id = req.app_id.unwrap_or(0);
-    let depot_id = req.depot_id.unwrap_or(0);
-    let gid = req.manifest_id.unwrap_or(0);
-    let job_id = match hdr.jobid_source {
-        Some(id) if id != 0 => id,
-        _ => {
+        Err(request_code::ManifestFetchError::MissingJobId) => {
             debug!("netpacket: missing or zero jobid_source, passing through");
             return false;
         }
     };
+    let request_code::ManifestCodeFetch {
+        job_id,
+        app_id,
+        depot_id,
+        gid,
+        req_hdr_bytes,
+    } = fetch;
 
     let runtime = crate::client::install::runtime_snapshot();
     let cfg = &runtime.config;
@@ -551,170 +541,29 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
             app_id,
             depot_id,
             gid,
-            req_hdr_bytes: header_bytes.to_vec(),
+            req_hdr_bytes,
         },
         cfg,
         lua_callback,
     )
 }
 
-// ---------------------------------------------------------------------------
-// try_inject called from RecvPkt hook
-// ---------------------------------------------------------------------------
-
-/// Check for pending responses and inject them via carrier packet.
-///
-/// # Safety
-/// `this` and `packet` must be valid pointers as passed to RecvPkt.
-pub unsafe fn try_inject<F>(
-    this: *mut std::ffi::c_void,
-    packet: *mut std::ffi::c_void,
-    call_original: F,
-) where
-    F: Fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
-{
-    let rp_inject_due = rich_presence::tracked_app().0 != 0 && rich_presence::has_inject_pending();
-    if PENDING.is_empty()
-        && CLOUD_PENDING.is_empty()
-        && LOCAL_RESPONSES.lock().unwrap().is_empty()
-        && !achievements::has_offline_responses()
-        && !rp_inject_due
-    {
-        return;
-    }
-
-    if packet.is_null() {
-        return;
-    }
-
-    // Inject manifest request code responses
-    let completed = PENDING.drain_completed();
-    for entry in completed {
-        let response_bytes = request_code::build_response_packet(
-            &entry.req_hdr_bytes,
-            entry.job_id,
-            entry.gid,
-            entry.code,
-        );
-        info!(
-            gid = entry.gid,
-            job_id = entry.job_id,
-            code = entry.code,
-            "netpacket: injecting manifest response"
-        );
-        crate::packet_capture::capture(
-            PacketDirection::Recv,
-            &response_bytes,
-            PacketChange::Injected,
-            None,
-        );
-        // SAFETY: packet is valid for this callback and the guard restores it.
-        let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
-        call_original(this, packet);
-    }
-
-    // Inject Cumulus-backed Steam client Cloud service responses.
-    for response_bytes in CLOUD_PENDING.drain_completed() {
-        // Upload responses carry the Cumulus bearer token in HTTP headers, so
-        // they must not be retained by the diagnostic packet capture.
-        // SAFETY: packet is valid for this callback and the guard restores it.
-        let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
-        call_original(this, packet);
-    }
-
-    // Inject synchronous local privacy responses.
-    let local_responses = std::mem::take(&mut *LOCAL_RESPONSES.lock().unwrap());
-    for response_bytes in local_responses {
-        crate::packet_capture::capture(
-            PacketDirection::Recv,
-            &response_bytes,
-            PacketChange::Injected,
-            None,
-        );
-        // SAFETY: packet is valid for this callback and the guard restores it.
-        let _guard = unsafe { PacketSwapGuard::new(packet, response_bytes) };
-        call_original(this, packet);
-    }
-
-    // Inject offline achievement responses
-    let offline = achievements::drain_offline_responses();
-    for resp in offline {
-        crate::packet_capture::capture(
-            PacketDirection::Recv,
-            &resp.packet,
-            PacketChange::Injected,
-            None,
-        );
-        // SAFETY: packet is valid for this callback and the guard restores it.
-        let _guard = unsafe { PacketSwapGuard::new(packet, resp.packet) };
-        call_original(this, packet);
-    }
-
-    // Inject a manufactured PersonaState carrying the real AppId and rich
-    // presence KVs, once per tracking/KV change, so friends get an update
-    // even when Valve's server never broadcasts one for an unowned AppId.
-    if rp_inject_due && rich_presence::take_inject_pending() {
-        let app = rich_presence::tracked_app();
-        match rich_presence::build_inject_packet(app) {
-            Some(inject_bytes) => {
-                info!(
-                    app = app.0,
-                    "netpacket: injecting manufactured PersonaState"
-                );
-                crate::packet_capture::capture(
-                    PacketDirection::Recv,
-                    &inject_bytes,
-                    PacketChange::Injected,
-                    None,
-                );
-                // SAFETY: packet is valid for this callback and the guard restores it.
-                let _guard = unsafe { PacketSwapGuard::new(packet, inject_bytes) };
-                call_original(this, packet);
-            }
-            None => {
-                // Self PersonaState not cached yet (or no local SteamID seen).
-                // Retry on the next RecvPkt instead of dropping the update.
-                rich_presence::mark_inject_pending();
-            }
-        }
-    }
-}
-
-/// Process an incoming RecvPkt for achievement stats stripping.
-/// Called from the RecvPkt hook AFTER call_original.
-///
-/// # Safety
-/// `packet` must be a valid CNetPacket pointer.
-pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
-    if packet.is_null() {
-        return;
-    }
-    // SAFETY: packet is the non-null CNetPacket supplied by Steam.
-    let p_data = unsafe { cnet_packet::data_slot(packet) };
-    // SAFETY: packet is the same validated CNetPacket.
-    let p_size = unsafe { cnet_packet::size_slot(packet) };
-    // SAFETY: both slots point into the live CNetPacket.
-    let data = unsafe { *p_data };
-    // SAFETY: both slots point into the live CNetPacket.
-    let size = unsafe { *p_size };
-    if data.is_null() || size == 0 {
-        return;
-    }
-
-    // SAFETY: Steam's packet supplies a non-null data pointer and byte size.
-    let buf = unsafe { std::slice::from_raw_parts(data, size as usize) };
-    let Some((emsg_raw, hdr_bytes, body_bytes)) = vapor_forge_abi::unpack_raw(buf) else {
+/// Process an incoming frame after Steam has handled the real packet.
+pub(super) fn process_recv_frame(buf: &[u8]) -> Option<Vec<u8>> {
+    let Some((emsg_raw, hdr_bytes, body_bytes)) = vapor_forge_steam_protocol::unpack_raw(buf)
+    else {
         crate::packet_capture::capture(
             PacketDirection::Recv,
             buf,
             PacketChange::DecodeFailed,
             None,
         );
-        return;
+        return None;
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
     let mut change = PacketChange::Unchanged;
     let mut final_len = None;
+    let mut replacement = None;
 
     // ServiceMethod response (147): playtime observation and achievement stats.
     if emsg == EMSG_SERVICE_METHOD_RESPONSE {
@@ -725,31 +574,35 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
                 PacketChange::DecodeFailed,
                 None,
             );
-            return;
+            return None;
         };
-        if let Some(snapshot) = vapor_forge_features::playtime::observe_response(
-            &hdr,
-            body_bytes,
-            rich_presence::local_steamid(),
-        ) {
-            rich_presence::set_local_steamid(snapshot.steam_id64);
+        if let Some(snapshot) =
+            vapor_forge_features::playtime::observe_response(&hdr, body_bytes, identity::steam_id())
+        {
+            observe_local_steamid(snapshot.steam_id64);
             crate::playtime_worker::queue(snapshot);
         }
+        let observed_app_id = hdr.jobid_target.and_then(take_stats_request);
+        let original_stats = PlayerGetUserStatsResponse::decode(body_bytes).ok();
         if let Some((new_hdr, new_body, schema)) =
             achievements::on_recv_service_stats(&hdr, body_bytes)
         {
             if let Some(schema) = schema {
+                crate::client::achievement::register_packet_schema(schema.app_id, &schema.content);
                 crate::achievement_worker::queue_schema(
                     schema.app_id,
                     schema.schema_version,
                     schema.content,
                 );
             }
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, &new_hdr, &new_body);
-            final_len = Some(replacement.len());
-            // SAFETY: packet remains valid for this hook callback.
-            unsafe { replace_packet_data(packet, replacement) };
+            let rewritten = vapor_forge_steam_protocol::assemble_raw(emsg_raw, &new_hdr, &new_body);
+            final_len = Some(rewritten.len());
+            replacement = Some(rewritten);
             change = PacketChange::Rewritten;
+        } else if let (Some(app_id), Some(response)) = (observed_app_id, original_stats) {
+            if let Some(schema) = response.schema {
+                crate::client::achievement::register_packet_schema(app_id, &schema);
+            }
         }
     }
 
@@ -762,16 +615,16 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
                 PacketChange::DecodeFailed,
                 None,
             );
-            return;
+            return None;
         };
         if let Some(method) = hdr.target_job_name.as_deref() {
             if let Some(snapshot) = vapor_forge_features::playtime::observe_notification(
                 method,
                 &hdr,
                 body_bytes,
-                rich_presence::local_steamid(),
+                identity::steam_id(),
             ) {
-                rich_presence::set_local_steamid(snapshot.steam_id64);
+                observe_local_steamid(snapshot.steam_id64);
                 crate::playtime_worker::queue(snapshot);
             }
         }
@@ -780,29 +633,39 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     // Legacy response (819): keep schema, remove reference-account values.
     if emsg == EMSG_REQUEST_USERSTATS_RESPONSE {
         let config = crate::client::install::config();
+        let original_stats =
+            vapor_forge_steam_protocol::ClientGetUserStatsResponse::decode(body_bytes).ok();
         if let Some((new_body, schema)) = achievements::on_recv_legacy_stats(body_bytes, &config) {
             if let Some(schema) = schema {
+                crate::client::achievement::register_packet_schema(schema.app_id, &schema.content);
                 crate::achievement_worker::queue_schema(
                     schema.app_id,
                     schema.schema_version,
                     schema.content,
                 );
             }
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
-            final_len = Some(replacement.len());
-            // SAFETY: packet remains valid for this hook callback.
-            unsafe { replace_packet_data(packet, replacement) };
+            let rewritten =
+                vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(rewritten.len());
+            replacement = Some(rewritten);
             change = PacketChange::Rewritten;
+        } else if let Some(response) = original_stats {
+            if let Some(game_id) = response.game_id {
+                let app_id = app_id(game_id);
+                if let Some(schema) = response.schema {
+                    crate::client::achievement::register_packet_schema(app_id, &schema);
+                }
+            }
         }
     }
 
     // Encrypted app ticket response (5527): cache or inject from Lua/cache
     if emsg == EMSG_ENCRYPTED_APPTICKET_RESPONSE {
         if let Some(new_body) = handle_encrypted_ticket_response(body_bytes) {
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
-            final_len = Some(replacement.len());
-            // SAFETY: packet remains valid for this hook callback.
-            unsafe { replace_packet_data(packet, replacement) };
+            let rewritten =
+                vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(rewritten.len());
+            replacement = Some(rewritten);
             change = PacketChange::Rewritten;
         }
     }
@@ -813,32 +676,99 @@ pub unsafe fn on_recv_packet(packet: *mut std::ffi::c_void) {
     if emsg == EMSG_CLIENT_PERSONA_STATE {
         rich_presence::cache_self_persona(hdr_bytes, body_bytes);
         if let Some(new_body) = rich_presence::patch_persona_state(body_bytes) {
-            let replacement = vapor_forge_abi::assemble_raw(emsg_raw, hdr_bytes, &new_body);
-            final_len = Some(replacement.len());
-            // SAFETY: packet remains valid for this hook callback.
-            unsafe { replace_packet_data(packet, replacement) };
+            let rewritten =
+                vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+            final_len = Some(rewritten.len());
+            replacement = Some(rewritten);
             change = PacketChange::Rewritten;
         }
     }
 
+    // SharedLibraryStopPlaying (9406): server tells the borrower to stop the
+    // family-shared app because the real owner just started playing. Blank
+    // the body so the client processes it as a no-op.
+    if emsg == EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING {
+        let rewritten = vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &[]);
+        info!("netpacket: cleared SharedLibraryStopPlaying body");
+        final_len = Some(rewritten.len());
+        replacement = Some(rewritten);
+        change = PacketChange::Rewritten;
+    }
+
+    // FamilyGroupsClient.NotifyRunningApps#1: server notifies the family group
+    // that the borrower is running an app; same suppression as above so the
+    // owner side never gets asked to kick us.
+    if emsg == EMSG_SERVICE_METHOD_RESPONSE {
+        if let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) {
+            if hdr.target_job_name.as_deref() == Some(FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB) {
+                let rewritten = vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &[]);
+                info!("netpacket: cleared FamilyGroupsClient.NotifyRunningApps body");
+                final_len = Some(rewritten.len());
+                replacement = Some(rewritten);
+                change = PacketChange::Rewritten;
+            }
+        }
+    }
+
     crate::packet_capture::capture(PacketDirection::Recv, buf, change, final_len);
+    replacement
+}
+
+fn track_stats_request(header: &CMsgProtoBufHeader, body: &[u8]) {
+    let Some(job_id) = header.jobid_source.filter(|job_id| *job_id != 0) else {
+        return;
+    };
+    let Some(app_id) = PlayerGetUserStatsRequest::decode(body)
+        .ok()
+        .and_then(|request| request.appid)
+        .filter(|app_id| *app_id != 0)
+    else {
+        return;
+    };
+    let mut requests = STATS_REQUESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    requests.retain(|(existing, _)| *existing != job_id);
+    if requests.len() == MAX_STATS_REQUESTS {
+        requests.pop_front();
+    }
+    requests.push_back((job_id, app_id));
+}
+
+fn take_stats_request(job_id: u64) -> Option<u32> {
+    let mut requests = STATS_REQUESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let position = requests
+        .iter()
+        .position(|(pending, _)| *pending == job_id)?;
+    requests.remove(position).map(|(_, app_id)| app_id)
+}
+
+fn app_id(game_id: u64) -> u32 {
+    game_id as u32 & 0x00ff_ffff
 }
 
 fn handle_encrypted_ticket_response(body_bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut resp = vapor_forge_abi::EncryptedAppTicketResponse::decode(body_bytes).ok()?;
+    let mut resp =
+        vapor_forge_steam_protocol::EncryptedAppTicketResponse::decode(body_bytes).ok()?;
     let app_id = AppId(resp.app_id.unwrap_or(0));
     let eresult = resp.eresult.unwrap_or(2);
 
     let ticket_cache = &*crate::client::install::TICKET_CACHE;
     let runtime = crate::client::install::runtime_snapshot();
     let ss = &runtime.script_state;
+    let cfg = &runtime.config;
+    let controlled = cfg.is_controlled_app(app_id);
 
-    if eresult == vapor_forge_abi::ERESULT_OK {
-        // Success: cache the ticket for future use
+    if eresult == vapor_forge_steam_protocol::ERESULT_OK {
+        // Success: cache the ticket for future use. For controlled apps we
+        // additionally override Steam's response with our cache/Lua ticket if
+        // one is configured, so the game side always ends up with the ticket
+        // we control instead of whatever the CM sent.
         if let Some(ticket) = &resp.encrypted_app_ticket {
             if let Some(data) = &ticket.encrypted_ticket {
-                let cfg = &runtime.config;
-                let persist = if cfg.is_controlled_app(app_id) {
+                let persist = if controlled {
                     cfg.ticket_mode(app_id) == vapor_forge_config::TicketMode::Delegate
                 } else {
                     cfg.ticket.cache == vapor_forge_config::TicketCacheMode::Disk
@@ -846,93 +776,32 @@ fn handle_encrypted_ticket_response(body_bytes: &[u8]) -> Option<Vec<u8>> {
                 ticket_cache.store_enc_ticket(app_id, data.clone(), persist);
             }
         }
+        if controlled {
+            if let Some(data) = ticket_cache.get_enc_ticket(app_id, &ss.enc_tickets) {
+                let already_matches = resp
+                    .encrypted_app_ticket
+                    .as_ref()
+                    .and_then(|t| t.encrypted_ticket.as_ref())
+                    .is_some_and(|existing| existing == &data);
+                if !already_matches {
+                    let ticket = resp
+                        .encrypted_app_ticket
+                        .get_or_insert_with(Default::default);
+                    ticket.encrypted_ticket = Some(data);
+                    info!(
+                        app_id = app_id.0,
+                        "netpacket: encrypted ticket overridden with cached copy"
+                    );
+                    return Some(resp.encode_to_vec());
+                }
+            }
+        }
         return None;
     }
 
-    // Failed: try Lua-provided or cached encrypted ticket
-    if let Some(data) = ticket_cache.get_enc_ticket(app_id, &ss.enc_tickets) {
-        resp.eresult = Some(vapor_forge_abi::ERESULT_OK);
-        let ticket = resp
-            .encrypted_app_ticket
-            .get_or_insert_with(Default::default);
-        ticket.encrypted_ticket = Some(data);
-        info!(
-            app_id = app_id.0,
-            "netpacket: encrypted ticket injected from cache/lua"
-        );
-        return Some(resp.encode_to_vec());
-    }
-
+    // IPC layer (eticket hooks + SetAPICallResult) handles failure recovery
+    // for controlled apps; no netpacket-layer injection needed.
     None
-}
-
-/// Replace CNetPacket data with new bytes (for recv-side rewriting).
-///
-/// # Safety
-/// `packet` must be a valid CNetPacket pointer.
-unsafe fn replace_packet_data(packet: *mut std::ffi::c_void, data: Vec<u8>) {
-    // Leak the vec so the pointer remains valid for Steam to process.
-    // This is intentional. The packet is consumed once by Steam and then
-    // the CNetPacket is released. The leaked bytes are small (< 1 KB).
-    let boxed = data.into_boxed_slice();
-    let len = boxed.len() as u32;
-    let ptr = Box::into_raw(boxed) as *mut u8;
-
-    // SAFETY: packet is valid and ptr remains allocated for process lifetime.
-    unsafe { cnet_packet::set_data(packet, ptr, len) };
-}
-
-// ---------------------------------------------------------------------------
-// RAII guard for CNetPacket data swap
-// ---------------------------------------------------------------------------
-
-struct PacketSwapGuard {
-    p_data: *mut *mut u8,
-    p_size: *mut u32,
-    orig_data: *mut u8,
-    orig_size: u32,
-    _response: Box<[u8]>,
-}
-
-impl PacketSwapGuard {
-    /// # Safety
-    /// `packet` must be a valid CNetPacket pointer.
-    unsafe fn new(packet: *mut std::ffi::c_void, response: Vec<u8>) -> Self {
-        // SAFETY: caller guarantees packet is a valid CNetPacket.
-        let p_data = unsafe { cnet_packet::data_slot(packet) };
-        // SAFETY: caller guarantees packet is a valid CNetPacket.
-        let p_size = unsafe { cnet_packet::size_slot(packet) };
-        // SAFETY: the slots above point into the live packet.
-        let orig_data = unsafe { *p_data };
-        // SAFETY: the slots above point into the live packet.
-        let orig_size = unsafe { *p_size };
-
-        let mut response_box = response.into_boxed_slice();
-        // SAFETY: both slots point into the live packet and response_box stays
-        // owned by the guard until restoration.
-        unsafe {
-            *p_data = response_box.as_mut_ptr();
-            *p_size = response_box.len() as u32;
-        }
-
-        Self {
-            p_data,
-            p_size,
-            orig_data,
-            orig_size,
-            _response: response_box,
-        }
-    }
-}
-
-impl Drop for PacketSwapGuard {
-    fn drop(&mut self) {
-        // SAFETY: the guard cannot outlive the packet callback that created it.
-        unsafe {
-            *self.p_data = self.orig_data;
-            *self.p_size = self.orig_size;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -943,19 +812,19 @@ mod tests {
 
     #[test]
     fn access_tokens_require_addappid_and_skip_zero() {
-        let request = vapor_forge_abi::PicsProductInfoRequest {
+        let request = vapor_forge_steam_protocol::PicsProductInfoRequest {
             apps: vec![
-                vapor_forge_abi::PicsAppInfo {
+                vapor_forge_steam_protocol::PicsAppInfo {
                     appid: Some(480),
                     access_token: None,
                     only_public_obsolete: None,
                 },
-                vapor_forge_abi::PicsAppInfo {
+                vapor_forge_steam_protocol::PicsAppInfo {
                     appid: Some(730),
                     access_token: Some(7),
                     only_public_obsolete: None,
                 },
-                vapor_forge_abi::PicsAppInfo {
+                vapor_forge_steam_protocol::PicsAppInfo {
                     appid: Some(999),
                     access_token: None,
                     only_public_obsolete: None,
@@ -965,11 +834,13 @@ mod tests {
         };
         let tokens = HashMap::from([(AppId(480), 42), (AppId(730), 0), (AppId(999), 99)]);
 
+        let controlled: std::collections::HashSet<AppId> =
+            [AppId(480), AppId(730)].into_iter().collect();
         let rewritten =
-            inject_access_tokens(&request.encode_to_vec(), &tokens, &[AppId(480), AppId(730)])
+            inject_access_tokens(&request.encode_to_vec(), &tokens, &controlled).unwrap();
+        let rewritten =
+            vapor_forge_steam_protocol::PicsProductInfoRequest::decode(rewritten.as_slice())
                 .unwrap();
-        let rewritten =
-            vapor_forge_abi::PicsProductInfoRequest::decode(rewritten.as_slice()).unwrap();
         assert_eq!(rewritten.apps[0].access_token, Some(42));
         assert_eq!(rewritten.apps[1].access_token, Some(7));
         assert_eq!(rewritten.apps[2].access_token, None);
@@ -977,8 +848,8 @@ mod tests {
 
     #[test]
     fn access_token_rewrite_is_none_without_eligible_apps() {
-        let request = vapor_forge_abi::PicsProductInfoRequest {
-            apps: vec![vapor_forge_abi::PicsAppInfo {
+        let request = vapor_forge_steam_protocol::PicsProductInfoRequest {
+            apps: vec![vapor_forge_steam_protocol::PicsAppInfo {
                 appid: Some(480),
                 access_token: None,
                 only_public_obsolete: None,
@@ -987,6 +858,7 @@ mod tests {
         };
         let tokens = HashMap::from([(AppId(480), 42)]);
 
-        assert!(inject_access_tokens(&request.encode_to_vec(), &tokens, &[]).is_none());
+        let empty: std::collections::HashSet<AppId> = std::collections::HashSet::new();
+        assert!(inject_access_tokens(&request.encode_to_vec(), &tokens, &empty).is_none());
     }
 }

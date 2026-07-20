@@ -117,7 +117,7 @@ mod linux_audit {
         let steamclient_seen = STEAM_MODULES.steamclient_seen();
         let steamui_seen = STEAM_MODULES.steamui_seen();
 
-        use vapor_forge_hooks::install::{
+        use vapor_forge_hooks::{
             ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
         };
 
@@ -135,7 +135,7 @@ mod linux_audit {
             !steamclient_seen || is_hook_batch_finished(HookBatch::SteamClient);
         let steamui_finished = !steamui_seen || is_hook_batch_finished(HookBatch::SteamUi);
         if (steamclient_seen || steamui_seen) && steamclient_finished && steamui_finished {
-            vapor_forge_hooks::detour::restore_trampoline_pages_rx();
+            vapor_forge_hooks::restore_trampoline_pages_rx();
         }
     }
 

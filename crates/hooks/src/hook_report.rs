@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]

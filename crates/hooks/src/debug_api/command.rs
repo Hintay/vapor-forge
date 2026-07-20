@@ -1,9 +1,6 @@
-use std::fmt::Write;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::Ordering;
-
 use serde_json::json;
-use vapor_forge_packet_inspect::{PacketChange, PacketDirection, PacketSummary, PacketType};
+use std::fmt::Write;
+use vapor_forge_packet_capture::{PacketChange, PacketDirection, PacketSummary, PacketType};
 
 use super::toast_args::{default_toast_style, parse_toast_args, toast_kind_name, toast_style_name};
 use super::{DebugTarget, DEFAULT_DURATION_MS, DEFAULT_TOAST_BODY};
@@ -476,12 +473,12 @@ fn ownership_label(state: vapor_forge_features::apps::OwnershipState) -> &'stati
 
 fn pkg0_response(json_mode: bool) -> String {
     #[cfg(target_os = "linux")]
-    let pkg0_captured = crate::client::package::PKG0_PTR.load(Ordering::Acquire) != 0;
+    let pkg0_captured = crate::client::package::pkg0_captured();
     #[cfg(not(target_os = "linux"))]
     let pkg0_captured = false;
 
     #[cfg(target_os = "linux")]
-    let cuser_captured = crate::client::package::CUSER_PTR.load(Ordering::Acquire) != 0;
+    let cuser_captured = crate::client::package::cuser_captured();
     #[cfg(not(target_os = "linux"))]
     let cuser_captured = false;
 

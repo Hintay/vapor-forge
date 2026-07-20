@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use tracing::{info, warn};
 
-type ExecuteJavaScriptFn = extern "C" fn(*mut c_void, *const c_char);
+type ExecuteJavaScriptFn = unsafe extern "C" fn(*mut c_void, *const c_char);
 
 const CHTML_WINDOW_RTTI_NAME: &[u8] = b"11CHTMLWindow\0";
 const CHTML_WINDOW_MIN_SIZE: usize = 0x3c;
@@ -54,7 +54,8 @@ pub(super) fn execute_javascript(script: &str) -> bool {
     // that same vtable before calling.
     let execute: ExecuteJavaScriptFn = unsafe { std::mem::transmute(exec_addr) };
     for window in windows {
-        execute(window as *mut c_void, script_cstr.as_ptr());
+        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+        unsafe { execute(window as *mut c_void, script_cstr.as_ptr()) };
     }
     true
 }

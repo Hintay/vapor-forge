@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod command;
 mod server;
 mod toast_args;

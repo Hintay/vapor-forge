@@ -417,9 +417,9 @@ fn packet_capture_filters_limits_and_exposes_raw_packets() {
     );
 
     crate::packet_capture::capture(
-        vapor_forge_packet_inspect::PacketDirection::Send,
+        vapor_forge_packet_capture::PacketDirection::Send,
         b"filtered",
-        vapor_forge_packet_inspect::PacketChange::Unchanged,
+        vapor_forge_packet_capture::PacketChange::Unchanged,
         None,
     );
     for raw in [
@@ -428,9 +428,9 @@ fn packet_capture_filters_limits_and_exposes_raw_packets() {
         b"third".as_slice(),
     ] {
         crate::packet_capture::capture(
-            vapor_forge_packet_inspect::PacketDirection::Recv,
+            vapor_forge_packet_capture::PacketDirection::Recv,
             raw,
-            vapor_forge_packet_inspect::PacketChange::Unchanged,
+            vapor_forge_packet_capture::PacketChange::Unchanged,
             None,
         );
     }
@@ -442,7 +442,7 @@ fn packet_capture_filters_limits_and_exposes_raw_packets() {
     assert!(packets[0].summary.id < packets[1].summary.id);
     assert_eq!(
         packets[0].summary.change,
-        vapor_forge_packet_inspect::PacketChange::DecodeFailed
+        vapor_forge_packet_capture::PacketChange::DecodeFailed
     );
 
     let list = dispatch("packet list direction=recv --json");

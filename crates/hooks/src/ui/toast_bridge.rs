@@ -69,6 +69,7 @@ pub fn pump() {
     vapor_forge_features::toast::mark_idle_if_empty();
 }
 
+#[cfg(debug_assertions)]
 pub fn request_pump() {
     PUMP_REQUESTED.store(true, Ordering::Release);
 }

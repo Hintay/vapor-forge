@@ -4,50 +4,33 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod achievement_worker;
 #[cfg(target_os = "linux")]
-pub mod client;
+pub(crate) mod client;
 #[cfg(any(
     all(target_os = "linux", debug_assertions),
     all(test, target_family = "unix")
 ))]
-pub mod debug_api;
-#[cfg(target_os = "linux")]
-pub mod detour;
+#[cfg_attr(all(not(target_os = "linux"), test), allow(dead_code))]
+pub(crate) mod debug_api;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]
+pub(crate) mod ipc_server;
+#[cfg(target_os = "linux")]
+pub(crate) mod netpacket;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod packet_capture;
+#[cfg(target_os = "linux")]
 pub(crate) mod playtime_worker;
 #[cfg(target_os = "linux")]
-pub use client::install;
+pub(crate) mod ui;
 #[cfg(target_os = "linux")]
-pub use client::package;
+pub(crate) mod vtable_scan;
 #[cfg(target_os = "linux")]
-pub mod ipc_server;
-#[cfg(target_os = "linux")]
-pub mod netpacket;
-#[cfg(target_os = "linux")]
-pub(crate) mod original;
-#[cfg(any(target_os = "linux", test))]
-pub mod packet_capture;
-pub mod pic_thunk;
-#[cfg(target_os = "linux")]
-pub mod ui;
-#[cfg(target_os = "linux")]
-pub use ui::install as steamui;
-#[cfg(target_os = "linux")]
-pub mod vmt;
-#[cfg(target_os = "linux")]
-pub mod vtable_scan;
-#[cfg(target_os = "linux")]
-pub mod watcher;
+pub(crate) mod watcher;
 
-use thiserror::Error;
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum HookError {
-    #[error("no PIC thunk call found in the scanned region")]
-    NoPicThunkFound,
-    #[error("PIC thunk uses an unsupported register (reg_field={0})")]
-    UnsupportedThunkRegister(u8),
-    #[error("mprotect failed: {0}")]
-    MprotectFailed(i32),
-}
+#[cfg(target_os = "linux")]
+pub use client::install::{
+    ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
+};
+#[cfg(target_os = "linux")]
+pub use vapor_forge_hook_engine::detour::restore_trampoline_pages_rx;
