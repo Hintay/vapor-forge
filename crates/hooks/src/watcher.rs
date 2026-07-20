@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -7,8 +9,15 @@ use arc_swap::ArcSwap;
 use inotify::{Inotify, WatchDescriptor, WatchMask};
 use tracing::{debug, info, warn};
 use vapor_forge_config::RuntimeConfig;
+use vapor_forge_scripting::{ManifestCodeProvider, RegistryHandle, ScriptRuntime};
 
 use crate::client::install::RuntimeSnapshot;
+
+#[derive(Debug, Clone, Copy)]
+enum LuaChange {
+    Upsert,
+    Remove,
+}
 
 #[derive(Default)]
 struct WatchTarget {
@@ -20,6 +29,7 @@ struct WatchTarget {
 #[derive(Default)]
 struct WatchSet {
     paths: HashMap<PathBuf, WatchDescriptor>,
+    dirs: HashMap<WatchDescriptor, PathBuf>,
     targets: HashMap<WatchDescriptor, WatchTarget>,
 }
 
@@ -67,20 +77,21 @@ fn watch_loop(
         };
 
         let mut config_changed = false;
-        let mut lua_changed = false;
+        let mut lua_changes: HashMap<PathBuf, LuaChange> = HashMap::new();
+        let mut lua_order: Vec<PathBuf> = Vec::new();
         let mut script_dirs_changed = false;
         for event in events {
             classify_event(
                 &watches,
-                &event.wd,
-                event.name,
+                &event,
                 &mut config_changed,
-                &mut lua_changed,
+                &mut lua_changes,
+                &mut lua_order,
                 &mut script_dirs_changed,
             );
         }
 
-        if config_changed || lua_changed || script_dirs_changed {
+        if config_changed || !lua_changes.is_empty() || script_dirs_changed {
             std::thread::sleep(std::time::Duration::from_millis(50));
             loop {
                 match inotify.read_events(&mut buf) {
@@ -88,10 +99,10 @@ fn watch_loop(
                         for event in events {
                             classify_event(
                                 &watches,
-                                &event.wd,
-                                event.name,
+                                &event,
                                 &mut config_changed,
-                                &mut lua_changed,
+                                &mut lua_changes,
+                                &mut lua_order,
                                 &mut script_dirs_changed,
                             );
                         }
@@ -111,31 +122,89 @@ fn watch_loop(
                 if script_dirs_changed {
                     refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
                 }
-                reload_lua(base_config_store, runtime_store);
+                if !lua_changes.is_empty() {
+                    apply_lua_changes(&lua_order, &lua_changes, base_config_store, runtime_store);
+                }
             }
         }
     }
 }
 
-fn classify_event(
-    watches: &WatchSet,
-    wd: &WatchDescriptor,
-    name: Option<&OsStr>,
-    config_changed: &mut bool,
-    lua_changed: &mut bool,
-    script_dirs_changed: &mut bool,
+fn apply_lua_changes(
+    order: &[PathBuf],
+    changes: &HashMap<PathBuf, LuaChange>,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
 ) {
-    let Some(target) = watches.targets.get(wd) else {
+    let snapshot = runtime_store.load();
+    let Some(handle) = snapshot.script_registry.clone() else {
+        // No live registry — fall back to full rebuild.
+        publish_full_rebuild(
+            (**base_config_store.load()).clone(),
+            base_config_store,
+            runtime_store,
+            "Lua scripts reloaded",
+        );
         return;
     };
-    let Some(name) = name else {
+    drop(snapshot);
+
+    for path in order {
+        match changes.get(path).copied().unwrap_or(LuaChange::Upsert) {
+            LuaChange::Remove => {
+                handle.unload_file(path);
+                debug!(path = %path.display(), "watcher: unload lua");
+            }
+            LuaChange::Upsert => match std::fs::read_to_string(path) {
+                Ok(source) => {
+                    let errors = handle.parse_file(path, &source);
+                    for error in errors {
+                        warn!(path = %path.display(), %error, "watcher: lua parse error");
+                    }
+                    debug!(path = %path.display(), "watcher: parse lua");
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "watcher: lua file read failed");
+                }
+            },
+        }
+    }
+
+    publish_incremental(&handle, base_config_store, runtime_store);
+}
+
+fn classify_event(
+    watches: &WatchSet,
+    event: &inotify::Event<&OsStr>,
+    config_changed: &mut bool,
+    lua_changes: &mut HashMap<PathBuf, LuaChange>,
+    lua_order: &mut Vec<PathBuf>,
+    script_dirs_changed: &mut bool,
+) {
+    let Some(target) = watches.targets.get(&event.wd) else {
+        return;
+    };
+    let Some(name) = event.name else {
         return;
     };
     if target.config_names.contains(name) {
         *config_changed = true;
     }
     if target.scripts && Path::new(name).extension() == Some(OsStr::new("lua")) {
-        *lua_changed = true;
+        let Some(dir) = watches.dirs.get(&event.wd) else {
+            return;
+        };
+        let full = dir.join(name);
+        let action = if event.mask.contains(inotify::EventMask::DELETE)
+            || event.mask.contains(inotify::EventMask::MOVED_FROM)
+        {
+            LuaChange::Remove
+        } else {
+            LuaChange::Upsert
+        };
+        if lua_changes.insert(full.clone(), action).is_none() {
+            lua_order.push(full);
+        }
     }
     if target.script_dir_names.contains(name) {
         *script_dirs_changed = true;
@@ -218,6 +287,7 @@ fn refresh_script_watches_for_paths(
             warn!(%error, "watcher: remove stale Lua watch failed");
         }
         watches.targets.remove(&wd);
+        watches.dirs.remove(&wd);
         watches.paths.retain(|_, existing| existing != &wd);
     }
 }
@@ -263,6 +333,7 @@ fn add_watch(
     match inotify.watches().add(path, mask) {
         Ok(wd) => {
             watches.paths.insert(path.to_path_buf(), wd.clone());
+            watches.dirs.insert(wd.clone(), path.to_path_buf());
             watches.targets.entry(wd.clone()).or_default();
             Some(wd)
         }
@@ -290,7 +361,7 @@ fn reload_config(
     match RuntimeConfig::load(path) {
         Ok(base_config) => {
             crate::client::install::sync_config_template(path);
-            publish_runtime(
+            publish_full_rebuild(
                 base_config,
                 base_config_store,
                 runtime_store,
@@ -305,25 +376,67 @@ fn reload_config(
     }
 }
 
-fn reload_lua(
-    base_config_store: &'static ArcSwap<RuntimeConfig>,
-    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
-) {
-    publish_runtime(
-        (**base_config_store.load()).clone(),
-        base_config_store,
-        runtime_store,
-        "Lua scripts reloaded",
-    );
-}
-
-fn publish_runtime(
+fn publish_full_rebuild(
     base_config: RuntimeConfig,
     base_config_store: &'static ArcSwap<RuntimeConfig>,
     runtime_store: &'static ArcSwap<RuntimeSnapshot>,
     message: &'static str,
 ) {
     let (new_config, new_script_runtime) = crate::client::install::build_runtime(&base_config);
+    finalize_snapshot(
+        base_config,
+        new_config,
+        new_script_runtime,
+        base_config_store,
+        runtime_store,
+        message,
+    );
+}
+
+fn publish_incremental(
+    handle: &RegistryHandle,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
+) {
+    let base_config = (**base_config_store.load()).clone();
+    let state = handle.snapshot_state();
+    let (has_basic, has_extended) = handle.provider_functions();
+    let manifest_code_provider = if has_basic || has_extended {
+        // Force provider construction by re-running Manifest lookups through a
+        // fresh dummy call: the persistent handle already carries the callback
+        // set, so we only need to advertise availability upward.
+        Some(ManifestCodeProvider::from(
+            handle.clone(),
+            has_basic,
+            has_extended,
+        ))
+    } else {
+        None
+    };
+    let new_config = crate::client::install::merge_script_apps(base_config.clone(), &state.apps);
+    let new_script_runtime = ScriptRuntime {
+        state,
+        manifest_code_provider,
+        registry: Some(handle.clone()),
+    };
+    finalize_snapshot(
+        base_config,
+        new_config,
+        new_script_runtime,
+        base_config_store,
+        runtime_store,
+        "Lua scripts reloaded",
+    );
+}
+
+fn finalize_snapshot(
+    base_config: RuntimeConfig,
+    new_config: RuntimeConfig,
+    new_script_runtime: ScriptRuntime,
+    base_config_store: &'static ArcSwap<RuntimeConfig>,
+    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
+    message: &'static str,
+) {
     let new_script_state = &new_script_runtime.state;
     let inject_count = new_config.apps.inject.len();
     let dlc_count: usize = new_config.apps.inject.iter().map(|app| app.dlc.len()).sum();
@@ -362,7 +475,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut buf = [0u8; 4096];
         let mut config_changed = false;
-        let mut lua_changed = false;
+        let mut lua_changes: HashMap<PathBuf, LuaChange> = HashMap::new();
+        let mut lua_order: Vec<PathBuf> = Vec::new();
         let mut script_dirs_changed = false;
 
         while Instant::now() < deadline {
@@ -371,14 +485,14 @@ mod tests {
                     for event in events {
                         classify_event(
                             watches,
-                            &event.wd,
-                            event.name,
+                            &event,
                             &mut config_changed,
-                            &mut lua_changed,
+                            &mut lua_changes,
+                            &mut lua_order,
                             &mut script_dirs_changed,
                         );
                     }
-                    if config_changed || lua_changed || script_dirs_changed {
+                    if config_changed || !lua_changes.is_empty() || script_dirs_changed {
                         break;
                     }
                 }
@@ -388,7 +502,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        (config_changed, lua_changed, script_dirs_changed)
+        (config_changed, !lua_changes.is_empty(), script_dirs_changed)
     }
 
     #[test]

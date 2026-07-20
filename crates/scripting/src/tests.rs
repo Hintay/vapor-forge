@@ -23,7 +23,7 @@ fn executes_addappid_script() {
     std::fs::write(dir.join("test.lua"), "AddAppId(480)\nADDAPPID(730)\n").unwrap();
 
     let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(state.apps, vec![AppId(480), AppId(730)]);
+    assert_eq!(state.apps, [AppId(480), AppId(730)].into_iter().collect());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -39,7 +39,7 @@ fn addappid_deduplicates_and_rejects_out_of_range_ids() {
     .unwrap();
 
     let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(report.state.apps, vec![AppId(480)]);
+    assert_eq!(report.state.apps, [AppId(480)].into_iter().collect());
     assert!(report.files[0]
         .result
         .as_ref()
@@ -132,7 +132,7 @@ fn registered_functions_are_case_insensitive_and_addtoken_is_standard() {
     .unwrap();
 
     let state = execute_scripts(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(state.apps, vec![AppId(480)]);
+    assert_eq!(state.apps, [AppId(480)].into_iter().collect());
     assert_eq!(state.app_tickets[&AppId(480)], vec![0xde, 0xad, 0xbe, 0xef]);
     assert_eq!(state.enc_tickets[&AppId(480)], vec![0xca, 0xfe, 0xba, 0xbe]);
     assert_eq!(state.stat_steam_ids[&AppId(480)], 76561198000000000);
@@ -214,7 +214,10 @@ fn scripts_share_one_vm_and_continue_after_runtime_errors() {
     .unwrap();
 
     let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(report.state.apps, vec![AppId(480), AppId(730)]);
+    assert_eq!(
+        report.state.apps,
+        [AppId(480), AppId(730)].into_iter().collect()
+    );
     assert!(report.files.iter().any(|file| file.result.is_err()));
     assert!(report
         .manifest_code_provider
@@ -259,7 +262,7 @@ fn scripts_without_manifest_callbacks_do_not_create_provider() {
     std::fs::write(dir.join("app.lua"), "addappid(736260)\n").unwrap();
 
     let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
-    assert_eq!(runtime.state.apps, vec![AppId(736260)]);
+    assert_eq!(runtime.state.apps, [AppId(736260)].into_iter().collect());
     assert!(runtime.manifest_code_provider.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);

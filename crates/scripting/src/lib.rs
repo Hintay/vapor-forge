@@ -5,6 +5,7 @@ use thiserror::Error;
 mod bindings;
 mod executor;
 mod manifest_provider;
+mod registry;
 mod report;
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ pub use executor::{
     execute_scripts_runtime, ScriptRuntime,
 };
 pub use manifest_provider::ManifestCodeProvider;
+pub use registry::RegistryHandle;
 pub use report::{
     ScriptCallReport, ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport,
 };

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use mlua::prelude::*;
 use vapor_forge_core::{AppId, DepotId, ManifestId};
@@ -12,9 +12,16 @@ use crate::{ManifestOverride, ScriptState};
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 10_000;
 const MAX_HTTP_BODY_BYTES: u64 = 256 * 1024;
 
+fn file_mtime_unix(path: &Path) -> Option<u32> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    u32::try_from(secs).ok()
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeState {
-    apps: Vec<AppId>,
+    // Aggregated state exposed via ScriptState.
+    apps: HashSet<AppId>,
     depot_keys: HashMap<DepotId, Vec<u8>>,
     manifests: HashMap<DepotId, ManifestOverride>,
     app_tickets: HashMap<AppId, Vec<u8>>,
@@ -22,11 +29,21 @@ pub(crate) struct RuntimeState {
     stat_steam_ids: HashMap<AppId, u64>,
     avatars: HashMap<AppId, AppId>,
     access_tokens: HashMap<AppId, u64>,
+    app_purchase_times: HashMap<AppId, u32>,
+
+    // Per-file bookkeeping backing incremental parse / unload.
+    current_file: Option<PathBuf>,
+    file_depots: HashMap<PathBuf, HashSet<DepotId>>,
+    file_manifest_overrides: HashMap<PathBuf, HashMap<DepotId, ManifestOverride>>,
+    file_parse_sequence: HashMap<PathBuf, u64>,
+    file_mtimes: HashMap<PathBuf, u32>,
+    next_parse_sequence: u64,
+    depot_refcount: HashMap<DepotId, u32>,
 }
 
-type Shared<T> = Arc<Mutex<T>>;
+pub(crate) type Shared<T> = Arc<Mutex<T>>;
 
-fn lock_shared<T>(shared: &Shared<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_shared<T>(shared: &Shared<T>) -> MutexGuard<'_, T> {
     shared.lock().unwrap_or_else(|error| error.into_inner())
 }
 
@@ -38,7 +55,7 @@ pub(crate) struct ScriptRunContext {
 }
 
 impl ScriptRunContext {
-    fn new(record_calls: bool) -> Self {
+    pub(crate) fn new(record_calls: bool) -> Self {
         Self {
             path: Arc::new(Mutex::new(String::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -64,16 +81,6 @@ impl ScriptRunContext {
     pub(crate) fn drain_calls(&self) -> Vec<ScriptCallReport> {
         lock_shared(&self.calls).drain(..).collect()
     }
-}
-
-pub(crate) fn create_runtime(
-    options: &ScriptExecutionOptions,
-) -> LuaResult<(Lua, Shared<RuntimeState>, ScriptRunContext)> {
-    let lua = Lua::new();
-    let state = Arc::new(Mutex::new(RuntimeState::default()));
-    let ctx = ScriptRunContext::new(options.record_calls);
-    install_lua_api(&lua, &state, &ctx, options)?;
-    Ok((lua, state, ctx))
 }
 
 pub(crate) fn execute_source(
@@ -137,10 +144,120 @@ pub(crate) fn snapshot_state(state: &Shared<RuntimeState>) -> ScriptState {
         stat_steam_ids: state.stat_steam_ids.clone(),
         avatars: state.avatars.clone(),
         access_tokens: state.access_tokens.clone(),
+        app_purchase_times: state.app_purchase_times.clone(),
     }
 }
 
-fn install_lua_api(
+/// Prepare `RuntimeState` to receive a file's contributions: drop any prior
+/// slice for the same path, stamp its mtime and parse sequence, then mark it
+/// as the active file so `addappid` / `setmanifestid` callbacks attribute
+/// their writes correctly.
+pub(crate) fn begin_parse_file(state: &Shared<RuntimeState>, path: &Path) {
+    unload_file(state, path);
+    let mut state = lock_shared(state);
+    let owned = path.to_path_buf();
+    state.next_parse_sequence += 1;
+    let seq = state.next_parse_sequence;
+    state.file_parse_sequence.insert(owned.clone(), seq);
+    let mtime = file_mtime_unix(path).unwrap_or(0);
+    state.file_mtimes.insert(owned.clone(), mtime);
+    state.current_file = Some(owned);
+}
+
+pub(crate) fn end_parse_file(state: &Shared<RuntimeState>) {
+    lock_shared(state).current_file = None;
+}
+
+/// Drop every contribution a file previously made: decrement depot refcounts,
+/// erase entries whose count hits zero, and rebuild manifest overrides so the
+/// active choice comes from a still-loaded file with the largest parse seq.
+pub(crate) fn unload_file(state: &Shared<RuntimeState>, path: &Path) {
+    let mut state = lock_shared(state);
+    if let Some(depots) = state.file_depots.remove(path) {
+        for depot_id in depots {
+            let hit_zero = match state.depot_refcount.get_mut(&depot_id) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                }
+                None => false,
+            };
+            if hit_zero {
+                state.depot_refcount.remove(&depot_id);
+                state.depot_keys.remove(&depot_id);
+                let app_id = AppId(depot_id.0);
+                state.apps.remove(&app_id);
+                state.app_purchase_times.remove(&app_id);
+            }
+        }
+    }
+    if let Some(overrides) = state.file_manifest_overrides.remove(path) {
+        let affected: Vec<DepotId> = overrides.keys().copied().collect();
+        for depot_id in affected {
+            rebuild_manifest_override(&mut state, depot_id);
+        }
+    }
+    state.file_parse_sequence.remove(path);
+    state.file_mtimes.remove(path);
+}
+
+pub(crate) fn provider_functions(lua: &Lua) -> (bool, bool) {
+    let globals = lua.globals();
+    let has_basic = matches!(
+        globals.raw_get::<LuaValue>("fetch_manifest_code"),
+        Ok(LuaValue::Function(_))
+    );
+    let has_extended = matches!(
+        globals.raw_get::<LuaValue>("fetch_manifest_code_ex"),
+        Ok(LuaValue::Function(_))
+    );
+    (has_basic, has_extended)
+}
+
+pub(crate) fn invoke_manifest_basic(lua: &Lua, gid: u64) -> LuaResult<Option<u64>> {
+    let function: LuaFunction = lua.globals().raw_get("fetch_manifest_code")?;
+    parse_manifest_code(function.call(exact_lua_uint(lua, gid)?)?)
+}
+
+pub(crate) fn invoke_manifest_extended(
+    lua: &Lua,
+    app_id: u32,
+    depot_id: u32,
+    gid: u64,
+) -> LuaResult<Option<u64>> {
+    let function: LuaFunction = lua.globals().raw_get("fetch_manifest_code_ex")?;
+    parse_manifest_code(function.call((
+        exact_lua_uint(lua, app_id as u64)?,
+        exact_lua_uint(lua, depot_id as u64)?,
+        exact_lua_uint(lua, gid)?,
+    ))?)
+}
+
+fn exact_lua_uint(lua: &Lua, value: u64) -> LuaResult<LuaValue> {
+    const MAX_EXACT_LUA_NUMBER: u64 = (1_u64 << 53) - 1;
+    if value <= LuaInteger::MAX as u64 && value <= MAX_EXACT_LUA_NUMBER {
+        Ok(LuaValue::Integer(value as LuaInteger))
+    } else {
+        Ok(LuaValue::String(lua.create_string(value.to_string())?))
+    }
+}
+
+fn parse_manifest_code(value: LuaValue) -> LuaResult<Option<u64>> {
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::Integer(value) if value >= 0 => Ok(Some(value as u64)),
+        LuaValue::String(value) => value.to_str()?.parse::<u64>().map(Some).map_err(|_| {
+            LuaError::RuntimeError(
+                "manifest request code must be a decimal uint64 string".to_owned(),
+            )
+        }),
+        _ => Err(LuaError::RuntimeError(
+            "manifest request code must be nil, an integer, or a decimal string".to_owned(),
+        )),
+    }
+}
+
+pub(crate) fn install_lua_api(
     lua: &Lua,
     state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
@@ -224,8 +341,32 @@ fn install_addappid(
             let mut detail = format!("app_id={id_raw}");
             let mut state = lock_shared(&state);
             let app_id = AppId(id_raw);
-            if !state.apps.contains(&app_id) {
-                state.apps.push(app_id);
+            let depot_id = DepotId(id_raw);
+
+            let current_file = state.current_file.clone();
+            if let Some(path) = current_file {
+                let first_time_for_file = state
+                    .file_depots
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(depot_id);
+                if first_time_for_file {
+                    let rc = state.depot_refcount.entry(depot_id).or_insert(0);
+                    *rc += 1;
+                    if *rc == 1 {
+                        state.apps.insert(app_id);
+                    }
+                    let mtime = state.file_mtimes.get(&path).copied().unwrap_or(0);
+                    if mtime != 0 {
+                        let slot = state.app_purchase_times.entry(app_id).or_insert(0);
+                        if mtime > *slot {
+                            *slot = mtime;
+                        }
+                    }
+                }
+            } else {
+                // Direct-invocation path (e.g. tests) without a parse context.
+                state.apps.insert(app_id);
             }
 
             if let Some(hex) = key_hex {
@@ -236,7 +377,10 @@ fn install_addappid(
                         ));
                     };
                     let key_len = key.len();
-                    state.depot_keys.insert(DepotId(id_raw), key);
+                    // Non-empty always wins; empty may only fill a missing slot.
+                    if !key.is_empty() || !state.depot_keys.contains_key(&depot_id) {
+                        state.depot_keys.insert(depot_id, key);
+                    }
                     detail.push_str(&format!(" depot_key_len={key_len}"));
                 }
             }
@@ -262,14 +406,23 @@ fn install_setmanifestid(
                 mlua::Error::RuntimeError("setmanifestid: gid must be decimal".into())
             })?;
             let depot_id = DepotId(depot_id_raw);
-            lock_shared(&state).manifests.insert(
+            let override_value = ManifestOverride {
                 depot_id,
-                ManifestOverride {
-                    depot_id,
-                    gid: ManifestId(gid_raw),
-                    size,
-                },
-            );
+                gid: ManifestId(gid_raw),
+                size,
+            };
+            let mut state = lock_shared(&state);
+            let current_file = state.current_file.clone();
+            if let Some(path) = current_file {
+                state
+                    .file_manifest_overrides
+                    .entry(path)
+                    .or_default()
+                    .insert(depot_id, override_value);
+                rebuild_manifest_override(&mut state, depot_id);
+            } else {
+                state.manifests.insert(depot_id, override_value);
+            }
 
             let detail = match size {
                 Some(size) => format!("depot_id={depot_id_raw} gid={gid_raw} size={size}"),
@@ -280,6 +433,26 @@ fn install_setmanifestid(
         },
     )?;
     register_function(globals, registry, "setmanifestid", function)
+}
+
+fn rebuild_manifest_override(state: &mut RuntimeState, depot_id: DepotId) {
+    let mut winner: Option<(u64, ManifestOverride)> = None;
+    for (file, overrides) in &state.file_manifest_overrides {
+        if let Some(entry) = overrides.get(&depot_id) {
+            let seq = state.file_parse_sequence.get(file).copied().unwrap_or(0);
+            if winner.as_ref().map_or(true, |(best, _)| seq > *best) {
+                winner = Some((seq, entry.clone()));
+            }
+        }
+    }
+    match winner {
+        Some((_, value)) => {
+            state.manifests.insert(depot_id, value);
+        }
+        None => {
+            state.manifests.remove(&depot_id);
+        }
+    }
 }
 
 fn install_ticket_api(

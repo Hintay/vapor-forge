@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -209,15 +209,23 @@ fn print_list(label: &str, values: &[String]) {
     }
 }
 
-fn print_app_list(label: &str, values: &[AppId]) {
+fn print_app_list(label: &str, values: &HashSet<AppId>) {
     println!("{label}:");
     if values.is_empty() {
         println!("  (none)");
     } else {
-        for app_id in values {
-            println!("  - {}", app_id.0);
+        for app_id in sorted_app_ids(values) {
+            println!("  - {app_id}");
         }
     }
+}
+
+/// `HashSet` iteration order varies per process, so sort before reporting to
+/// keep runs comparable.
+fn sorted_app_ids(values: &HashSet<AppId>) -> Vec<u32> {
+    let mut ids: Vec<u32> = values.iter().map(|app_id| app_id.0).collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn print_bytes_map<K>(label: &str, values: &HashMap<K, Vec<u8>>)
@@ -430,7 +438,7 @@ struct JsonState {
 impl JsonState {
     fn from_state(state: &ScriptState) -> Self {
         Self {
-            addappid_apps: state.apps.iter().map(|app_id| app_id.0).collect(),
+            addappid_apps: sorted_app_ids(&state.apps),
             depot_keys: bytes_entries(&state.depot_keys),
             manifests: manifest_entries(&state.manifests),
             app_tickets: bytes_entries(&state.app_tickets),

@@ -11,35 +11,34 @@
 use core::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use retour::GenericDetour;
 #[cfg(target_pointer_width = "64")]
 use tracing::error;
 use tracing::{info, warn};
-use vapor_forge_abi::steamui::CSteamApp;
 use vapor_forge_config::AppId;
+use vapor_forge_hook_engine::detour::Detour;
+use vapor_forge_steam_native_abi::steamui::CSteamApp;
 
 use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
-use crate::original::detour_or_return;
+use vapor_forge_hook_engine::original::detour_or_return;
 
-pub use super::library::{
-    cancel_removal, queue_removal, remove_app_and_send_change, stamp_purchase_time,
-};
+pub use super::library::queue_removal;
 use super::state::{
     GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, CONTROLLER,
     GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
 };
 
-type RunFrameFn = extern "C" fn(*mut c_void);
-type FillInAppOverviewFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
-type BuildCompleteChangeFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+type RunFrameFn = unsafe extern "C" fn(*mut c_void);
+type FillInAppOverviewFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type BuildCompleteChangeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 
 static mut REPEATED_FIELD_ADD: Option<RepeatedFieldAddFn> = None;
-static mut RUN_FRAME_DETOUR: Option<GenericDetour<RunFrameFn>> = None;
-static mut FILL_IN_OVERVIEW_DETOUR: Option<GenericDetour<FillInAppOverviewFn>> = None;
-static mut BUILD_COMPLETE_DETOUR: Option<GenericDetour<BuildCompleteChangeFn>> = None;
+static mut RUN_FRAME_DETOUR: Option<Detour<RunFrameFn>> = None;
+static mut FILL_IN_OVERVIEW_DETOUR: Option<Detour<FillInAppOverviewFn>> = None;
+static mut BUILD_COMPLETE_DETOUR: Option<Detour<BuildCompleteChangeFn>> = None;
 static INIT_TOAST_QUEUED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn hk_run_frame(controller: *mut c_void) {
+unsafe extern "C" fn hk_run_frame(controller: *mut c_void) {
     if CONTROLLER.load(Ordering::Relaxed) == 0 {
         CONTROLLER.store(controller as usize, Ordering::Release);
     }
@@ -49,12 +48,13 @@ extern "C" fn hk_run_frame(controller: *mut c_void) {
     crate::ui::toast_bridge::bootstrap();
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR);
-    original.call(controller);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(controller) };
     maybe_show_init_toast();
     crate::ui::toast_bridge::pump();
 }
 
-extern "C" fn hk_fill_in_app_overview(
+unsafe extern "C" fn hk_fill_in_app_overview(
     this: *mut c_void,
     app_overview: *mut c_void,
     app: *mut c_void,
@@ -68,15 +68,25 @@ extern "C" fn hk_fill_in_app_overview(
         if vapor_forge_features::apps::classify_app(&cfg, AppId(app_id_raw))
             .requires_injected_ownership()
         {
-            // Use configured purchase time, or fall back to current time.
+            // Precedence: explicit config → max mtime across the .lua files
+            // that contribute this app's depots (mirrors OpenSteamTool's
+            // `LuaConfig::GetPurchaseTime`). If neither is available, leave
+            // the field untouched so the original `FillInAppOverview` still
+            // writes whatever Steam had.
             let mut t = cfg.purchase_time(AppId(app_id_raw));
             if t == 0 {
-                // SAFETY: passing null asks libc::time to return only the timestamp.
-                t = unsafe { libc::time(std::ptr::null_mut()) } as u32;
+                let script_state = crate::client::install::script_state();
+                t = script_state
+                    .app_purchase_times
+                    .get(&AppId(app_id_raw))
+                    .copied()
+                    .unwrap_or(0);
             }
-            // Stamp BEFORE the original copies the field into the overview.
-            // SAFETY: steam_app points to the CSteamApp passed by SteamUI.
-            unsafe { (*steam_app).purchased_time = t };
+            if t != 0 {
+                // Stamp BEFORE the original copies the field into the overview.
+                // SAFETY: steam_app points to the CSteamApp passed by SteamUI.
+                unsafe { (*steam_app).purchased_time = t };
+            }
         }
     }
     // SAFETY: detour set before hook enabled.
@@ -85,10 +95,11 @@ extern "C" fn hk_fill_in_app_overview(
         FILL_IN_OVERVIEW_DETOUR,
         std::ptr::null_mut()
     );
-    original.call(this, app_overview, app)
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, app_overview, app) }
 }
 
-extern "C" fn hk_build_complete_change(
+unsafe extern "C" fn hk_build_complete_change(
     controller: *mut c_void,
     change: *mut c_void,
     callback_slot: *mut c_void,
@@ -99,14 +110,15 @@ extern "C" fn hk_build_complete_change(
         "CSteamUIAppController::BuildCompleteAppOverviewChange",
         BUILD_COMPLETE_DETOUR
     );
-    original.call(controller, change, callback_slot);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(controller, change, callback_slot) };
 
     // SAFETY: REPEATED_FIELD_ADD resolved once at install time.
     let add_fn = unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) };
     super::library::append_removed_appids(change, add_fn);
 }
 
-extern "C" fn hk_get_app_by_id(
+unsafe extern "C" fn hk_get_app_by_id(
     controller: *mut c_void,
     app_id: u32,
     b_create: bool,
@@ -120,27 +132,29 @@ extern "C" fn hk_get_app_by_id(
         GET_APP_BY_ID_DETOUR,
         std::ptr::null_mut()
     );
-    let app = original.call(controller, app_id, b_create);
+    let app = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(controller, app_id, b_create) };
     crate::ui::toast_bridge::pump();
     app
 }
 
-extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
+unsafe extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
     if APP_CHANGE_SOURCE.load(Ordering::Relaxed) == 0 {
         APP_CHANGE_SOURCE.store(source as usize, Ordering::Release);
     }
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
-    original.call(source, app_id, flags);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(source, app_id, flags) };
     crate::ui::toast_bridge::pump();
 }
 
 /// Install the steamui.so hooks after the loader reaches a consistent state.
 pub fn install(
-    steamui_code: &crate::detour::CodeRegion,
+    steamui_code: &vapor_forge_hook_engine::detour::CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> bool {
-    use crate::detour;
+    use vapor_forge_hook_engine::detour;
 
     let names = [
         "CSteamUIAppController::RunFrame",
@@ -318,11 +332,11 @@ fn maybe_show_init_toast() {
 
 /// Resolve RepeatedField<uint32>::Add from steamui.so.
 fn resolve_repeated_field_add(
-    steamui_code: &crate::detour::CodeRegion,
+    steamui_code: &vapor_forge_hook_engine::detour::CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let entry = registry.get("google::protobuf::RepeatedField<uint32>::Add")?;
-    let addr = crate::detour::resolve_pattern_entry(
+    let addr = vapor_forge_hook_engine::detour::resolve_pattern_entry(
         steamui_code,
         "google::protobuf::RepeatedField<uint32>::Add",
         &entry,
@@ -349,7 +363,10 @@ fn resolve_repeated_field_add(
 }
 
 #[cfg(target_pointer_width = "64")]
-fn is_repeated_field_u32_add_abi(code: &crate::detour::CodeRegion, addr: usize) -> bool {
+fn is_repeated_field_u32_add_abi(
+    code: &vapor_forge_hook_engine::detour::CodeRegion,
+    addr: usize,
+) -> bool {
     let Some(offset) = addr.checked_sub(code.base) else {
         return false;
     };
@@ -362,7 +379,7 @@ fn is_repeated_field_u32_add_abi(code: &crate::detour::CodeRegion, addr: usize) 
 }
 
 /// Resolve steamui.so code region from /proc/self/maps.
-pub fn get_steamui_code() -> Option<crate::detour::CodeRegion> {
+pub fn get_steamui_code() -> Option<vapor_forge_hook_engine::detour::CodeRegion> {
     use vapor_forge_memory::find_proc_self_maps_targets;
 
     let entries = find_proc_self_maps_targets(64).ok()?;
@@ -374,5 +391,5 @@ pub fn get_steamui_code() -> Option<crate::detour::CodeRegion> {
     let size = exec_entry.range.size;
     // SAFETY: reading the executable mapping of steamui.so.
     let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    Some(crate::detour::CodeRegion { base, bytes })
+    Some(vapor_forge_hook_engine::detour::CodeRegion { base, bytes })
 }

@@ -3,15 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, error, info};
-use vapor_forge_abi::steamui::{CAppOverviewChange, CSteamApp};
 use vapor_forge_config::AppId;
+use vapor_forge_steam_native_abi::steamui::{CAppOverviewChange, CSteamApp};
 
-use crate::original::detour_or_return;
+use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::state::{
-    RepeatedFieldAddFn, APP_CHANGE_SOURCE, CONTROLLER, EAPPCHANGE_ADDED_OR_CREATED,
-    EAPP_OWNERSHIP_FLAGS_NONE, EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR, INSTALLED,
-    MARK_APP_CHANGE_DETOUR,
+    RepeatedFieldAddFn, APP_CHANGE_SOURCE, EAPPCHANGE_ADDED_OR_CREATED, EAPP_OWNERSHIP_FLAGS_NONE,
+    EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
 };
 
 // Pending removals queued from the FileWatcher thread, drained on the
@@ -45,7 +44,8 @@ pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<Repeated
     // SAFETY: change is a valid CAppOverview_Change* from SteamUI.
     let field = unsafe { CAppOverviewChange::mutable_removed_appid(change) };
     for &app_id in removed.iter() {
-        add_fn(field, &app_id);
+        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+        unsafe { add_fn(field, &app_id) };
     }
     debug!(
         count = removed.len(),
@@ -66,20 +66,6 @@ pub fn queue_removal(app_id: AppId) {
     pending.push(app_id);
     HAS_PENDING.store(true, Ordering::Release);
     debug!(app = app_id.0, "steamui: removal queued");
-}
-
-/// Cancel a pending removal (e.g. when an app is re-added during hot-reload).
-pub fn cancel_removal(app_id: AppId) {
-    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
-        pending.retain(|&id| id != app_id);
-    } else {
-        error!("steamui: pending removal lock poisoned");
-    }
-    if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
-        removed.retain(|&id| id != app_id.0);
-    } else {
-        error!("steamui: removed app set lock poisoned");
-    }
 }
 
 pub(crate) fn drain_pending_removals(controller: *mut c_void) {
@@ -118,7 +104,8 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     // SAFETY: calling through the trampoline with captured this pointers.
     let get_app_by_id =
         detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
-    let app_ptr = get_app_by_id.call(controller, app_id.0, false);
+    let app_ptr = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { get_app_by_id(controller, app_id.0, false) };
     if app_ptr.is_null() {
         return;
     }
@@ -144,72 +131,7 @@ fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
     // SAFETY: calling through the trampoline.
     let mark_app_change =
         detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
-    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { mark_app_change(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED) };
     info!(app = app_id.0, "steamui: app removed from library");
-}
-
-/// Clear ownership + trigger UI refresh for a removed app.
-/// Direct call variant (use queue_removal for cross-thread safety).
-pub fn remove_app_and_send_change(app_id: AppId) {
-    if !INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    let ctrl = CONTROLLER.load(Ordering::Acquire);
-    let src = APP_CHANGE_SOURCE.load(Ordering::Acquire);
-    if ctrl == 0 || src == 0 {
-        debug!(app = app_id.0, "steamui: this pointers not captured yet");
-        return;
-    }
-
-    // SAFETY: calling through the trampoline with captured this pointers.
-    let get_app_by_id =
-        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
-    let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
-    if app_ptr.is_null() {
-        return;
-    }
-
-    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
-    unsafe {
-        (*app_ptr.cast::<CSteamApp>()).ownership_flags = EAPP_OWNERSHIP_FLAGS_NONE;
-    }
-
-    // Notify UI.
-    // SAFETY: calling through the trampoline.
-    let mark_app_change =
-        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
-    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
-    info!(app = app_id.0, "steamui: app removed from library");
-}
-
-/// Stamp purchase time on a CSteamApp and refresh the UI.
-pub fn stamp_purchase_time(app_id: AppId, time: u32) {
-    if !INSTALLED.load(Ordering::Acquire) || time == 0 {
-        return;
-    }
-    let ctrl = CONTROLLER.load(Ordering::Acquire);
-    let src = APP_CHANGE_SOURCE.load(Ordering::Acquire);
-    if ctrl == 0 || src == 0 {
-        return;
-    }
-
-    // SAFETY: calling through the trampoline.
-    let get_app_by_id =
-        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
-    let app_ptr = get_app_by_id.call(ctrl as *mut c_void, app_id.0, false);
-    if app_ptr.is_null() {
-        return;
-    }
-
-    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
-    unsafe {
-        (*app_ptr.cast::<CSteamApp>()).purchased_time = time;
-    }
-
-    // Notify UI.
-    // SAFETY: calling through the trampoline.
-    let mark_app_change =
-        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
-    mark_app_change.call(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED);
-    debug!(app = app_id.0, time, "steamui: purchase time stamped");
 }

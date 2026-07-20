@@ -1,17 +1,19 @@
 use core::ffi::c_void;
+use core::marker::PhantomData;
+use core::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, error, info, warn};
-use vapor_forge_abi::{
-    package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
-    ProcessPendingLicenseUpdatesFn,
-};
 use vapor_forge_config::AppId;
 use vapor_forge_features::package::ReloadDiff;
 use vapor_forge_patterns::registry::PatternRegistry;
+use vapor_forge_steam_native_abi::{
+    package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
+    ProcessPendingLicenseUpdatesFn,
+};
 
-use crate::detour::CodeRegion;
+use vapor_forge_hook_engine::detour::CodeRegion;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -36,17 +38,173 @@ static mut FN_GROW: Option<CUtlMemoryGrowFn> = None;
 static mut FN_GET_PKG_INFO: Option<GetPackageInfoArchFn> = None;
 
 /// Captured IClientUser `this` pointer from CheckAppOwnership.
-pub(crate) static CUSER_PTR: AtomicUsize = AtomicUsize::new(0);
+static CUSER_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Captured package helper `this` pointer.
-pub(crate) static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
+static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Captured pkg0 PackageInfo pointer.
-pub(crate) static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
+static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Latest desired controlled-app set. The watcher only replaces this queue;
 /// Steam-owned memory is mutated by `pump_reload` on a Steam hook thread.
 static PENDING_RELOAD: Mutex<Option<Vec<AppId>>> = Mutex::new(None);
+
+/// Proof that package operations are executing inside the live
+/// `CheckAppOwnership` callback on Steam's thread.
+pub(crate) struct SteamPackageHookScope {
+    _private: (),
+}
+
+impl SteamPackageHookScope {
+    /// # Safety
+    /// Must only be called for the dynamic extent of Steam's
+    /// `CheckAppOwnership` callback.
+    pub(crate) unsafe fn enter() -> Self {
+        Self { _private: () }
+    }
+}
+
+pub(crate) struct SteamPackageAccess<'hook> {
+    pkg0: NonNull<u8>,
+    cuser: NonNull<c_void>,
+    mark_license: MarkLicenseAsChangedFn,
+    process_updates: ProcessPendingLicenseUpdatesFn,
+    grow: CUtlMemoryGrowFn,
+    _scope: PhantomData<&'hook mut SteamPackageHookScope>,
+}
+
+impl<'hook> SteamPackageAccess<'hook> {
+    pub(crate) fn from_hook(_scope: &'hook mut SteamPackageHookScope) -> Option<Self> {
+        let pkg0 = NonNull::new(PKG0_PTR.load(Ordering::Acquire) as *mut u8)?;
+        let cuser = NonNull::new(CUSER_PTR.load(Ordering::Acquire) as *mut c_void)?;
+        // SAFETY: initialization writes each slot before hooks are enabled and
+        // never mutates it afterward.
+        let (mark_license, process_updates, grow) = unsafe {
+            (
+                (*std::ptr::addr_of!(FN_MARK_LICENSE))?,
+                (*std::ptr::addr_of!(FN_PROCESS_UPDATES))?,
+                (*std::ptr::addr_of!(FN_GROW))?,
+            )
+        };
+        Some(Self {
+            pkg0,
+            cuser,
+            mark_license,
+            process_updates,
+            grow,
+            _scope: PhantomData,
+        })
+    }
+
+    fn app_ids(&mut self) -> &mut vapor_forge_steam_native_abi::CUtlVector<u32> {
+        // SAFETY: construction is restricted to the live Steam callback after
+        // pkg0 validation, and the returned borrow cannot outlive this access.
+        unsafe { &mut *package_info::app_id_vec(self.pkg0.as_ptr()) }
+    }
+
+    fn mark_and_process(&self) {
+        // SAFETY: the capability holds the live callback's CUser and the
+        // architecture-matched functions resolved before hook activation.
+        unsafe {
+            (self.mark_license)(self.cuser.as_ptr(), 0, false);
+            (self.process_updates)(self.cuser.as_ptr());
+        }
+    }
+
+    pub(crate) fn inject(&mut self, app_ids: &[AppId]) -> Vec<AppId> {
+        if app_ids.is_empty() {
+            debug!("package: no apps to inject");
+            return Vec::new();
+        }
+
+        let mut injected = Vec::new();
+        for &app_id in app_ids {
+            let raw_id = app_id.0;
+            // SAFETY: `app_ids` returns the validated pkg0 vector for this capability.
+            if unsafe { self.app_ids().contains(&raw_id) } {
+                continue;
+            }
+            if self.append(raw_id) {
+                injected.push(app_id);
+            } else {
+                error!(app_id = raw_id, "package: failed to append (grow failed)");
+            }
+        }
+
+        if !injected.is_empty() {
+            self.mark_and_process();
+            info!(
+                injected = injected.len(),
+                total = app_ids.len(),
+                "package: pkg0 injection complete"
+            );
+        }
+        injected
+    }
+
+    fn append(&mut self, value: u32) -> bool {
+        // SAFETY: this capability owns the only mutable pkg0 access for the callback.
+        if unsafe { self.app_ids().try_append(value) } {
+            return true;
+        }
+
+        let grow = self.grow;
+        let vec = self.app_ids();
+        // SAFETY: `vec` is Steam's live CUtlVector and `grow` is the matching
+        // CUtlMemory implementation resolved before hook activation.
+        unsafe {
+            grow(
+                &mut vec.m_memory as *mut vapor_forge_steam_native_abi::CUtlMemory<u32>
+                    as *mut c_void,
+                GROW_BATCH,
+            );
+            vec.try_append(value)
+        }
+    }
+
+    fn apply_reload_diff(&mut self, diff: &ReloadDiff) -> ReloadDiff {
+        let mut applied = ReloadDiff {
+            additions: Vec::new(),
+            removals: Vec::new(),
+        };
+
+        for &app_id in &diff.removals {
+            let raw_id = app_id.0;
+            // SAFETY: the capability guarantees a live writable pkg0 vector.
+            if unsafe { self.app_ids().find_and_fast_remove(&raw_id) } {
+                debug!(app_id = raw_id, "package: removed from pkg0");
+                crate::ui::install::queue_removal(app_id);
+                applied.removals.push(app_id);
+            }
+        }
+
+        for &app_id in &diff.additions {
+            let raw_id = app_id.0;
+            // SAFETY: the capability guarantees a live readable pkg0 vector.
+            if unsafe { self.app_ids().contains(&raw_id) } {
+                debug!(app_id = raw_id, "package: already in pkg0, skipping");
+                continue;
+            }
+            if self.append(raw_id) {
+                debug!(app_id = raw_id, "package: added to pkg0");
+                applied.additions.push(app_id);
+            } else {
+                error!(app_id = raw_id, "package: failed to append on reload");
+            }
+        }
+
+        if !applied.additions.is_empty() || !applied.removals.is_empty() {
+            info!(
+                additions = applied.additions.len(),
+                removals = applied.removals.len(),
+                "package: reload mutation applied on Steam thread"
+            );
+            self.mark_and_process();
+        }
+        applied
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Resolution called from install::do_install
@@ -54,7 +212,10 @@ static PENDING_RELOAD: Mutex<Option<Vec<AppId>>> = Mutex::new(None);
 
 /// Resolve all 4 function addresses needed for pkg0 injection.
 /// Not hooks. These are just address resolutions via pattern matching and are called directly.
-pub fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
+/// # Safety
+/// The registry must have been validated against `code` from the live
+/// steamclient executable mapping.
+pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
     if let Some(addr) = resolve_raw_address(registry, code, "CUser::MarkLicenseAsChanged") {
         // SAFETY: the registry entry identifies this concrete Steam function ABI.
         unsafe {
@@ -104,7 +265,7 @@ fn resolve_raw_address(registry: &PatternRegistry, code: &CodeRegion, name: &str
         }
     };
 
-    crate::detour::resolve_pattern_entry(code, name, &entry)
+    vapor_forge_hook_engine::detour::resolve_pattern_entry(code, name, &entry)
 }
 
 /// Get the resolved GetPackageInfo function address (for hooking).
@@ -113,7 +274,9 @@ pub fn get_package_info_addr() -> Option<usize> {
     unsafe { (*std::ptr::addr_of!(FN_GET_PKG_INFO)).map(|f| f as usize) }
 }
 
-pub(crate) fn capture_pkg_info_this(this: *mut c_void) {
+/// # Safety
+/// `this` must be the live CPackageInfo receiver for the active Steam callback.
+pub(crate) unsafe fn capture_pkg_info_this(this: *mut c_void) {
     if CPKG_INFO_PTR.load(Ordering::Acquire) == 0 {
         CPKG_INFO_PTR.store(this as usize, Ordering::Release);
         info!(
@@ -123,29 +286,32 @@ pub(crate) fn capture_pkg_info_this(this: *mut c_void) {
     }
 }
 
-pub(crate) fn try_capture_pkg0_from_package_info(this: *mut c_void) {
+#[cfg(target_pointer_width = "32")]
+/// # Safety
+/// `this` must be the live CPackageInfo receiver for the active Steam callback.
+pub(crate) unsafe fn try_capture_pkg0_from_package_info(this: *mut c_void) {
     if PKG0_PTR.load(Ordering::Acquire) != 0 {
         return;
     }
 
-    capture_pkg_info_this(this);
-    let Some(pkg_ptr) = query_pkg0(this) else {
+    // SAFETY: inherited from this function's contract.
+    unsafe { capture_pkg_info_this(this) };
+    // SAFETY: inherited from this function's contract.
+    let Some(pkg_ptr) = (unsafe { query_pkg0(this) }) else {
         return;
     };
-    capture_validated_pkg0(pkg_ptr);
+    // SAFETY: pkg_ptr was returned by Steam's typed package lookup.
+    unsafe { capture_validated_pkg0(pkg_ptr) };
 }
 
-fn query_pkg0(this: *mut c_void) -> Option<*mut u8> {
+#[cfg(target_pointer_width = "32")]
+unsafe fn query_pkg0(this: *mut c_void) -> Option<*mut u8> {
     // SAFETY: resolved once before hook installation and read-only afterward.
     let get_pkg = unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) }?;
 
-    // The package lookup has different ABI surfaces per architecture. 32-bit
-    // receives (package_id, access_token), while Linux x86_64 receives a pointer
-    // to the package token key and searches the token-keyed package map.
-    #[cfg(target_pointer_width = "64")]
-    let pkg_ptr = get_pkg(this, &PKG0_ACCESS_TOKEN);
-    #[cfg(target_pointer_width = "32")]
-    let pkg_ptr = get_pkg(this, 0, PKG0_ACCESS_TOKEN);
+    // The 32-bit lookup receives package_id and access_token directly.
+    // SAFETY: caller guarantees the receiver is live and the function slot was resolved.
+    let pkg_ptr = unsafe { get_pkg(this, 0, PKG0_ACCESS_TOKEN) };
 
     if pkg_ptr.is_null() {
         debug!("package: GetPackageInfo(pkg0 token) returned null");
@@ -167,159 +333,21 @@ pub fn all_functions_resolved() -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pkg0 capture called from hk_check_app_ownership
-// ---------------------------------------------------------------------------
+pub(crate) fn pkg0_captured() -> bool {
+    PKG0_PTR.load(Ordering::Acquire) != 0
+}
 
-/// Attempt to capture pkg0. Called from the CheckAppOwnership hook.
-///
+pub(crate) fn cuser_captured() -> bool {
+    CUSER_PTR.load(Ordering::Acquire) != 0
+}
+
 /// # Safety
-/// `cuser` must be a valid IClientUser pointer from Steam.
-pub unsafe fn try_capture_pkg0(cuser: *mut c_void) {
-    // Store cuser (first time only)
+/// `this` must be the live CUser receiver for the active Steam callback.
+pub(crate) unsafe fn capture_cuser(this: *mut c_void) {
     if CUSER_PTR.load(Ordering::Acquire) == 0 {
-        CUSER_PTR.store(cuser as usize, Ordering::Release);
-        debug!("package: captured IClientUser at 0x{:x}", cuser as usize);
+        CUSER_PTR.store(this as usize, Ordering::Release);
+        debug!("package: captured CUser at 0x{:x}", this as usize);
     }
-
-    // Already captured?
-    if PKG0_PTR.load(Ordering::Acquire) != 0 {
-        return;
-    }
-
-    let cpkg = CPKG_INFO_PTR.load(Ordering::Acquire);
-    if cpkg != 0 {
-        try_capture_pkg0_from_package_info(cpkg as *mut c_void);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Injection called once after pkg0 is captured
-// ---------------------------------------------------------------------------
-
-/// Inject app IDs into pkg0 and trigger license re-evaluation.
-///
-/// Existing app IDs are left untouched; only IDs added by this hook are tracked
-/// for later hot-reload removal.
-///
-/// # Safety
-/// Must only be called after pkg0 and cuser are captured, and all function
-/// pointers are resolved.
-pub unsafe fn try_inject_once(app_ids: &[AppId]) -> Vec<AppId> {
-    let pkg0 = PKG0_PTR.load(Ordering::Acquire);
-    if pkg0 == 0 {
-        return Vec::new();
-    }
-    let cuser = CUSER_PTR.load(Ordering::Acquire);
-    if cuser == 0 {
-        return Vec::new();
-    }
-
-    if app_ids.is_empty() {
-        debug!("package: no apps to inject");
-        return Vec::new();
-    }
-
-    // SAFETY: pkg0 is a validated PackageInfo pointer.
-    let vec = unsafe { &mut *package_info::app_id_vec(pkg0 as *mut u8) };
-
-    let mut injected = Vec::new();
-    for &app_id in app_ids {
-        let raw_id = app_id.0;
-        if vec.contains(&raw_id) {
-            continue;
-        }
-        if append_growing(vec, raw_id) {
-            injected.push(app_id);
-        } else {
-            error!(app_id = raw_id, "package: failed to append (grow failed)");
-        }
-    }
-
-    if !injected.is_empty() {
-        mark_and_process(cuser);
-        info!(
-            injected = injected.len(),
-            total = app_ids.len(),
-            "package: pkg0 injection complete"
-        );
-    }
-    injected
-}
-
-// ---------------------------------------------------------------------------
-// Hot-reload diff application
-// ---------------------------------------------------------------------------
-
-/// Apply a hot-reload diff to pkg0.
-///
-/// # Safety
-/// Must only be called when pkg0 and cuser are captured, and all function
-/// pointers are resolved.
-unsafe fn apply_reload_diff(diff: &ReloadDiff) -> ReloadDiff {
-    let pkg0 = PKG0_PTR.load(Ordering::Acquire);
-    if pkg0 == 0 {
-        debug!("package: reload diff skipped — pkg0 not captured");
-        return ReloadDiff {
-            additions: Vec::new(),
-            removals: Vec::new(),
-        };
-    }
-    let cuser = CUSER_PTR.load(Ordering::Acquire);
-    if cuser == 0 {
-        return ReloadDiff {
-            additions: Vec::new(),
-            removals: Vec::new(),
-        };
-    }
-
-    if diff.additions.is_empty() && diff.removals.is_empty() {
-        return ReloadDiff {
-            additions: Vec::new(),
-            removals: Vec::new(),
-        };
-    }
-
-    // SAFETY: pkg0 is a validated PackageInfo pointer.
-    let vec = unsafe { &mut *package_info::app_id_vec(pkg0 as *mut u8) };
-    let mut applied = ReloadDiff {
-        additions: Vec::new(),
-        removals: Vec::new(),
-    };
-
-    // Removals: remove from pkg0 and queue UI removal for the UI thread.
-    for &app_id in &diff.removals {
-        let raw_id = app_id.0;
-        if vec.find_and_fast_remove(&raw_id) {
-            debug!(app_id = raw_id, "package: removed from pkg0");
-            crate::ui::install::queue_removal(app_id);
-            applied.removals.push(app_id);
-        }
-    }
-
-    // Additions: skip if already present (prevents Cloud "out of date" badge)
-    for &app_id in &diff.additions {
-        let raw_id = app_id.0;
-        if vec.contains(&raw_id) {
-            debug!(app_id = raw_id, "package: already in pkg0, skipping");
-            continue;
-        }
-        if append_growing(vec, raw_id) {
-            debug!(app_id = raw_id, "package: added to pkg0");
-            applied.additions.push(app_id);
-        } else {
-            error!(app_id = raw_id, "package: failed to append on reload");
-        }
-    }
-
-    if !applied.additions.is_empty() || !applied.removals.is_empty() {
-        info!(
-            additions = applied.additions.len(),
-            removals = applied.removals.len(),
-            "package: reload mutation applied on Steam thread"
-        );
-    }
-    applied
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +361,10 @@ pub fn queue_reload(controlled: Vec<AppId>) {
 }
 
 /// Apply the latest queued runtime state from a Steam-thread hook callback.
-pub fn pump_reload() {
+pub fn pump_reload(
+    access: &mut SteamPackageAccess<'_>,
+    snapshot_actual_ownership: impl FnOnce(&[AppId]),
+) {
     let controlled = PENDING_RELOAD
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -341,31 +372,25 @@ pub fn pump_reload() {
     let Some(controlled) = controlled else {
         return;
     };
-    let cuser = CUSER_PTR.load(Ordering::Acquire);
-    if cuser == 0 {
-        queue_reload(controlled);
-        return;
-    }
+
     let package_state = crate::client::install::package_state();
     let diff = package_state.compute_hot_reload_diff(&controlled);
-    // Query through the original detour before additions become visible in pkg0.
-    // SAFETY: this pump runs inside CheckAppOwnership with a captured CUser.
-    unsafe { super::ownership::snapshot_actual_ownership(&diff.additions) };
-    // SAFETY: this pump runs inside CheckAppOwnership after pkg0/cuser capture.
-    let applied = unsafe { apply_reload_diff(&diff) };
+    snapshot_actual_ownership(&diff.additions);
+    let applied = access.apply_reload_diff(&diff);
     package_state.apply_diff(&applied);
-    if applied.additions.is_empty() && applied.removals.is_empty() {
-        return;
+    if !applied.additions.is_empty() || !applied.removals.is_empty() {
+        info!("package: hot reload completed on Steam thread");
     }
-    mark_and_process(cuser);
-    info!("package: hot reload completed on Steam thread");
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn capture_validated_pkg0(pkg_ptr: *mut u8) {
+/// # Safety
+/// `pkg_ptr` must point to a live PackageInfo returned by Steam. This function
+/// validates the identifying fields and vector header before publishing it.
+pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
     if pkg_ptr.is_null() {
         return;
     }
@@ -390,56 +415,19 @@ pub(crate) fn capture_validated_pkg0(pkg_ptr: *mut u8) {
         return;
     }
 
-    PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
-    info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
-}
-
-/// Append a value to a CUtlVector<u32>, growing the backing CUtlMemory if needed.
-fn append_growing(vec: &mut vapor_forge_abi::CUtlVector<u32>, value: u32) -> bool {
-    if vec.try_append(value) {
-        return true;
+    // SAFETY: caller guarantees pkg_ptr points to a live PackageInfo.
+    let app_ids = unsafe { &*package_info::app_id_vec(pkg_ptr) };
+    let size = app_ids.m_size;
+    let capacity = app_ids.m_memory.m_n_allocation_count;
+    let memory = app_ids.m_memory.m_p_memory;
+    if size < 0
+        || size as u32 > capacity
+        || (capacity > 0 && (memory.is_null() || !memory.is_aligned()))
+    {
+        warn!(size, capacity, "package: pkg0 app vector header is invalid");
+        return;
     }
 
-    // Need to grow by calling Steam's CUtlMemory::Grow.
-    // SAFETY: FN_GROW written once during init, read-only after.
-    let grow_fn = match unsafe { *std::ptr::addr_of!(FN_GROW) } {
-        Some(f) => f,
-        None => {
-            error!("package: CUtlMemoryGrow not resolved");
-            return false;
-        }
-    };
-
-    // SAFETY: growing Steam's CUtlMemory via its own internal function.
-    grow_fn(
-        &mut vec.m_memory as *mut vapor_forge_abi::CUtlMemory<u32> as *mut c_void,
-        GROW_BATCH,
-    );
-
-    vec.try_append(value)
-}
-
-/// Call MarkLicenseAsChanged(cuser, 0, true) + ProcessPendingLicenseUpdates(cuser).
-fn mark_and_process(cuser: usize) {
-    // SAFETY: FN_MARK_LICENSE and FN_PROCESS_UPDATES written once during init.
-    let mark_fn = match unsafe { *std::ptr::addr_of!(FN_MARK_LICENSE) } {
-        Some(f) => f,
-        None => {
-            error!("package: MarkLicenseAsChanged not resolved");
-            return;
-        }
-    };
-    // SAFETY: resolved once before hook installation and read-only afterward.
-    let process_fn = match unsafe { *std::ptr::addr_of!(FN_PROCESS_UPDATES) } {
-        Some(f) => f,
-        None => {
-            error!("package: ProcessPendingLicenseUpdates not resolved");
-            return;
-        }
-    };
-
-    // SAFETY: calling Steam functions with validated cuser pointer.
-    mark_fn(cuser as *mut c_void, 0, true);
-    process_fn(cuser as *mut c_void);
-    debug!("package: mark + process called");
+    PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
+    info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
 }

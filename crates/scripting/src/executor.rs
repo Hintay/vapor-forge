@@ -4,12 +4,14 @@ use tracing::{debug, info, warn};
 use vapor_forge_core::ScriptState;
 
 use crate::manifest_provider::{ManifestCodeProvider, ScriptSource};
+use crate::registry::RegistryHandle;
 use crate::report::{ScriptExecutionOptions, ScriptExecutionReport, ScriptFileReport};
 
 #[derive(Clone, Debug, Default)]
 pub struct ScriptRuntime {
     pub state: ScriptState,
     pub manifest_code_provider: Option<ManifestCodeProvider>,
+    pub registry: Option<RegistryHandle>,
 }
 
 pub fn execute_scripts(dirs: &[String]) -> ScriptState {
@@ -53,6 +55,7 @@ pub fn execute_scripts_runtime(dirs: &[String]) -> ScriptRuntime {
     ScriptRuntime {
         state: report.state,
         manifest_code_provider: report.manifest_code_provider,
+        registry: report.registry,
     }
 }
 
@@ -107,6 +110,7 @@ pub fn execute_scripts_report_with_options(
             report.files.extend(execution.files);
             report.calls = execution.calls;
             report.manifest_code_provider = execution.provider;
+            report.registry = Some(execution.handle);
         }
         Err(error) => report.files.push(ScriptFileReport {
             path: "<lua-runtime>".to_owned(),

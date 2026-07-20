@@ -1,11 +1,13 @@
 use vapor_forge_core::ScriptState;
 
+use crate::registry::RegistryHandle;
 use crate::ManifestCodeProvider;
 
 #[derive(Clone, Debug, Default)]
 pub struct ScriptExecutionReport {
     pub state: ScriptState,
     pub manifest_code_provider: Option<ManifestCodeProvider>,
+    pub registry: Option<RegistryHandle>,
     pub files: Vec<ScriptFileReport>,
     pub calls: Vec<ScriptCallReport>,
     pub skipped_dirs: Vec<String>,

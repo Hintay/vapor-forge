@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -134,7 +134,8 @@ pub struct Address(pub usize);
 
 #[derive(Clone, Debug, Default)]
 pub struct ScriptState {
-    pub apps: Vec<AppId>,
+    /// Set of controlled apps registered via `addappid`.
+    pub apps: HashSet<AppId>,
     pub depot_keys: HashMap<DepotId, Vec<u8>>,
     pub manifests: HashMap<DepotId, ManifestOverride>,
     pub app_tickets: HashMap<AppId, Vec<u8>>,
@@ -142,6 +143,9 @@ pub struct ScriptState {
     pub stat_steam_ids: HashMap<AppId, u64>,
     pub avatars: HashMap<AppId, AppId>,
     pub access_tokens: HashMap<AppId, u64>,
+    /// Per-app max mtime across every `.lua` file that contributed the
+    /// app via `addappid`; used to stamp the library's "purchased" date.
+    pub app_purchase_times: HashMap<AppId, u32>,
 }
 
 #[derive(Clone, Debug)]

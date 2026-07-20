@@ -112,20 +112,21 @@ impl Default for PackageState {
 /// Build the combined controlled-app-IDs list from config + script state.
 /// Includes both main app IDs and their DLC IDs (DLC goes into pkg0 so
 /// Steam downloads appinfo and handles DLC enumeration natively).
-pub fn controlled_app_ids(config: &RuntimeConfig, script_apps: &[AppId]) -> Vec<AppId> {
+pub fn controlled_app_ids(config: &RuntimeConfig, script_apps: &HashSet<AppId>) -> Vec<AppId> {
+    let mut seen: HashSet<AppId> = HashSet::new();
     let mut ids: Vec<AppId> = Vec::new();
     for app in &config.apps.inject {
-        if !ids.contains(&app.id) {
+        if seen.insert(app.id) {
             ids.push(app.id);
         }
         for &dlc in &app.dlc {
-            if !ids.contains(&dlc) {
+            if seen.insert(dlc) {
                 ids.push(dlc);
             }
         }
     }
     for &id in script_apps {
-        if !ids.contains(&id) {
+        if seen.insert(id) {
             ids.push(id);
         }
     }
@@ -220,7 +221,12 @@ mod tests {
     #[test]
     fn controlled_app_ids_dedup_script_apps() {
         let config = make_config(&[100, 200]);
-        let ids = controlled_app_ids(&config, &[AppId(200), AppId(300)]);
-        assert_eq!(ids, vec![AppId(100), AppId(200), AppId(300)]);
+        let script_apps: HashSet<AppId> = [AppId(200), AppId(300)].into_iter().collect();
+        let ids = controlled_app_ids(&config, &script_apps);
+        // Config-order entries come first, then any script-only extras. Script
+        // apps that duplicate config entries are dropped.
+        assert_eq!(&ids[..2], &[AppId(100), AppId(200)]);
+        assert!(ids.contains(&AppId(300)));
+        assert_eq!(ids.len(), 3);
     }
 }
