@@ -347,6 +347,8 @@ pub(super) enum AdapterError {
     Outbox(#[from] vapor_forge_sync_state::OutboxError),
     #[error("Cumulus client failed: {0}")]
     Client(#[from] vapor_forge_cloud_cumulus::CumulusError),
+    #[error("cloud backend failed: {0}")]
+    Backend(#[from] vapor_forge_cloud_core::BackendError),
 }
 
 pub(super) fn required<T>(value: Option<T>, field: &str) -> Result<T, AdapterError> {

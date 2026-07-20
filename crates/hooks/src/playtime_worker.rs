@@ -5,7 +5,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
-use vapor_forge_cloud_cumulus::CumulusSettings;
+use vapor_forge_cloud_core::CloudBackend;
+use vapor_forge_cloud_cumulus::{CumulusBackend, CumulusSettings};
 use vapor_forge_features::playtime::{PlaytimeGame, PlaytimeSnapshot};
 use vapor_forge_sync_state::playtime::{Outbox, PlaytimeEntry};
 
@@ -112,11 +113,10 @@ fn persist_pending(
     outbox: &Arc<Mutex<Outbox>>,
     pending: &Arc<Mutex<HashMap<(u64, u32), PlaytimeGame>>>,
 ) {
-    let Some(settings) = settings_context() else {
+    let Some(backend) = backend_context() else {
         return;
     };
-    let owner_scope =
-        vapor_forge_cloud_core::credential_scope(&settings.server_url, &settings.token);
+    let owner_scope = backend.credential_scope();
     let observed_at = unix_now();
     let games = match pending.lock() {
         Ok(mut pending) => pending.drain().collect::<Vec<_>>(),
@@ -188,17 +188,17 @@ fn debounce(wake: &mpsc::Receiver<()>) {
 }
 
 fn flush(outbox: &Arc<Mutex<Outbox>>) {
-    let Some(settings) = settings_context() else {
+    let Some(backend) = backend_context() else {
         return;
     };
     let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
         return;
     };
-    if let Err(error) = vapor_forge_cloud_cumulus::ensure_device_bound(&settings, &descriptor) {
+    if let Err(error) = backend.ensure_device_bound(&descriptor) {
         warn!(%error, "playtime-sync: device binding deferred");
         return;
     }
-    let scope = vapor_forge_cloud_core::credential_scope(&settings.server_url, &settings.token);
+    let scope = backend.credential_scope();
 
     for _ in 0..20 {
         let accounts = match outbox.lock() {
@@ -230,12 +230,7 @@ fn flush(outbox: &Arc<Mutex<Outbox>>) {
                 continue;
             }
             attempted = true;
-            let result = vapor_forge_cloud_cumulus::playtime::upload(
-                &settings,
-                descriptor.client_id,
-                &steam_id64,
-                &entries,
-            );
+            let result = backend.upload_playtime(descriptor.client_id, &steam_id64, &entries);
             let mut guard = match outbox.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -269,17 +264,18 @@ fn flush(outbox: &Arc<Mutex<Outbox>>) {
     }
 }
 
-fn settings_context() -> Option<CumulusSettings> {
+/// Composition root: the only place this worker names a concrete backend.
+fn backend_context() -> Option<Box<dyn CloudBackend>> {
     let config = crate::client::install::config();
     if !config.cumulus_configured() {
         return None;
     }
-    Some(CumulusSettings {
+    Some(Box::new(CumulusBackend::new(CumulusSettings {
         server_url: config.cloud.server_url.clone(),
         token: config.cloud.token.clone(),
         timeout_connect_ms: config.cloud.timeout_connect_ms,
         timeout_ms: config.cloud.timeout_ms,
-    })
+    })))
 }
 
 fn unix_now() -> i64 {

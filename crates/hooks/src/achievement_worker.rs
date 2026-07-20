@@ -5,8 +5,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
-use vapor_forge_cloud_cumulus::achievement::SchemaUploadOutcome;
-use vapor_forge_cloud_cumulus::CumulusSettings;
+use vapor_forge_cloud_core::{CloudBackend, SchemaUploadOutcome};
+use vapor_forge_cloud_cumulus::{CumulusBackend, CumulusSettings};
 use vapor_forge_sync_state::{
     Outbox, QueuedAchievementEvent, QueuedAchievementSchema, UploadIdentity,
 };
@@ -34,9 +34,9 @@ pub fn queue_event(mut event: QueuedAchievementEvent) -> bool {
     let Some(worker) = worker() else {
         return false;
     };
-    if let Some((settings, identity)) = upload_context() {
+    if let Some((backend, identity)) = upload_context() {
         if owner_matches(&event.owner_steam_id64, &identity) {
-            attribute_event(&mut event, &settings, &identity);
+            attribute_event(&mut event, backend.as_ref(), &identity);
             match worker.outbox.lock() {
                 Ok(outbox) => match outbox.enqueue(&event, unix_now()) {
                     Ok(inserted) => {
@@ -79,9 +79,9 @@ pub fn queue_schema(app_id: u32, schema_version: Option<String>, content: Vec<u8
         return;
     };
     let schema = QueuedAchievementSchema {
-        owner_scope: settings_context()
+        owner_scope: backend_context()
             .as_ref()
-            .map(|settings| vapor_forge_sync_state::endpoint_scope(&settings.server_url))
+            .map(|backend| backend.endpoint_scope())
             .unwrap_or_default(),
         app_id,
         language: "english".into(),
@@ -205,7 +205,7 @@ fn defer(worker: &AchievementWorker, event: QueuedAchievementEvent) -> bool {
 fn flush_unattributed(
     outbox: &Arc<Mutex<Outbox>>,
     unattributed: &Arc<Mutex<VecDeque<QueuedAchievementEvent>>>,
-    settings: &CumulusSettings,
+    backend: &dyn CloudBackend,
     identity: &UploadIdentity,
 ) -> Result<(), vapor_forge_sync_state::OutboxError> {
     let guard = match outbox.lock() {
@@ -229,7 +229,7 @@ fn flush_unattributed(
             unmatched.push_back(event);
             continue;
         }
-        attribute_event(&mut event, settings, identity);
+        attribute_event(&mut event, backend, identity);
         let result = guard.enqueue(&event, unix_now()).map(|_| ());
         if let Err(error) = result {
             drop(guard);
@@ -280,19 +280,17 @@ fn upload_loop(
     {
         persist_current_device_descriptor(&outbox);
         for _ in 0..10 {
-            let Some(settings) = settings_context() else {
+            let Some(backend) = backend_context() else {
                 break;
             };
             let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
                 break;
             };
-            if let Err(error) =
-                vapor_forge_cloud_cumulus::ensure_device_bound(&settings, &descriptor)
-            {
+            if let Err(error) = backend.ensure_device_bound(&descriptor) {
                 warn!(%error, "achievement-sync: device binding deferred");
                 break;
             }
-            let scope = vapor_forge_sync_state::endpoint_scope(&settings.server_url);
+            let scope = backend.endpoint_scope();
             let mut attempted = false;
             match outbox.lock() {
                 Ok(outbox) => {
@@ -316,14 +314,13 @@ fn upload_loop(
             };
             for schema in &schemas {
                 attempted = true;
-                let result =
-                    vapor_forge_cloud_cumulus::achievement::upload_schema(&settings, schema);
+                let result = backend.upload_achievement_schema(schema);
                 let guard = match outbox.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
                 };
                 match result {
-                    Ok(SchemaUploadOutcome::Uploaded | SchemaUploadOutcome::Disabled) => {
+                    Ok(SchemaUploadOutcome::Accepted | SchemaUploadOutcome::Declined) => {
                         if let Err(error) = guard.mark_schema_delivered(schema) {
                             warn!(%error, app_id = schema.app_id, "achievement-sync: failed to acknowledge schema upload");
                         }
@@ -358,7 +355,9 @@ fn upload_loop(
                 }
                 Err(_) => break,
             }
-            if let Err(error) = flush_unattributed(&outbox, &unattributed, &settings, &identity) {
+            if let Err(error) =
+                flush_unattributed(&outbox, &unattributed, backend.as_ref(), &identity)
+            {
                 warn!(%error, "achievement-sync: failed to attribute pending events");
                 break;
             }
@@ -374,9 +373,7 @@ fn upload_loop(
             };
             if !events.is_empty() {
                 attempted = true;
-                let result = vapor_forge_cloud_cumulus::achievement::upload_events(
-                    &settings, &identity, &events,
-                );
+                let result = backend.upload_achievement_events(&identity, &events);
                 let mut guard = match outbox.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
@@ -433,24 +430,25 @@ fn persist_current_device_descriptor(outbox: &Arc<Mutex<Outbox>>) {
 
 fn attribute_event(
     event: &mut QueuedAchievementEvent,
-    settings: &CumulusSettings,
+    backend: &dyn CloudBackend,
     identity: &UploadIdentity,
 ) {
-    event.owner_scope = vapor_forge_sync_state::endpoint_scope(&settings.server_url);
+    event.owner_scope = backend.endpoint_scope();
     event.owner_steam_id64.clone_from(&identity.steam_id64);
 }
 
-fn settings_context() -> Option<CumulusSettings> {
+/// Composition root: the only place this worker names a concrete backend.
+fn backend_context() -> Option<Box<dyn CloudBackend>> {
     let config = crate::client::install::config();
     if !config.cumulus_configured() {
         return None;
     }
-    Some(CumulusSettings {
+    Some(Box::new(CumulusBackend::new(CumulusSettings {
         server_url: config.cloud.server_url.clone(),
         token: config.cloud.token.clone(),
         timeout_connect_ms: config.cloud.timeout_connect_ms,
         timeout_ms: config.cloud.timeout_ms,
-    })
+    })))
 }
 
 fn upload_identity() -> Option<UploadIdentity> {
@@ -469,8 +467,8 @@ fn upload_identity() -> Option<UploadIdentity> {
     })
 }
 
-fn upload_context() -> Option<(CumulusSettings, UploadIdentity)> {
-    Some((settings_context()?, upload_identity()?))
+fn upload_context() -> Option<(Box<dyn CloudBackend>, UploadIdentity)> {
+    Some((backend_context()?, upload_identity()?))
 }
 
 fn unix_now() -> i64 {

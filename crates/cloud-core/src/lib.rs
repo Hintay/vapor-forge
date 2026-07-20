@@ -1,13 +1,20 @@
 #![forbid(unsafe_code)]
 
+mod backend;
 mod device;
+mod files;
 mod sync;
 
 use sha2::{Digest, Sha256};
 
+pub use backend::{BackendError, CloudBackend, SchemaUploadOutcome};
 pub use device::{
     device_descriptor, record_device_descriptor, record_local_client_id, restore_device_descriptor,
     DeviceDescriptor,
+};
+pub use files::{
+    ByteStore, ChangeList, CloudFileStore, DirectTransfer, FileEntry, FileMetadata, HttpHeader,
+    HttpTarget, Quota, Transfer, UploadBlock,
 };
 pub use sync::{AchievementEvent, AchievementSchema, PlaytimeEntry, UploadIdentity};
 

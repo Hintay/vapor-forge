@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
-use vapor_forge_cloud_core::device_descriptor;
+use vapor_forge_cloud_core::{device_descriptor, CloudBackend};
 use vapor_forge_steam_protocol::*;
 use vapor_forge_sync_state::{
     default_outbox_path, new_conflict_event_id, Outbox, QueuedConflictResolution,
@@ -90,21 +90,24 @@ pub(super) fn execute_rpc(
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     state.prepare(settings);
-    if settings.bind_device {
-        let descriptor = device_descriptor().ok_or_else(|| {
-            AdapterError::Protocol("Steam ClientID is not available for device binding".into())
-        })?;
-        let binding_settings = vapor_forge_cloud_cumulus::CumulusSettings {
+    // Composition root for the RPC path: device binding and scoping go through
+    // the backend port; the file transfers below still speak Cumulus HTTP.
+    let backend = vapor_forge_cloud_cumulus::CumulusBackend::new(
+        vapor_forge_cloud_cumulus::CumulusSettings {
             server_url: settings.server_url.clone(),
             token: settings.token.clone(),
             timeout_connect_ms: settings.timeout_connect_ms,
             timeout_ms: settings.timeout_ms,
-        };
-        vapor_forge_cloud_cumulus::ensure_device_bound(&binding_settings, &descriptor)?;
+        },
+    );
+    if settings.bind_device {
+        let descriptor = device_descriptor().ok_or_else(|| {
+            AdapterError::Protocol("Steam ClientID is not available for device binding".into())
+        })?;
+        backend.ensure_device_bound(&descriptor)?;
     }
     let client = CumulusClient::new(settings)?;
-    let conflict_scope =
-        vapor_forge_cloud_core::credential_scope(&settings.server_url, &settings.token);
+    let conflict_scope = backend.credential_scope();
     if let Err(error) = deliver_ready_conflicts(state, &client, &conflict_scope) {
         warn!(%error, "cloud-rpc: deferred conflict report failed");
     }
