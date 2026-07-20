@@ -135,6 +135,22 @@ impl CloudRpcQueue {
         self.count.load(Ordering::Acquire) == 0
     }
 
+    pub fn is_issued_transfer_target(
+        &self,
+        config: &RuntimeConfig,
+        authority: &str,
+        path: &str,
+    ) -> bool {
+        if !config.cumulus_configured() {
+            return false;
+        }
+        self.transfer_targets.contains(
+            &super::transfer_targets::CloudStateScope::from_config(config),
+            authority,
+            path,
+        )
+    }
+
     pub(super) fn worker(&self, app_id: u32) -> &RpcWorker {
         &self.workers[app_id as usize % self.workers.len()]
     }
@@ -161,7 +177,9 @@ impl CloudRpcQueue {
         body: &[u8],
         config: &RuntimeConfig,
     ) -> bool {
-        if config.cumulus_configured() && method == LAUNCH_INTENT {
+        if (config.local_cloud_configured() || config.cumulus_configured())
+            && method == LAUNCH_INTENT
+        {
             capture_device_descriptor(body);
         }
         if is_cumulus_transfer_report(method, body, config, &self.transfer_targets) {
@@ -183,7 +201,7 @@ impl CloudRpcQueue {
         let Some(app_id) = request_app_id(method, body) else {
             return false;
         };
-        if !config.cumulus_configured()
+        if (!config.local_cloud_configured() && !config.cumulus_configured())
             || !crate::apps::classify_app(config, AppId(app_id)).is_confirmed_unowned()
         {
             return false;

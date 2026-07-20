@@ -80,6 +80,15 @@ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89
 [[steamclient."CCMConnection::RecvPkt".variants]]
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 8B 45 08 89 45 D4 8B 45 0C 89 FB 89 45 D0 89 C1 65 A1 14 00 00 00"
 
+# CHTTPRequestJob start boundary used by the process-local cloud transfer hook.
+[steamclient."CHTTPRequestJob::Start"]
+follow = "none"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 6C 8B 5D 14 8B 45 0C 8B 55 10 8B 7D 08 89 5D ? 89 45 ? 89 55 ? 65 8B 1D 14 00 00 00"
+optional = true
+
+[[steamclient."CHTTPRequestJob::Start".variants]]
+pattern = "55 89 E5 57 56 8D 4D B4 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 6C 8B 45 10 8B 7D 08 8B 5D 0C 89 45 ? 8B 45 14 F3 0F 7E 47 38 66 0F 6F 8E ? ? ? ? 89 5D ? 8B 57 04 89 45 ? 66 0F D4 C1"
+
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"
 pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"

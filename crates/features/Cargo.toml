@@ -23,6 +23,7 @@ thiserror.workspace = true
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-cloud-core = { path = "../cloud-core" }
 vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
+vapor-forge-cloud-local = { path = "../cloud-local" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }
 vapor-forge-sync-state = { path = "../sync-state" }

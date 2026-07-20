@@ -42,6 +42,8 @@ pub struct ChangeList {
     /// The backend's newest change number; callers pass it back to resume.
     pub current_change_number: u64,
     pub files: Vec<FileEntry>,
+    /// Paths removed after the requested change number.
+    pub deleted_paths: Vec<String>,
 }
 
 /// Storage consumption for one app.
@@ -174,6 +176,7 @@ mod tests {
             Ok(ChangeList {
                 current_change_number: self.change_number,
                 files: Vec::new(),
+                deleted_paths: Vec::new(),
             })
         }
 

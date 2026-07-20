@@ -37,6 +37,9 @@ pub(super) fn is_cumulus_transfer_report(
     config: &RuntimeConfig,
     transfer_targets: &TransferTargetRegistry,
 ) -> bool {
+    if config.local_cloud_configured() {
+        return is_local_transfer_report(method, body);
+    }
     if !config.cumulus_configured() {
         return false;
     }
@@ -63,6 +66,27 @@ pub(super) fn is_cumulus_transfer_report(
                     || transfer_targets.contains(&scope, &host, &path)
             })
         }
+        _ => false,
+    }
+}
+
+fn is_local_transfer_report(method: &str, body: &[u8]) -> bool {
+    match method {
+        CDN_REPORT => CloudCdnReportNotification::decode(body)
+            .ok()
+            .and_then(|report| report.url)
+            .and_then(|url| parse_absolute_target(&url))
+            .is_some_and(|(_, authority, path)| {
+                authority.eq_ignore_ascii_case(vapor_forge_cloud_local::LOCAL_TRANSFER_AUTHORITY)
+                    && path.starts_with("/v1/")
+            }),
+        EXTERNAL_TRANSFER_REPORT => CloudExternalStorageTransferReportNotification::decode(body)
+            .ok()
+            .and_then(|report| report.host.zip(report.path))
+            .is_some_and(|(authority, path)| {
+                authority.eq_ignore_ascii_case(vapor_forge_cloud_local::LOCAL_TRANSFER_AUTHORITY)
+                    && path.starts_with("/v1/")
+            }),
         _ => false,
     }
 }

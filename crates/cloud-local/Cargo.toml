@@ -1,0 +1,15 @@
+[package]
+name = "vapor-forge-cloud-local"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+sha1.workspace = true
+vapor-forge-cloud-core = { path = "../cloud-core" }
+zip.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

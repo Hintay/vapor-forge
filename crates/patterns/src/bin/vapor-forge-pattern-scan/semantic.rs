@@ -127,6 +127,11 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_ccm_recv_pkt32,
     },
     SemanticCheck {
+        name: "CHTTPRequestJob::Start",
+        label: "CHTTPRequestJob::Start body",
+        validate: validate_http_request_job_start32,
+    },
+    SemanticCheck {
         name: "CUser::MarkLicenseAsChanged",
         label: "CUser::MarkLicenseAsChanged body",
         validate: validate_mark_license_changed32,
@@ -218,6 +223,11 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CCMConnection::RecvPkt",
         label: "CCMConnection::RecvPkt body",
         validate: validate_ccm_recv_pkt64,
+    },
+    SemanticCheck {
+        name: "CHTTPRequestJob::Start",
+        label: "CHTTPRequestJob::Start body",
+        validate: validate_http_request_job_start64,
     },
     SemanticCheck {
         name: "CUser::MarkLicenseAsChanged",
@@ -2366,6 +2376,12 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86, "CCMConnection::RecvPkt") => ccm_recv_pkt32_evidence(code, offset),
         (SemanticArch::X86_64, "CCMConnection::RecvPkt") => ccm_recv_pkt64_evidence(code, offset),
+        (SemanticArch::X86, "CHTTPRequestJob::Start") => {
+            http_request_job_start32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CHTTPRequestJob::Start") => {
+            http_request_job_start64_evidence(code, offset)
+        }
         (SemanticArch::X86, "CUser::MarkLicenseAsChanged") => {
             mark_license_changed32_evidence(code, offset)
         }
@@ -3241,6 +3257,87 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 || has_asm64_call_after(bytes, |a| a.mov(rdi, r12), 0x10),
         ),
         ("packet null check", has_asm64(bytes, |a| a.test(rax, rax))),
+    ]))
+}
+
+fn validate_http_request_job_start32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        http_request_job_start32_evidence(code, offset),
+        "manager/job/request start boundary",
+    )
+}
+
+fn http_request_job_start32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    let classic_args = has_asm32(bytes, |a| a.mov(edi, dword_ptr(ebp + 0x08)))
+        && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
+        && has_asm32(bytes, |a| a.mov(edx, dword_ptr(ebp + 0x10)))
+        && has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x14)));
+    let steamrt_args = has_asm32(bytes, |a| a.mov(edi, dword_ptr(ebp + 0x08)))
+        && has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x0C)))
+        && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
+        && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x14)));
+    let classic_counter = has_asm32(bytes, |a| a.add(dword_ptr(edi + 0x38), 1))
+        && has_asm32(bytes, |a| a.adc(dword_ptr(edi + 0x3C), 0));
+    let steamrt_counter = has_asm32(bytes, |a| a.movq(xmm0, qword_ptr(edi + 0x38)))
+        && has_seq(bytes, &[0x66, 0x0F, 0x6F, 0x8E])
+        && has_asm32(bytes, |a| a.paddq(xmm0, xmm1))
+        && has_asm32(bytes, |a| a.movq(qword_ptr(edi + 0x38), xmm0));
+    Some(Evidence::required([
+        (
+            "cdecl manager/job/request arguments",
+            classic_args || steamrt_args,
+        ),
+        (
+            "manager outstanding increment",
+            classic_counter || steamrt_counter,
+        ),
+        (
+            "job start field",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x60)))
+                || has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebx + 0x60))),
+        ),
+        (
+            "job request flags",
+            has_asm32(bytes, |a| a.or(byte_ptr(edx + 0x46), al))
+                || has_asm32(bytes, |a| a.or(byte_ptr(ecx + 0x46), al)),
+        ),
+    ]))
+}
+
+fn validate_http_request_job_start64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        http_request_job_start64_evidence(code, offset),
+        "manager/job/request start boundary",
+    )
+}
+
+fn http_request_job_start64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    let classic_args = has_asm64(bytes, |a| a.mov(rbp, rsi))
+        && has_asm64(bytes, |a| a.mov(rbx, rdi));
+    let linux_args = has_asm64(bytes, |a| a.mov(r12, rsi))
+        && has_asm64(bytes, |a| a.mov(rbp, rdi));
+    Some(Evidence::required([
+        ("manager and job arguments", classic_args || linux_args),
+        (
+            "request argument preservation",
+            has_asm64(bytes, |a| a.mov(qword_ptr(rsp), rdx))
+                || has_asm64(bytes, |a| a.mov(qword_ptr(rsp + 0x08), rdx)),
+        ),
+        (
+            "manager outstanding increment",
+            has_asm64(bytes, |a| a.add(qword_ptr(rdi + 0x40), 1)),
+        ),
+        (
+            "job start field",
+            has_asm64(bytes, |a| a.mov(r15, qword_ptr(rsi + 0x88))),
+        ),
+        (
+            "job request flags",
+            has_asm64(bytes, |a| a.or(byte_ptr(rbp + 0x52), r12b))
+                || has_asm64(bytes, |a| a.or(byte_ptr(r12 + 0x52), al)),
+        ),
     ]))
 }
 

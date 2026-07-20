@@ -250,6 +250,7 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
             method: COMPLETE_BATCH.into(),
             body: Vec::new(),
             settings: CloudSettings {
+                local_path: String::new(),
                 server_url: "http://127.0.0.1".into(),
                 token: "token".into(),
                 steam_client_id: Some(7),
@@ -268,6 +269,7 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
 fn adapter_state_is_discarded_when_cumulus_scope_changes() {
     let mut state = AdapterState::default();
     let first = CloudSettings {
+        local_path: String::new(),
         server_url: "https://cloud-a.example".into(),
         token: "token-a".into(),
         steam_client_id: Some(7),
@@ -408,6 +410,7 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
 fn forwards_cumulus_transfer_reports_to_cumulus() {
     let (server_url, captured) = scripted_server(&[(204, ""), (204, "")]);
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "report-token".into(),
         steam_client_id: None,
@@ -474,6 +477,7 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
         (200, r#"{"batch_id":"43","app_change_number":1}"#),
     ]);
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "batch-token".into(),
         steam_client_id: None,
@@ -540,6 +544,7 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         (200, r#"{"batch_id":"43","app_change_number":3}"#),
     ]);
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "conflict-token".into(),
         steam_client_id: None,
@@ -768,6 +773,7 @@ fn changelist_http_response_maps_to_steam_rpc() {
         }"#,
     );
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "secret-token".into(),
         steam_client_id: Some(11_047_413_376_560_171_870),
@@ -823,6 +829,7 @@ fn download_uses_external_descriptor_without_cumulus_bearer() {
         ),
     ]);
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "cumulus-secret".into(),
         steam_client_id: None,
@@ -896,6 +903,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
         (200, r#"{"change_number":1}"#),
     ]);
     let settings = CloudSettings {
+        local_path: String::new(),
         server_url,
         token: "lifecycle-token".into(),
         steam_client_id: Some(7),
@@ -1018,4 +1026,196 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
     assert!(requests.iter().all(|request| request
         .to_ascii_lowercase()
         .contains("x-cumulus-steam-client-id: 7")));
+}
+
+#[test]
+fn local_folder_lifecycle_uses_in_process_transfer_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = CloudSettings {
+        local_path: directory.path().to_string_lossy().into_owned(),
+        server_url: String::new(),
+        token: String::new(),
+        steam_client_id: Some(7),
+        bind_device: false,
+        timeout_connect_ms: 1,
+        timeout_ms: 1,
+    };
+    let mut state = AdapterState::default();
+    let app_id = 480;
+
+    let changelist = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(0),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &changelist.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(0));
+    assert!(response.files.is_empty());
+
+    let begin = CloudBeginAppUploadBatchRequest {
+        app_id: Some(app_id),
+        machine_name: Some("deck".into()),
+        files_to_upload: vec!["save.dat".into()],
+        files_to_delete: Vec::new(),
+        client_id: Some(7),
+        app_build_id: Some(1),
+    };
+    let reply = execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+    let batch = CloudBeginAppUploadBatchResponse::decode(reply.body.as_slice()).unwrap();
+    let batch_id = batch.batch_id.unwrap();
+
+    let contents = b"save";
+    let declare = CloudClientBeginFileUploadRequest {
+        app_id: Some(app_id),
+        file_size: Some(contents.len() as u32),
+        raw_file_size: Some(contents.len() as u32),
+        file_sha: Some(hex_to_bytes("13a4a11319d31c1b323d5774f44240a9ffc984d0").unwrap()),
+        timestamp: Some(1_700_000_000),
+        filename: Some("save.dat".into()),
+        platforms_to_sync: Some(u32::MAX),
+        cell_id: None,
+        can_encrypt: Some(false),
+        is_shared_file: Some(false),
+        deprecated_realm: None,
+        upload_batch_id: Some(batch_id),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        BEGIN_FILE_UPLOAD,
+        &declare.encode_to_vec(),
+    )
+    .unwrap();
+    let declared = CloudClientBeginFileUploadResponse::decode(reply.body.as_slice()).unwrap();
+    let target = &declared.block_requests[0];
+    let outcome = vapor_forge_cloud_local::intercept_transfer(
+        target.url_host.as_deref().unwrap(),
+        target.url_path.as_deref().unwrap(),
+        contents,
+    )
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        vapor_forge_cloud_local::LocalTransferOutcome::Upload(Ok(1))
+    ));
+
+    let commit = CloudClientCommitFileUploadRequest {
+        transfer_succeeded: Some(true),
+        app_id: Some(app_id),
+        file_sha: declare.file_sha,
+        filename: Some("save.dat".into()),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        COMMIT_FILE_UPLOAD,
+        &commit.encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        CloudClientCommitFileUploadResponse::decode(reply.body.as_slice())
+            .unwrap()
+            .file_committed,
+        Some(true)
+    );
+    let complete = CloudCompleteAppUploadBatchRequest {
+        app_id: Some(app_id),
+        batch_id: Some(batch_id),
+        batch_eresult: Some(super::ERESULT_OK as u32),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        COMPLETE_BATCH,
+        &complete.encode_to_vec(),
+    )
+    .unwrap();
+
+    let download = CloudClientFileDownloadRequest {
+        app_id: Some(app_id),
+        filename: Some("save.dat".into()),
+        realm: None,
+        force_proxy: None,
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        FILE_DOWNLOAD,
+        &download.encode_to_vec(),
+    )
+    .unwrap();
+    let download = CloudClientFileDownloadResponse::decode(reply.body.as_slice()).unwrap();
+    let outcome = vapor_forge_cloud_local::intercept_transfer(
+        download.url_host.as_deref().unwrap(),
+        download.url_path.as_deref().unwrap(),
+        &[],
+    )
+    .unwrap();
+    match outcome {
+        vapor_forge_cloud_local::LocalTransferOutcome::Download(result) => {
+            assert_eq!(result.unwrap(), contents)
+        }
+        _ => panic!("expected local download"),
+    }
+
+    let begin_delete = CloudBeginAppUploadBatchRequest {
+        app_id: Some(app_id),
+        machine_name: Some("deck".into()),
+        files_to_upload: Vec::new(),
+        files_to_delete: vec!["save.dat".into()],
+        client_id: Some(7),
+        app_build_id: Some(1),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        BEGIN_BATCH,
+        &begin_delete.encode_to_vec(),
+    )
+    .unwrap();
+    let delete_batch = CloudBeginAppUploadBatchResponse::decode(reply.body.as_slice())
+        .unwrap()
+        .batch_id
+        .unwrap();
+    let delete = CloudClientDeleteFileRequest {
+        app_id: Some(app_id),
+        filename: Some("save.dat".into()),
+        is_explicit_delete: Some(true),
+        upload_batch_id: Some(delete_batch),
+    };
+    execute_rpc(&mut state, &settings, DELETE_FILE, &delete.encode_to_vec()).unwrap();
+    let complete = CloudCompleteAppUploadBatchRequest {
+        app_id: Some(app_id),
+        batch_id: Some(delete_batch),
+        batch_eresult: Some(super::ERESULT_OK as u32),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        COMPLETE_BATCH,
+        &complete.encode_to_vec(),
+    )
+    .unwrap();
+
+    let delta = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &delta.encode_to_vec(),
+    )
+    .unwrap();
+    let delta = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(delta.current_change_number, Some(2));
+    assert_eq!(delta.files.len(), 1);
+    assert_eq!(delta.files[0].persist_state, Some(2));
 }

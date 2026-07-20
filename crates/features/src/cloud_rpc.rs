@@ -2,6 +2,7 @@
 
 mod adapter;
 mod http;
+mod local;
 mod protocol;
 mod queue;
 mod transfer_targets;

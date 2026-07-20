@@ -5,6 +5,7 @@ pub(crate) mod achievement;
 pub(crate) mod achievement_adapters;
 pub(crate) mod client_id;
 pub(crate) mod cloud;
+pub(crate) mod cloud_http;
 pub(crate) mod current_app;
 pub(crate) mod depot;
 pub(crate) mod dlc;

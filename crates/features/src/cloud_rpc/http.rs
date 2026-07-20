@@ -10,6 +10,7 @@ use vapor_forge_steam_protocol::CloudHttpHeader;
 
 #[derive(Clone)]
 pub(super) struct CloudSettings {
+    pub(super) local_path: String,
     pub(super) server_url: String,
     pub(super) token: String,
     pub(super) steam_client_id: Option<u64>,
@@ -21,6 +22,7 @@ pub(super) struct CloudSettings {
 impl CloudSettings {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
         Self {
+            local_path: config.cloud.local_path.trim().to_string(),
             server_url: config.cloud.server_url.trim().to_string(),
             token: config.cloud.token.trim().to_string(),
             steam_client_id: device_descriptor().map(|descriptor| descriptor.client_id),

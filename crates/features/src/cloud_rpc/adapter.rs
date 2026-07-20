@@ -90,6 +90,9 @@ pub(super) fn execute_rpc(
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     state.prepare(settings);
+    if !settings.local_path.is_empty() {
+        return super::local::execute_local_rpc(state, settings, method, body);
+    }
     // Composition root for the RPC path: device binding and scoping go through
     // the backend port; the file transfers below still speak Cumulus HTTP.
     let backend = vapor_forge_cloud_cumulus::CumulusBackend::new(

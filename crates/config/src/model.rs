@@ -149,6 +149,9 @@ pub struct CloudSection {
     pub server_url: String,
     #[serde(default)]
     pub token: String,
+    /// Local folder backend root. Takes precedence over Cumulus when non-empty.
+    #[serde(default)]
+    pub local_path: String,
     #[serde(default = "default_timeout_connect_ms")]
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
@@ -161,6 +164,7 @@ impl Default for CloudSection {
             enabled: None,
             server_url: String::new(),
             token: String::new(),
+            local_path: String::new(),
             timeout_connect_ms: default_timeout_connect_ms(),
             timeout_ms: default_timeout_ms(),
         }
@@ -467,7 +471,13 @@ impl RuntimeConfig {
     }
 
     pub fn cloud_enabled_for_controlled_apps(&self) -> bool {
-        self.cumulus_configured() || self.cloud.enabled.unwrap_or(false)
+        self.local_cloud_configured()
+            || self.cumulus_configured()
+            || self.cloud.enabled.unwrap_or(false)
+    }
+
+    pub fn local_cloud_configured(&self) -> bool {
+        !self.cloud.local_path.trim().is_empty()
     }
 
     pub fn cumulus_configured(&self) -> bool {

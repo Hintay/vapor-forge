@@ -1031,6 +1031,71 @@ mod tests {
     }
 
     #[test]
+    fn validates_http_request_job_start32_cdecl_shape() {
+        let mut code = vec![0x90; 0x200];
+        let start = 0x20;
+        place_asm32(&mut code, start + 0x10, |a| {
+            a.mov(ebx, dword_ptr(ebp + 0x14))?;
+            a.mov(eax, dword_ptr(ebp + 0x0C))?;
+            a.mov(edx, dword_ptr(ebp + 0x10))?;
+            a.mov(edi, dword_ptr(ebp + 0x08))
+        });
+        place_asm32(&mut code, start + 0x30, |a| {
+            a.add(dword_ptr(edi + 0x38), 1)?;
+            a.adc(dword_ptr(edi + 0x3C), 0)?;
+            a.mov(eax, dword_ptr(eax + 0x60))
+        });
+        place_asm32(&mut code, start + 0x50, |a| a.or(byte_ptr(edx + 0x46), al));
+
+        assert!(http_request_job_start32_evidence(&code, start)
+            .is_some_and(|evidence| evidence.is_complete()));
+
+        let incomplete = &code[..start + 0x50];
+        assert!(http_request_job_start32_evidence(incomplete, start)
+            .is_some_and(|evidence| !evidence.is_complete()));
+    }
+
+    #[test]
+    fn validates_http_request_job_start32_steamrt_shape() {
+        let mut code = vec![0x90; 0x200];
+        let start = 0x20;
+        place_asm32(&mut code, start + 0x10, |a| {
+            a.mov(eax, dword_ptr(ebp + 0x10))?;
+            a.mov(edi, dword_ptr(ebp + 0x08))?;
+            a.mov(ebx, dword_ptr(ebp + 0x0C))?;
+            a.mov(eax, dword_ptr(ebp + 0x14))
+        });
+        place_asm32(&mut code, start + 0x30, |a| {
+            a.movq(xmm0, qword_ptr(edi + 0x38))?;
+            a.movdqa(xmm1, xmmword_ptr(esi + 0x1234))?;
+            a.paddq(xmm0, xmm1)?;
+            a.movq(qword_ptr(edi + 0x38), xmm0)?;
+            a.mov(eax, dword_ptr(ebx + 0x60))
+        });
+        place_asm32(&mut code, start + 0x50, |a| a.or(byte_ptr(ecx + 0x46), al));
+
+        assert!(http_request_job_start32_evidence(&code, start)
+            .is_some_and(|evidence| evidence.is_complete()));
+    }
+
+    #[test]
+    fn validates_http_request_job_start64_linux_shape() {
+        let mut code = vec![0x90; 0x200];
+        let start = 0x20;
+        place_asm64(&mut code, start + 0x10, |a| {
+            a.mov(r12, rsi)?;
+            a.mov(rbp, rdi)?;
+            a.mov(qword_ptr(rsp + 0x08), rdx)?;
+            a.add(qword_ptr(rdi + 0x40), 1)?;
+            a.mov(r15, qword_ptr(rsi + 0x88))?;
+            a.or(byte_ptr(r12 + 0x52), al)
+        });
+
+        assert!(http_request_job_start64_evidence(&code, start)
+            .is_some_and(|evidence| evidence.is_complete()));
+    }
+
+    #[test]
     fn recognizes_x86_cgameid_reference_abi() {
         let code = asm_bytes32(|a| {
             a.push(ebp)?;

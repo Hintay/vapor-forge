@@ -16,6 +16,9 @@ pub(super) struct CloudStateScope {
 
 impl CloudStateScope {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
+        if config.local_cloud_configured() {
+            return Self::local(&config.cloud.local_path);
+        }
         Self {
             credential_scope: vapor_forge_cloud_core::credential_scope(
                 &config.cloud.server_url,
@@ -25,11 +28,23 @@ impl CloudStateScope {
     }
 
     pub(super) fn from_settings(settings: &CloudSettings) -> Self {
+        if !settings.local_path.is_empty() {
+            return Self::local(&settings.local_path);
+        }
         Self {
             credential_scope: vapor_forge_cloud_core::credential_scope(
                 &settings.server_url,
                 &settings.token,
             ),
+        }
+    }
+
+    fn local(path: &str) -> Self {
+        Self {
+            credential_scope: vapor_forge_cloud_core::endpoint_scope(&format!(
+                "file://{}",
+                path.trim()
+            )),
         }
     }
 }

@@ -853,6 +853,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1142,6 +1153,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vapor-forge-cloud-local"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sha1",
+ "tempfile",
+ "vapor-forge-cloud-core",
+ "zip",
+]
+
+[[package]]
 name = "vapor-forge-config"
 version = "0.1.0"
 dependencies = [
@@ -1181,6 +1203,7 @@ dependencies = [
  "ureq",
  "vapor-forge-cloud-core",
  "vapor-forge-cloud-cumulus",
+ "vapor-forge-cloud-local",
  "vapor-forge-config",
  "vapor-forge-core",
  "vapor-forge-steam-protocol",
@@ -1224,6 +1247,7 @@ dependencies = [
  "tracing",
  "vapor-forge-cloud-core",
  "vapor-forge-cloud-cumulus",
+ "vapor-forge-cloud-local",
  "vapor-forge-config",
  "vapor-forge-diagnostics",
  "vapor-forge-features",

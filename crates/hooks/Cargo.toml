@@ -31,6 +31,7 @@ vapor-forge-steam-native-abi = { path = "../steam-native-abi" }
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-cloud-core = { path = "../cloud-core" }
 vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
+vapor-forge-cloud-local = { path = "../cloud-local" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-features = { path = "../features" }

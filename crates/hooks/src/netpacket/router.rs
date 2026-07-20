@@ -60,6 +60,10 @@ pub enum SendFrameDecision {
     Rewrite(Vec<u8>),
 }
 
+pub(crate) fn is_cloud_transfer_target(authority: &str, path: &str) -> bool {
+    CLOUD_PENDING.is_issued_transfer_target(&crate::client::install::config(), authority, path)
+}
+
 /// Inspect an outgoing frame and decide whether to pass, drop, or rewrite it.
 pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     let mut decision = SendFrameDecision::Pass;

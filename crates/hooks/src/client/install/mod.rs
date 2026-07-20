@@ -578,6 +578,12 @@ fn do_install() {
         "CCMConnection::RecvPkt",
         super::network::hk_recv_pkt as super::network::RecvPktFn,
     );
+    let d_http_job_start = resolve_from_registry(
+        &registry,
+        &code,
+        super::cloud_http::HTTP_JOB_START_NAME,
+        super::cloud_http::hk_http_job_start as super::cloud_http::HttpJobStartFn,
+    );
     let d_write_vdf = if vmt_scanner_supported() {
         resolve_from_registry(
             &registry,
@@ -671,6 +677,7 @@ fn do_install() {
             d_send_frame
         ),
         hr!("CCMConnection::RecvPkt", d_recv_pkt),
+        hr!(super::cloud_http::HTTP_JOB_START_NAME, d_http_job_start),
         hr!("CConfigStore::WriteVdfFile", d_write_vdf),
         hr!("CUser::BuildSpawnEnvBlock", d_build_spawn_env),
         hr!("CUser::SpawnProcess", d_spawn_process),
@@ -788,6 +795,11 @@ fn do_install() {
             "CCMConnection::RecvPkt",
             std::ptr::addr_of_mut!(super::network::RECV_PKT_DETOUR),
             d_recv_pkt,
+        );
+        detour::store_and_finalize(
+            super::cloud_http::HTTP_JOB_START_NAME,
+            std::ptr::addr_of_mut!(super::cloud_http::HTTP_JOB_START_DETOUR),
+            d_http_job_start,
         );
         detour::store_and_finalize(
             "CConfigStore::WriteVdfFile",
