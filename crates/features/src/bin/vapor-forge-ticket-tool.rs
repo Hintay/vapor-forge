@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use prost::Message;
 use serde::Serialize;
-use vapor_forge_abi::{
+use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, EncryptedAppTicketResponse, EMSG_ENCRYPTED_APPTICKET_RESPONSE,
     K_MSG_HDR_PROTO_FLAG,
 };
@@ -413,7 +413,8 @@ struct ProtoHeaderReport {
 }
 
 fn inspect_packet(bytes: &[u8]) -> Result<PacketReport, String> {
-    let Some((emsg_raw, header_bytes, body_bytes)) = vapor_forge_abi::unpack_raw(bytes) else {
+    let Some((emsg_raw, header_bytes, body_bytes)) = vapor_forge_steam_protocol::unpack_raw(bytes)
+    else {
         return Err("packet is too short or has invalid header length".to_owned());
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
@@ -676,7 +677,9 @@ mod tests {
 
         let report = inspect_app_ticket(&ticket, &args);
         let preview = report.forge_preview.unwrap();
-        assert_eq!(preview.total_size, 332);
+        // total_size reports the source length, not the 332-byte physical
+        // buffer that also holds the inserted appId.
+        assert_eq!(preview.total_size, 328);
         assert_eq!(preview.app_id_offset, 200);
         assert_eq!(preview.inserted_app_id, Some(480));
     }

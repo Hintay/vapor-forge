@@ -302,6 +302,28 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         } else {
             scan_steamclient32_layouts(segment.bytes, segment.vaddr, &resolved)
         };
+        failed |= scan_user_stats_wrapper_abi(path, &data);
+        failed |= scan_cuser_stats_adapters(
+            path,
+            segment.bytes,
+            segment.vaddr,
+            if is_elf64 {
+                SemanticArch::X86_64
+            } else {
+                SemanticArch::X86
+            },
+        );
+        failed |= scan_cuser_adapters(
+            path,
+            segment.bytes,
+            segment.vaddr,
+            if is_elf64 {
+                SemanticArch::X86_64
+            } else {
+                SemanticArch::X86
+            },
+            &resolved,
+        );
         failed |= scan_client_id_config_behavior(path, &data, segment, &resolved);
     } else if module == "steamui" {
         failed |= if is_elf64 {
@@ -1009,6 +1031,57 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_x86_cgameid_reference_abi() {
+        let code = asm_bytes32(|a| {
+            a.push(ebp)?;
+            a.mov(ebp, esp)?;
+            a.mov(eax, dword_ptr(ebp + 0x0c))?;
+            a.movq(xmm0, qword_ptr(eax))
+        })
+        .unwrap();
+        assert!(wrapper_dereferences_game_id(&code, ElfClass::Elf32));
+
+        let by_value = asm_bytes32(|a| a.mov(eax, dword_ptr(ebp + 0x0c))).unwrap();
+        assert!(!wrapper_dereferences_game_id(&by_value, ElfClass::Elf32));
+    }
+
+    #[test]
+    fn recognizes_x86_cgameid_reference_abi_after_frame_spill() {
+        let code = asm_bytes32(|a| {
+            a.push(ebp)?;
+            a.mov(ebp, esp)?;
+            a.mov(edx, dword_ptr(ebp + 0x0c))?;
+            a.mov(dword_ptr(ebp - 0x70), edx)?;
+            a.xor(edx, edx)?;
+            a.mov(edx, dword_ptr(ebp - 0x70))?;
+            a.movq(xmm0, qword_ptr(edx))
+        })
+        .unwrap();
+        assert!(wrapper_dereferences_game_id(&code, ElfClass::Elf32));
+
+        let by_value = asm_bytes32(|a| {
+            a.mov(edx, dword_ptr(ebp + 0x0c))?;
+            a.mov(dword_ptr(ebp - 0x70), edx)?;
+            a.mov(eax, dword_ptr(ebp - 0x70))
+        })
+        .unwrap();
+        assert!(!wrapper_dereferences_game_id(&by_value, ElfClass::Elf32));
+    }
+
+    #[test]
+    fn recognizes_x86_64_cgameid_reference_abi() {
+        let code = asm_bytes64(|a| {
+            a.mov(r12, rsi)?;
+            a.mov(rax, qword_ptr(r12))
+        })
+        .unwrap();
+        assert!(wrapper_dereferences_game_id(&code, ElfClass::Elf64));
+
+        let by_value = asm_bytes64(|a| a.mov(rax, rsi)).unwrap();
+        assert!(!wrapper_dereferences_game_id(&by_value, ElfClass::Elf64));
+    }
+
+    #[test]
     fn validates_check_app_ownership32_ubuntu12_shape() {
         let mut code = vec![0x90; 0x420];
         let start = 0x20;
@@ -1257,6 +1330,31 @@ mod tests {
     }
 
     #[test]
+    fn discovers_current_package_info64_layout_from_lookup_shape() {
+        let mut code = vec![0x90; 0x200];
+        let start = 0x30;
+        place_asm64(&mut code, start, |a| a.movsxd(rax, dword_ptr(rdi + 0x570)));
+        place_asm64(&mut code, start + 0x10, |a| {
+            a.mov(rcx, qword_ptr(rdi + 0x588))
+        });
+        place_asm64(&mut code, start + 0x20, |a| a.imul_3(rax, rax, 0x78));
+        place_asm64(&mut code, start + 0x30, |a| {
+            a.cmp(rdx, qword_ptr(rax + 0x10))
+        });
+        place_asm64(&mut code, start + 0x40, |a| {
+            a.add(rax, 0x18)?;
+            a.ret()
+        });
+
+        let layout = discover_package_info64_layout(&code, start).unwrap();
+        assert_eq!(layout.count_off, 0x570);
+        assert_eq!(layout.elements_off, 0x588);
+        assert_eq!(layout.node_size, 0x78);
+        assert_eq!(layout.node_key_off, 0x10);
+        assert_eq!(layout.node_value_off, 0x18);
+    }
+
+    #[test]
     fn validates_is_user_subscribed_app_in_ticket32_checker() {
         let mut code = vec![0x90; 0x220];
         let start = 0x20;
@@ -1291,6 +1389,59 @@ mod tests {
         let evidence = is_user_subscribed_app_in_ticket32_evidence(&code, start).unwrap();
         assert!(!evidence.is_complete());
         assert_eq!(evidence.missing, vec!["ticket removal side effect"]);
+    }
+
+    #[test]
+    fn cuser_adapter_resolution_rejects_missing_implementation() {
+        let code = vec![0x90; 0x200];
+        assert_eq!(
+            resolve_cuser_adapter_implementation(
+                &code,
+                0,
+                0x20,
+                CUserAdapterKind::IsSubscribedInTicket,
+                SemanticArch::X86_64,
+                &HashMap::new(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cuser_adapter_resolution_follows_wrapper_to_implementation() {
+        let mut code = vec![0x90; 0x400];
+        let wrapper = 0x20usize;
+        let implementation = 0x280usize;
+        let call = wrapper + 14;
+        let displacement = (implementation as isize - (call + 5) as isize) as i32;
+        let mut wrapper_bytes = vec![
+            0x89, 0xd1, // mov ecx, edx
+            0x48, 0x8d, 0x54, 0x24, 0x08, // lea rdx, [rsp+8]
+            0x48, 0x8d, 0xbf, 0x30, 0xe0, 0xff, 0xff, // lea rdi, [rdi-0x1fd0]
+            0xe8, // call implementation
+        ];
+        wrapper_bytes.extend_from_slice(&displacement.to_le_bytes());
+        wrapper_bytes.push(0xc3);
+        code[wrapper..wrapper + wrapper_bytes.len()].copy_from_slice(&wrapper_bytes);
+        code[implementation..implementation + 22].copy_from_slice(&[
+            0x83, 0xe2, 0xfd, 0x83, 0xfa, 0x01, // ticket status filter
+            0x41, 0xb8, 0x02, 0x00, 0x00, 0x00, // return code 2
+            0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, // return code 1
+            0x45, 0x31, 0xc0, // return code 0
+            0xc3,
+        ]);
+
+        assert_eq!(
+            resolve_cuser_adapter_implementation(
+                &code,
+                0,
+                wrapper,
+                CUserAdapterKind::IsSubscribedInTicket,
+                SemanticArch::X86_64,
+                &HashMap::new(),
+            ),
+            Some(implementation)
+        );
     }
 
     #[test]

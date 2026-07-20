@@ -8,8 +8,8 @@ use vapor_forge_patterns::registry::PatternRegistry;
 
 use vapor_forge_hook_boundary::{validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput};
 
-use crate::detour::{self, CodeRegion, PendingDetour};
 use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
+use vapor_forge_hook_engine::detour::{self, CodeRegion, PendingDetour};
 
 mod package_info;
 mod runtime;
@@ -19,8 +19,8 @@ mod steamui;
 pub use runtime::ensure_runtime_initialized;
 pub(crate) use runtime::{
     build_runtime, build_script_dirs, config, effective_ticket_mode,
-    ensure_runtime_services_for_config, package_state, runtime_snapshot, script_state,
-    sync_config_template, RuntimeSnapshot, IPC_SERVER, TICKET_CACHE,
+    ensure_runtime_services_for_config, merge_script_apps, package_state, runtime_snapshot,
+    script_state, sync_config_template, RuntimeSnapshot, IPC_SERVER, TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ pub(crate) fn load_pattern_registry() -> PatternRegistry {
 }
 
 /// Resolve a function address from the registry and create a pending detour.
-pub(crate) fn resolve_from_registry<F: retour::Function>(
+pub(crate) fn resolve_from_registry<F: vapor_forge_hook_engine::detour::HookFn>(
     registry: &PatternRegistry,
     code: &CodeRegion,
     name: &str,
@@ -138,7 +138,15 @@ pub(crate) fn resolve_from_registry<F: retour::Function>(
     })?;
 
     let addr = detour::resolve_pattern_entry(code, name, &entry)?;
+    resolve_from_address(code, name, addr, replacement)
+}
 
+fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
+    code: &CodeRegion,
+    name: &str,
+    addr: usize,
+    replacement: F,
+) -> Option<PendingDetour<F>> {
     // SAFETY: F is a function pointer type; its bit pattern is the address.
     let replacement_addr: usize = unsafe { std::mem::transmute_copy(&replacement) };
 
@@ -151,6 +159,139 @@ pub(crate) fn resolve_from_registry<F: retour::Function>(
     let target: F = unsafe { std::mem::transmute_copy(&addr) };
     // SAFETY: target is a valid function pointer.
     unsafe { detour::create_detour(name, target, addr, replacement) }
+}
+
+fn resolve_cuser_stats_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
+    code: &CodeRegion,
+    name: &str,
+    public_method: &str,
+    overload: usize,
+    expected_overloads: usize,
+    replacement: F,
+) -> Option<PendingDetour<F>> {
+    let slots = crate::vtable_scan::slots_of("IClientUserStats", public_method);
+    if slots.len() != expected_overloads {
+        error!(
+            hook = name,
+            public_method,
+            found = slots.len(),
+            expected = expected_overloads,
+            "CUserStats adapter slot lookup failed"
+        );
+        return None;
+    }
+    let slot = slots[overload];
+    let Some(addr) = crate::vtable_scan::method_address("CUserStats", slot) else {
+        error!(
+            hook = name,
+            slot, "CUserStats adapter address was not found"
+        );
+        return None;
+    };
+    if !super::achievement_adapters::validate_adapter_target(code, name, addr) {
+        error!(
+            hook = name,
+            slot,
+            target = format_args!("0x{addr:x}"),
+            "CUserStats adapter ABI validation failed"
+        );
+        return None;
+    }
+    debug!(
+        hook = name,
+        public_method,
+        slot,
+        target = format_args!("0x{addr:x}"),
+        "CUserStats adapter resolved from vtable"
+    );
+    resolve_from_address(code, name, addr, replacement)
+}
+
+fn resolve_cuser_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
+    code: &CodeRegion,
+    name: &str,
+    public_method: &str,
+    check_ownership: Option<usize>,
+    replacement: F,
+) -> Option<PendingDetour<F>> {
+    let slots = crate::vtable_scan::slots_of("IClientUser", public_method);
+    if slots.len() != 1 {
+        error!(
+            hook = name,
+            public_method,
+            found = slots.len(),
+            "CUser adapter slot lookup failed"
+        );
+        return None;
+    }
+    let public_slot = slots[0];
+    // Pick the CUser secondary vtable whose slot count matches the IClientUser
+    // interface width, then take its entry at public_slot.
+    let Some(iface_slot_count) = crate::vtable_scan::interface_slot_count("IClientUser") else {
+        error!(
+            hook = name,
+            public_method, "IClientUser interface width unknown; cannot resolve CUser adapter"
+        );
+        return None;
+    };
+    let candidates = crate::vtable_scan::class_method_candidates("CUser")
+        .into_iter()
+        .filter(|candidate| candidate.offset_to_top < 0)
+        .collect::<Vec<_>>();
+    let mut by_slot = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.slot == public_slot)
+        .filter(|candidate| vtable_slot_count(&candidates, candidate.vtable_va) == iface_slot_count)
+        .map(|candidate| {
+            let implementation = super::ticket::resolve_adapter_implementation(
+                code,
+                name,
+                candidate.func_va,
+                check_ownership,
+            )
+            .unwrap_or(candidate.func_va);
+            (candidate, implementation)
+        })
+        .collect::<Vec<_>>();
+    by_slot.sort_by_key(|(_, implementation)| *implementation);
+    by_slot.dedup_by_key(|(_, implementation)| *implementation);
+
+    if by_slot.len() != 1 {
+        error!(
+            hook = name,
+            public_method,
+            public_slot,
+            iface_slot_count,
+            found = by_slot.len(),
+            "CUser adapter slot resolution did not produce a unique target"
+        );
+        return None;
+    }
+    let (candidate, implementation) = by_slot[0];
+    debug!(
+        hook = name,
+        public_method,
+        public_slot,
+        offset_to_top = candidate.offset_to_top,
+        vtable = format_args!("0x{:x}", candidate.vtable_va),
+        adapter = format_args!("0x{:x}", candidate.func_va),
+        target = format_args!("0x{implementation:x}"),
+        "CUser adapter resolved from vtable"
+    );
+    resolve_from_address(code, name, implementation, replacement)
+}
+
+fn vtable_slot_count(
+    candidates: &[crate::vtable_scan::MethodCandidate],
+    vtable_va: usize,
+) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.vtable_va == vtable_va)
+        .map(|candidate| candidate.slot + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +384,9 @@ fn do_install() {
 
     // Resolve pkg0 injection function addresses. These are not hooks and are called directly.
     if package_injection_supported() {
-        super::package::resolve_functions(&code, &registry);
+        // SAFETY: registry entries are resolved and semantically validated
+        // against this live steamclient executable mapping.
+        unsafe { super::package::resolve_functions(&code, &registry) };
 
         if super::package::all_functions_resolved() {
             info!("hook-install: pkg0 functions resolved (4/4)");
@@ -258,10 +401,17 @@ fn do_install() {
     }
 
     super::client_id::resolve(&registry, &code);
+    super::eticket::resolve_set_api_call_result(&code, &registry);
 
-    // Phase 1: create all detours (retour allocates trampolines on a shared pool page).
+    // Phase 1: create all detours (the engine allocates trampolines on a shared pool page).
     // Do NOT mprotect or PIC-repair yet. Modifying page permissions between allocations
-    // would lock the pool page to RX before retour can write the next trampoline.
+    // would lock the pool page to RX before the engine can write the next trampoline.
+    let d_steam_engine_init = resolve_from_registry(
+        &registry,
+        &code,
+        "CSteamEngine::Init",
+        super::eticket::hk_steam_engine_init as super::eticket::SteamEngineInitFn,
+    );
     let d_ownership = resolve_from_registry(
         &registry,
         &code,
@@ -304,28 +454,105 @@ fn do_install() {
     } else {
         None
     };
+    let d_set_stat_int = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::SET_STAT_INT_NAME,
+        "SetStat",
+        0,
+        2,
+        super::achievement_adapters::hook_set_stat_int as super::achievement_adapters::SetStatIntFn,
+    );
+    let d_set_stat_float = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::SET_STAT_FLOAT_NAME,
+        "SetStat",
+        1,
+        2,
+        super::achievement_adapters::hook_set_stat_float
+            as super::achievement_adapters::SetStatFloatFn,
+    );
+    let d_set_achievement = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::SET_ACHIEVEMENT_NAME,
+        "SetAchievement",
+        0,
+        1,
+        super::achievement_adapters::hook_set_achievement
+            as super::achievement_adapters::SetAchievementFn,
+    );
+    let d_clear_achievement = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
+        "ClearAchievement",
+        0,
+        1,
+        super::achievement_adapters::hook_clear_achievement
+            as super::achievement_adapters::SetAchievementFn,
+    );
+    let d_store_stats = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::STORE_STATS_NAME,
+        "StoreStats",
+        0,
+        1,
+        super::achievement_adapters::hook_store_stats as super::achievement_adapters::StoreStatsFn,
+    );
+    let d_achievement_progress = resolve_cuser_stats_adapter(
+        &code,
+        super::achievement_adapters::PROGRESS_NAME,
+        "IndicateAchievementProgress",
+        0,
+        1,
+        super::achievement_adapters::hook_progress
+            as super::achievement_adapters::IndicateAchievementProgressFn,
+    );
+    super::current_app::resolve(
+        &code,
+        d_achievement_progress
+            .as_ref()
+            .map(|detour| detour.callee_addr),
+    );
     let d_get_pkg_info = if package_injection_supported() {
         package_info::create_detour()
     } else {
         None
     };
-    let d_ticket_ext = resolve_from_registry(
-        &registry,
+    let check_ownership = d_ownership.as_ref().map(|detour| detour.callee_addr);
+    let d_ticket_ext = resolve_cuser_adapter(
         &code,
-        "IClientUser::GetAppOwnershipTicketExtendedData",
+        super::ticket::TICKET_EXT_DATA_NAME,
+        "GetAppOwnershipTicketExtendedData",
+        check_ownership,
         super::ticket::hk_ticket_ext_data as super::ticket::TicketExtDataFn,
     );
-    let d_update_ticket = resolve_from_registry(
-        &registry,
+    let d_update_ticket = resolve_cuser_adapter(
         &code,
-        "IClientUser::BUpdateAppOwnershipTicket",
+        super::ticket::UPDATE_TICKET_NAME,
+        "BUpdateAppOwnershipTicket",
+        check_ownership,
         super::ticket::hk_update_ticket as super::ticket::UpdateTicketFn,
     );
-    let d_is_sub_ticket = resolve_from_registry(
-        &registry,
+    let d_is_sub_ticket = resolve_cuser_adapter(
         &code,
-        "IClientUser::IsUserSubscribedAppInTicket",
+        super::ticket::IS_SUBSCRIBED_IN_TICKET_NAME,
+        "IsUserSubscribedAppInTicket",
+        check_ownership,
         super::ticket::hk_is_subscribed_in_ticket as super::ticket::IsSubscribedInTicketFn,
+    );
+    let d_request_enc = resolve_cuser_adapter(
+        &code,
+        super::eticket::REQUEST_ENCRYPTED_NAME,
+        "RequestEncryptedAppTicket",
+        check_ownership,
+        super::eticket::hk_request_encrypted_app_ticket
+            as super::eticket::RequestEncryptedAppTicketFn,
+    );
+    let d_get_enc = resolve_cuser_adapter(
+        &code,
+        super::eticket::GET_ENCRYPTED_NAME,
+        "GetEncryptedAppTicket",
+        check_ownership,
+        super::eticket::hk_get_encrypted_app_ticket as super::eticket::GetEncryptedAppTicketFn,
     );
     let d_build_depot = resolve_from_registry(
         &registry,
@@ -397,11 +624,33 @@ fn do_install() {
         };
     }
     let hook_results = vec![
+        hr!("CSteamEngine::Init", d_steam_engine_init),
         hr!("CUser::CheckAppOwnership", d_ownership),
         hr!("CUser::GetSubscribedApps", d_subscribed),
         hr!("IClientRemoteStorage::RunIPCFrame", d_remote_storage_ipc),
         hr!("IClientAppManager::RunIPCFrame", d_app_mgr_ipc),
         hr!("IClientApps::RunIPCFrame", d_client_apps_ipc),
+        hr!(
+            super::achievement_adapters::SET_STAT_INT_NAME,
+            d_set_stat_int
+        ),
+        hr!(
+            super::achievement_adapters::SET_STAT_FLOAT_NAME,
+            d_set_stat_float
+        ),
+        hr!(
+            super::achievement_adapters::SET_ACHIEVEMENT_NAME,
+            d_set_achievement
+        ),
+        hr!(
+            super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
+            d_clear_achievement
+        ),
+        hr!(super::achievement_adapters::STORE_STATS_NAME, d_store_stats),
+        hr!(
+            super::achievement_adapters::PROGRESS_NAME,
+            d_achievement_progress
+        ),
         HookResult {
             name: package_info::hook_name(),
             installed: d_get_pkg_info.is_some(),
@@ -413,6 +662,8 @@ fn do_install() {
         ),
         hr!("IClientUser::BUpdateAppOwnershipTicket", d_update_ticket),
         hr!("IClientUser::IsUserSubscribedAppInTicket", d_is_sub_ticket),
+        hr!("IClientUser::RequestEncryptedAppTicket", d_request_enc),
+        hr!("IClientUser::GetEncryptedAppTicket", d_get_enc),
         hr!("BuildDepotDependency", d_build_depot),
         hr!("LoadDepotDecryptionKey", d_depot_key),
         hr!(
@@ -428,6 +679,11 @@ fn do_install() {
     // Phase 2: PIC-repair all trampolines, then enable.
     // SAFETY: each static is written exactly once during init.
     unsafe {
+        detour::store_and_finalize(
+            "CSteamEngine::Init",
+            std::ptr::addr_of_mut!(super::eticket::STEAM_ENGINE_INIT_DETOUR),
+            d_steam_engine_init,
+        );
         detour::store_and_finalize(
             "CUser::CheckAppOwnership",
             std::ptr::addr_of_mut!(super::ownership::OWNERSHIP_DETOUR),
@@ -454,6 +710,36 @@ fn do_install() {
             d_client_apps_ipc,
         );
         detour::store_and_finalize(
+            super::achievement_adapters::SET_STAT_INT_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::SET_STAT_INT_DETOUR),
+            d_set_stat_int,
+        );
+        detour::store_and_finalize(
+            super::achievement_adapters::SET_STAT_FLOAT_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::SET_STAT_FLOAT_DETOUR),
+            d_set_stat_float,
+        );
+        detour::store_and_finalize(
+            super::achievement_adapters::SET_ACHIEVEMENT_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::SET_ACHIEVEMENT_DETOUR),
+            d_set_achievement,
+        );
+        detour::store_and_finalize(
+            super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::CLEAR_ACHIEVEMENT_DETOUR),
+            d_clear_achievement,
+        );
+        detour::store_and_finalize(
+            super::achievement_adapters::STORE_STATS_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::STORE_STATS_DETOUR),
+            d_store_stats,
+        );
+        detour::store_and_finalize(
+            super::achievement_adapters::PROGRESS_NAME,
+            std::ptr::addr_of_mut!(super::achievement_adapters::PROGRESS_DETOUR),
+            d_achievement_progress,
+        );
+        detour::store_and_finalize(
             package_info::hook_name(),
             std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
             d_get_pkg_info,
@@ -472,6 +758,16 @@ fn do_install() {
             "IClientUser::IsUserSubscribedAppInTicket",
             std::ptr::addr_of_mut!(super::ticket::IS_SUBSCRIBED_IN_TICKET_DETOUR),
             d_is_sub_ticket,
+        );
+        detour::store_and_finalize(
+            "IClientUser::RequestEncryptedAppTicket",
+            std::ptr::addr_of_mut!(super::eticket::REQUEST_ENCRYPTED_DETOUR),
+            d_request_enc,
+        );
+        detour::store_and_finalize(
+            "IClientUser::GetEncryptedAppTicket",
+            std::ptr::addr_of_mut!(super::eticket::GET_ENCRYPTED_DETOUR),
+            d_get_enc,
         );
         detour::store_and_finalize(
             "BuildDepotDependency",

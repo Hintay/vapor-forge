@@ -27,6 +27,19 @@ impl TicketCache {
         }
     }
 
+    /// Whether we already have an app ticket cached (memory or disk).
+    pub fn has_app_ticket(&self, app_id: AppId) -> bool {
+        if self
+            .app_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&app_id)
+        {
+            return true;
+        }
+        self.load_from_disk(app_id, "ticket").is_some()
+    }
+
     /// Get an app ticket. Priority: Lua-provided → memory cache → disk cache.
     pub fn get_app_ticket(
         &self,
@@ -232,7 +245,11 @@ static DELEGATE_STEAMID: AtomicU64 = AtomicU64::new(0);
 /// Check if we're still in the delegate window for this app.
 ///
 /// Each call counts as one request. Returns true (serve cached ticket) for
-/// the first `DELEGATE_WINDOW_SIZE` calls, then false afterwards.
+/// the first `DELEGATE_WINDOW_SIZE` calls, then false afterwards. Mirrors
+/// OpenSteamTool's DenuvoAuth `IsAuthorizedPipe`: the window covers the
+/// initial handshakes DRM cares about, then closes — after which
+/// `GetSteamID` must stop reporting the borrowed identity so the rest of
+/// the Steam session runs under the real user.
 pub fn in_delegate_window(app_id: AppId) -> bool {
     let mut guard = DELEGATE_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
     let counts = guard.get_or_insert_with(HashMap::new);
@@ -240,7 +257,6 @@ pub fn in_delegate_window(app_id: AppId) -> bool {
     *count += 1;
     let in_window = *count <= DELEGATE_WINDOW_SIZE;
     if !in_window {
-        // Window just closed (or already closed): stop overriding GetSteamID.
         clear_delegate_steamid();
     }
     in_window
@@ -307,6 +323,9 @@ pub mod forge {
     /// Layout: `[signed_data] [target_app_id le32] [signature]`
     ///
     /// The target appId is inserted between the signed body and the signature.
+    /// The reported `total_size` matches the source ticket length (not the
+    /// physical buffer length), so the DRM's signature-coverage calculation
+    /// still spans only the originally signed bytes.
     pub fn forge_from_source(source_ticket: &[u8], target_app_id: u32) -> Option<ForgedTicket> {
         if source_ticket.len() <= SIGNATURE_SIZE {
             return None;
@@ -314,18 +333,15 @@ pub mod forge {
         let signed_size = source_ticket.len() - SIGNATURE_SIZE;
 
         let mut data = Vec::with_capacity(source_ticket.len() + 4);
-        // Copy everything before the signature
         data.extend_from_slice(&source_ticket[..signed_size]);
-        // Insert target appId
         data.extend_from_slice(&target_app_id.to_le_bytes());
-        // Append the original signature
         data.extend_from_slice(&source_ticket[signed_size..]);
 
         let app_id_offset = signed_size as u32;
         let signature_offset = app_id_offset + 4;
 
         Some(ForgedTicket {
-            total_size: data.len() as u32,
+            total_size: source_ticket.len() as u32,
             app_id_offset,
             steam_id_offset: TICKET_STEAMID_OFFSET as u32,
             signature_offset,
@@ -339,6 +355,8 @@ pub mod forge {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    static DELEGATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cache_stores_and_retrieves_app_ticket() {
@@ -422,9 +440,12 @@ mod tests {
 
         let forged = forge::forge_from_source(&source, 480).expect("forge should succeed");
 
-        // Output should be 4 bytes larger (inserted appId)
+        // Physical buffer is 4 bytes larger (inserted appId) but the reported
+        // size matches the source: the DRM's signature-coverage calculation
+        // uses total_size - signature_size, and must stop at the original
+        // signed span for the source ticket's signature to still verify.
         assert_eq!(forged.data.len(), 332);
-        assert_eq!(forged.total_size, 332);
+        assert_eq!(forged.total_size, source.len() as u32);
 
         // The first 200 bytes (signed body) should be identical
         assert_eq!(&forged.data[..200], &source[..200]);
@@ -459,11 +480,11 @@ mod tests {
         assert_eq!(cache.get_enc_ticket(AppId(730), &empty_lua), None);
     }
 
-    // Delegate window tests use distinct AppIds per test since the state is
-    // global (mirrors the real single-process usage) and tests run in parallel.
+    // Delegate tests share process-global state, so the test lock serializes them.
 
     #[test]
     fn delegate_window_allows_first_n_requests_then_forges() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
         let app = AppId(100_001);
         // First DELEGATE_WINDOW_SIZE (2) requests: still in window.
         assert!(in_delegate_window(app));
@@ -475,6 +496,7 @@ mod tests {
 
     #[test]
     fn delegate_window_is_independent_per_app() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
         let app_a = AppId(100_002);
         let app_b = AppId(100_003);
 
@@ -490,6 +512,7 @@ mod tests {
 
     #[test]
     fn reset_delegate_window_restarts_the_count() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
         let app = AppId(100_004);
         assert!(in_delegate_window(app));
         assert!(in_delegate_window(app));
@@ -505,6 +528,7 @@ mod tests {
 
     #[test]
     fn delegate_steamid_set_get_clear() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
         set_delegate_steamid(76561198000000001);
         assert_eq!(delegate_steamid(), 76561198000000001);
         clear_delegate_steamid();
@@ -513,15 +537,16 @@ mod tests {
 
     #[test]
     fn delegate_window_closing_clears_steamid() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
         let app = AppId(100_005);
-        // Exhaust the window first (may already be partially consumed by parallel tests).
         reset_delegate_window(app);
         assert!(in_delegate_window(app));
         assert!(in_delegate_window(app));
-        // Set the steamid right before the 3rd call that will close the window.
         set_delegate_steamid(76561198000000002);
+        // Window closes → GetSteamID must fall back to the real user, so the
+        // delegate SteamID gets cleared (mirrors OpenSteamTool's DenuvoAuth
+        // `IsAuthorizedPipe` returning false past the window).
         assert!(!in_delegate_window(app));
-        // The 3rd call exceeded the window and should have cleared the steamid.
         assert_eq!(delegate_steamid(), 0);
     }
 }

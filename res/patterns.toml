@@ -22,26 +22,35 @@ pattern = "55 89 E5 57 ? ? ? ? ? ? ? ? ? ? ? ? 53 83 C4 80 0F B6 45 14 6A 00 6A 
 [[steamclient."CUser::GetSubscribedApps".variants]]
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 7C 8B 45 0C 8B 4D 08 89 45 84 0F B6 45 14 8B 91 D0 1B 00 00"
 
+[steamclient."CSteamEngine::Init"]
+follow = "relative"
+pattern = "E8 ? ? ? ? 83 C4 10 8D 83 ? ? ? ? 83 EC 0C 89 AB"
+
+# Public/publicbeta share the primary pattern; variants are only for steamrt implementation differences, not old releases.
+[steamclient."CSteamEngine::SetAPICallResult"]
+follow = "none"
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC ? 8B 55 14 C7 45 ? 00 00 00 00 C7 45 ? 00 00 00 00 89 45 ? 8B 45 10 C7 45 ? 00 00 00 00 89 55 ?"
+
 [steamclient."IClientRemoteStorage::RunIPCFrame"]
 follow = "none"
 pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 60 05 00 00"
 
 [[steamclient."IClientRemoteStorage::RunIPCFrame".variants]]
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC E0 01 00 00 8B 45 08 8B 4D 0C 89 85 ? FE FF FF 8B 45 10 89 8D ? FE FF FF 89 F3 89 85 ? FE FF FF 8D 85 ? FE FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FE FF FF 83 C4 10 3D 6D E8 2F 87"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC E0 01 00 00 8B 45 08 8B 4D 0C 89 85 ? FE FF FF 8B 45 10 89 8D ? FE FF FF 89 F3 89 85 ? FE FF FF 8D 85 ? FE FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FE FF FF 83 C4 10 3D ? E8 2F 87"
 
 [steamclient."IClientAppManager::RunIPCFrame"]
 follow = "none"
 pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 80 07 00 00"
 
 [[steamclient."IClientAppManager::RunIPCFrame".variants]]
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 60 03 00 00 8B 45 08 8B 4D 0C 89 85 ? FC FF FF 8B 45 10 89 8D ? FC FF FF 89 F3 89 85 ? FC FF FF 8D 85 ? FD FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FD FF FF 83 C4 10 3D B7 85 0A 7A"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 60 03 00 00 8B 45 08 8B 4D 0C 89 85 ? FC FF FF 8B 45 10 89 8D ? FC FF FF 89 F3 89 85 ? FC FF FF 8D 85 ? FD FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FD FF FF 83 C4 10 3D ? 85 0A 7A"
 
 [steamclient."IClientApps::RunIPCFrame"]
 follow = "none"
 pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 70 01 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 ? ? FF FF 8B 45 10 89 8D ? ? FF FF 89 F3 89 85 ? ? FF FF 65 A1 14 00 00 00 89 45 E4 31 C0 8D 85 ? FF FF FF 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FF FF FF 83 C4 10 3D ? 9C 88 A6"
 
 [[steamclient."IClientApps::RunIPCFrame".variants]]
-pattern = "55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 30 01 00 00 8B 45 08 8B 4D 0C 89 85 ? FF FF FF 8B 45 10 89 8D ? FF FF FF 89 9D ? FF FF FF 89 85 ? FF FF FF 8D 85 ? FF FF FF 65 8B 35 14 00 00 00 89 75 E4 8B 75 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FF FF FF 83 C4 10 3D 36 9C 88 A6"
+pattern = "55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 30 01 00 00 8B 45 08 8B 4D 0C 89 85 ? FF FF FF 8B 45 10 89 8D ? FF FF FF 89 9D ? FF FF FF 89 85 ? FF FF FF 8D 85 ? FF FF FF 65 8B 35 14 00 00 00 89 75 E4 8B 75 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FF FF FF 83 C4 10 3D ? 9C 88 A6"
 
 [steamclient."LoadDepotDecryptionKey"]
 follow = "none"
@@ -71,38 +80,6 @@ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89
 [[steamclient."CCMConnection::RecvPkt".variants]]
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 8B 45 08 89 45 D4 8B 45 0C 89 FB 89 45 D0 89 C1 65 A1 14 00 00 00"
 
-[steamclient."IClientUser::GetAppOwnershipTicketExtendedData"]
-follow = "upward"
-prologue = "E8 53 56 57"
-pattern = "6A 04 FF 74 24 ? 8D 44 24 ? 50 FF 74 24 ? 57 56 8B 44 24 ? 2D D4 18 00 00"
-optional = true
-
-[[steamclient."IClientUser::GetAppOwnershipTicketExtendedData".variants]]
-prologue = "53 56 57 55"
-pattern = "6A 04 55 8D 44 24 ? 50 57 FF 74 24 ? 56 8B 44 24 ? 2D D4 18 00 00"
-
-[[steamclient."IClientUser::GetAppOwnershipTicketExtendedData".variants]]
-pattern = "6A 04 FF 74 24 ? 8D 44 24 ? 50 FF 74 24 ? 57 56 8B 44 24 ? 2D D8 18 00 00"
-
-[[steamclient."IClientUser::GetAppOwnershipTicketExtendedData".variants]]
-prologue = "53 56 57 55"
-pattern = "6A 04 55 8D 44 24 ? 50 57 FF 74 24 ? 56 8B 44 24 ? 2D D8 18 00 00"
-
-[steamclient."IClientUser::BUpdateAppOwnershipTicket"]
-follow = "upward"
-prologue = "56 57 E5 89 55"
-pattern = "83 EC 0C 89 F3 8B 7D ? FF 30 E8 ? ? ? ? 83 C4 10 83 FF 01 77 ? 84 C0 75 ? 80 7D ? 00 74 ? 80 7D ? 00 0F 84 ? ? ? ? 8D 65"
-
-[[steamclient."IClientUser::BUpdateAppOwnershipTicket".variants]]
-pattern = "83 EC 0C 89 F3 8B 7D ? FF 30 E8 ? ? ? ? 83 C4 10 83 FF 01 77 ? 84 C0 0F 85 ? ? ? ? 80 7D ? 00 0F 84 ? ? ? ? 80 7D ? 00 0F 85 ? ? ? ?"
-
-[steamclient."IClientUser::IsUserSubscribedAppInTicket"]
-follow = "none"
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 3C 8B 7C 24 50 8B 44 24 54 8B 54 24 58 8B 8F ? ? 00 00"
-
-[[steamclient."IClientUser::IsUserSubscribedAppInTicket".variants]]
-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 57 56 53 83 EC 3C 8B ? 24 50 89 44 24 ? 8B 44 24 54 8B ? 84 18 00 00 89 04 24 8B 44 24 58 85 ? 89 44 24 04"
-
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"
 pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"
@@ -122,8 +99,8 @@ follow = "relative"
 pattern = "E8 ? ? ? ? 8B 85 04 FF FF FF 83 C4 10 8B 40 54 89 85 FC FE FF FF"
 
 [[steamclient."CUtlMemory::Grow".variants]]
-follow = "none"
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 4B 3B 33 02 83 EC 0C 8B 6C 24 24 8B 74 24 20 85 ED 0F 8E ? ? ? ? 8D BB FE 3F 83 FD 8B 56 08 85 D2 78 ? 8B 4E 04 6A 04"
+follow = "relative"
+pattern = "E8 ? ? ? ? 8B 85 ? ? ? ? 83 C4 10 8B 40 58 89 85 ? ? ? ? 83 C0 01"
 
 [steamclient."CPackageInfo::GetPackageInfo"]
 follow = "none"

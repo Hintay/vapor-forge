@@ -1,11 +1,18 @@
 pub mod install;
 pub mod package;
 
+pub(crate) mod achievement;
+pub(crate) mod achievement_adapters;
 pub(crate) mod client_id;
 pub(crate) mod cloud;
+pub(crate) mod current_app;
 pub(crate) mod depot;
 pub(crate) mod dlc;
 pub(crate) mod env;
+pub(crate) mod eticket;
 pub(crate) mod network;
 pub(crate) mod ownership;
+pub(crate) mod steam_session;
 pub(crate) mod ticket;
+pub(crate) mod user;
+pub(crate) mod user_stats;

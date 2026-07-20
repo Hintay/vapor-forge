@@ -10,9 +10,6 @@ fn wrapper_policy(name: &str) -> WrapperPolicy {
         "IClientRemoteStorage::RunIPCFrame"
         | "IClientAppManager::RunIPCFrame"
         | "IClientApps::RunIPCFrame" => WrapperPolicy::WrapperAllowed,
-        "IClientUser::BUpdateAppOwnershipTicket"
-        | "IClientUser::GetAppOwnershipTicketExtendedData"
-        | "IClientUser::IsUserSubscribedAppInTicket" => WrapperPolicy::ImplementationRequired,
         _ if name.starts_with("IClient") => WrapperPolicy::ImplementationRequired,
         _ => WrapperPolicy::NotApplicable,
     }
@@ -83,6 +80,16 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CUser::GetSubscribedApps",
         label: "CUser::GetSubscribedApps body",
         validate: validate_get_subscribed_apps32,
+    },
+    SemanticCheck {
+        name: "CSteamEngine::Init",
+        label: "CSteamEngine::Init body",
+        validate: validate_steam_engine_init32,
+    },
+    SemanticCheck {
+        name: "CSteamEngine::SetAPICallResult",
+        label: "CSteamEngine::SetAPICallResult body",
+        validate: validate_set_api_call_result32,
     },
     SemanticCheck {
         name: "IClientRemoteStorage::RunIPCFrame",
@@ -166,6 +173,16 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CUser::GetSubscribedApps",
         label: "CUser::GetSubscribedApps body",
         validate: validate_get_subscribed_apps64,
+    },
+    SemanticCheck {
+        name: "CSteamEngine::Init",
+        label: "CSteamEngine::Init body",
+        validate: validate_steam_engine_init64,
+    },
+    SemanticCheck {
+        name: "CSteamEngine::SetAPICallResult",
+        label: "CSteamEngine::SetAPICallResult body",
+        validate: validate_set_api_call_result64,
     },
     SemanticCheck {
         name: "IClientRemoteStorage::RunIPCFrame",
@@ -307,9 +324,6 @@ const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
 
 const STEAMCLIENT_SPECIAL_SEMANTIC_CHECKS: &[&str] = &[
     "CConfigStore::ClientIDConfigAccess",
-    "IClientUser::GetAppOwnershipTicketExtendedData",
-    "IClientUser::BUpdateAppOwnershipTicket",
-    "IClientUser::IsUserSubscribedAppInTicket",
     "CPackageInfo::GetPackageInfo",
 ];
 
@@ -510,6 +524,788 @@ fn validate_config_store_vtable(path: &Path) -> Result<(u64, u64), String> {
         .filter(|method| method.name == "SetUint64")
         .ok_or_else(|| "slot 11 is not IClientConfigStore::SetUint64".to_owned())?;
     Ok((getter.func_va, setter.func_va))
+}
+
+const USER_STATS_WRAPPER_METHODS: &[&str] = &[
+    "GetNumAchievements",
+    "GetAchievementName",
+    "RequestCurrentStats",
+    "GetAchievement",
+    "SetAchievement",
+    "ClearAchievement",
+    "StoreStats",
+    "IndicateAchievementProgress",
+];
+
+fn scan_user_stats_wrapper_abi(path: &Path, data: &[u8]) -> bool {
+    let image = match ElfImage::parse(data) {
+        Ok(image) => image,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} required ({error})",
+                "IClientUserStats wrapper CGameID ABI"
+            );
+            return true;
+        }
+    };
+    let wanted = vec!["IClientUserStats".to_owned()];
+    let report = match vtable_scan::scan_file(path, Some(&wanted)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} required ({error})",
+                "IClientUserStats wrapper CGameID ABI"
+            );
+            return true;
+        }
+    };
+    let Some(interface) = report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "IClientUserStats")
+    else {
+        println!(
+            "  FAIL {:<58} required (vtable was not found)",
+            "IClientUserStats wrapper CGameID ABI"
+        );
+        return true;
+    };
+
+    for &name in USER_STATS_WRAPPER_METHODS {
+        let Some(method) = interface.methods.iter().find(|method| method.name == name) else {
+            println!(
+                "  FAIL {:<58} required ({name} wrapper was not found)",
+                "IClientUserStats wrapper CGameID ABI"
+            );
+            return true;
+        };
+        let Some(offset) = image.va_to_offset(method.func_va) else {
+            println!(
+                "  FAIL {:<58} required ({name} wrapper is outside the file image)",
+                "IClientUserStats wrapper CGameID ABI"
+            );
+            return true;
+        };
+        let bytes = &data[offset..data.len().min(offset.saturating_add(0x100))];
+        if !wrapper_dereferences_game_id(bytes, image.class) {
+            println!(
+                "  FAIL {:<58} slot={} required ({name} does not dereference CGameID argument)",
+                "IClientUserStats wrapper CGameID ABI", method.slot
+            );
+            return true;
+        }
+    }
+
+    println!(
+        "  OK   {:<58} methods={} argument=const CGameID&",
+        "IClientUserStats wrapper CGameID ABI",
+        USER_STATS_WRAPPER_METHODS.len()
+    );
+    false
+}
+
+fn wrapper_dereferences_game_id(bytes: &[u8], class: ElfClass) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::with_ip(class.bits().into(), bytes, 0, DecoderOptions::NONE);
+    let mut aliases = std::collections::HashSet::new();
+    let mut frame_aliases = std::collections::HashSet::new();
+    if class == ElfClass::Elf64 {
+        aliases.insert(Register::RSI);
+    }
+
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let memory_source = instruction.op1_kind() == OpKind::Memory;
+        if memory_source
+            && instruction.memory_displacement64() == 0
+            && aliases.contains(&instruction.memory_base())
+        {
+            return true;
+        }
+
+        if class == ElfClass::Elf32
+            && instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && memory_source
+            && instruction.memory_base() == Register::EBP
+            && instruction.memory_displacement64() == 0x0c
+        {
+            aliases.insert(instruction.op0_register());
+            continue;
+        }
+
+        let frame_slot = || {
+            (instruction.memory_base() == Register::EBP
+                || instruction.memory_base() == Register::RBP)
+                .then_some(instruction.memory_displacement64())
+        };
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.op1_kind() == OpKind::Register
+        {
+            if let Some(slot) = frame_slot() {
+                if aliases.contains(&instruction.op1_register()) {
+                    frame_aliases.insert(slot);
+                } else {
+                    frame_aliases.remove(&slot);
+                }
+            }
+        }
+
+        if instruction.mnemonic() == Mnemonic::Mov && instruction.op0_kind() == OpKind::Register {
+            let destination = instruction.op0_register();
+            let copies_alias = instruction.op1_kind() == OpKind::Register
+                && aliases.contains(&instruction.op1_register());
+            let restores_alias = memory_source
+                && frame_slot().is_some_and(|slot| frame_aliases.contains(&slot));
+            if copies_alias || restores_alias {
+                aliases.insert(destination);
+            } else {
+                aliases.remove(&destination);
+            }
+        }
+    }
+    false
+}
+
+fn scan_cuser_stats_adapters(
+    path: &Path,
+    code: &[u8],
+    text_vaddr: u64,
+    arch: SemanticArch,
+) -> bool {
+    let wanted = vec!["IClientUserStats".to_owned(), "CUserStats".to_owned()];
+    let report = match vtable_scan::scan_file(path, Some(&wanted)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!("  FAIL {:<58} required ({error})", "CUserStats vtable adapters");
+            return true;
+        }
+    };
+    let Some(public) = report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "IClientUserStats")
+    else {
+        println!(
+            "  FAIL {:<58} required (IClientUserStats vtable was not found)",
+            "CUserStats vtable adapters"
+        );
+        return true;
+    };
+    let Some(service) = report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "CUserStats")
+    else {
+        println!(
+            "  FAIL {:<58} required (CUserStats primary vtable was not found)",
+            "CUserStats vtable adapters"
+        );
+        return true;
+    };
+
+    let set_stat_slots = public
+        .methods
+        .iter()
+        .filter(|method| method.name == "SetStat")
+        .map(|method| method.slot)
+        .collect::<Vec<_>>();
+    if set_stat_slots.len() != 2 {
+        println!(
+            "  FAIL {:<58} required (expected two SetStat overloads, found {})",
+            "CUserStats vtable adapters",
+            set_stat_slots.len()
+        );
+        return true;
+    }
+
+    let named_slot = |name: &str| {
+        public
+            .methods
+            .iter()
+            .find(|method| method.name == name)
+            .map(|method| method.slot)
+    };
+    let Some(set_achievement_slot) = named_slot("SetAchievement") else {
+        return print_missing_user_stats_slot("SetAchievement");
+    };
+    let Some(clear_achievement_slot) = named_slot("ClearAchievement") else {
+        return print_missing_user_stats_slot("ClearAchievement");
+    };
+    let Some(store_stats_slot) = named_slot("StoreStats") else {
+        return print_missing_user_stats_slot("StoreStats");
+    };
+    let Some(progress_slot) = named_slot("IndicateAchievementProgress") else {
+        return print_missing_user_stats_slot("IndicateAchievementProgress");
+    };
+
+    /// Collects the evidence for one adapter body at a given offset.
+    type EvidenceFn = fn(&[u8], usize) -> Option<Evidence>;
+
+    let specs: [(&str, usize, EvidenceFn); 6] = match arch {
+        SemanticArch::X86 => [
+            ("SetStat(int32)", set_stat_slots[0], |code, offset| {
+                set_stat_adapter32_evidence(code, offset, 0xe4)
+            }),
+            ("SetStat(float)", set_stat_slots[1], |code, offset| {
+                set_stat_adapter32_evidence(code, offset, 0xe8)
+            }),
+            (
+                "SetAchievement",
+                set_achievement_slot,
+                |code, offset| named_achievement_adapter32_evidence(code, offset, 0xf0),
+            ),
+            (
+                "ClearAchievement",
+                clear_achievement_slot,
+                |code, offset| named_achievement_adapter32_evidence(code, offset, 0xf4),
+            ),
+            ("StoreStats", store_stats_slot, store_stats_adapter32_evidence),
+            (
+                "IndicateAchievementProgress",
+                progress_slot,
+                achievement_progress_adapter32_evidence,
+            ),
+        ],
+        SemanticArch::X86_64 => [
+            ("SetStat(int32)", set_stat_slots[0], set_stat_int_adapter64_evidence),
+            ("SetStat(float)", set_stat_slots[1], set_stat_float_adapter64_evidence),
+            (
+                "SetAchievement",
+                set_achievement_slot,
+                set_achievement_adapter64_evidence,
+            ),
+            (
+                "ClearAchievement",
+                clear_achievement_slot,
+                clear_achievement_adapter64_evidence,
+            ),
+            ("StoreStats", store_stats_slot, store_stats_adapter64_evidence),
+            (
+                "IndicateAchievementProgress",
+                progress_slot,
+                achievement_progress_adapter64_evidence,
+            ),
+        ],
+    };
+
+    let mut failed = false;
+    for (name, slot, validate) in specs {
+        let Some(method) = service.methods.get(slot) else {
+            println!(
+                "  FAIL {:<58} slot={} required (slot is outside CUserStats vtable)",
+                format!("CUserStats::{name} adapter"),
+                slot
+            );
+            failed = true;
+            continue;
+        };
+        let Some(offset) = method.func_va.checked_sub(text_vaddr).map(|offset| offset as usize)
+        else {
+            failed = true;
+            continue;
+        };
+        let evidence = validate(code, offset);
+        if evidence.as_ref().is_some_and(Evidence::is_complete) {
+            println!(
+                "  OK   {:<58} slot={} va=0x{:x}",
+                format!("CUserStats::{name} adapter"),
+                slot,
+                method.func_va
+            );
+        } else {
+            print_evidence_failure(
+                &format!("CUserStats::{name} adapter"),
+                method.func_va,
+                evidence.as_ref(),
+                "semantic validation failed",
+            );
+            failed = true;
+        }
+    }
+    failed
+}
+
+fn print_missing_user_stats_slot(name: &str) -> bool {
+    println!(
+        "  FAIL {:<58} required (IClientUserStats::{name} was not found)",
+        "CUserStats vtable adapters"
+    );
+    true
+}
+
+#[derive(Clone, Copy)]
+enum CUserAdapterKind {
+    TicketExtendedData,
+    UpdateTicket,
+    IsSubscribedInTicket,
+}
+
+fn scan_cuser_adapters(
+    path: &Path,
+    code: &[u8],
+    text_vaddr: u64,
+    arch: SemanticArch,
+    resolved: &HashMap<&str, usize>,
+) -> bool {
+    let wanted = vec!["IClientUser".to_owned()];
+    let public_report = match vtable_scan::scan_file(path, Some(&wanted)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!("  FAIL {:<58} required ({error})", "CUser vtable adapters");
+            return true;
+        }
+    };
+    let Some(public) = public_report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "IClientUser")
+    else {
+        println!(
+            "  FAIL {:<58} required (IClientUser vtable was not found)",
+            "CUser vtable adapters"
+        );
+        return true;
+    };
+    let class_vtables = match vtable_scan::scan_class_vtables(path, "CUser") {
+        Ok(vtables) if !vtables.is_empty() => vtables,
+        Ok(_) => {
+            println!(
+                "  FAIL {:<58} required (CUser vtables were not found)",
+                "CUser vtable adapters"
+            );
+            return true;
+        }
+        Err(error) => {
+            println!("  FAIL {:<58} required ({error})", "CUser vtable adapters");
+            return true;
+        }
+    };
+    let specs = [
+        (
+            "GetAppOwnershipTicketExtendedData",
+            CUserAdapterKind::TicketExtendedData,
+        ),
+        (
+            "BUpdateAppOwnershipTicket",
+            CUserAdapterKind::UpdateTicket,
+        ),
+        (
+            "IsUserSubscribedAppInTicket",
+            CUserAdapterKind::IsSubscribedInTicket,
+        ),
+    ];
+
+    let mut failed = false;
+    for (name, kind) in specs {
+        let slots = public
+            .methods
+            .iter()
+            .filter(|method| method.name == name)
+            .map(|method| method.slot)
+            .collect::<Vec<_>>();
+        if slots.len() != 1 {
+            println!(
+                "  FAIL {:<58} required (expected one IClientUser slot, found {})",
+                format!("CUser::{name} adapter"),
+                slots.len()
+            );
+            failed = true;
+            continue;
+        }
+        let public_slot = slots[0];
+        let iface_slot_count = public.methods.len();
+        // Pick the CUser secondary vtable whose slot count matches the
+        // IClientUser interface width, then take its entry at public_slot.
+        let mut matches = class_vtables
+            .iter()
+            .filter(|vtable| vtable.offset_to_top < 0)
+            .filter(|vtable| vtable.methods.len() == iface_slot_count)
+            .flat_map(|vtable| {
+                vtable.methods.iter().filter_map(|method| {
+                    if method.slot != public_slot {
+                        return None;
+                    }
+                    let offset = method.func_va.checked_sub(text_vaddr)? as usize;
+                    let implementation = resolve_cuser_adapter_implementation(
+                        code,
+                        text_vaddr,
+                        offset,
+                        kind,
+                        arch,
+                        resolved,
+                    )
+                    .unwrap_or(offset);
+                    Some((
+                        method.func_va,
+                        vtable.offset_to_top,
+                        method.slot,
+                        offset,
+                        implementation,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|candidate| candidate.4);
+        matches.dedup_by_key(|candidate| candidate.4);
+        if matches.len() != 1 {
+            println!(
+                "  FAIL {:<58} public-slot={} required (validated entries={})",
+                format!("CUser::{name} adapter"),
+                public_slot,
+                matches.len()
+            );
+            for (func_va, offset_to_top, service_slot, _, implementation) in &matches {
+                println!(
+                    "       validated entry service-slot={} adapter=0x{:x} target=0x{:x} offset-to-top={:#x}",
+                    service_slot,
+                    func_va,
+                    text_vaddr + *implementation as u64,
+                    offset_to_top
+                );
+            }
+            failed = true;
+            continue;
+        }
+        let (func_va, offset_to_top, service_slot, _, implementation) = matches[0];
+        println!(
+            "  OK   {:<58} public-slot={} service-slot={} adapter=0x{:x} target=0x{:x} offset-to-top={:#x}",
+            format!("CUser::{name} adapter"),
+            public_slot,
+            service_slot,
+            func_va,
+            text_vaddr + implementation as u64,
+            offset_to_top
+        );
+    }
+    failed
+}
+
+fn resolve_cuser_adapter_implementation(
+    code: &[u8],
+    text_vaddr: u64,
+    offset: usize,
+    kind: CUserAdapterKind,
+    arch: SemanticArch,
+    resolved: &HashMap<&str, usize>,
+) -> Option<usize> {
+    if matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
+        && !validate_is_subscribed_wrapper_abi(code, offset, arch)
+    {
+        return None;
+    }
+    if !matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
+        && validate_cuser_adapter_direct(code, text_vaddr, offset, kind, arch, resolved)
+    {
+        return Some(offset);
+    }
+    let mut targets = direct_branch_target_offsets(code, text_vaddr, offset, 0x180, arch)
+        .into_iter()
+        .filter(|&target| {
+            validate_cuser_adapter_direct(code, text_vaddr, target, kind, arch, resolved)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.len() == 1 {
+        targets.first().copied()
+    } else {
+        None
+    }
+}
+
+fn validate_is_subscribed_wrapper_abi(
+    code: &[u8],
+    offset: usize,
+    arch: SemanticArch,
+) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x180))) else {
+        return false;
+    };
+    if arch == SemanticArch::X86 {
+        let adjusts_this = has_seq(bytes, &[0x81, 0xee, 0xd4, 0x18, 0x00, 0x00])
+            || has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
+            || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00]);
+        return adjusts_this
+            && bytes
+                .windows(4)
+                .any(|window| window[0..3] == [0x8d, 0x44, 0x24]);
+    }
+
+    let mut decoder = Decoder::with_ip(64, bytes, offset as u64, DecoderOptions::NONE);
+    let mut app_id_aliases = std::collections::HashSet::from([Register::EDX]);
+    let mut forwards_app_id = false;
+    let mut constructs_game_id = false;
+    let mut adjusts_this = false;
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov && instruction.op0_kind() == OpKind::Register {
+            let destination = instruction.op0_register();
+            if instruction.op1_kind() == OpKind::Register
+                && app_id_aliases.contains(&instruction.op1_register())
+            {
+                app_id_aliases.insert(destination);
+            } else if destination != Register::ECX {
+                app_id_aliases.remove(&destination);
+            }
+            if destination == Register::ECX
+                && instruction.op1_kind() == OpKind::Register
+                && app_id_aliases.contains(&instruction.op1_register())
+            {
+                forwards_app_id = true;
+            }
+        }
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_register() == Register::RDX
+            && instruction.memory_base() == Register::RSP
+        {
+            constructs_game_id = true;
+        }
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_register() == Register::RDI
+            && instruction.memory_displacement64() as i64 == -0x1fd0
+        {
+            adjusts_this = true;
+        }
+    }
+    forwards_app_id && constructs_game_id && adjusts_this
+}
+
+fn validate_cuser_adapter_direct(
+    code: &[u8],
+    text_vaddr: u64,
+    offset: usize,
+    kind: CUserAdapterKind,
+    arch: SemanticArch,
+    resolved: &HashMap<&str, usize>,
+) -> bool {
+    validate_cuser_adapter(code, offset, kind, arch, resolved)
+        && (!matches!(kind, CUserAdapterKind::TicketExtendedData)
+            || ticket_ext_semantics_are_reachable(code, text_vaddr, offset, arch))
+}
+
+fn validate_cuser_adapter(
+    code: &[u8],
+    offset: usize,
+    kind: CUserAdapterKind,
+    arch: SemanticArch,
+    resolved: &HashMap<&str, usize>,
+) -> bool {
+    let evidence = match (arch, kind) {
+        (SemanticArch::X86, CUserAdapterKind::TicketExtendedData) => {
+            ticket_ext_data_mode4_thunk32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, CUserAdapterKind::TicketExtendedData) => {
+            ticket_ext_data_mode4_thunk64_evidence(code, offset)
+        }
+        (SemanticArch::X86, CUserAdapterKind::UpdateTicket) => resolved
+            .get("CUser::CheckAppOwnership")
+            .and_then(|check| update_ticket32_evidence(code, offset, *check)),
+        (SemanticArch::X86_64, CUserAdapterKind::UpdateTicket) => resolved
+            .get("CUser::CheckAppOwnership")
+            .and_then(|check| update_ticket64_evidence(code, offset, *check)),
+        (SemanticArch::X86, CUserAdapterKind::IsSubscribedInTicket) => {
+            is_user_subscribed_app_in_ticket32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, CUserAdapterKind::IsSubscribedInTicket) => {
+            is_user_subscribed_app_in_ticket64_evidence(code, offset)
+        }
+    };
+    evidence.is_some_and(|evidence| evidence.is_complete())
+}
+
+fn direct_branch_target_offsets(
+    code: &[u8],
+    text_vaddr: u64,
+    offset: usize,
+    max_len: usize,
+    arch: SemanticArch,
+) -> Vec<usize> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(max_len))) else {
+        return Vec::new();
+    };
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
+    let mut decoder = Decoder::with_ip(
+        bitness,
+        bytes,
+        text_vaddr + offset as u64,
+        DecoderOptions::NONE,
+    );
+    let mut targets = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Call | FlowControl::UnconditionalBranch
+        ) {
+            let target = instruction.near_branch_target();
+            if let Some(offset) = target
+                .checked_sub(text_vaddr)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|&offset| offset < code.len())
+            {
+                targets.push(offset);
+            }
+        }
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Return | FlowControl::UnconditionalBranch
+        ) {
+            break;
+        }
+    }
+    targets
+}
+
+fn ticket_ext_semantics_are_reachable(
+    code: &[u8],
+    text_vaddr: u64,
+    offset: usize,
+    arch: SemanticArch,
+) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
+
+    let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x160))) else {
+        return false;
+    };
+    let adjustments: &[&[u8]] = match arch {
+        SemanticArch::X86 => &[
+            &[0x2d, 0xd4, 0x18, 0x00, 0x00],
+            &[0x2d, 0xd8, 0x18, 0x00, 0x00],
+        ],
+        SemanticArch::X86_64 => &[
+            &[0x49, 0x8d, 0xbc, 0x24, 0x30, 0xe0, 0xff, 0xff],
+            &[0x48, 0x8d, 0xbb, 0x30, 0xe0, 0xff, 0xff],
+        ],
+    };
+    let reachable = reachable_instruction_offsets(
+        bytes,
+        text_vaddr + offset as u64,
+        match arch {
+            SemanticArch::X86 => 32,
+            SemanticArch::X86_64 => 64,
+        },
+    );
+    let has_adjustment = adjustments.iter().any(|needle| {
+        bytes
+            .windows(needle.len())
+            .enumerate()
+            .any(|(index, window)| window == *needle && reachable.contains(&index))
+    });
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
+    let mut has_mode4 = false;
+    let mut has_call_after_mode4 = false;
+    let mut has_high_stack_argument = false;
+    let mut register_self_tests = 0usize;
+    for &instruction_offset in &reachable {
+        let mut decoder = Decoder::with_ip(
+            bitness,
+            &bytes[instruction_offset..],
+            text_vaddr + offset as u64 + instruction_offset as u64,
+            DecoderOptions::NONE,
+        );
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            continue;
+        }
+        if bytes.get(instruction_offset..instruction_offset + 2) == Some(&[0x6a, 0x04]) {
+            has_mode4 = true;
+        }
+        if instruction.flow_control() == FlowControl::Call
+            && reachable.iter().any(|&push| {
+                bytes.get(push..push + 2) == Some(&[0x6a, 0x04])
+                    && instruction_offset > push
+                    && instruction_offset <= push + 0x30
+            })
+        {
+            has_call_after_mode4 = true;
+        }
+        if matches!(instruction.memory_base(), Register::RSP | Register::ESP) {
+            has_high_stack_argument |=
+                (0x30..=0x100).contains(&(instruction.memory_displacement64() as usize));
+        }
+        if instruction.mnemonic() == Mnemonic::Test
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.op1_register()
+        {
+            register_self_tests += 1;
+        }
+    }
+    has_adjustment
+        && has_mode4
+        && has_call_after_mode4
+        && has_high_stack_argument
+        && register_self_tests >= 2
+}
+
+fn reachable_instruction_offsets(
+    bytes: &[u8],
+    ip: u64,
+    bitness: u32,
+) -> std::collections::HashSet<usize> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    let mut pending = vec![0usize];
+    let mut reachable = std::collections::HashSet::new();
+    while let Some(offset) = pending.pop() {
+        if offset >= bytes.len() || !reachable.insert(offset) {
+            continue;
+        }
+        let mut decoder = Decoder::with_ip(
+            bitness,
+            &bytes[offset..],
+            ip + offset as u64,
+            DecoderOptions::NONE,
+        );
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            continue;
+        }
+        let next = offset.saturating_add(instruction.len());
+        let branch_offset = instruction
+            .near_branch_target()
+            .checked_sub(ip)
+            .and_then(|target| usize::try_from(target).ok())
+            .filter(|&target| target < bytes.len());
+        match instruction.flow_control() {
+            FlowControl::Return | FlowControl::IndirectBranch => {}
+            FlowControl::UnconditionalBranch => {
+                if let Some(target) = branch_offset {
+                    pending.push(target);
+                }
+            }
+            FlowControl::ConditionalBranch => {
+                pending.push(next);
+                if let Some(target) = branch_offset {
+                    pending.push(target);
+                }
+            }
+            _ => pending.push(next),
+        }
+    }
+    reachable
 }
 
 fn validate_client_id_behavior32(
@@ -943,11 +1739,19 @@ fn validate_client_id_behavior64(
         {
             install_store = true;
         }
-        if setter_register.is_some_and(|setter| {
+        let calls_loaded_setter = setter_register.is_some_and(|setter| {
             instruction.flow_control() == FlowControl::IndirectCall
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op0_register() == setter
-        }) {
+        });
+        let calls_direct_setter = vtable_register.is_some_and(|vtable| {
+            instruction.flow_control() == FlowControl::IndirectCall
+                && instruction.op0_kind() == OpKind::Memory
+                && instruction.memory_base() == vtable
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == (CONFIG_SET_UINT64_SLOT * 8) as u64
+        });
+        if calls_loaded_setter || calls_direct_setter {
             setter_called = store_register == Some(Register::RDI)
                 && key_registers.contains(&Register::RDX)
                 && install_store;
@@ -1492,13 +2296,59 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "CUser::GetSubscribedApps") => {
             get_subscribed_apps64_evidence(code, offset)
         }
+        (SemanticArch::X86, "CSteamEngine::Init") => steam_engine_init32_evidence(code, offset),
+        (SemanticArch::X86_64, "CSteamEngine::Init") => {
+            steam_engine_init64_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CSteamEngine::SetAPICallResult") => {
+            set_api_call_result32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CSteamEngine::SetAPICallResult") => {
+            set_api_call_result64_evidence(code, offset)
+        }
         (SemanticArch::X86, "IClientRemoteStorage::RunIPCFrame")
         | (SemanticArch::X86, "IClientAppManager::RunIPCFrame")
         | (SemanticArch::X86, "IClientApps::RunIPCFrame") => ipc_run_frame32_evidence(code, offset),
+        (SemanticArch::X86, "CUserStats::SetStat(int32)") => {
+            set_stat_adapter32_evidence(code, offset, 0xe4)
+        }
+        (SemanticArch::X86, "CUserStats::SetStat(float)") => {
+            set_stat_adapter32_evidence(code, offset, 0xe8)
+        }
+        (SemanticArch::X86, "CUserStats::SetAchievement") => {
+            named_achievement_adapter32_evidence(code, offset, 0xf0)
+        }
+        (SemanticArch::X86, "CUserStats::ClearAchievement") => {
+            named_achievement_adapter32_evidence(code, offset, 0xf4)
+        }
+        (SemanticArch::X86, "CUserStats::StoreStats") => {
+            store_stats_adapter32_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CUserStats::IndicateAchievementProgress") => {
+            achievement_progress_adapter32_evidence(code, offset)
+        }
         (SemanticArch::X86_64, "IClientRemoteStorage::RunIPCFrame")
         | (SemanticArch::X86_64, "IClientAppManager::RunIPCFrame")
         | (SemanticArch::X86_64, "IClientApps::RunIPCFrame") => {
             ipc_run_frame64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::SetStat(int32)") => {
+            set_stat_int_adapter64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::SetStat(float)") => {
+            set_stat_float_adapter64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::SetAchievement") => {
+            set_achievement_adapter64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::ClearAchievement") => {
+            clear_achievement_adapter64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::StoreStats") => {
+            store_stats_adapter64_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CUserStats::IndicateAchievementProgress") => {
+            achievement_progress_adapter64_evidence(code, offset)
         }
         (SemanticArch::X86, "LoadDepotDecryptionKey") => load_depot_key32_evidence(code, offset),
         (SemanticArch::X86_64, "LoadDepotDecryptionKey") => load_depot_key64_evidence(code, offset),
@@ -1630,22 +2480,33 @@ fn validate_check_app_ownership64(code: &[u8], offset: usize) -> Option<&'static
 
 fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x360)?;
-    let has_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
+    let old_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
         && has_asm64(bytes, |a| a.mov(ecx, 6))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x70), -1));
+    let current_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
+        && has_asm64(bytes, |a| a.mov(eax, -1))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax));
     let has_license_state =
         has_x64_rm32_disp32_load(bytes, 0x2498) && has_x64_rm32_disp32_load(bytes, 0x24bc);
-    let has_success_flags = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
+    let old_success_flags = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
         && has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x30), 1))
         && has_asm64(bytes, |a| a.mov(word_ptr(r14 + 0x33), r8w));
-    let has_owned_app_iteration = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rax + 0x10)))
+    let current_success_flags = has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x28), 1))
+        && has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x30), 1))
+        && has_asm64(bytes, |a| a.mov(word_ptr(rbx + 0x33), r8w));
+    let old_owned_app_iteration = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rax + 0x10)))
         && has_asm64(bytes, |a| a.movsxd(rdx, dword_ptr(rdx + r13 * 4)));
+    let current_owned_app_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(rax + 0x10)))
+        && has_asm64(bytes, |a| a.movsxd(rax, dword_ptr(rax + r12 * 4)));
 
     let mut evidence = Evidence::default();
-    evidence.require("ownership result frame", has_result_frame);
+    evidence.require("ownership result frame", old_result_frame || current_result_frame);
     evidence.require("license state offsets", has_license_state);
-    evidence.require("success result writes", has_success_flags);
-    evidence.require("owned app vector iteration", has_owned_app_iteration);
+    evidence.require("success result writes", old_success_flags || current_success_flags);
+    evidence.require(
+        "owned app vector iteration",
+        old_owned_app_iteration || current_owned_app_iteration,
+    );
     Some(evidence)
 }
 
@@ -1682,6 +2543,16 @@ fn validate_get_subscribed_apps64(code: &[u8], offset: usize) -> Option<&'static
 
 fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x260)?;
+    let old_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
+        && has_asm64(bytes, |a| a.shl(rbx, 4))
+        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(r12 + 0x2488)))
+        && has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
+        && has_asm64(bytes, |a| a.cmp(r13d, -1));
+    let current_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r13 + r13 * 4)))
+        && has_asm64(bytes, |a| a.shl(rbx, 4))
+        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(rdi + 0x2488)))
+        && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rbx)))
+        && has_asm64(bytes, |a| a.cmp(r12d, -1));
     Some(Evidence::required([
         (
             "include hidden subscriptions flag",
@@ -1689,26 +2560,132 @@ fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence
         ),
         (
             "license vector count",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0x2498))),
+            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0x2498)))
+                || has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0x2498))),
         ),
-        (
-            "license vector entry stride",
-            has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
-                && has_asm64(bytes, |a| a.shl(rbx, 4)),
-        ),
-        (
-            "license vector base",
-            has_asm64(bytes, |a| a.add(rbx, qword_ptr(r12 + 0x2488))),
-        ),
-        (
-            "license app id filter",
-            has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
-                && has_asm64(bytes, |a| a.cmp(r13d, -1)),
-        ),
+        ("known license entry layout", old_license_entry || current_license_entry),
         (
             "package lookup state",
             has_asm64(bytes, |a| a.add(rdi, 0x1018))
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
+        ),
+    ]))
+}
+
+fn validate_steam_engine_init32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        steam_engine_init32_evidence(code, offset),
+        "CSteamEngine object initialization",
+    )
+}
+
+fn steam_engine_init32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x300)?;
+    Some(Evidence::required([
+        ("primary vtable write", has_seq(bytes, &[0x89, 0x06])),
+        (
+            "secondary vtable write at +0x9f0",
+            has_seq(bytes, &[0x89, 0x86, 0xf0, 0x09, 0x00, 0x00]),
+        ),
+        (
+            "engine member initialization at +0xa20",
+            has_seq(bytes, &[0x8d, 0x86, 0x20, 0x0a, 0x00, 0x00]),
+        ),
+    ]))
+}
+
+fn validate_steam_engine_init64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        steam_engine_init64_evidence(code, offset),
+        "CSteamEngine object initialization",
+    )
+}
+
+fn steam_engine_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x300)?;
+    Some(Evidence::required([
+        ("primary vtable write", has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax))),
+        (
+            "secondary vtable write at +0xcf0",
+            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0xcf0), rax)),
+        ),
+        (
+            "engine member initialization at +0xd28",
+            has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + 0xd28))),
+        ),
+    ]))
+}
+
+fn validate_set_api_call_result32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        set_api_call_result32_evidence(code, offset),
+        "api-call map + callback posting",
+    )
+}
+
+fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x520)?;
+    Some(Evidence::required([
+        (
+            "api-call map root/index offset",
+            has_x86_rm32_disp32_load(bytes, 0x14ac),
+        ),
+        (
+            "api-call map storage offset",
+            has_x86_rm32_disp32_load(bytes, 0x14c0),
+        ),
+        (
+            "api-call node stride 0x30",
+            has_asm32(bytes, |a| a.push(0x30)),
+        ),
+        (
+            "callback object virtual dispatch",
+            has_asm32(bytes, |a| a.call(dword_ptr(eax + 0x10)))
+                || has_asm32(bytes, |a| a.call(dword_ptr(ecx + 0x10)))
+                || has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x10))),
+        ),
+        (
+            "SteamAPICallCompleted callback id",
+            has_asm32(bytes, |a| a.push(0x2bf)),
+        ),
+        (
+            "callback payload size",
+            has_asm32(bytes, |a| a.push(0x10)),
+        ),
+    ]))
+}
+
+fn validate_set_api_call_result64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        set_api_call_result64_evidence(code, offset),
+        "api-call map + callback posting",
+    )
+}
+
+fn set_api_call_result64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x520)?;
+    let has_map_base = has_asm64(bytes, |a| a.add(rdi, 0x19a8))
+        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r13 + 0x19a8)));
+    let has_storage = has_asm64(bytes, |a| a.mov(rcx, qword_ptr(rdi + 0x19d8)))
+        || has_asm64(bytes, |a| a.mov(r9, qword_ptr(r13 + 0x19d8)))
+        || has_asm64(bytes, |a| a.add(r15, qword_ptr(r14 + 0x19d8)));
+    let has_node_stride = has_asm64(bytes, |a| a.imul_3(rbx, rbx, 0x38))
+        || has_asm64(bytes, |a| a.imul_3(r15, r15, 0x38));
+    Some(Evidence::required([
+        ("api-call map base offset", has_map_base),
+        ("api-call map storage offset", has_storage),
+        ("api-call node stride 0x38", has_node_stride),
+        (
+            "callback object virtual dispatch",
+            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x20))),
+        ),
+        (
+            "SteamAPICallCompleted callback id",
+            has_asm64(bytes, |a| a.mov(edx, 0x2bf)),
+        ),
+        (
+            "callback payload size",
+            has_asm64(bytes, |a| a.mov(r8d, 0x10)),
         ),
     ]))
 }
@@ -1752,7 +2729,7 @@ fn validate_ipc_run_frame64(code: &[u8], offset: usize) -> Option<&'static str> 
 }
 
 fn ipc_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
+    let bytes = bounded_tail(code, offset, 0x500)?;
     Some(Evidence::required([
         ("mode=4 ipc argument", has_asm64(bytes, |a| a.mov(edx, 4))),
         (
@@ -1768,6 +2745,264 @@ fn ipc_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                     0xA688_9C37,
                 ],
             ),
+        ),
+    ]))
+}
+
+fn set_stat_adapter32_evidence(
+    code: &[u8],
+    offset: usize,
+    implementation_slot: u8,
+) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x120)?;
+    let old_shape = has_seq(bytes, &[0x8b, 0x6c, 0x24, 0x4c])
+        && has_seq(bytes, &[0x8b, 0x44, 0x24, 0x50, 0xf3, 0x0f, 0x7e, 0x08])
+        && has_seq(bytes, &[0xff, 0xd0, 0x83, 0xc4, 0x4c]);
+    let current_shape = has_seq(bytes, &[0x83, 0xec, 0x48])
+        && has_seq(bytes, &[0x8b, 0x74, 0x24, 0x5c, 0x8b, 0x06])
+        && has_seq(bytes, &[0x8b, 0x44, 0x24, 0x60, 0xf3, 0x0f, 0x7e, 0x00])
+        && has_seq(bytes, &[0xff, 0xd7, 0x83, 0xc4, 0x20]);
+    Some(Evidence::required([
+        ("known cdecl adapter layout", old_shape || current_shape),
+        (
+            "typed SetStat implementation slot",
+            has_seq(bytes, &[0x8b, 0x80, implementation_slot, 0x00, 0x00, 0x00])
+                || has_seq(bytes, &[0x8b, 0xb8, implementation_slot, 0x00, 0x00, 0x00]),
+        ),
+    ]))
+}
+
+fn named_achievement_adapter32_evidence(
+    code: &[u8],
+    offset: usize,
+    implementation_slot: u8,
+) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x120)?;
+    let old_shape = has_seq(bytes, &[0x8b, 0x6c, 0x24, 0x4c])
+        && has_seq(bytes, &[0x8b, 0x44, 0x24, 0x50, 0xf3, 0x0f, 0x7e, 0x08])
+        && has_seq(bytes, &[0xff, 0x74, 0x24, 0x54])
+        && has_seq(bytes, &[0xff, 0xd0, 0x83, 0xc4, 0x4c]);
+    let current_shape = has_seq(bytes, &[0x83, 0xec, 0x48])
+        && has_seq(bytes, &[0x8b, 0x74, 0x24, 0x5c, 0x8b, 0x06])
+        && has_seq(bytes, &[0x8b, 0x44, 0x24, 0x60, 0xf3, 0x0f, 0x7e, 0x00])
+        && has_seq(bytes, &[0xff, 0xd7, 0x83, 0xc4, 0x20]);
+    let current_clear_shape = implementation_slot == 0xf4
+        && has_seq(bytes, &[0x83, 0xec, 0x5c])
+        && has_seq(bytes, &[0x8b, 0x74, 0x24, 0x70])
+        && has_seq(bytes, &[0x8b, 0x06, 0x8b, 0x80, 0xf4, 0x00, 0x00, 0x00])
+        && has_seq(bytes, &[0x8b, 0x44, 0x24, 0x7c, 0xf3, 0x0f, 0x7e, 0x00]);
+    Some(Evidence::required([
+        (
+            "known named adapter layout",
+            old_shape || current_shape || current_clear_shape,
+        ),
+        (
+            "named achievement implementation slot",
+            has_seq(bytes, &[0x8b, 0x80, implementation_slot, 0x00, 0x00, 0x00])
+                || has_seq(bytes, &[0x8b, 0xb8, implementation_slot, 0x00, 0x00, 0x00]),
+        ),
+    ]))
+}
+
+fn store_stats_adapter32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    Some(Evidence::required([
+        (
+            "cdecl CGameID argument",
+            has_seq(bytes, &[0x8b, 0x45, 0x0c, 0x8b, 0x30, 0x8b, 0x58, 0x04])
+                || has_seq(bytes, &[0x8b, 0x45, 0x0c, 0x8b, 0x38, 0x8b, 0x40, 0x04]),
+        ),
+        (
+            "CGameID validation",
+            has_seq(bytes, &[0xc1, 0xe8, 0x18])
+                && (has_seq(bytes, &[0xf7, 0xc6, 0xff, 0xff, 0xff, 0x00])
+                    || has_seq(bytes, &[0xf7, 0xc7, 0xff, 0xff, 0xff, 0x00])),
+        ),
+        (
+            "StoreStats result preservation",
+            has_seq(bytes, &[0x89, 0xc7, 0x74]),
+        ),
+    ]))
+}
+
+fn set_stat_int_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x80)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.mov(r12d, ecx))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp), rax))
+        && has_asm64(bytes, |a| a.mov(rdx, rsp));
+    let current_shape = has_asm64(bytes, |a| a.mov(r12, rdx))
+        && has_asm64(bytes, |a| a.mov(ebx, ecx))
+        && has_asm64(bytes, |a| a.lea(rdx, qword_ptr(rsp + 0x08)));
+    Some(Evidence::required([
+        (
+            "known integer adapter layout",
+            old_shape || current_shape,
+        ),
+        (
+            "int32 implementation slot",
+            has_seq(bytes, &[0x4c, 0x8b, 0xa8, 0xc8, 0x01, 0x00, 0x00]),
+        ),
+        (
+            "CGameID forwarding",
+            has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsi))),
+        ),
+    ]))
+}
+
+fn set_stat_float_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x80)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax + 0x1D0)))
+        && has_asm64(bytes, |a| a.lea(rdx, qword_ptr(rsp + 0x10)));
+    let current_shape = has_asm64(bytes, |a| a.mov(r12, rdx))
+        && has_asm64(bytes, |a| a.mov(rbx, qword_ptr(rax + 0x1D0)))
+        && has_asm64(bytes, |a| a.lea(rdx, qword_ptr(rsp + 0x18)));
+    Some(Evidence::required([
+        (
+            "float argument preservation",
+            has_seq(bytes, &[0xf3, 0x0f, 0x11, 0x44, 0x24, 0x0c])
+                && has_seq(bytes, &[0xf3, 0x0f, 0x10, 0x44, 0x24, 0x0c]),
+        ),
+        (
+            "known float adapter layout",
+            old_shape || current_shape,
+        ),
+        (
+            "CGameID forwarding",
+            has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsi))),
+        ),
+    ]))
+}
+
+fn set_achievement_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x80)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax + 0x1E0)))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp), rax))
+        && has_asm64(bytes, |a| a.mov(rdx, rsp));
+    let current_shape = has_asm64(bytes, |a| a.mov(r12, rdx))
+        && has_asm64(bytes, |a| a.mov(rbx, qword_ptr(rax + 0x1E0)))
+        && has_asm64(bytes, |a| a.lea(rdx, qword_ptr(rsp + 0x08)));
+    Some(Evidence::required([
+        (
+            "known SetAchievement adapter layout",
+            old_shape || current_shape,
+        ),
+        (
+            "CGameID forwarding",
+            has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsi))),
+        ),
+    ]))
+}
+
+fn clear_achievement_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r12, rdx))
+        && has_asm64(bytes, |a| a.mov(r13, qword_ptr(rax + 0x1E8)))
+        && has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rsp + 0x0B)));
+    let current_shape = has_asm64(bytes, |a| a.mov(r13, rdx))
+        && has_asm64(bytes, |a| a.mov(rbx, qword_ptr(rax + 0x1E8)))
+        && has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rsp + 0x13)));
+    Some(Evidence::required([
+        (
+            "known ClearAchievement adapter layout",
+            old_shape || current_shape,
+        ),
+        (
+            "CGameID validation",
+            has_asm64(bytes, |a| a.and(eax, 0x00FF_FFFF)),
+        ),
+    ]))
+}
+
+fn store_stats_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x160)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r12, qword_ptr(rsi)))
+        && has_asm64(bytes, |a| a.test(r12d, 0x00FF_FFFF))
+        && has_asm64(bytes, |a| a.mov(ebp, eax))
+        && has_asm64(bytes, |a| a.mov(eax, ebp));
+    let current_shape = has_asm64(bytes, |a| a.mov(rbp, qword_ptr(rsi)))
+        && has_asm64(bytes, |a| a.test(ebp, 0x00FF_FFFF))
+        && has_asm64(bytes, |a| a.mov(r12d, eax))
+        && has_asm64(bytes, |a| a.mov(eax, r12d));
+    Some(Evidence::required([
+        ("known StoreStats adapter layout", old_shape || current_shape),
+        (
+            "CGameID account type validation",
+            has_asm64(bytes, |a| a.shr(rax, 0x18))
+                && has_asm64(bytes, |a| a.cmp(al, 1))
+                && has_asm64(bytes, |a| a.cmp(al, 2)),
+        ),
+    ]))
+}
+
+fn achievement_progress_adapter32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm32(bytes, |a| a.mov(eax, dword_ptr(esp + 0x40)))
+        && has_asm32(bytes, |a| a.mov(esi, dword_ptr(esp + 0x44)))
+        && has_asm32(bytes, |a| a.mov(ecx, dword_ptr(esp + 0x48)))
+        && has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x4C)))
+        && has_asm32(bytes, |a| a.mov(ebp, dword_ptr(esp + 0x50)));
+    let current_shape = has_seq(
+        bytes,
+        &[
+            0x81, 0xec, 0x0c, 0x01, 0x00, 0x00, 0x8b, 0x8c, 0x24, 0x24, 0x01, 0x00,
+            0x00,
+        ],
+    ) && has_seq(bytes, &[0x39, 0xbc, 0x24, 0x2c, 0x01, 0x00, 0x00]);
+    Some(Evidence::required([
+        ("known cdecl progress layout", old_shape || current_shape),
+        (
+            "CGameID validation",
+            (has_asm32(bytes, |a| a.movzx(eax, byte_ptr(esi + 3)))
+                && has_asm32(bytes, |a| a.and(eax, 0x00FF_FFFF)))
+                || (has_asm32(bytes, |a| a.movzx(eax, byte_ptr(ecx + 3)))
+                    && has_asm32(bytes, |a| a.cmp(al, 1))
+                    && has_asm32(bytes, |a| a.cmp(al, 2))),
+        ),
+        (
+            "progress argument repack",
+            (has_asm32(bytes, |a| a.mov(dword_ptr(esp + 0x40), edi))
+                && has_asm32(bytes, |a| a.mov(dword_ptr(esp + 0x44), ebp)))
+                || current_shape,
+        ),
+        (
+            "register-ABI tail adapter",
+            (has_asm32(bytes, |a| a.mov(edx, esi))
+                && has_seq(bytes, &[0x83, 0xC4, 0x2C, 0x5B, 0x5E, 0x5F, 0x5D, 0xE9]))
+                || current_shape,
+        ),
+    ]))
+}
+
+fn achievement_progress_adapter64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x120)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r15, rdx))
+        && has_asm64(bytes, |a| a.mov(r14d, ecx))
+        && has_asm64(bytes, |a| a.mov(r12, rsi))
+        && has_asm64(bytes, |a| a.mov(ebx, r8d))
+        && has_asm64(bytes, |a| a.movd(xmm2, ebx))
+        && has_asm64(bytes, |a| a.movd(xmm1, r14d))
+        && has_asm64(bytes, |a| a.punpckldq(xmm1, xmm2));
+    let current_shape = has_asm64(bytes, |a| a.mov(r13, rdi))
+        && has_asm64(bytes, |a| a.mov(r12d, ecx))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp + 0x10), rdx))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x1C), r8d))
+        && has_asm64(bytes, |a| a.and(eax, 0x00FF_FFFF))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsi), rax))
+        && has_seq(bytes, &[0x48, 0x83, 0xC4, 0x38, 0x44, 0x89, 0xE1, 0x4C, 0x89, 0xEF])
+        && has_seq(bytes, &[0x41, 0x5C, 0x41, 0x5D, 0xE9]);
+    Some(Evidence::required([
+        (
+            "known achievement progress adapter layout",
+            old_shape || current_shape,
+        ),
+        (
+            "CGameID account type validation",
+            has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rsi + 3)))
+                && has_asm64(bytes, |a| a.cmp(al, 1))
+                && has_asm64(bytes, |a| a.cmp(al, 2)),
         ),
     ]))
 }
@@ -1864,28 +3099,25 @@ fn validate_build_depot_dependency64(code: &[u8], offset: usize) -> Option<&'sta
 
 fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8)))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1))
+        && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r14 + 0xF8)))
+        && has_asm64(bytes, |a| a.add(rbp, 0xF20));
+    let current_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2E0)))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x110), -1))
+        && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r15 + 0xF8)))
+        && (has_asm64(bytes, |a| a.add(rbp, 0xF20))
+            || has_asm64(bytes, |a| a.add(r12, 0xF20)));
     Some(Evidence::required([
         (
-            "eighth argument load",
-            has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8))),
+            "known depot dependency layout",
+            old_shape || current_shape,
         ),
         (
             "self-named profiling scope",
             has_asm64(bytes, |a| a.mov(esi, 4)) && has_x64_rip_lea(bytes, 0x3d),
         ),
-        (
-            "ownership result init",
-            has_asm64(bytes, |a| a.mov(ecx, 6))
-                && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1)),
-        ),
-        (
-            "CUser ownership check call receiver",
-            has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r14 + 0xF8))),
-        ),
-        (
-            "app state lookup map",
-            has_asm64(bytes, |a| a.add(rbp, 0xF20)),
-        ),
+        ("ownership result init", has_asm64(bytes, |a| a.mov(ecx, 6)) || has_asm64(bytes, |a| a.mov(ecx, 7))),
     ]))
 }
 
@@ -1937,16 +3169,22 @@ fn validate_websocket_send_frame64(code: &[u8], offset: usize) -> Option<&'stati
 
 fn websocket_send_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x1c0)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r13d, esi))
+        && has_asm64(bytes, |a| a.mov(rbx, rdx))
+        && has_asm64(bytes, |a| a.cmp(ebp, 0xFFFF))
+        && has_asm64(bytes, |a| a.xor(sil, byte_ptr(rbx + r14)))
+        && has_asm64(bytes, |a| a.add(r14, 1));
+    let current_shape = has_asm64(bytes, |a| a.mov(r14d, esi))
+        && has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.cmp(r12d, 0xFFFF))
+        && has_asm64(bytes, |a| a.xor(sil, byte_ptr(rbp + rbx)))
+        && has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + 1)));
     Some(Evidence::required([
         (
             "websocket open-state check",
             has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x18), 2)),
         ),
-        (
-            "frame type argument",
-            has_asm64(bytes, |a| a.mov(r13d, esi)),
-        ),
-        ("payload argument", has_asm64(bytes, |a| a.mov(rbx, rdx))),
+        ("known frame argument and mask layout", old_shape || current_shape),
         (
             "websocket frame header buffer",
             has_asm64(bytes, |a| a.mov(ecx, 0x40)) && has_asm64(bytes, |a| a.mov(edx, 0x0E)),
@@ -1954,15 +3192,9 @@ fn websocket_send_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         (
             "websocket opcode/length encoding",
             has_asm64(bytes, |a| a.and(esi, 0x0F))
-                && has_asm64(bytes, |a| a.or(sil, 0x80))
-                && has_asm64(bytes, |a| a.cmp(ebp, 0xFFFF)),
+                && has_asm64(bytes, |a| a.or(sil, 0x80)),
         ),
-        (
-            "masking key xor loop",
-            has_asm64(bytes, |a| a.bswap(eax))
-                && has_asm64(bytes, |a| a.xor(sil, byte_ptr(rbx + r14)))
-                && has_asm64(bytes, |a| a.add(r14, 1)),
-        ),
+        ("masking key byte order", has_asm64(bytes, |a| a.bswap(eax))),
     ]))
 }
 
@@ -2005,7 +3237,8 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         ("receive mode argument", has_asm64(bytes, |a| a.mov(esi, 1))),
         (
             "connection receive call",
-            has_asm64_call_after(bytes, |a| a.mov(rdi, rbp), 0x10),
+            has_asm64_call_after(bytes, |a| a.mov(rdi, rbp), 0x10)
+                || has_asm64_call_after(bytes, |a| a.mov(rdi, r12), 0x10),
         ),
         ("packet null check", has_asm64(bytes, |a| a.test(rax, rax))),
     ]))
@@ -2057,24 +3290,23 @@ fn validate_mark_license_changed64(code: &[u8], offset: usize) -> Option<&'stati
 
 fn mark_license_changed64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(ebx, esi))
+        && has_asm64(bytes, |a| a.lea(rbp, qword_ptr(rax + 0xF20)))
+        && has_asm64_call_after(bytes, |a| a.mov(esi, ebx), 0x20)
+        && has_asm64(bytes, |a| a.mov(ecx, 6))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x40), -1))
+        && has_asm64(bytes, |a| a.mov(rdi, r12));
+    let current_shape = has_asm64(bytes, |a| a.mov(ebp, esi))
+        && has_asm64(bytes, |a| a.lea(r12, qword_ptr(rax + 0xF20)))
+        && has_asm64_call_after(bytes, |a| a.mov(esi, ebp), 0x20)
+        && has_asm64(bytes, |a| a.mov(ecx, 7))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp), -1))
+        && has_asm64(bytes, |a| a.mov(rdi, r13));
     Some(Evidence::required([
-        ("license id save", has_asm64(bytes, |a| a.mov(ebx, esi))),
-        (
-            "license state map",
-            has_asm64(bytes, |a| a.lea(rbp, qword_ptr(rax + 0xF20))),
-        ),
-        (
-            "license state lookup",
-            has_asm64_call_after(bytes, |a| a.mov(esi, ebx), 0x20),
-        ),
-        (
-            "ownership result init",
-            has_asm64(bytes, |a| a.mov(ecx, 6))
-                && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x40), -1)),
-        ),
+        ("known license-change layout", old_shape || current_shape),
         (
             "ownership recheck call",
-            has_asm64(bytes, |a| a.mov(rdi, r12)) && has_asm64(bytes, |a| a.test(al, al)),
+            has_asm64(bytes, |a| a.test(al, al)),
         ),
     ]))
 }
@@ -2133,6 +3365,12 @@ fn validate_process_pending_license_updates64(code: &[u8], offset: usize) -> Opt
 
 fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    let old_package_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x50)))
+        && has_asm64(bytes, |a| a.mov(ebp, dword_ptr(rax + r14 * 4)))
+        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)));
+    let current_package_iteration = has_asm64(bytes, |a| a.mov(r8d, dword_ptr(r14 + 0x50)))
+        && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rax + r15 * 4)))
+        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)));
     Some(Evidence::required([
         (
             "pending-license count offset",
@@ -2153,17 +3391,13 @@ fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Opt
                 && has_asm64(bytes, |a| a.cmp(esi, -1)),
         ),
         (
-            "package appid vector iteration",
-            has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x50)))
-                && has_asm64(bytes, |a| a.mov(ebp, dword_ptr(rax + r14 * 4))),
-        ),
-        (
-            "license state lookup map",
-            has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20))),
+            "known package appid lookup layout",
+            old_package_iteration || current_package_iteration,
         ),
         (
             "pending update state write",
-            has_asm64(bytes, |a| a.mov(byte_ptr(rax + 0x233E), 0)),
+            has_asm64(bytes, |a| a.mov(byte_ptr(rax + 0x233E), 0))
+                || has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x233E), 0)),
         ),
     ]))
 }
@@ -2206,33 +3440,33 @@ fn validate_cutl_memory_grow64(code: &[u8], offset: usize) -> Option<&'static st
 
 fn cutl_memory_grow64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x160)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r12d, esi))
+        && has_asm64(bytes, |a| a.lea(rsi, qword_ptr(rax * 4)))
+        && (has_asm64(bytes, |a| a.call(qword_ptr(r11 + 0x30)))
+            || has_asm64(bytes, |a| a.call(qword_ptr(r11 + 0x28))));
+    let current_shape = has_asm64(bytes, |a| a.mov(ebp, esi))
+        && has_asm64(bytes, |a| a.shl(rdx, 2))
+        && has_asm64(bytes, |a| a.shl(rsi, 2))
+        && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x30)))
+        && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28)));
     Some(Evidence::required([
         (
             "CUtlMemory receiver save",
             has_asm64(bytes, |a| a.mov(rbx, rdi)),
         ),
         (
-            "requested grow count save",
-            has_asm64(bytes, |a| a.mov(r12d, esi)),
+            "known allocator layout",
+            old_shape || current_shape,
         ),
         (
             "allocation count/capacity loads",
             has_asm64(bytes, |a| a.mov(esi, dword_ptr(rbx + 0x0C)))
                 && has_asm64(bytes, |a| a.mov(edi, dword_ptr(rbx + 0x08))),
         ),
-        (
-            "u32 element size",
-            has_asm64(bytes, |a| a.mov(ecx, 4))
-                && has_asm64(bytes, |a| a.lea(rsi, qword_ptr(rax * 4))),
-        ),
+        ("u32 element size", has_asm64(bytes, |a| a.mov(ecx, 4))),
         (
             "allocation count store",
             has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x08), eax)),
-        ),
-        (
-            "allocator grow/realloc call",
-            has_asm64(bytes, |a| a.call(qword_ptr(r11 + 0x30)))
-                || has_asm64(bytes, |a| a.call(qword_ptr(r11 + 0x28))),
         ),
         (
             "allocation pointer store",
@@ -2294,32 +3528,38 @@ fn validate_write_vdf_file64(code: &[u8], offset: usize) -> Option<&'static str>
 
 fn write_vdf_file64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rdi, r15))
+        && has_asm64(bytes, |a| a.lea(rbx, qword_ptr(rsp + 0x20)))
+        && has_asm64(bytes, |a| a.mov(rdi, r12))
+        && has_asm64_call_after(
+            bytes,
+            |a| {
+                a.mov(rcx, rax)?;
+                a.mov(edx, r14d)
+            },
+            0x40,
+        );
+    let current_shape = has_asm64(bytes, |a| a.mov(rdi, r12))
+        && has_asm64(bytes, |a| a.lea(rbx, qword_ptr(rsp + 0x10)))
+        && has_asm64(bytes, |a| a.mov(rdi, r13))
+        && has_asm64_call_after(
+            bytes,
+            |a| {
+                a.mov(rdi, r13)?;
+                a.mov(rcx, r14)
+            },
+            0x40,
+        );
     Some(Evidence::required([
         (
             "write size cap",
             has_asm64(bytes, |a| a.cmp(r9d, 0x06400000)),
         ),
         (
-            "optional compression path",
-            has_asm64(bytes, |a| a.test(r8, r8)) && has_asm64(bytes, |a| a.mov(rdi, r15)),
-        ),
-        (
-            "write buffer object",
-            has_asm64(bytes, |a| a.lea(rbx, qword_ptr(rsp + 0x20))),
+            "known VDF writer layout",
+            old_shape || current_shape,
         ),
         ("write flag argument", has_asm64(bytes, |a| a.push(1))),
-        ("vdf object argument", has_asm64(bytes, |a| a.mov(rdi, r12))),
-        (
-            "VDF write dispatch",
-            has_asm64_call_after(
-                bytes,
-                |a| {
-                    a.mov(rcx, rax)?;
-                    a.mov(edx, r14d)
-                },
-                0x40,
-            ),
-        ),
     ]))
 }
 
@@ -2364,12 +3604,18 @@ fn validate_spawn_process64(code: &[u8], offset: usize) -> Option<&'static str> 
 
 fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x240)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(r15, rdi))
+        && has_asm64(bytes, |a| a.mov(rbx, rsi))
+        && has_asm64(bytes, |a| a.mov(r12, r8))
+        && has_asm64_call_after(bytes, |a| a.mov(r8, r12), 0x10);
+    let current_shape = has_asm64(bytes, |a| a.mov(r14, rdi))
+        && has_asm64(bytes, |a| a.mov(rbx, r8))
+        && has_asm64(bytes, |a| a.mov(r8, r15));
     Some(Evidence::required([
         (
-            "path argument save",
-            has_asm64(bytes, |a| a.mov(r15, rdi)) && has_asm64(bytes, |a| a.mov(rbx, rsi)),
+            "known spawn argument layout",
+            old_shape || current_shape,
         ),
-        ("env argument save", has_asm64(bytes, |a| a.mov(r12, r8))),
         (
             "game id discriminator",
             has_asm64(bytes, |a| a.cmp(byte_ptr(r8 + 0x03), 2))
@@ -2378,13 +3624,13 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         (
             "launch context allocation",
             has_asm64(bytes, |a| a.mov(edi, 0xC8))
-                && has_asm64(bytes, |a| a.mov(dword_ptr(rdx + 0xC0), -1)),
+                && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + 0xC0), -1))
+                    || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + 0xC0), -1))),
         ),
         (
             "environment block builder call",
             has_asm64(bytes, |a| a.push(1))
                 && has_asm64(bytes, |a| a.mov(r9d, dword_ptr(rbp + 0x18)))
-                && has_asm64_call_after(bytes, |a| a.mov(r8, r12), 0x10)
                 && has_x64_push_rbp_negative_local_before_call(bytes),
         ),
     ]))
@@ -2443,19 +3689,20 @@ fn validate_build_spawn_env_block64(code: &[u8], offset: usize) -> Option<&'stat
 
 fn build_spawn_env_block64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rbp + 0x10)))
+        && has_asm64(bytes, |a| a.mov(r14, qword_ptr(rbp + 0x18)))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31F0), rsi))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31E8), rcx))
+        && has_asm64(bytes, |a| a.mov(byte_ptr(rbp - 0x3100), 0));
+    let current_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rbp + 0x18)))
+        && has_asm64(bytes, |a| a.mov(r13, qword_ptr(rbp + 0x10)))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31A8), rsi))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31A0), rcx))
+        && has_asm64(bytes, |a| a.mov(byte_ptr(rbp - 0x3040), 0));
     Some(Evidence::required([
         (
-            "output env block pointer",
-            has_asm64(bytes, |a| a.mov(rax, qword_ptr(rbp + 0x10))),
-        ),
-        (
-            "env destination pointer",
-            has_asm64(bytes, |a| a.mov(r14, qword_ptr(rbp + 0x18))),
-        ),
-        (
-            "env var source object",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31F0), rsi))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31E8), rcx)),
+            "known spawn environment layout",
+            old_shape || current_shape,
         ),
         (
             "Steam launch id formatting",
@@ -2463,8 +3710,7 @@ fn build_spawn_env_block64_evidence(code: &[u8], offset: usize) -> Option<Eviden
         ),
         (
             "env vector append",
-            has_asm64_call_after(bytes, |a| a.mov(edx, -1), 0x40)
-                && has_asm64(bytes, |a| a.mov(byte_ptr(rbp - 0x3100), 0)),
+            has_asm64_call_after(bytes, |a| a.mov(edx, -1), 0x40),
         ),
     ]))
 }
@@ -2491,14 +3737,14 @@ fn validate_set_env_string64(code: &[u8], offset: usize) -> Option<&'static str>
 
 fn set_env_string64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    let old_shape = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4)))
+        && has_asm64(bytes, |a| a.lea(r14, qword_ptr(r15 + 0x80)));
+    let current_shape = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0xA4)))
+        && has_asm64(bytes, |a| a.lea(r14, qword_ptr(r13 + 0x80)));
     Some(Evidence::required([
         (
-            "environment map count",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4))),
-        ),
-        (
-            "environment map base",
-            has_asm64(bytes, |a| a.lea(r14, qword_ptr(r15 + 0x80))),
+            "known environment map layout",
+            old_shape || current_shape,
         ),
         ("insert mode argument", has_asm64(bytes, |a| a.mov(ecx, 1))),
     ]))
@@ -2825,66 +4071,6 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         SemanticArch::X86_64,
     );
 
-    if let Some(&ticket_ext_offset) = resolved.get("IClientUser::GetAppOwnershipTicketExtendedData")
-    {
-        let evidence = ticket_ext_data_mode4_thunk64_evidence(code, ticket_ext_offset);
-        if evidence.as_ref().is_some_and(Evidence::is_complete) {
-            println!(
-                "  OK   {:<58} layer=mode4-thunk",
-                "IClientUser::GetAppOwnershipTicketExtendedData body"
-            );
-        } else {
-            print_evidence_failure(
-                "IClientUser::GetAppOwnershipTicketExtendedData body",
-                vaddr + ticket_ext_offset as u64,
-                evidence.as_ref(),
-                "body is not the mode=4 ticket thunk",
-            );
-            failed = true;
-        }
-    }
-
-    if let (Some(&update_offset), Some(&check_offset)) = (
-        resolved.get("IClientUser::BUpdateAppOwnershipTicket"),
-        resolved.get("CUser::CheckAppOwnership"),
-    ) {
-        let evidence = update_ticket64_evidence(code, update_offset, check_offset);
-        match validate_update_ticket64(code, update_offset, check_offset) {
-            Some(validation) => println!(
-                "  OK   {:<58} receiver={} check_ownership_call=true",
-                "IClientUser::BUpdateAppOwnershipTicket body",
-                validation.receiver.label()
-            ),
-            None => {
-                print_evidence_failure(
-                    "IClientUser::BUpdateAppOwnershipTicket body",
-                    vaddr + update_offset as u64,
-                    evidence.as_ref(),
-                    "body is not the ownership-ticket updater",
-                );
-                failed = true;
-            }
-        }
-    }
-
-    if let Some(&is_subscribed_offset) = resolved.get("IClientUser::IsUserSubscribedAppInTicket") {
-        let evidence = is_user_subscribed_app_in_ticket64_evidence(code, is_subscribed_offset);
-        if evidence.as_ref().is_some_and(Evidence::is_complete) {
-            println!(
-                "  OK   {:<58} status_filter=true returns=0/1/2",
-                "IClientUser::IsUserSubscribedAppInTicket body"
-            );
-        } else {
-            print_evidence_failure(
-                "IClientUser::IsUserSubscribedAppInTicket body",
-                vaddr + is_subscribed_offset as u64,
-                evidence.as_ref(),
-                "body is not the ticket subscription checker",
-            );
-            failed = true;
-        }
-    }
-
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         match discover_package_info64_layout(code, get_package_info_offset) {
             Some(layout) => {
@@ -2923,66 +4109,6 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         STEAMCLIENT32_SEMANTIC_CHECKS,
         SemanticArch::X86,
     );
-
-    if let Some(&ticket_ext_offset) = resolved.get("IClientUser::GetAppOwnershipTicketExtendedData")
-    {
-        let evidence = ticket_ext_data_mode4_thunk32_evidence(code, ticket_ext_offset);
-        if evidence.as_ref().is_some_and(Evidence::is_complete) {
-            println!(
-                "  OK   {:<58} layer=mode4-thunk",
-                "IClientUser::GetAppOwnershipTicketExtendedData body"
-            );
-        } else {
-            print_evidence_failure(
-                "IClientUser::GetAppOwnershipTicketExtendedData body",
-                vaddr + ticket_ext_offset as u64,
-                evidence.as_ref(),
-                "body is not the mode=4 ticket thunk",
-            );
-            failed = true;
-        }
-    }
-
-    if let (Some(&update_offset), Some(&check_offset)) = (
-        resolved.get("IClientUser::BUpdateAppOwnershipTicket"),
-        resolved.get("CUser::CheckAppOwnership"),
-    ) {
-        let evidence = update_ticket32_evidence(code, update_offset, check_offset);
-        match validate_update_ticket32(code, update_offset, check_offset) {
-            Some(validation) => println!(
-                "  OK   {:<58} receiver={} check_ownership_call=true",
-                "IClientUser::BUpdateAppOwnershipTicket body",
-                validation.receiver.label()
-            ),
-            None => {
-                print_evidence_failure(
-                    "IClientUser::BUpdateAppOwnershipTicket body",
-                    vaddr + update_offset as u64,
-                    evidence.as_ref(),
-                    "body is not the ownership-ticket updater",
-                );
-                failed = true;
-            }
-        }
-    }
-
-    if let Some(&is_subscribed_offset) = resolved.get("IClientUser::IsUserSubscribedAppInTicket") {
-        let evidence = is_user_subscribed_app_in_ticket32_evidence(code, is_subscribed_offset);
-        if evidence.as_ref().is_some_and(Evidence::is_complete) {
-            println!(
-                "  OK   {:<58} status_filter=true returns=0/1/2",
-                "IClientUser::IsUserSubscribedAppInTicket body"
-            );
-        } else {
-            print_evidence_failure(
-                "IClientUser::IsUserSubscribedAppInTicket body",
-                vaddr + is_subscribed_offset as u64,
-                evidence.as_ref(),
-                "body is not the ticket subscription checker",
-            );
-            failed = true;
-        }
-    }
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         match discover_package_info32_layout(code, get_package_info_offset) {
@@ -3035,7 +4161,8 @@ fn ticket_ext_data_mode4_thunk64_evidence(code: &[u8], offset: usize) -> Option<
     let bytes = bounded_tail(code, offset, 0x100)?;
 
     let has_mode4 = has_asm64(bytes, |a| a.push(4));
-    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 - 0x1FD0)));
+    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 - 0x1FD0)))
+        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx - 0x1FD0)));
     let calls_shared_builder_after_mode = has_call_after_mode4_push(bytes);
 
     let mut evidence = Evidence::default();
@@ -3046,43 +4173,6 @@ fn ticket_ext_data_mode4_thunk64_evidence(code: &[u8], offset: usize) -> Option<
         calls_shared_builder_after_mode,
     );
     Some(evidence)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct UpdateTicketValidation {
-    receiver: UpdateTicketReceiver,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UpdateTicketReceiver {
-    ClientUserAdjusted(u32),
-    DirectCUser,
-    DirectCUserWithAdjacentWrapper,
-}
-
-impl UpdateTicketReceiver {
-    fn label(self) -> String {
-        match self {
-            Self::ClientUserAdjusted(adjust) => format!("clientuser-adjusted(-0x{adjust:x})"),
-            Self::DirectCUser => "direct-cuser".to_owned(),
-            Self::DirectCUserWithAdjacentWrapper => {
-                "direct-cuser(wrapper-adjust=-0x1fd0)".to_owned()
-            }
-        }
-    }
-}
-
-fn validate_update_ticket32(
-    code: &[u8],
-    offset: usize,
-    check_ownership_offset: usize,
-) -> Option<UpdateTicketValidation> {
-    let bytes = bounded_tail(code, offset, 0x280)?;
-    if !update_ticket32_evidence(code, offset, check_ownership_offset)?.is_complete() {
-        return None;
-    }
-
-    update_ticket32_receiver(bytes).map(|receiver| UpdateTicketValidation { receiver })
 }
 
 fn update_ticket32_evidence(
@@ -3098,41 +4188,28 @@ fn update_ticket32_evidence(
             .any(|w| w[0] == 0xc7 && w[1] == 0x45 && w[3..7] == [0xff, 0xff, 0xff, 0xff]);
     let calls_check_ownership =
         has_relative_call_to(code, offset, bytes.len(), check_ownership_offset);
-    let receiver = update_ticket32_receiver(bytes);
+    let receiver_is_valid = update_ticket32_has_valid_receiver(bytes);
 
     let mut evidence = Evidence::default();
     evidence.require("force argument branch", has_force_arg_branch);
     evidence.require("ownership result struct init", has_result_struct_init);
     evidence.require("CheckAppOwnership call", calls_check_ownership);
-    evidence.require("CUser receiver layout", receiver.is_some());
+    evidence.require("CUser receiver layout", receiver_is_valid);
     Some(evidence)
 }
 
-fn update_ticket32_receiver(bytes: &[u8]) -> Option<UpdateTicketReceiver> {
+fn update_ticket32_has_valid_receiver(bytes: &[u8]) -> bool {
     let receiver_adjust_window = &bytes[..bytes.len().min(0x100)];
-    if let Some(adjust) = find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| {
+    if find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| {
         matches!(imm, 0x18d4 | 0x18d8)
             && has_x86_cmp_rm32_imm8(bytes, 0u32.wrapping_sub(imm - 0xf8), 0x04)
-    }) {
-        return Some(UpdateTicketReceiver::ClientUserAdjusted(adjust));
-    }
-
-    let direct_cuser_layout = has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0xF8), 4));
-    direct_cuser_layout.then_some(UpdateTicketReceiver::DirectCUser)
-}
-
-fn validate_update_ticket64(
-    code: &[u8],
-    offset: usize,
-    check_ownership_offset: usize,
-) -> Option<UpdateTicketValidation> {
-    let bytes = bounded_tail(code, offset, 0x330)?;
-    if !update_ticket64_evidence(code, offset, check_ownership_offset)?.is_complete() {
-        return None;
-    }
-    Some(UpdateTicketValidation {
-        receiver: update_ticket64_receiver(bytes),
     })
+    .is_some()
+    {
+        return true;
+    }
+
+    has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0xF8), 4))
 }
 
 fn update_ticket64_evidence(
@@ -3142,27 +4219,20 @@ fn update_ticket64_evidence(
 ) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x330)?;
     let has_force_arg_branch = has_asm64(bytes, |a| a.test(dl, dl));
-    let has_status_check = has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x1E8), 4));
-    let has_result_struct_init = has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x70), -1))
+    let old_shape = has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x1E8), 4))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x70), -1))
         && has_asm64(bytes, |a| a.mov(ecx, 6));
+    let current_shape = has_asm64(bytes, |a| a.cmp(dword_ptr(rbx - 0x1DE8), 4))
+        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x20), -1))
+        && has_asm64(bytes, |a| a.mov(ecx, 7));
     let calls_check_ownership =
         has_relative_call_to(code, offset, bytes.len(), check_ownership_offset);
 
     let mut evidence = Evidence::default();
     evidence.require("force argument branch", has_force_arg_branch);
-    evidence.require("ticket status check", has_status_check);
-    evidence.require("ownership result struct init", has_result_struct_init);
+    evidence.require("known ticket update layout", old_shape || current_shape);
     evidence.require("CheckAppOwnership call", calls_check_ownership);
     Some(evidence)
-}
-
-fn update_ticket64_receiver(bytes: &[u8]) -> UpdateTicketReceiver {
-    let has_adjacent_wrapper = has_asm64(bytes, |a| a.sub(rdi, 0x1FD0));
-    if has_adjacent_wrapper {
-        UpdateTicketReceiver::DirectCUserWithAdjacentWrapper
-    } else {
-        UpdateTicketReceiver::DirectCUser
-    }
 }
 
 fn has_relative_call_to(
@@ -3232,16 +4302,17 @@ fn is_user_subscribed_app_in_ticket64_evidence(code: &[u8], offset: usize) -> Op
         a.and(edx, -3)?;
         a.cmp(edx, 1)
     });
-    let has_no_entries_return = has_asm64(bytes, |a| a.mov(esi, 2));
-    let has_miss_return = has_asm64(bytes, |a| a.mov(esi, 1));
-    let has_hit_return = has_asm64(bytes, |a| a.xor(esi, esi));
+    let old_returns = has_asm64(bytes, |a| a.mov(esi, 2))
+        && has_asm64(bytes, |a| a.mov(esi, 1))
+        && has_asm64(bytes, |a| a.xor(esi, esi));
+    let current_returns = has_asm64(bytes, |a| a.mov(r8d, 2))
+        && has_asm64(bytes, |a| a.mov(r8d, 1))
+        && has_asm64(bytes, |a| a.xor(r8d, r8d));
     let removes_ticket_entry = has_asm64(bytes, |a| a.mov(dword_ptr(r13 + 0x1F60), edx));
 
     let mut evidence = Evidence::default();
     evidence.require("ticket status filter", has_status_filter);
-    evidence.require("no-entry return code 2", has_no_entries_return);
-    evidence.require("miss return code 1", has_miss_return);
-    evidence.require("hit return code 0", has_hit_return);
+    evidence.require("known return-code layout", old_returns || current_returns);
     evidence.reject("ticket removal side effect", removes_ticket_entry);
     Some(evidence)
 }
@@ -3310,7 +4381,7 @@ fn discover_package_info64_layout(
 ) -> Option<PackageMapLayout> {
     let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x120))?;
     let root_off = find_x64_movslq_rdi_disp32(bytes)?;
-    let elements_off = find_x64_mov_rdi_rdi_disp32(bytes)?;
+    let elements_off = find_x64_elements_load_from_rdi(bytes)?;
     let node_size = find_x64_node_size(bytes)?;
     let node_key_off = find_x64_node_key_off(bytes)?;
     let node_value_off =
@@ -3328,7 +4399,7 @@ fn discover_package_info64_layout(
 fn package_info64_evidence(code: &[u8], get_package_info_offset: usize) -> Option<Evidence> {
     let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x120))?;
     let root_off = find_x64_movslq_rdi_disp32(bytes);
-    let elements_off = find_x64_mov_rdi_rdi_disp32(bytes);
+    let elements_off = find_x64_elements_load_from_rdi(bytes);
     let node_size = find_x64_node_size(bytes);
     let node_key_off = find_x64_node_key_off(bytes);
     let node_value_off =
@@ -3441,9 +4512,9 @@ fn find_x64_movslq_rdi_disp32(bytes: &[u8]) -> Option<usize> {
     })
 }
 
-fn find_x64_mov_rdi_rdi_disp32(bytes: &[u8]) -> Option<usize> {
+fn find_x64_elements_load_from_rdi(bytes: &[u8]) -> Option<usize> {
     bytes.windows(7).enumerate().find_map(|(idx, w)| {
-        (w[0..3] == [0x48, 0x8b, 0xbf])
+        (w[0..3] == [0x48, 0x8b, 0xbf] || w[0..3] == [0x48, 0x8b, 0x8f])
             .then(|| read_u32_le(bytes, idx + 3))
             .flatten()
     })
@@ -3473,6 +4544,10 @@ fn find_x64_node_key_off(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).find_map(|w| {
         ((w[0..3] == [0x48, 0x8b, 0x50]) || (w[0..3] == [0x48, 0x8b, 0x48]))
             .then_some(w[3] as usize)
+            .or_else(|| {
+                (w[0..3] == [0x48, 0x3b, 0x50] || w[0..3] == [0x48, 0x3b, 0x48])
+                    .then_some(w[3] as usize)
+            })
     })
 }
 

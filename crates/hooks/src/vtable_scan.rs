@@ -1,30 +1,24 @@
 use std::collections::HashMap;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use tracing::{debug, info, warn};
 use vapor_forge_memory::find_proc_self_maps_targets;
+use vapor_forge_patterns::vtable_scan::DEFAULT_INTERFACES;
 
 static SCAN_ONCE: Once = Once::new();
-static mut SCAN_RESULT: Option<ScanResult> = None;
+static SCAN_RESULT: OnceLock<ScanResult> = OnceLock::new();
 
 const MAX_SLOTS: usize = 250;
+const MAX_SUBOBJECT_OFFSET: isize = 0x10_0000;
 const STRING_MAX: usize = 96;
 const RECENT_LEAS: usize = 6;
 const EARLY_SCAN: usize = 0x400;
-
-const INTERESTING_IFACES: &[&str] = &[
-    "IClientAppManager",
-    "IClientApps",
-    "IClientConfigStore",
-    "IClientRemoteStorage",
-    "IClientUser",
-    "IClientUtils",
-];
 
 #[derive(Clone, Debug)]
 pub struct Method {
     pub slot: usize,
     pub name: String,
+    pub func_va: usize,
     pub func_hash: u32,
 }
 
@@ -38,6 +32,28 @@ pub struct Interface {
 struct ScanResult {
     interfaces: Vec<Interface>,
     by_name: HashMap<String, usize>,
+    class_vtables: HashMap<String, Vec<ClassVtable>>,
+}
+
+#[derive(Clone, Debug)]
+struct ClassVtable {
+    vtable_va: usize,
+    offset_to_top: isize,
+    methods: Vec<Method>,
+}
+
+struct CandidateVtable {
+    vtable_va: usize,
+    offset_to_top: isize,
+    slots: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MethodCandidate {
+    pub vtable_va: usize,
+    pub offset_to_top: isize,
+    pub slot: usize,
+    pub func_va: usize,
 }
 
 struct SegmentRanges {
@@ -50,8 +66,7 @@ pub fn warmup() {
 }
 
 pub fn slot_of(iface: &str, method: &str) -> Option<usize> {
-    // SAFETY: SCAN_RESULT is set in warmup (Once), never modified after.
-    let result = unsafe { (*std::ptr::addr_of!(SCAN_RESULT)).as_ref()? };
+    let result = SCAN_RESULT.get()?;
     let idx = *result.by_name.get(iface)?;
     let iface_data = &result.interfaces[idx];
     iface_data
@@ -61,11 +76,61 @@ pub fn slot_of(iface: &str, method: &str) -> Option<usize> {
         .map(|m| m.slot)
 }
 
+#[allow(dead_code)] // Kept for runtime diagnostics that inspect the decoded interface table.
 pub fn find_interface(iface: &str) -> Option<&'static Interface> {
-    // SAFETY: SCAN_RESULT is set in warmup (Once), never modified after.
-    let result = unsafe { (*std::ptr::addr_of!(SCAN_RESULT)).as_ref()? };
+    let result = SCAN_RESULT.get()?;
     let idx = *result.by_name.get(iface)?;
     Some(&result.interfaces[idx])
+}
+
+pub fn slots_of(iface: &str, method: &str) -> Vec<usize> {
+    let Some(result) = SCAN_RESULT.get() else {
+        return Vec::new();
+    };
+    let Some(&idx) = result.by_name.get(iface) else {
+        return Vec::new();
+    };
+    result.interfaces[idx]
+        .methods
+        .iter()
+        .filter(|method_data| method_data.name == method)
+        .map(|method_data| method_data.slot)
+        .collect()
+}
+
+pub fn method_address(class: &str, slot: usize) -> Option<usize> {
+    let result = SCAN_RESULT.get()?;
+    let idx = *result.by_name.get(class)?;
+    result.interfaces[idx]
+        .methods
+        .get(slot)
+        .map(|method| method.func_va)
+}
+
+pub fn interface_slot_count(iface: &str) -> Option<usize> {
+    let result = SCAN_RESULT.get()?;
+    let idx = *result.by_name.get(iface)?;
+    Some(result.interfaces[idx].methods.len())
+}
+
+pub fn class_method_candidates(class: &str) -> Vec<MethodCandidate> {
+    let Some(result) = SCAN_RESULT.get() else {
+        return Vec::new();
+    };
+    let Some(vtables) = result.class_vtables.get(class) else {
+        return Vec::new();
+    };
+    vtables
+        .iter()
+        .flat_map(|vtable| {
+            vtable.methods.iter().map(|method| MethodCandidate {
+                vtable_va: vtable.vtable_va,
+                offset_to_top: vtable.offset_to_top,
+                slot: method.slot,
+                func_va: method.func_va,
+            })
+        })
+        .collect()
 }
 
 fn do_scan() {
@@ -88,14 +153,18 @@ fn do_scan() {
         return;
     }
 
-    let interest: std::collections::HashSet<&str> = INTERESTING_IFACES.iter().copied().collect();
-    let candidates = find_candidate_vtables(&segs);
+    let mut interest: std::collections::HashSet<&str> =
+        DEFAULT_INTERFACES.iter().copied().collect();
+    interest.insert("CUserStats");
+    interest.insert("CUser");
+    let candidates = find_candidate_vtables(&segs, true);
 
     let mut interfaces: Vec<Interface> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut class_vtables: HashMap<String, Vec<ClassVtable>> = HashMap::new();
 
-    for (method0_va, slots) in &candidates {
-        let iface_name = match typeinfo_iface_name(*method0_va, &segs) {
+    for candidate in &candidates {
+        let iface_name = match typeinfo_class_name(candidate.vtable_va, &segs) {
             Some(n) => n,
             None => continue,
         };
@@ -103,25 +172,52 @@ fn do_scan() {
             continue;
         }
 
+        if iface_name == "CUser" {
+            let methods = candidate
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(slot, &func_va)| Method {
+                    slot,
+                    name: String::new(),
+                    func_va,
+                    func_hash: 0,
+                })
+                .collect();
+            class_vtables
+                .entry(iface_name)
+                .or_default()
+                .push(ClassVtable {
+                    vtable_va: candidate.vtable_va,
+                    offset_to_top: candidate.offset_to_top,
+                    methods,
+                });
+            continue;
+        }
+        if candidate.offset_to_top != 0 {
+            continue;
+        }
+
         if let Some(&existing_idx) = by_name.get(&iface_name) {
-            if interfaces[existing_idx].methods.len() >= slots.len() {
+            if interfaces[existing_idx].methods.len() >= candidate.slots.len() {
                 continue;
             }
         }
 
-        let mut methods = Vec::with_capacity(slots.len());
-        for (idx, &slot_va) in slots.iter().enumerate() {
+        let mut methods = Vec::with_capacity(candidate.slots.len());
+        for (idx, &slot_va) in candidate.slots.iter().enumerate() {
             let (name, func_hash) = decode_wrapper(slot_va, &segs);
             methods.push(Method {
                 slot: idx,
                 name,
+                func_va: slot_va,
                 func_hash,
             });
         }
 
         let rec = Interface {
             name: iface_name.clone(),
-            vtable_va: *method0_va,
+            vtable_va: candidate.vtable_va,
             methods,
         };
 
@@ -145,7 +241,8 @@ fn do_scan() {
     let elapsed = t0.elapsed();
     info!(
         found = interfaces.len(),
-        expected = INTERESTING_IFACES.len(),
+        expected = DEFAULT_INTERFACES.len() + 1,
+        class_vtables = class_vtables.values().map(Vec::len).sum::<usize>(),
         func_hashes = func_hash_count,
         candidates = candidates.len(),
         elapsed_ms = format_args!("{:.1}", elapsed.as_secs_f64() * 1000.0),
@@ -167,13 +264,11 @@ fn do_scan() {
         );
     }
 
-    // SAFETY: storing result; never modified after.
-    unsafe {
-        std::ptr::addr_of_mut!(SCAN_RESULT).write(Some(ScanResult {
-            interfaces,
-            by_name,
-        }));
-    }
+    let _ = SCAN_RESULT.set(ScanResult {
+        interfaces,
+        by_name,
+        class_vtables,
+    });
 }
 
 fn build_segments() -> Option<SegmentRanges> {
@@ -230,10 +325,6 @@ fn parse_maps_line(line: &str) -> Option<MapsEntry> {
 
 fn in_text(va: usize, segs: &SegmentRanges) -> bool {
     segs.text.iter().any(|&(lo, hi)| va >= lo && va < hi)
-}
-
-fn in_rodata(va: usize, segs: &SegmentRanges) -> bool {
-    segs.rodata.iter().any(|&(lo, hi)| va >= lo && va < hi)
 }
 
 fn is_in_segments(va: usize, len: usize, segs: &SegmentRanges) -> bool {
@@ -332,15 +423,11 @@ fn module_base(segs: &SegmentRanges) -> usize {
 }
 
 fn read_cstring(va: usize, segs: &SegmentRanges) -> String {
-    if !in_rodata(va, segs) {
+    let Some(bytes) = mapped_slice(&segs.rodata, va, STRING_MAX) else {
         return String::new();
-    }
-    // SAFETY: va is within a readable segment of steamclient.so.
-    let ptr = va as *const u8;
+    };
     let mut out = String::new();
-    for i in 0..STRING_MAX {
-        // SAFETY: bounded read within verified readable segment.
-        let byte = unsafe { *ptr.add(i) };
+    for &byte in bytes {
         if byte == 0 {
             return out;
         }
@@ -352,7 +439,19 @@ fn read_cstring(va: usize, segs: &SegmentRanges) -> String {
     String::new()
 }
 
-fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String> {
+fn mapped_slice(ranges: &[(usize, usize)], va: usize, max_len: usize) -> Option<&'static [u8]> {
+    let &(_, end) = ranges
+        .iter()
+        .find(|&&(start, end)| start <= va && va < end)?;
+    let len = max_len.min(end.checked_sub(va)?);
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: the selected /proc/self/maps range proves va..va+len is readable.
+    Some(unsafe { std::slice::from_raw_parts(va as *const u8, len) })
+}
+
+fn typeinfo_class_name(method0_va: usize, segs: &SegmentRanges) -> Option<String> {
     let base = module_base(segs);
     let word = word_size();
 
@@ -386,7 +485,7 @@ fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String
         return None;
     }
 
-    // Parse "<digits>IClient<Foo>Map"
+    // Parse the Itanium ABI "<length><class-name>" encoding.
     let mut i = 0;
     let mut declared = 0usize;
     let bytes = nm.as_bytes();
@@ -402,15 +501,13 @@ fn typeinfo_iface_name(method0_va: usize, segs: &SegmentRanges) -> Option<String
     if body.len() != declared {
         return None;
     }
-    if !body.starts_with("IClient") || !body.ends_with("Map") {
-        return None;
+    if body.starts_with("IClient") && body.ends_with("Map") {
+        return Some(body[..body.len() - 3].to_owned());
     }
-
-    let iface = &body[..body.len() - 3]; // strip "Map"
-    Some(iface.to_owned())
+    Some(body.to_owned())
 }
 
-fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
+fn find_candidate_vtables(segs: &SegmentRanges, include_secondary: bool) -> Vec<CandidateVtable> {
     let base = module_base(segs);
     let word = word_size();
     let mut out = Vec::new();
@@ -429,8 +526,11 @@ fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
             // SAFETY: reading vtable header slots (use read_unaligned for safety).
             let ti = unsafe { read_word_unaligned(p - word) };
             // SAFETY: p starts two words into the segment, so the header is readable.
-            let ot = unsafe { read_word_unaligned(p - 2 * word) };
-            if ot != 0 || ti == 0 {
+            let ot = unsafe { read_word_unaligned(p - 2 * word) } as isize;
+            if (!include_secondary && ot != 0)
+                || !(-MAX_SUBOBJECT_OFFSET..=0).contains(&ot)
+                || ti == 0
+            {
                 p += word;
                 continue;
             }
@@ -453,7 +553,11 @@ fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
             }
 
             if slots.len() >= 3 {
-                out.push((p, slots));
+                out.push(CandidateVtable {
+                    vtable_va: p,
+                    offset_to_top: ot,
+                    slots,
+                });
             }
             p += word;
         }
@@ -464,28 +568,20 @@ fn find_candidate_vtables(segs: &SegmentRanges) -> Vec<(usize, Vec<usize>)> {
 
 #[cfg(target_pointer_width = "32")]
 fn find_pic_anchor(func_start: usize, scan_len: usize, segs: &SegmentRanges) -> usize {
-    if !in_text(func_start, segs) {
+    let Some(bytes) = mapped_slice(&segs.text, func_start, scan_len) else {
         return 0;
-    }
-    // SAFETY: func_start is in .text.
-    let base = func_start as *const u8;
-    for i in 0..scan_len.saturating_sub(11) {
-        // SAFETY: bounded read within .text.
-        let byte = unsafe { *base.add(i) };
-        if byte != 0xE8 {
+    };
+    for i in 0..bytes.len().saturating_sub(11) {
+        if bytes[i] != 0xE8 {
             continue;
         }
         let after_call = func_start + i + 5;
-        let end = (i + 5 + 16).min(scan_len.saturating_sub(5));
+        let end = (i + 5 + 16).min(bytes.len().saturating_sub(5));
         for j in (i + 5)..end {
-            // SAFETY: bounded read.
-            let b0 = unsafe { *base.add(j) };
-            // SAFETY: end is capped so j + 1 remains inside the scan range.
-            let b1 = unsafe { *base.add(j + 1) };
+            let b0 = bytes[j];
+            let b1 = bytes[j + 1];
             if b0 == 0x81 && (b1 & 0xF8) == 0xC0 {
-                // add r32, imm32
-                // SAFETY: reading 4-byte immediate (unaligned: instruction stream).
-                let imm = unsafe { ((func_start + j + 2) as *const i32).read_unaligned() };
+                let imm = i32::from_le_bytes(bytes[j + 2..j + 6].try_into().unwrap());
                 return (after_call as i64 + imm as i64) as usize;
             }
         }
@@ -505,8 +601,9 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
         return (String::new(), 0);
     }
 
-    // SAFETY: func_start is in .text, reading up to EARLY_SCAN bytes.
-    let base = func_start as *const u8;
+    let Some(bytes) = mapped_slice(&segs.text, func_start, EARLY_SCAN) else {
+        return (String::new(), 0);
+    };
 
     let mut recent = [const { String::new() }; RECENT_LEAS];
     let mut head = 0usize;
@@ -514,9 +611,8 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
     let mut func_hash = 0u32;
     let mut tipc_matched = false;
 
-    for i in 0..EARLY_SCAN.saturating_sub(5) {
-        // SAFETY: bounded read.
-        let b = unsafe { *base.add(i) };
+    for i in 0..bytes.len().saturating_sub(5) {
+        let b = bytes[i];
 
         // Look for CALL (E8) to match the first ipc-internal call
         if b == 0xE8 && !tipc_matched {
@@ -535,12 +631,10 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
         }
 
         // LEA r32, [reg + disp32] (8D XX where modrm indicates [reg+disp32])
-        if b == 0x8D && i + 6 <= EARLY_SCAN {
-            // SAFETY: bounded read.
-            let modrm = unsafe { *base.add(i + 1) };
+        if b == 0x8D && i + 6 <= bytes.len() {
+            let modrm = bytes[i + 1];
             if (modrm & 0xC0) == 0x80 && (modrm & 0x07) != 4 {
-                // SAFETY: reading 4-byte displacement.
-                let disp = unsafe { ((func_start + i + 2) as *const i32).read_unaligned() };
+                let disp = i32::from_le_bytes(bytes[i + 2..i + 6].try_into().unwrap());
                 let target =
                     ((pic_base as u64).wrapping_add(disp as u32 as u64) & 0xFFFFFFFF) as usize;
                 let s = read_cstring(target, segs);
@@ -552,20 +646,17 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
         }
 
         // funcHash: C7 45 ?? IMM32 6A 04 50 57 E8
-        if func_hash == 0 && i + 12 <= EARLY_SCAN {
-            // SAFETY: bounded reads.
-            unsafe {
-                if *base.add(i) == 0xC7
-                    && *base.add(i + 1) == 0x45
-                    && *base.add(i + 7) == 0x6A
-                    && *base.add(i + 8) == 0x04
-                    && *base.add(i + 9) == 0x50
-                    && *base.add(i + 10) == 0x57
-                    && *base.add(i + 11) == 0xE8
-                {
-                    func_hash = ((func_start + i + 3) as *const u32).read_unaligned();
-                }
-            }
+        if func_hash == 0
+            && i + 12 <= bytes.len()
+            && bytes[i] == 0xC7
+            && bytes[i + 1] == 0x45
+            && bytes[i + 7] == 0x6A
+            && bytes[i + 8] == 0x04
+            && bytes[i + 9] == 0x50
+            && bytes[i + 10] == 0x57
+            && bytes[i + 11] == 0xE8
+        {
+            func_hash = u32::from_le_bytes(bytes[i + 3..i + 7].try_into().unwrap());
         }
 
         if tipc_matched && func_hash != 0 {
@@ -578,30 +669,23 @@ fn decode_wrapper(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
 
 #[cfg(target_pointer_width = "64")]
 fn decode_wrapper_x86_64(func_start: usize, segs: &SegmentRanges) -> (String, u32) {
-    if !in_text(func_start, segs) {
+    let Some(bytes) = mapped_slice(&segs.text, func_start, EARLY_SCAN) else {
         return (String::new(), 0);
-    }
-
-    // SAFETY: func_start is in .text, reading bounded instruction bytes.
-    let base = func_start as *const u8;
+    };
     let mut recent = [const { String::new() }; RECENT_LEAS];
     let mut head = 0usize;
     let mut method = String::new();
     let mut func_hash = 0u32;
 
-    for i in 0..EARLY_SCAN.saturating_sub(8) {
-        // SAFETY: bounded read in executable mapping.
-        let b = unsafe { *base.add(i) };
+    for i in 0..bytes.len().saturating_sub(8) {
+        let b = bytes[i];
 
         // RIP-relative LEA: 48/4c 8d modrm disp32.
-        if (b == 0x48 || b == 0x4c) && i + 7 <= EARLY_SCAN {
-            // SAFETY: bounded reads in executable mapping.
-            let op = unsafe { *base.add(i + 1) };
-            // SAFETY: the instruction bound check above covers i + 2.
-            let modrm = unsafe { *base.add(i + 2) };
+        if (b == 0x48 || b == 0x4c) && i + 7 <= bytes.len() {
+            let op = bytes[i + 1];
+            let modrm = bytes[i + 2];
             if op == 0x8d && (modrm & 0xc7) == 0x05 {
-                // SAFETY: disp32 is part of the instruction stream.
-                let disp = unsafe { ((func_start + i + 3) as *const i32).read_unaligned() };
+                let disp = i32::from_le_bytes(bytes[i + 3..i + 7].try_into().unwrap());
                 let target = (func_start + i + 7).wrapping_add_signed(disp as isize);
                 let s = read_cstring(target, segs);
                 if !s.is_empty() {
@@ -628,12 +712,10 @@ fn decode_wrapper_x86_64(func_start: usize, segs: &SegmentRanges) -> (String, u3
 
         // Hash constants are passed as 32-bit immediates. Keep this deliberately
         // broad; the name is what slot lookup uses today, the hash is diagnostic.
-        if func_hash == 0 && i + 5 <= EARLY_SCAN && b == 0xc7 {
-            // SAFETY: bounded reads in executable mapping.
-            let modrm = unsafe { *base.add(i + 1) };
+        if func_hash == 0 && i + 7 <= bytes.len() && b == 0xc7 {
+            let modrm = bytes[i + 1];
             if (modrm & 0xc0) == 0x40 || (modrm & 0xc0) == 0x80 {
-                // SAFETY: reading a possible imm32 from instruction stream.
-                func_hash = unsafe { ((func_start + i + 3) as *const u32).read_unaligned() };
+                func_hash = u32::from_le_bytes(bytes[i + 3..i + 7].try_into().unwrap());
             }
         }
 

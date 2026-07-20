@@ -5,6 +5,7 @@ pub use crate::elf::ElfClass;
 use crate::elf::ElfImage;
 
 const MAX_SLOTS: usize = 250;
+const MAX_SUBOBJECT_OFFSET: i64 = 0x10_0000;
 const STRING_MAX: usize = 96;
 const RECENT_LEAS: usize = 6;
 const EARLY_SCAN: usize = 0x400;
@@ -15,6 +16,7 @@ pub const DEFAULT_INTERFACES: &[&str] = &[
     "IClientConfigStore",
     "IClientRemoteStorage",
     "IClientUser",
+    "IClientUserStats",
     "IClientUtils",
 ];
 
@@ -41,32 +43,49 @@ pub struct Method {
     pub func_hash: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClassVtable {
+    pub name: String,
+    pub vtable_va: u64,
+    pub offset_to_top: i64,
+    pub methods: Vec<Method>,
+}
+
+struct CandidateVtable {
+    vtable_va: u64,
+    offset_to_top: i64,
+    slots: Vec<u64>,
+}
+
 pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableScanReport, String> {
     let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let image = ElfImage::parse(&data)?;
     let wanted = interfaces.map(|items| items.iter().map(String::as_str).collect::<HashSet<_>>());
-    let candidates = find_candidate_vtables(&image);
+    let candidates = find_candidate_vtables(&image, false);
 
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut found = Vec::<Interface>::new();
 
-    for (vtable_va, slots) in &candidates {
-        let Some(name) = typeinfo_iface_name(&image, *vtable_va) else {
+    for candidate in &candidates {
+        let Some((name, is_interface)) = typeinfo_class_name(&image, candidate.vtable_va) else {
             continue;
         };
         if let Some(wanted) = wanted.as_ref() {
             if !wanted.contains(name.as_str()) {
                 continue;
             }
+        } else if !is_interface {
+            continue;
         }
 
         if let Some(&existing) = by_name.get(&name) {
-            if found[existing].methods.len() >= slots.len() {
+            if found[existing].methods.len() >= candidate.slots.len() {
                 continue;
             }
         }
 
-        let methods = slots
+        let methods = candidate
+            .slots
             .iter()
             .enumerate()
             .map(|(slot, &func_va)| {
@@ -82,7 +101,7 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
 
         let interface = Interface {
             name: name.clone(),
-            vtable_va: *vtable_va,
+            vtable_va: candidate.vtable_va,
             methods,
         };
 
@@ -104,7 +123,42 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
     })
 }
 
-fn find_candidate_vtables(image: &ElfImage<'_>) -> Vec<(u64, Vec<u64>)> {
+pub fn scan_class_vtables(path: &Path, class: &str) -> Result<Vec<ClassVtable>, String> {
+    let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let image = ElfImage::parse(&data)?;
+    let mut found = Vec::new();
+
+    for candidate in find_candidate_vtables(&image, true) {
+        let Some((name, _)) = typeinfo_class_name(&image, candidate.vtable_va) else {
+            continue;
+        };
+        if name != class {
+            continue;
+        }
+        let methods = candidate
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(slot, &func_va)| Method {
+                slot,
+                name: String::new(),
+                func_va,
+                func_hash: 0,
+            })
+            .collect();
+        found.push(ClassVtable {
+            name,
+            vtable_va: candidate.vtable_va,
+            offset_to_top: candidate.offset_to_top,
+            methods,
+        });
+    }
+
+    found.sort_by_key(|vtable| (vtable.offset_to_top, vtable.vtable_va));
+    Ok(found)
+}
+
+fn find_candidate_vtables(image: &ElfImage<'_>, include_secondary: bool) -> Vec<CandidateVtable> {
     let word = image.word_size() as u64;
     let mut out = Vec::new();
 
@@ -124,8 +178,12 @@ fn find_candidate_vtables(image: &ElfImage<'_>) -> Vec<(u64, Vec<u64>)> {
             }
 
             let ti = image.read_word_va(p - word).unwrap_or(0);
-            let ot = image.read_word_va(p - 2 * word).unwrap_or(1);
-            if ot != 0 || ti == 0 || !image.in_module(ti) {
+            let ot_raw = image.read_word_va(p - 2 * word).unwrap_or(1);
+            let Some(offset_to_top) = decode_offset_to_top(image.class, ot_raw) else {
+                p += word;
+                continue;
+            };
+            if (!include_secondary && offset_to_top != 0) || ti == 0 || !image.in_module(ti) {
                 p += word;
                 continue;
             }
@@ -148,7 +206,11 @@ fn find_candidate_vtables(image: &ElfImage<'_>) -> Vec<(u64, Vec<u64>)> {
             }
 
             if slots.len() >= 3 {
-                out.push((p, slots));
+                out.push(CandidateVtable {
+                    vtable_va: p,
+                    offset_to_top,
+                    slots,
+                });
             }
             p += word;
         }
@@ -157,7 +219,17 @@ fn find_candidate_vtables(image: &ElfImage<'_>) -> Vec<(u64, Vec<u64>)> {
     out
 }
 
-fn typeinfo_iface_name(image: &ElfImage<'_>, vtable_va: u64) -> Option<String> {
+fn decode_offset_to_top(class: ElfClass, raw: u64) -> Option<i64> {
+    let value = match class {
+        ElfClass::Elf32 => i64::from(raw as u32 as i32),
+        ElfClass::Elf64 => raw as i64,
+    };
+    (-MAX_SUBOBJECT_OFFSET..=0)
+        .contains(&value)
+        .then_some(value)
+}
+
+fn typeinfo_class_name(image: &ElfImage<'_>, vtable_va: u64) -> Option<(String, bool)> {
     let word = image.word_size() as u64;
     let ti = image.read_word_va(vtable_va.checked_sub(word)?)?;
     if !image.in_module(ti) {
@@ -169,10 +241,14 @@ fn typeinfo_iface_name(image: &ElfImage<'_>, vtable_va: u64) -> Option<String> {
     }
     let name = image.read_cstring(name_va, STRING_MAX);
     let (digits, body) = split_decimal_prefix(&name)?;
-    if body.len() != digits || !body.starts_with("IClient") || !body.ends_with("Map") {
+    if body.len() != digits {
         return None;
     }
-    Some(body[..body.len() - 3].to_owned())
+    if body.starts_with("IClient") && body.ends_with("Map") {
+        Some((body[..body.len() - 3].to_owned(), true))
+    } else {
+        Some((body.to_owned(), false))
+    }
 }
 
 fn split_decimal_prefix(text: &str) -> Option<(usize, &str)> {

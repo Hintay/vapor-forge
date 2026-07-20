@@ -475,19 +475,23 @@ mod tests {
     fn registry_finds_embedded() {
         let reg = PatternRegistry::embedded();
         let lookup = reg.get("CUser::CheckAppOwnership").expect("should find");
+        #[cfg(target_pointer_width = "32")]
         assert_eq!(lookup.follow(), FollowMode::Relative);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(lookup.follow(), FollowMode::None);
         assert!(!lookup.pattern().is_empty());
     }
 
     #[test]
-    fn registry_finds_optional_ticket_pattern() {
+    fn registry_omits_vtable_resolved_ticket_adapters() {
         let reg = PatternRegistry::embedded();
-        let lookup = reg
-            .get("IClientUser::GetAppOwnershipTicketExtendedData")
-            .expect("should find");
-        assert_eq!(lookup.follow(), FollowMode::Upward);
-        assert!(lookup.prologue_bytes().is_some());
-        assert!(lookup.optional());
+        for name in [
+            "IClientUser::GetAppOwnershipTicketExtendedData",
+            "IClientUser::BUpdateAppOwnershipTicket",
+            "IClientUser::IsUserSubscribedAppInTicket",
+        ] {
+            assert!(reg.get(name).is_none(), "{name} should use vtable scanning");
+        }
     }
 
     #[test]
