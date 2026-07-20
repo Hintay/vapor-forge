@@ -20,11 +20,12 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-vapor-forge-abi = { path = "../steam-abi" }
-vapor-forge-achievement-sync = { path = "../achievement-sync" }
+vapor-forge-steam-protocol = { path = "../steam-protocol" }
+vapor-forge-cloud-core = { path = "../cloud-core" }
+vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }
-vapor-forge-packet-inspect = { path = "../packet-inspect" }
+vapor-forge-sync-state = { path = "../sync-state" }
 tracing.workspace = true
 ureq.workspace = true
 

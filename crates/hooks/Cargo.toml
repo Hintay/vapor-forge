@@ -4,31 +4,13 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-autobins = false
-
-[features]
-default = []
-tools = [
-    "dep:prost",
-    "dep:vapor-forge-abi",
-    "dep:vapor-forge-config",
-]
-
-[[bin]]
-name = "vapor-forge-packet-tool"
-path = "src/bin/vapor-forge-packet-tool.rs"
-required-features = ["tools"]
 
 [dependencies]
 iced-x86.workspace = true
 libc.workspace = true
 serde_json.workspace = true
-prost = { workspace = true, optional = true }
-vapor-forge-abi = { path = "../steam-abi", optional = true }
-vapor-forge-config = { path = "../config", optional = true }
 vapor-forge-hook-boundary = { path = "../hook-boundary" }
-vapor-forge-packet-inspect = { path = "../packet-inspect" }
-thiserror.workspace = true
+vapor-forge-packet-capture = { path = "../packet-capture" }
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -43,16 +25,18 @@ vapor-forge-features = { path = "../features" }
 arc-swap.workspace = true
 inotify.workspace = true
 once_cell.workspace = true
-retour.workspace = true
 tracing.workspace = true
-vapor-forge-abi = { path = "../steam-abi" }
-vapor-forge-achievement-sync = { path = "../achievement-sync" }
+vapor-forge-hook-engine = { path = "../hook-engine" }
+vapor-forge-steam-native-abi = { path = "../steam-native-abi" }
+vapor-forge-steam-protocol = { path = "../steam-protocol" }
+vapor-forge-cloud-core = { path = "../cloud-core" }
+vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-features = { path = "../features" }
 vapor-forge-memory = { path = "../memory" }
 vapor-forge-patterns = { path = "../patterns" }
-vapor-forge-playtime-sync = { path = "../playtime-sync" }
+vapor-forge-sync-state = { path = "../sync-state" }
 prost.workspace = true
 vapor-forge-scripting = { path = "../scripting" }
 vapor-forge-game-bridge = { path = "../game-bridge" }

@@ -1,0 +1,14 @@
+[package]
+name = "vapor-forge-cloud-cumulus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+vapor-forge-cloud-core = { path = "../cloud-core" }

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod pic_thunk;
+
 #[cfg(test)]
 use core::fmt;
 use thiserror::Error;
@@ -48,6 +50,12 @@ pub enum HookBoundaryError {
     PatchLengthTooSmall,
     #[error("patch plan relative jump is outside the supported range")]
     RelativeJumpOutOfRange,
+    #[error("no PIC thunk call found in the scanned region")]
+    NoPicThunkFound,
+    #[error("PIC thunk uses an unsupported register (reg_field={0})")]
+    UnsupportedThunkRegister(u8),
+    #[error("PIC thunk repair range is outside the target buffer")]
+    PicThunkPatchOutsideBuffer,
     #[cfg(test)]
     #[error("synthetic patch buffer is too small")]
     SyntheticBufferTooSmall,
