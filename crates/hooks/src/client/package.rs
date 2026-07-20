@@ -337,6 +337,7 @@ pub(crate) fn pkg0_captured() -> bool {
     PKG0_PTR.load(Ordering::Acquire) != 0
 }
 
+#[cfg(debug_assertions)]
 pub(crate) fn cuser_captured() -> bool {
     CUSER_PTR.load(Ordering::Acquire) != 0
 }
