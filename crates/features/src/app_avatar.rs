@@ -46,7 +46,7 @@ pub fn rewrite_games_played(
     static_map: &HashMap<AppId, AppId>,
 ) -> Option<Vec<u8>> {
     use prost::Message;
-    let mut msg = vapor_forge_abi::CMsgClientGamesPlayed::decode(body_bytes).ok()?;
+    let mut msg = vapor_forge_steam_protocol::CMsgClientGamesPlayed::decode(body_bytes).ok()?;
     let mut changed = false;
     for game in &mut msg.games_played {
         if let Some(gid) = game.game_id {

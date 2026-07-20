@@ -1,10 +1,10 @@
 use core::ffi::c_void;
 
-use retour::GenericDetour;
 use tracing::info;
 use vapor_forge_config::DepotId;
+use vapor_forge_hook_engine::detour::Detour;
 
-use crate::original::detour_or_return;
+use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::install::script_state;
 
@@ -12,7 +12,7 @@ use super::install::script_state;
 // Function type aliases
 // ---------------------------------------------------------------------------
 
-pub(crate) type BuildDepotDependencyFn = extern "C" fn(
+pub(crate) type BuildDepotDependencyFn = unsafe extern "C" fn(
     *mut c_void,
     u32,
     *mut c_void,
@@ -24,20 +24,20 @@ pub(crate) type BuildDepotDependencyFn = extern "C" fn(
 ) -> bool;
 
 pub(crate) type LoadDepotDecryptionKeyFn =
-    extern "C" fn(*mut c_void, u32, *const i8, *mut u8, u32) -> i32;
+    unsafe extern "C" fn(*mut c_void, u32, *const i8, *mut u8, u32) -> i32;
 
 // ---------------------------------------------------------------------------
 // Static detour slots
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut BUILD_DEPOT_DETOUR: Option<GenericDetour<BuildDepotDependencyFn>> = None;
-pub(crate) static mut DEPOT_KEY_DETOUR: Option<GenericDetour<LoadDepotDecryptionKeyFn>> = None;
+pub(crate) static mut BUILD_DEPOT_DETOUR: Option<Detour<BuildDepotDependencyFn>> = None;
+pub(crate) static mut DEPOT_KEY_DETOUR: Option<Detour<LoadDepotDecryptionKeyFn>> = None;
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: BuildDepotDependency (manifest injection)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_build_depot_dependency(
+pub(crate) unsafe extern "C" fn hk_build_depot_dependency(
     this: *mut c_void,
     app_id: u32,
     user_config: *mut c_void,
@@ -49,7 +49,8 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
 ) -> bool {
     // SAFETY: calling original.
     let original = detour_or_return!("BuildDepotDependency", BUILD_DEPOT_DETOUR, false);
-    let result = original.call(
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(
         this,
         app_id,
         user_config,
@@ -58,13 +59,16 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
         p_steam_app,
         p_build_id,
         pb_beta_fallback,
-    );
+    ) };
 
     if !p_depot_info.is_null() {
         let ss = script_state();
         if !ss.manifests.is_empty() {
             // SAFETY: p_depot_info is a CUtlVector<DepotEntry>* filled by Steam.
-            let vec = p_depot_info as *mut vapor_forge_abi::CUtlVector<vapor_forge_abi::DepotEntry>;
+            let vec = p_depot_info
+                as *mut vapor_forge_steam_native_abi::CUtlVector<
+                    vapor_forge_steam_native_abi::DepotEntry,
+                >;
             // SAFETY: vec is valid after BuildDepotDependency returned.
             let size = unsafe { (*vec).len() };
             // SAFETY: vec is the same Steam-owned vector validated above.
@@ -107,7 +111,7 @@ pub(crate) extern "C" fn hk_build_depot_dependency(
 // Hook replacement functions: LoadDepotDecryptionKey (depot key injection)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_load_depot_decryption_key(
+pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
     this: *mut c_void,
     unknown: u32,
     key_name: *const i8,
@@ -115,7 +119,10 @@ pub(crate) extern "C" fn hk_load_depot_decryption_key(
     key_size: u32,
 ) -> i32 {
     if !key_name.is_null() && key_size >= 32 && !key_buf.is_null() {
-        if let Some(depot_id_raw) = extract_depot_id_from_raw(key_name) {
+        if let Some(depot_id_raw) =
+            /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+            unsafe { extract_depot_id_from_raw(key_name) }
+        {
             let ss = script_state();
             if let Some(key) =
                 vapor_forge_features::depot_key::provide_key(DepotId(depot_id_raw), &ss.depot_keys)
@@ -131,10 +138,14 @@ pub(crate) extern "C" fn hk_load_depot_decryption_key(
 
     // SAFETY: calling original.
     let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
-    original.call(this, unknown, key_name, key_buf, key_size)
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, unknown, key_name, key_buf, key_size) }
 }
 
-pub(crate) fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
+/// # Safety
+/// `key_name` must point to a readable NUL-terminated string of at most
+/// `MAX_SCAN` bytes.
+pub(crate) unsafe fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
     // Bounded scan for "\DecryptionKey" in the C string.
     const MAX_SCAN: usize = 512;
     const TAG: &[u8] = b"\\DecryptionKey";

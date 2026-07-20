@@ -14,15 +14,15 @@
 //!    receive an update even if the server never sends one.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, info};
-use vapor_forge_abi::{
+use vapor_forge_config::AppId;
+use vapor_forge_steam_protocol::{
     ECLIENTPERSONASTATEFLAG_RICH_PRESENCE, EMSG_CLIENT_PERSONA_STATE,
     EPERSONASTATEFLAG_HAS_RICH_PRESENCE, K_MSG_HDR_PROTO_FLAG,
 };
-use vapor_forge_config::AppId;
 
 type RichPresenceKvs = HashMap<AppId, Vec<(String, String)>>;
 
@@ -37,10 +37,6 @@ static SELF_CACHE: Mutex<Option<SelfPersonaCache>> = Mutex::new(None);
 // AppId currently being played through an avatar mapping. Zero means none.
 static TRACKED_APP: AtomicU32 = AtomicU32::new(0);
 
-// Current local SteamID, refreshed from outgoing packet headers so an account
-// switch inside the same Steam process cannot retain the previous identity.
-static LOCAL_STEAMID: AtomicU64 = AtomicU64::new(0);
-
 // Set whenever tracking changes or new rich presence KVs arrive, so try_inject
 // fires a manufactured PersonaState exactly once per change instead of on
 // every RecvPkt call.
@@ -51,15 +47,15 @@ struct SelfPersonaCache {
     body: Vec<u8>,
 }
 
-/// Record the current local SteamID observed on an outgoing packet.
-pub fn set_local_steamid(steamid: u64) {
-    if steamid != 0 {
-        LOCAL_STEAMID.store(steamid, Ordering::Release);
+pub fn reset_account_state() {
+    if let Ok(mut cache) = SELF_CACHE.lock() {
+        *cache = None;
     }
-}
-
-pub fn local_steamid() -> u64 {
-    LOCAL_STEAMID.load(Ordering::Acquire)
+    if let Ok(mut kvs) = RP_KVS.lock() {
+        *kvs = None;
+    }
+    TRACKED_APP.store(0, Ordering::Release);
+    INJECT_PENDING.store(false, Ordering::Release);
 }
 
 pub fn tracked_app() -> AppId {
@@ -112,9 +108,9 @@ pub fn on_rich_presence_upload(kv_data: &[u8]) {
 /// If the local SteamID is not known yet, cache unconditionally as a fallback.
 pub fn cache_self_persona(header: &[u8], body: &[u8]) {
     use prost::Message;
-    let steamid = local_steamid();
+    let steamid = crate::identity::steam_id();
     if steamid != 0 {
-        let has_self = vapor_forge_abi::ClientPersonaState::decode(body)
+        let has_self = vapor_forge_steam_protocol::ClientPersonaState::decode(body)
             .map(|msg| msg.friends.iter().any(|f| f.friendid == Some(steamid)))
             .unwrap_or(false);
         if !has_self {
@@ -163,12 +159,13 @@ pub fn build_inject_packet(app_id: AppId) -> Option<Vec<u8>> {
     use prost::Message;
     let cache = SELF_CACHE.lock().unwrap();
     let cache = cache.as_ref()?;
-    let steamid = local_steamid();
+    let steamid = crate::identity::steam_id();
     if steamid == 0 {
         return None;
     }
 
-    let mut msg = vapor_forge_abi::ClientPersonaState::decode(cache.body.as_slice()).ok()?;
+    let mut msg =
+        vapor_forge_steam_protocol::ClientPersonaState::decode(cache.body.as_slice()).ok()?;
     let entry = msg
         .friends
         .iter_mut()
@@ -179,7 +176,7 @@ pub fn build_inject_packet(app_id: AppId) -> Option<Vec<u8>> {
 
     let new_body = msg.encode_to_vec();
     let emsg_raw = EMSG_CLIENT_PERSONA_STATE | K_MSG_HDR_PROTO_FLAG;
-    Some(vapor_forge_abi::assemble_raw(
+    Some(vapor_forge_steam_protocol::assemble_raw(
         emsg_raw,
         &cache.header,
         &new_body,
@@ -194,12 +191,12 @@ pub fn patch_persona_state(body_bytes: &[u8]) -> Option<Vec<u8>> {
     if app.0 == 0 {
         return None;
     }
-    let steamid = local_steamid();
+    let steamid = crate::identity::steam_id();
     if steamid == 0 {
         return None;
     }
 
-    let mut msg = vapor_forge_abi::ClientPersonaState::decode(body_bytes).ok()?;
+    let mut msg = vapor_forge_steam_protocol::ClientPersonaState::decode(body_bytes).ok()?;
     let entry = msg
         .friends
         .iter_mut()
@@ -212,17 +209,19 @@ pub fn patch_persona_state(body_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(msg.encode_to_vec())
 }
 
-fn apply_game_fields(entry: &mut vapor_forge_abi::PersonaStateFriend, app_id: AppId) {
+fn apply_game_fields(entry: &mut vapor_forge_steam_protocol::PersonaStateFriend, app_id: AppId) {
     entry.game_played_app_id = Some(app_id.0);
     entry.gameid = Some(app_id.0 as u64);
     entry.rich_presence.clear();
     let kvs = get_kvs(app_id);
     let has_kvs = !kvs.is_empty();
     for (k, v) in kvs {
-        entry.rich_presence.push(vapor_forge_abi::PersonaStateKV {
-            key: Some(k),
-            value: Some(v),
-        });
+        entry
+            .rich_presence
+            .push(vapor_forge_steam_protocol::PersonaStateKV {
+                key: Some(k),
+                value: Some(v),
+            });
     }
 
     let flags = entry.persona_state_flags.unwrap_or(0);
@@ -234,7 +233,7 @@ fn apply_game_fields(entry: &mut vapor_forge_abi::PersonaStateFriend, app_id: Ap
 }
 
 /// Mark the top-level status_flags as carrying rich presence field data.
-fn set_rich_presence_flag(msg: &mut vapor_forge_abi::ClientPersonaState) {
+fn set_rich_presence_flag(msg: &mut vapor_forge_steam_protocol::ClientPersonaState) {
     let flags = msg.status_flags.unwrap_or(0);
     msg.status_flags = Some(flags | ECLIENTPERSONASTATEFLAG_RICH_PRESENCE);
 }
@@ -345,7 +344,7 @@ mod tests {
             m
         });
 
-        let mut entry = vapor_forge_abi::PersonaStateFriend::default();
+        let mut entry = vapor_forge_steam_protocol::PersonaStateFriend::default();
         apply_game_fields(&mut entry, AppId(480));
 
         assert_eq!(entry.game_played_app_id, Some(480));

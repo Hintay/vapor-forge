@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use prost::Message;
 use tracing::{debug, error, info, warn};
-use vapor_forge_abi::{
+use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
     K_MSG_HDR_PROTO_FLAG,
 };
-use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub type ManifestCodeCallback =
     Arc<dyn Fn(u32, u32, u64) -> Result<Option<u64>, String> + Send + Sync>;
@@ -26,12 +26,37 @@ pub struct ManifestCodeFetch {
     pub req_hdr_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub enum ManifestFetchError {
+    Decode(prost::DecodeError),
+    MissingJobId,
+}
+
+pub fn plan_fetch(
+    header: &CMsgProtoBufHeader,
+    header_bytes: &[u8],
+    body_bytes: &[u8],
+) -> Result<ManifestCodeFetch, ManifestFetchError> {
+    let request = vapor_forge_steam_protocol::GetManifestRequestCodeRequest::decode(body_bytes)
+        .map_err(ManifestFetchError::Decode)?;
+    Ok(ManifestCodeFetch {
+        job_id: header
+            .jobid_source
+            .filter(|job_id| *job_id != 0)
+            .ok_or(ManifestFetchError::MissingJobId)?,
+        app_id: request.app_id.unwrap_or(0),
+        depot_id: request.depot_id.unwrap_or(0),
+        gid: request.manifest_id.unwrap_or(0),
+        req_hdr_bytes: header_bytes.to_vec(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// ServiceMethod name we intercept.
-pub use vapor_forge_packet_inspect::MANIFEST_REQUEST_CODE_JOB_NAME as TARGET_JOB_NAME;
+pub const TARGET_JOB_NAME: &str = vapor_forge_steam_protocol::MANIFEST_REQUEST_CODE_JOB_NAME;
 
 /// Manifest code provider endpoints.
 /// `{gid}` is replaced with the manifest ID.
@@ -208,7 +233,16 @@ impl Default for PendingQueue {
 /// Returns `true` if this app's request should be intercepted (dropped from
 /// the outgoing wire and fetched from an external provider instead).
 pub fn should_intercept(app_id: AppId, config: &RuntimeConfig) -> bool {
-    crate::apps::classify_app(config, app_id).requires_injected_ownership()
+    should_intercept_with_ownership(app_id, config, crate::apps::actual_ownership)
+}
+
+pub fn should_intercept_with_ownership(
+    app_id: AppId,
+    config: &RuntimeConfig,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> bool {
+    crate::apps::classify_app_with_ownership(config, app_id, ownership)
+        .requires_injected_ownership()
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +281,7 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
     let body_bytes = resp_body.encode_to_vec();
     let emsg_raw = EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG;
 
-    vapor_forge_abi::assemble_raw(emsg_raw, &hdr_bytes, &body_bytes)
+    vapor_forge_steam_protocol::assemble_raw(emsg_raw, &hdr_bytes, &body_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +334,11 @@ fn fetch_manifest_code(
     None
 }
 
+/// User-Agent used only when hitting the opensteamtool endpoint. The other
+/// providers get ureq's default UA — sending "OpenSteamTool/1.0" to them
+/// would pollute their stats and misattribute vapor-forge traffic as OST.
+const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
+
 fn fetch_from_provider(
     name: &str,
     url: &str,
@@ -313,51 +352,38 @@ fn fetch_from_provider(
         .new_agent();
 
     let mut req = agent.get(url);
-
-    // Per-provider User-Agent
     if name == "opensteamtool" {
-        req = req.header("User-Agent", "OpenSteamTool/1.0");
+        req = req.header("User-Agent", OPENSTEAMTOOL_USER_AGENT);
     }
 
     let body = req.call()?.body_mut().read_to_string()?;
     let body = body.trim();
 
     if name == "steamrun" {
-        // JSON format: {"manifest_request_code": 12345}
-        parse_steamrun_json(body)
+        parse_steamrun_content(body)
     } else {
-        // Plain uint64 string
         body.parse::<u64>()
             .map_err(|e| format!("parse error: {} (body: {:?})", e, body).into())
     }
 }
 
-fn parse_steamrun_json(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    // Minimal JSON parsing avoids pulling in serde_json for one field.
-    // Expected: {"manifest_request_code": 12345} or {"manifest_request_code":12345}
-    let key = "\"manifest_request_code\"";
-    let pos = body.find(key).ok_or("missing manifest_request_code key")?;
-
+/// steam.run returns `{... "content": "12345" ...}`; the value is a quoted
+/// uint string. Extracts and parses it. Matches OpenSteamTool's
+/// `ParseSteamRunJson`.
+fn parse_steamrun_content(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let key = "\"content\"";
+    let pos = body.find(key).ok_or("missing content key")?;
     let after_key = &body[pos + key.len()..];
-    // Skip optional whitespace and colon
-    let after_colon = after_key
-        .trim_start()
-        .strip_prefix(':')
-        .ok_or("missing colon after key")?
-        .trim_start();
-
-    // Read digits
-    let digits: String = after_colon
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        return Err("no digits after key".into());
-    }
-
-    digits
+    let q1 = after_key
+        .find('"')
+        .ok_or("missing opening quote after content")?;
+    let value_start = &after_key[q1 + 1..];
+    let q2 = value_start
+        .find('"')
+        .ok_or("missing closing quote after content")?;
+    value_start[..q2]
         .parse::<u64>()
-        .map_err(|e| format!("parse error: {}", e).into())
+        .map_err(|e| format!("parse error: {} (value: {:?})", e, &value_start[..q2]).into())
 }
 
 #[cfg(test)]
@@ -382,7 +408,8 @@ mod tests {
     fn build_response_routes_to_caller() {
         let req_hdr = make_req_header(42, TARGET_JOB_NAME);
         let packet = build_response_packet(&req_hdr, 42, 123, 99999);
-        let (emsg, hdr_bytes, body_bytes) = vapor_forge_abi::unpack_raw(&packet).unwrap();
+        let (emsg, hdr_bytes, body_bytes) =
+            vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
         assert_eq!(emsg, EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG);
 
         let resp_hdr = CMsgProtoBufHeader::decode(hdr_bytes).unwrap();
@@ -397,13 +424,40 @@ mod tests {
     fn build_response_failure_returns_access_denied() {
         let req_hdr = make_req_header(7, TARGET_JOB_NAME);
         let packet = build_response_packet(&req_hdr, 7, 123, 0);
-        let (_, hdr_bytes, body_bytes) = vapor_forge_abi::unpack_raw(&packet).unwrap();
+        let (_, hdr_bytes, body_bytes) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
 
         let resp_hdr = CMsgProtoBufHeader::decode(hdr_bytes).unwrap();
         assert_eq!(resp_hdr.eresult, Some(15));
 
         let resp_body = GetManifestRequestCodeResponse::decode(body_bytes).unwrap();
         assert_eq!(resp_body.manifest_request_code, None);
+    }
+
+    #[test]
+    fn fetch_plan_preserves_request_context_and_rejects_missing_jobs() {
+        let header_bytes = make_req_header(42, TARGET_JOB_NAME);
+        let header = CMsgProtoBufHeader::decode(header_bytes.as_slice()).unwrap();
+        let body = vapor_forge_steam_protocol::GetManifestRequestCodeRequest {
+            app_id: Some(480),
+            depot_id: Some(481),
+            manifest_id: Some(1234),
+        }
+        .encode_to_vec();
+        let fetch = plan_fetch(&header, &header_bytes, &body).unwrap();
+        assert_eq!(fetch.job_id, 42);
+        assert_eq!(fetch.app_id, 480);
+        assert_eq!(fetch.depot_id, 481);
+        assert_eq!(fetch.gid, 1234);
+        assert_eq!(fetch.req_hdr_bytes, header_bytes);
+
+        assert!(matches!(
+            plan_fetch(&CMsgProtoBufHeader::default(), &[], &body),
+            Err(ManifestFetchError::MissingJobId)
+        ));
+        assert!(matches!(
+            plan_fetch(&header, &[], &[0xff]),
+            Err(ManifestFetchError::Decode(_))
+        ));
     }
 
     #[test]
@@ -518,19 +572,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_steamrun_json_valid() {
-        let body = r#"{"manifest_request_code": 12345678}"#;
-        assert_eq!(parse_steamrun_json(body).unwrap(), 12345678);
+    fn parse_steamrun_content_valid() {
+        let body = r#"{"content":"12345678"}"#;
+        assert_eq!(parse_steamrun_content(body).unwrap(), 12345678);
     }
 
     #[test]
-    fn parse_steamrun_json_no_key() {
-        assert!(parse_steamrun_json(r#"{"other": 1}"#).is_err());
+    fn parse_steamrun_content_tolerates_whitespace_and_extras() {
+        let body = r#"{ "gid":"1", "content": "9999999999" , "note":"ok" }"#;
+        assert_eq!(parse_steamrun_content(body).unwrap(), 9999999999);
     }
 
     #[test]
-    fn parse_steamrun_json_zero() {
-        let body = r#"{"manifest_request_code": 0}"#;
-        assert_eq!(parse_steamrun_json(body).unwrap(), 0);
+    fn parse_steamrun_content_no_key() {
+        assert!(parse_steamrun_content(r#"{"other":"1"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_steamrun_content_zero() {
+        let body = r#"{"content":"0"}"#;
+        assert_eq!(parse_steamrun_content(body).unwrap(), 0);
     }
 }

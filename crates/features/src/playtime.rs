@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use prost::Message;
-use vapor_forge_abi::{
+use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, PlayerGetLastPlayedTimesResponse, PlayerLastPlayedGame,
     PlayerLastPlayedTimesNotification,
 };

@@ -1,9 +1,12 @@
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once, OnceLock};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use vapor_forge_config::{AppId, RuntimeConfig};
-use vapor_forge_scripting::{ManifestCodeProvider, ScriptRuntime, ScriptState};
+use vapor_forge_scripting::{ManifestCodeProvider, RegistryHandle, ScriptRuntime, ScriptState};
 
 const CONFIG_FILENAME: &str = "config.toml";
 
@@ -15,6 +18,7 @@ pub(crate) struct RuntimeSnapshot {
     pub config: Arc<RuntimeConfig>,
     pub script_state: Arc<ScriptState>,
     pub manifest_code_provider: Option<Arc<ManifestCodeProvider>>,
+    pub script_registry: Option<RegistryHandle>,
     pub avatar_map: Arc<HashMap<AppId, AppId>>,
 }
 
@@ -32,6 +36,7 @@ impl RuntimeSnapshot {
             config: Arc::new(config),
             script_state: Arc::new(script_runtime.state),
             manifest_code_provider: script_runtime.manifest_code_provider.map(Arc::new),
+            script_registry: script_runtime.registry,
             avatar_map: Arc::new(avatar_map),
         }
     }
@@ -166,14 +171,20 @@ pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
     let mut dirs = Vec::new();
 
     // 1. Steam root config/lua + config/scripts
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{}/.local/share/Steam/config/lua", home));
-        dirs.push(format!("{}/.local/share/Steam/config/scripts", home));
+    if let Some(root) = steam_install_root() {
+        debug!(path = %root.display(), "scripting: resolved Steam root");
+        dirs.push(root.join("config/lua").to_string_lossy().into_owned());
+        dirs.push(root.join("config/scripts").to_string_lossy().into_owned());
     }
 
     // 2. User config directory
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(format!("{}/.config/vapor-forge/scripts", home));
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(
+            PathBuf::from(home)
+                .join(".config/vapor-forge/scripts")
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
 
     // 3. Extra dirs from config. Highest priority; later dirs override earlier.
@@ -184,6 +195,58 @@ pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
     }
 
     dirs
+}
+
+fn steam_install_root() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let compat_root = std::env::var_os("STEAM_COMPAT_CLIENT_INSTALL_PATH").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_steam_install_root(
+        current_exe.as_deref(),
+        compat_root.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn resolve_steam_install_root(
+    current_exe: Option<&Path>,
+    compat_root: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    current_exe
+        .and_then(steam_root_from_executable)
+        .or_else(|| compat_root.and_then(canonical_steam_root))
+        .or_else(|| {
+            let home = home?;
+            [
+                home.join(".steam/root"),
+                home.join(".steam/steam"),
+                home.join(".local/share/Steam"),
+                home.join(".steam/debian-installation"),
+            ]
+            .into_iter()
+            .find_map(|candidate| canonical_steam_root(&candidate))
+        })
+}
+
+fn steam_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    if executable.file_name()? != "steam" {
+        return None;
+    }
+    let runtime_dir = executable.parent()?;
+    let runtime_name = runtime_dir.file_name()?.to_str()?;
+    if !matches!(
+        runtime_name,
+        "ubuntu12_32" | "ubuntu12_64" | "steamrt32" | "steamrt64"
+    ) {
+        return None;
+    }
+    runtime_dir.parent().map(Path::to_path_buf)
+}
+
+fn canonical_steam_root(candidate: &Path) -> Option<PathBuf> {
+    let root = candidate.canonicalize().ok()?;
+    root.join("ubuntu12_32/steam").is_file().then_some(root)
 }
 
 /// Execute Lua scripts from default + config directories and merge addappid
@@ -199,7 +262,10 @@ pub(crate) fn build_runtime(base_config: &RuntimeConfig) -> (RuntimeConfig, Scri
     (config, runtime)
 }
 
-fn merge_script_apps(mut config: RuntimeConfig, apps: &[AppId]) -> RuntimeConfig {
+pub(crate) fn merge_script_apps(
+    mut config: RuntimeConfig,
+    apps: &std::collections::HashSet<AppId>,
+) -> RuntimeConfig {
     let mut existing_ids: std::collections::HashSet<AppId> =
         config.apps.inject.iter().map(|a| a.id).collect();
 
@@ -296,17 +362,61 @@ pub(crate) fn sync_config_template(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vapor-forge-{name}-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn steam_root_is_inferred_from_the_running_steam_executable() {
+        let executable = Path::new("/home/user/.steam/debian-installation/ubuntu12_32/steam");
+
+        assert_eq!(
+            steam_root_from_executable(executable),
+            Some(PathBuf::from("/home/user/.steam/debian-installation"))
+        );
+        assert_eq!(
+            steam_root_from_executable(Path::new("/usr/bin/steam")),
+            None
+        );
+    }
+
+    #[test]
+    fn steam_root_falls_back_to_the_home_symlink() {
+        let base = temp_dir("steam-root");
+        let home = base.join("home");
+        let install = base.join("debian-installation");
+        fs::create_dir_all(home.join(".steam")).unwrap();
+        fs::create_dir_all(install.join("ubuntu12_32")).unwrap();
+        fs::write(install.join("ubuntu12_32/steam"), []).unwrap();
+        std::os::unix::fs::symlink(&install, home.join(".steam/root")).unwrap();
+
+        let resolved = resolve_steam_install_root(None, None, Some(&home));
+
+        assert_eq!(resolved, Some(install.canonicalize().unwrap()));
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn script_apps_never_mutate_the_base_config() {
         let base = RuntimeConfig::default();
-        let effective = merge_script_apps(base.clone(), &[AppId(480), AppId(480)]);
+        let scripts: std::collections::HashSet<AppId> = [AppId(480)].into_iter().collect();
+        let effective = merge_script_apps(base.clone(), &scripts);
 
         assert!(base.apps.inject.is_empty());
         assert_eq!(effective.apps.inject.len(), 1);
         assert_eq!(effective.apps.inject[0].id, AppId(480));
 
-        let after_script_removal = merge_script_apps(base.clone(), &[]);
+        let empty = std::collections::HashSet::new();
+        let after_script_removal = merge_script_apps(base.clone(), &empty);
         assert!(after_script_removal.apps.inject.is_empty());
     }
 

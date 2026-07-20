@@ -1,29 +1,30 @@
 use core::ffi::c_void;
 
-use retour::GenericDetour;
+use vapor_forge_hook_engine::detour::Detour;
 
 use crate::netpacket::SendFrameDecision;
-use crate::original::detour_or_return;
+use vapor_forge_hook_engine::original::detour_or_return;
 
 // ---------------------------------------------------------------------------
 // Function type aliases
 // ---------------------------------------------------------------------------
 
-pub(crate) type BBuildAndAsyncSendFrameFn = extern "C" fn(*mut c_void, i32, *mut u8, u32) -> bool;
-pub(crate) type RecvPktFn = extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+pub(crate) type BBuildAndAsyncSendFrameFn =
+    unsafe extern "C" fn(*mut c_void, i32, *mut u8, u32) -> bool;
+pub(crate) type RecvPktFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 
 // ---------------------------------------------------------------------------
 // Static detour slots
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut SEND_FRAME_DETOUR: Option<GenericDetour<BBuildAndAsyncSendFrameFn>> = None;
-pub(crate) static mut RECV_PKT_DETOUR: Option<GenericDetour<RecvPktFn>> = None;
+pub(crate) static mut SEND_FRAME_DETOUR: Option<Detour<BBuildAndAsyncSendFrameFn>> = None;
+pub(crate) static mut RECV_PKT_DETOUR: Option<Detour<RecvPktFn>> = None;
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: BBuildAndAsyncSendFrame (outgoing WS frames)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_send_frame(
+pub(crate) unsafe extern "C" fn hk_send_frame(
     this: *mut c_void,
     opcode: i32,
     data: *mut u8,
@@ -43,31 +44,37 @@ pub(crate) extern "C" fn hk_send_frame(
                 // SAFETY: calling original with rewritten data.
                 let original =
                     detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
-                return original.call(
+                return // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(
                     this,
                     opcode,
                     rewritten.as_ptr() as *mut u8,
                     rewritten.len() as u32,
-                );
+                ) };
             }
         }
     }
 
     // SAFETY: SEND_FRAME_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
-    original.call(this, opcode, data, size)
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, opcode, data, size) }
 }
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: RecvPkt (incoming packets)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> *mut c_void {
+pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> *mut c_void {
     // Try to inject fabricated responses from completed fetches.
     // SAFETY: this and packet are valid pointers from Steam's caller.
     // The closure calls the original RecvPkt.
-    let call_original =
-        |t, p| detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut()).call(t, p);
+    let call_original = |t, p| {
+        let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut());
+        // SAFETY: the typed original and unchanged callback arguments satisfy
+        // RecvPkt's ABI contract.
+        unsafe { original(t, p) }
+    };
     // SAFETY: this and packet are the unchanged arguments supplied by Steam.
     unsafe {
         crate::netpacket::try_inject(this, packet, call_original);
@@ -76,7 +83,8 @@ pub(crate) extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) -> 
     // Process the real packet normally
     // SAFETY: RECV_PKT_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR, std::ptr::null_mut());
-    let result = original.call(this, packet);
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(this, packet) };
 
     // Post-process: strip achievement stats from incoming responses
     if !packet.is_null() {

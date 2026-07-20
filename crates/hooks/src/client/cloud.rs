@@ -1,10 +1,10 @@
 use core::ffi::c_void;
-use retour::GenericDetour;
 use tracing::{debug, info, warn};
 use vapor_forge_config::AppId;
+use vapor_forge_hook_engine::detour::Detour;
 
-use crate::original::{detour_or_return, vmt_or_return};
-use crate::vmt;
+use vapor_forge_hook_engine::original::{detour_or_return, vmt_or_return};
+use vapor_forge_hook_engine::vmt;
 
 use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 
@@ -12,18 +12,19 @@ use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 // Function type aliases
 // ---------------------------------------------------------------------------
 
-pub(crate) type RunIPCFrameFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
-pub(crate) type IsCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32) -> bool;
-pub(crate) type SetCloudEnabledForAppFn = extern "C" fn(*mut c_void, u32, bool);
+pub(crate) type RunIPCFrameFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
+pub(crate) type IsCloudEnabledForAppFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
+pub(crate) type SetCloudEnabledForAppFn = unsafe extern "C" fn(*mut c_void, u32, bool);
 pub(crate) type WriteVdfFileFn =
-    extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u8, u32) -> u32;
+    unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u8, u32) -> u32;
 
 // ---------------------------------------------------------------------------
 // Static state
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut REMOTE_STORAGE_RUN_IPC_DETOUR: Option<GenericDetour<RunIPCFrameFn>> = None;
-pub(crate) static mut WRITE_VDF_DETOUR: Option<GenericDetour<WriteVdfFileFn>> = None;
+pub(crate) static mut REMOTE_STORAGE_RUN_IPC_DETOUR: Option<Detour<RunIPCFrameFn>> = None;
+pub(crate) static mut WRITE_VDF_DETOUR: Option<Detour<WriteVdfFileFn>> = None;
 pub(crate) static mut ORIGINAL_IS_CLOUD_ENABLED: Option<IsCloudEnabledForAppFn> = None;
 pub(crate) static mut SET_CLOUD_FN: Option<SetCloudEnabledForAppFn> = None;
 static CLOUD_VMT_GATE: vmt::InstallGate = vmt::InstallGate::new();
@@ -33,7 +34,7 @@ static SET_CLOUD_CAPTURE_GATE: vmt::InstallGate = vmt::InstallGate::new();
 // Hook replacement functions: IClientRemoteStorage::RunIPCFrame (cloud VMT)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_remote_storage_run_ipc_frame(
+pub(crate) unsafe extern "C" fn hk_remote_storage_run_ipc_frame(
     this: *mut c_void,
     a1: *mut c_void,
     a2: *mut c_void,
@@ -48,13 +49,15 @@ pub(crate) extern "C" fn hk_remote_storage_run_ipc_frame(
         "IClientRemoteStorage::RunIPCFrame",
         REMOTE_STORAGE_RUN_IPC_DETOUR
     );
-    original.call(this, a1, a2, a3);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, a1, a2, a3) };
 }
 
-extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> bool {
+unsafe extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> bool {
     // SAFETY: ORIGINAL_IS_CLOUD_ENABLED set before VMT swap.
     let original = vmt_or_return!("IsCloudEnabledForApp", ORIGINAL_IS_CLOUD_ENABLED, true);
-    let result = original(this, app_id);
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(this, app_id) };
 
     let cfg = config();
     let should_disable = vapor_forge_features::apps::classify_app(&cfg, AppId(app_id))
@@ -68,7 +71,8 @@ extern "C" fn hk_is_cloud_enabled_for_app(this: *mut c_void, app_id: u32) -> boo
         if vapor_forge_features::cloud::mark_cloud_wrote(AppId(app_id)) {
             // SAFETY: captured from this object's VMT before the hook is enabled.
             if let Some(set_fn) = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) } {
-                set_fn(this, app_id, false);
+                /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                unsafe { set_fn(this, app_id, false) };
                 info!(
                     app_id,
                     "cloud: SetCloudEnabledForApp(false) — badge suppressed"
@@ -157,7 +161,7 @@ fn capture_set_cloud_from_vtable(this: *mut c_void) {
 // Hook replacement functions: CConfigStore::WriteVdfFile (VDF cloud filter)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_write_vdf_file(
+pub(crate) unsafe extern "C" fn hk_write_vdf_file(
     a0: *mut c_void,
     a1: u32,
     a2: u32,
@@ -176,11 +180,13 @@ pub(crate) extern "C" fn hk_write_vdf_file(
             );
             // SAFETY: calling original with filtered buffer.
             let original = detour_or_return!("WriteVdfFile", WRITE_VDF_DETOUR, 0);
-            return original.call(a0, a1, a2, a3, filtered.as_ptr(), filtered.len() as u32);
+            return // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(a0, a1, a2, a3, filtered.as_ptr(), filtered.len() as u32) };
         }
     }
 
     // SAFETY: pass through unmodified.
     let original = detour_or_return!("WriteVdfFile", WRITE_VDF_DETOUR, 0);
-    original.call(a0, a1, a2, a3, buffer, size)
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(a0, a1, a2, a3, buffer, size) }
 }

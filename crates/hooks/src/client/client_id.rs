@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 use vapor_forge_patterns::registry::PatternRegistry;
 
 #[cfg(target_pointer_width = "32")]
-use crate::detour;
-use crate::detour::CodeRegion;
+use vapor_forge_hook_engine::detour;
+use vapor_forge_hook_engine::detour::CodeRegion;
 
 #[cfg(target_pointer_width = "32")]
 const ACCESS_PATTERN: &str = "CConfigStore::ClientIDConfigAccess";
@@ -205,7 +205,7 @@ fn refresh_device_descriptor_x86() {
         return;
     };
 
-    vapor_forge_achievement_sync::record_local_client_id(client_id);
+    vapor_forge_cloud_core::record_local_client_id(client_id);
     CAPTURE_STATE.store(CAPTURE_COMPLETE, Ordering::Release);
     info!(client_id, "Steam ClientID read from CConfigStore");
 }
@@ -234,15 +234,19 @@ fn read_client_id(accessor: Accessor, mappings: &[Mapping]) -> Option<u64> {
         return None;
     }
 
-    type GetUint64Fn = extern "C" fn(*mut c_void, u32, *const c_char, u64) -> u64;
+    type GetUint64Fn = unsafe extern "C" fn(*mut c_void, u32, *const c_char, u64) -> u64;
     // SAFETY: slot 3 is CConfigStore::GetUint64 for the validated object.
     let getter: GetUint64Fn = unsafe { std::mem::transmute(getter_address) };
-    let value = getter(
-        store as *mut c_void,
-        INSTALL_CONFIG_STORE,
-        CLIENT_ID_KEY.as_ptr().cast(),
-        0,
-    );
+    // SAFETY: getter is the validated 32-bit CConfigStore function and all
+    // arguments remain live for this call.
+    let value = unsafe {
+        getter(
+            store as *mut c_void,
+            INSTALL_CONFIG_STORE,
+            CLIENT_ID_KEY.as_ptr().cast(),
+            0,
+        )
+    };
     (value != 0).then_some(value)
 }
 

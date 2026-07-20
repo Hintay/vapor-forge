@@ -1,12 +1,12 @@
 use core::ffi::c_void;
 
-use retour::GenericDetour;
 use tracing::{debug, info, warn};
 use vapor_forge_config::AppId;
+use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_patterns::registry::PatternRegistry;
 
-use crate::detour::{self, CodeRegion};
-use crate::original::detour_or_return;
+use vapor_forge_hook_engine::detour::{self, CodeRegion};
+use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::install::{config, IPC_SERVER};
 
@@ -17,7 +17,7 @@ use super::install::{config, IPC_SERVER};
 // Library injection: BuildSpawnEnvBlock builds the child process env block for
 // a game launch. CGameID is passed by pointer and is 8 bytes on both i686 and
 // x86_64: low 24 bits = AppId, byte 3 = type (2 = app).
-pub(crate) type BuildSpawnEnvBlockFn = extern "C" fn(
+pub(crate) type BuildSpawnEnvBlockFn = unsafe extern "C" fn(
     *mut c_void, // CGameID*
     *const i8,   // pExePath
     *const i8,   // pWorkingDir
@@ -30,12 +30,12 @@ pub(crate) type BuildSpawnEnvBlockFn = extern "C" fn(
 
 // SetEnvString(pEnvMap, key, value): 3-param cdecl helper used to write into
 // the env map built by BuildSpawnEnvBlock.
-pub(crate) type SetEnvStringFn = extern "C" fn(*mut c_void, *const i8, *const i8);
+pub(crate) type SetEnvStringFn = unsafe extern "C" fn(*mut c_void, *const i8, *const i8);
 
 // CUser::SpawnProcess: launches a game. On x86_64 SysV, this/exe/command/dir/
 // CGameID/extra are register args and later flags stay on the native ABI stack.
 // pCommandLine contains user launch options.
-pub(crate) type SpawnProcessFn = extern "C" fn(
+pub(crate) type SpawnProcessFn = unsafe extern "C" fn(
     *mut c_void, // this (CUser)
     *const i8,   // pExePath
     *const i8,   // pCommandLine
@@ -53,15 +53,15 @@ pub(crate) type SpawnProcessFn = extern "C" fn(
 // Static state
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut BUILD_SPAWN_ENV_DETOUR: Option<GenericDetour<BuildSpawnEnvBlockFn>> = None;
-pub(crate) static mut SPAWN_PROCESS_DETOUR: Option<GenericDetour<SpawnProcessFn>> = None;
+pub(crate) static mut BUILD_SPAWN_ENV_DETOUR: Option<Detour<BuildSpawnEnvBlockFn>> = None;
+pub(crate) static mut SPAWN_PROCESS_DETOUR: Option<Detour<SpawnProcessFn>> = None;
 pub(crate) static mut SET_ENV_STRING_FN: Option<SetEnvStringFn> = None;
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: BuildSpawnEnvBlock (native .so injection)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_build_spawn_env_block(
+pub(crate) unsafe extern "C" fn hk_build_spawn_env_block(
     game_id: *mut c_void,
     exe_path: *const i8,
     working_dir: *const i8,
@@ -74,7 +74,8 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
     // Call original first so Steam has already populated the env block.
     // SAFETY: BUILD_SPAWN_ENV_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("BuildSpawnEnvBlock", BUILD_SPAWN_ENV_DETOUR, 0);
-    let result = original.call(
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(
         game_id,
         exe_path,
         working_dir,
@@ -83,7 +84,7 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         something,
         env_map,
         context,
-    );
+    ) };
 
     if game_id.is_null() || env_map.is_null() {
         return result;
@@ -113,7 +114,8 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         if !inj.native_libs.is_empty() {
             let ld_preload = inj.native_libs.join(":");
             if let Ok(value) = std::ffi::CString::new(ld_preload.as_str()) {
-                set_env(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr());
+                /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                unsafe { set_env(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr()) };
                 info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
             }
         }
@@ -135,13 +137,15 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
                 std::ffi::CString::new(vapor_forge_game_bridge::ENV_GAME_BRIDGE_TOKEN),
                 std::ffi::CString::new(hex.as_str()),
             ) {
-                set_env(env_map, key.as_ptr(), val.as_ptr());
+                /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                unsafe { set_env(env_map, key.as_ptr(), val.as_ptr()) };
             }
             if let (Ok(key), Ok(val)) = (
                 std::ffi::CString::new(vapor_forge_game_bridge::ENV_GAME_BRIDGE_SOCK),
                 std::ffi::CString::new(server.socket_path()),
             ) {
-                set_env(env_map, key.as_ptr(), val.as_ptr());
+                /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                unsafe { set_env(env_map, key.as_ptr(), val.as_ptr()) };
             }
             debug!(app = app_id.0, "library_inject: IPC token injected");
         }
@@ -151,7 +155,8 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
         if !has_proton_dll {
             if let Some(path) = resolve_helper_path(&cfg.library_inject.helper_path) {
                 if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
-                    set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr());
+                    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                    unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
                     debug!(app = app_id.0, helper = %path, "library_inject: helper loaded for IPC only");
                 }
             }
@@ -168,12 +173,16 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
                         std::ffi::CString::new(path.as_str()),
                         std::ffi::CString::new(dll_path.as_str()),
                     ) {
-                        set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr());
-                        set_env(
-                            env_map,
-                            c"VAPOR_FORGE_INJECT_DLL".as_ptr(),
-                            dll_val.as_ptr(),
-                        );
+                        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                        unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
+                        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                        unsafe {
+                            set_env(
+                                env_map,
+                                c"VAPOR_FORGE_INJECT_DLL".as_ptr(),
+                                dll_val.as_ptr(),
+                            )
+                        };
                         info!(app = app_id.0, dll = %dll_path, helper = %path, "library_inject: Proton DLL injection set");
                     }
                 }
@@ -191,7 +200,7 @@ pub(crate) extern "C" fn hk_build_spawn_env_block(
 // Hook replacement functions -- CUser::SpawnProcess (flag evaluation)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_spawn_process(
+pub(crate) unsafe extern "C" fn hk_spawn_process(
     this: *mut c_void,
     exe_path: *const i8,
     command_line: *const i8,
@@ -236,19 +245,22 @@ pub(crate) extern "C" fn hk_spawn_process(
     }
 
     let original = detour_or_return!("SpawnProcess", SPAWN_PROCESS_DETOUR, -1);
-    original.call(
-        this,
-        exe_path,
-        command_line,
-        working_dir,
-        game_id,
-        extra,
-        flags1,
-        flags2,
-        launch_source,
-        flags3,
-        p_pid,
-    )
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe {
+        original(
+            this,
+            exe_path,
+            command_line,
+            working_dir,
+            game_id,
+            extra,
+            flags1,
+            flags2,
+            launch_source,
+            flags3,
+            p_pid,
+        )
+    }
 }
 
 /// Bounded read of a C string into a Rust String.

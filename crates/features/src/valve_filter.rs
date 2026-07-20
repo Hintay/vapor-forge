@@ -5,13 +5,13 @@
 
 use prost::Message;
 use std::collections::HashMap;
-use vapor_forge_abi::{
+use vapor_forge_config::{AppId, RuntimeConfig};
+use vapor_forge_steam_protocol::{
     assemble_raw, CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientStatsUpdated,
     ClientStoreUserStats2Request, ClientStoreUserStatsRequest, ClientStoreUserStatsResponse,
     EMSG_SERVICE_METHOD_RESPONSE, EMSG_STATS_UPDATED, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2,
     EMSG_STORE_USERSTATS_RESPONSE, ERESULT_OK, K_MSG_HDR_PROTO_FLAG,
 };
-use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub const APP_INTERFACE_METRICS: &str = "ClientMetrics.ClientAppInterfaceStatsReport#1";
 pub const CLOUD_SYNC_METRICS: &str = "ClientMetrics.ClientCloudAppSyncStats#1";
@@ -41,8 +41,14 @@ struct GameIdField1 {
     game_id: Option<u64>,
 }
 
-fn protected(config: &RuntimeConfig, app_id: u32) -> bool {
-    app_id != 0 && crate::apps::classify_app(config, AppId(app_id)).requires_injected_ownership()
+fn protected_with_ownership(
+    config: &RuntimeConfig,
+    app_id: u32,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> bool {
+    app_id != 0
+        && crate::apps::classify_app_with_ownership(config, AppId(app_id), ownership)
+            .requires_injected_ownership()
 }
 
 /// Rewrite AppAvatar entries and remove protected apps without an avatar.
@@ -50,6 +56,20 @@ pub fn filter_games_played(
     body: &[u8],
     config: &RuntimeConfig,
     avatar_map: &HashMap<AppId, AppId>,
+) -> Option<GamesPlayedFilter> {
+    filter_games_played_with_runtime(
+        body,
+        config,
+        |app_id| crate::app_avatar::get_avatar(app_id, avatar_map),
+        crate::apps::actual_ownership,
+    )
+}
+
+pub fn filter_games_played_with_runtime(
+    body: &[u8],
+    config: &RuntimeConfig,
+    mut avatar: impl FnMut(AppId) -> Option<AppId>,
+    mut ownership: impl FnMut(AppId) -> crate::apps::OwnershipState,
 ) -> Option<GamesPlayedFilter> {
     let mut message = CMsgClientGamesPlayed::decode(body).ok()?;
     let mut changed = false;
@@ -62,13 +82,13 @@ pub fn filter_games_played(
             continue;
         };
         let app_id = AppId(game_id as u32);
-        if let Some(avatar) = crate::app_avatar::get_avatar(app_id, avatar_map) {
-            game.game_id = Some(avatar.0 as u64);
+        if let Some(avatar_id) = avatar(app_id) {
+            game.game_id = Some(avatar_id.0 as u64);
             changed = true;
             filtered.push(game);
             continue;
         }
-        if protected(config, app_id.0) {
+        if protected_with_ownership(config, app_id.0, &mut ownership) {
             blocked_rich_presence_app.get_or_insert(app_id);
             changed = true;
             continue;
@@ -90,6 +110,22 @@ pub fn service_method_action(
     body: &[u8],
     config: &RuntimeConfig,
 ) -> PrivacyAction {
+    service_method_action_with_ownership(
+        header,
+        _header_bytes,
+        body,
+        config,
+        crate::apps::actual_ownership,
+    )
+}
+
+pub fn service_method_action_with_ownership(
+    header: &CMsgProtoBufHeader,
+    _header_bytes: &[u8],
+    body: &[u8],
+    config: &RuntimeConfig,
+    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+) -> PrivacyAction {
     let Some(method) = header.target_job_name.as_deref() else {
         return PrivacyAction::Pass;
     };
@@ -110,7 +146,7 @@ pub fn service_method_action(
         _ => return PrivacyAction::Pass,
     };
 
-    if !protected(config, app_id) {
+    if !protected_with_ownership(config, app_id, ownership) {
         return PrivacyAction::Pass;
     }
     PrivacyAction::Drop { app_id }
@@ -123,6 +159,22 @@ pub fn store_stats_action(
     body: &[u8],
     config: &RuntimeConfig,
 ) -> PrivacyAction {
+    store_stats_action_with_ownership(
+        emsg,
+        header_bytes,
+        body,
+        config,
+        crate::apps::actual_ownership,
+    )
+}
+
+pub fn store_stats_action_with_ownership(
+    emsg: u32,
+    header_bytes: &[u8],
+    body: &[u8],
+    config: &RuntimeConfig,
+    mut ownership: impl FnMut(AppId) -> crate::apps::OwnershipState,
+) -> PrivacyAction {
     match emsg {
         EMSG_STORE_USERSTATS => {
             let Ok(request) = ClientStoreUserStatsRequest::decode(body) else {
@@ -132,7 +184,7 @@ pub fn store_stats_action(
                 return PrivacyAction::Pass;
             };
             let app_id = game_id as u32;
-            if !protected(config, app_id) {
+            if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
             let response = ClientStoreUserStatsResponse {
@@ -158,7 +210,7 @@ pub fn store_stats_action(
                 return PrivacyAction::Pass;
             };
             let app_id = game_id as u32;
-            if !protected(config, app_id) {
+            if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
             let response = ClientStatsUpdated {
@@ -281,7 +333,7 @@ mod tests {
         let request = ClientStoreUserStatsRequest {
             game_id: Some(736_262),
             explicit_reset: Some(false),
-            stats_to_store: vec![vapor_forge_abi::StoreUserStatsEntry {
+            stats_to_store: vec![vapor_forge_steam_protocol::StoreUserStatsEntry {
                 stat_id: Some(1),
                 stat_value: Some(2),
             }],
@@ -294,7 +346,7 @@ mod tests {
         ) else {
             panic!("expected a local response");
         };
-        let (emsg, _, body) = vapor_forge_abi::unpack_raw(&packet).unwrap();
+        let (emsg, _, body) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
         assert_eq!(emsg, EMSG_STORE_USERSTATS_RESPONSE | K_MSG_HDR_PROTO_FLAG);
         assert_eq!(
             ClientStoreUserStatsResponse::decode(body).unwrap().eresult,
@@ -305,7 +357,7 @@ mod tests {
     #[test]
     fn games_played_removes_protected_app_without_avatar() {
         let body = CMsgClientGamesPlayed {
-            games_played: vec![vapor_forge_abi::GamePlayed {
+            games_played: vec![vapor_forge_steam_protocol::GamePlayed {
                 game_id: Some(736_263),
                 ..Default::default()
             }],
@@ -323,7 +375,7 @@ mod tests {
     #[test]
     fn games_played_rewrites_avatar_instead_of_removing_app() {
         let body = CMsgClientGamesPlayed {
-            games_played: vec![vapor_forge_abi::GamePlayed {
+            games_played: vec![vapor_forge_steam_protocol::GamePlayed {
                 game_id: Some(736_264),
                 ..Default::default()
             }],

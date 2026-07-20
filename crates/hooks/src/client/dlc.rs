@@ -1,10 +1,10 @@
 use core::ffi::c_void;
-use retour::GenericDetour;
 use tracing::{debug, warn};
 use vapor_forge_config::AppId;
+use vapor_forge_hook_engine::detour::Detour;
 
-use crate::original::{detour_or_return, vmt_or_return};
-use crate::vmt;
+use vapor_forge_hook_engine::original::{detour_or_return, vmt_or_return};
+use vapor_forge_hook_engine::vmt;
 
 use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 
@@ -12,10 +12,15 @@ use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
 // Function type aliases
 // ---------------------------------------------------------------------------
 
-pub(crate) type IsAppDlcInstalledFn = extern "C" fn(*mut c_void, u32, u32) -> bool;
-pub(crate) type BIsDlcEnabledFn = extern "C" fn(*mut c_void, u32, u32, *mut c_void) -> bool;
-pub(crate) type LaunchAppFn =
-    extern "C" fn(*mut c_void, *mut u32, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+pub(crate) type IsAppDlcInstalledFn = unsafe extern "C" fn(*mut c_void, u32, u32) -> bool;
+pub(crate) type BIsDlcEnabledFn = unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) -> bool;
+pub(crate) type LaunchAppFn = unsafe extern "C" fn(
+    *mut c_void,
+    *mut u32,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+) -> *mut c_void;
 
 // Re-use RunIPCFrameFn from cloud module
 use super::cloud::RunIPCFrameFn;
@@ -24,8 +29,8 @@ use super::cloud::RunIPCFrameFn;
 // Static state
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut APP_MANAGER_DETOUR: Option<GenericDetour<RunIPCFrameFn>> = None;
-pub(crate) static mut CLIENT_APPS_DETOUR: Option<GenericDetour<RunIPCFrameFn>> = None;
+pub(crate) static mut APP_MANAGER_DETOUR: Option<Detour<RunIPCFrameFn>> = None;
+pub(crate) static mut CLIENT_APPS_DETOUR: Option<Detour<RunIPCFrameFn>> = None;
 pub(crate) static mut ORIG_IS_APP_DLC_INSTALLED: Option<IsAppDlcInstalledFn> = None;
 pub(crate) static mut ORIG_B_IS_DLC_ENABLED: Option<BIsDlcEnabledFn> = None;
 pub(crate) static mut ORIG_LAUNCH_APP: Option<LaunchAppFn> = None;
@@ -37,7 +42,7 @@ static LAUNCH_APP_GATE: vmt::InstallGate = vmt::InstallGate::new();
 // Hook replacement functions: IClientAppManager::RunIPCFrame (DLC VMT)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_app_manager_run_ipc_frame(
+pub(crate) unsafe extern "C" fn hk_app_manager_run_ipc_frame(
     this: *mut c_void,
     a1: *mut c_void,
     a2: *mut c_void,
@@ -49,19 +54,21 @@ pub(crate) extern "C" fn hk_app_manager_run_ipc_frame(
 
     // SAFETY: APP_MANAGER_DETOUR set before enabled.
     let original = detour_or_return!("IClientAppManager::RunIPCFrame", APP_MANAGER_DETOUR);
-    original.call(this, a1, a2, a3);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, a1, a2, a3) };
 }
 
-extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u32) -> bool {
+unsafe extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u32) -> bool {
     // SAFETY: original function pointer set before VMT swap.
     let original = vmt_or_return!("IsAppDlcInstalled", ORIG_IS_APP_DLC_INSTALLED, false);
-    let result = original(this, app_id, dlc_id);
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(this, app_id, dlc_id) };
 
     let cfg = config();
     vapor_forge_features::dlc::on_is_dlc_installed(&cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
-extern "C" fn hk_b_is_dlc_enabled(
+unsafe extern "C" fn hk_b_is_dlc_enabled(
     this: *mut c_void,
     app_id: u32,
     dlc_id: u32,
@@ -69,13 +76,14 @@ extern "C" fn hk_b_is_dlc_enabled(
 ) -> bool {
     // SAFETY: original function pointer set before VMT swap.
     let original = vmt_or_return!("BIsDlcEnabled", ORIG_B_IS_DLC_ENABLED, false);
-    let result = original(this, app_id, dlc_id, unknown);
+    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+unsafe { original(this, app_id, dlc_id, unknown) };
 
     let cfg = config();
     vapor_forge_features::dlc::on_is_dlc_enabled(&cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
-extern "C" fn hk_launch_app(
+unsafe extern "C" fn hk_launch_app(
     this: *mut c_void,
     p_app_id: *mut u32,
     a2: *mut c_void,
@@ -89,7 +97,8 @@ extern "C" fn hk_launch_app(
     }
     // Flag evaluation moved to SpawnProcess hook (has pCommandLine directly).
     let original = vmt_or_return!("LaunchApp", ORIG_LAUNCH_APP, std::ptr::null_mut());
-    original(this, p_app_id, a2, a3, a4)
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, p_app_id, a2, a3, a4) }
 }
 
 fn install_app_manager_vmt(this: *mut c_void) {
@@ -182,7 +191,7 @@ fn app_manager_vmt_settled() -> bool {
 // Hook replacement functions: IClientApps::RunIPCFrame (DLC count/data VMT)
 // ---------------------------------------------------------------------------
 
-pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
+pub(crate) unsafe extern "C" fn hk_client_apps_run_ipc_frame(
     this: *mut c_void,
     a1: *mut c_void,
     a2: *mut c_void,
@@ -190,7 +199,8 @@ pub(crate) extern "C" fn hk_client_apps_run_ipc_frame(
 ) {
     // SAFETY: CLIENT_APPS_DETOUR set before enabled.
     let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR);
-    original.call(this, a1, a2, a3);
+    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    unsafe { original(this, a1, a2, a3) };
 }
 
 // DLC enumeration (GetDLCCount / BGetDLCDataByIndex) is NOT hooked.
