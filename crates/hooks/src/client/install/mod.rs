@@ -95,7 +95,7 @@ fn env_hooks_supported() -> bool {
 }
 
 fn steamui_hooks_supported() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(target_os = "linux") && std::env::var_os("VAPOR_FORGE_SKIP_STEAMUI_HOOKS").is_none()
 }
 
 fn current_hook_architecture() -> &'static str {
