@@ -6,14 +6,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use tracing::{debug, info, warn};
-use vapor_forge_cloud_core::{CloudBackend, PlaytimeEntry as RemotePlaytimeEntry};
-use vapor_forge_cloud_cumulus::{CumulusBackend, CumulusSettings};
-use vapor_forge_cloud_local::LocalBackend;
+use vapor_forge_cloud_core::PlaytimeEntry as RemotePlaytimeEntry;
 use vapor_forge_features::playtime::{PlaytimeGame, PlaytimeSnapshot};
 use vapor_forge_steam_protocol::{
     PlayerGetLastPlayedTimesResponse, PlayerLastPlayedGame, PlayerLastPlayedTimesNotification,
 };
 use vapor_forge_sync_state::playtime::{Outbox, PlaytimeEntry};
+
+use crate::downsync_worker::SubscriptionContext;
 
 #[derive(Clone)]
 struct PlaytimeWorker {
@@ -23,7 +23,13 @@ struct PlaytimeWorker {
 
 static WORKER: OnceLock<PlaytimeWorker> = OnceLock::new();
 static WORKER_INIT: Mutex<()> = Mutex::new(());
-static REMOTE_STATE: OnceLock<Mutex<HashMap<(u64, u32), RemotePlaytimeEntry>>> = OnceLock::new();
+static REMOTE_STATE: OnceLock<Mutex<Option<RemotePlaytimeState>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct RemotePlaytimeState {
+    context: SubscriptionContext,
+    entries: HashMap<u32, RemotePlaytimeEntry>,
+}
 
 pub fn ensure_started() {
     let _ = worker();
@@ -104,7 +110,6 @@ fn upload_loop(
     pending: Arc<Mutex<HashMap<(u64, u32), PlaytimeGame>>>,
     wake: mpsc::Receiver<()>,
 ) {
-    let mut last_pull = None;
     loop {
         match wake.recv_timeout(Duration::from_secs(5)) {
             Ok(()) => debounce(&wake),
@@ -112,15 +117,7 @@ fn upload_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         persist_pending(&outbox, &pending);
-        let flushed = flush(&outbox);
-        if flushed
-            && last_pull.map_or(true, |last: Instant| {
-                last.elapsed() >= Duration::from_secs(60)
-            })
-            && pull_remote_state()
-        {
-            last_pull = Some(Instant::now());
-        }
+        flush(&outbox);
     }
 }
 
@@ -128,7 +125,7 @@ fn persist_pending(
     outbox: &Arc<Mutex<Outbox>>,
     pending: &Arc<Mutex<HashMap<(u64, u32), PlaytimeGame>>>,
 ) {
-    let Some(backend) = backend_context() else {
+    let Some(backend) = crate::cloud_backend::backend_context() else {
         return;
     };
     let owner_scope = backend.credential_scope();
@@ -203,7 +200,7 @@ fn debounce(wake: &mpsc::Receiver<()>) {
 }
 
 fn flush(outbox: &Arc<Mutex<Outbox>>) -> bool {
-    let Some(backend) = backend_context() else {
+    let Some(backend) = crate::cloud_backend::backend_context() else {
         return false;
     };
     let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
@@ -281,57 +278,40 @@ fn flush(outbox: &Arc<Mutex<Outbox>>) -> bool {
     true
 }
 
-/// Composition root: the only place this worker names a concrete backend.
-fn backend_context() -> Option<Box<dyn CloudBackend>> {
-    let config = crate::client::install::config();
-    if config.local_cloud_configured() {
-        return match LocalBackend::open(&config.cloud.local_path) {
-            Ok(backend) => Some(Box::new(backend)),
-            Err(error) => {
-                warn!(%error, "playtime-sync: local backend unavailable");
-                None
-            }
-        };
+/// Replace the cached remote playtime with a freshly converged snapshot. The
+/// subscription context travels with the state so a logout, account switch,
+/// device change, or backend reload makes it unusable immediately.
+pub(crate) fn apply_remote_playtime(
+    context: &SubscriptionContext,
+    entries: Vec<RemotePlaytimeEntry>,
+) {
+    if !context.is_current() {
+        return;
     }
-    if !config.cumulus_configured() {
-        return None;
+    let next = RemotePlaytimeState {
+        context: context.clone(),
+        entries: entries
+            .into_iter()
+            .map(|entry| (entry.app_id, entry))
+            .collect(),
+    };
+    let mut remote = REMOTE_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if context.is_current() {
+        *remote = Some(next);
     }
-    Some(Box::new(CumulusBackend::new(CumulusSettings {
-        server_url: config.cloud.server_url.clone(),
-        token: config.cloud.token.clone(),
-        timeout_connect_ms: config.cloud.timeout_connect_ms,
-        timeout_ms: config.cloud.timeout_ms,
-    })))
 }
 
-fn pull_remote_state() -> bool {
-    let Some(backend) = backend_context() else {
-        return false;
+/// Drop cached down-sync state when the authoritative Steam identity changes.
+pub(crate) fn clear_remote_playtime() {
+    let Some(remote) = REMOTE_STATE.get() else {
+        return;
     };
-    let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
-        return false;
-    };
-    let steam_id64 = vapor_forge_features::identity::steam_id();
-    if steam_id64 == 0 {
-        return false;
-    }
-    match backend.pull_account_state(descriptor.client_id, &steam_id64.to_string()) {
-        Ok(state) => {
-            let mut remote = REMOTE_STATE
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            remote.retain(|(owner, _), _| *owner != steam_id64);
-            for entry in state.playtime {
-                remote.insert((steam_id64, entry.app_id), entry);
-            }
-            true
-        }
-        Err(error) => {
-            warn!(%error, "playtime-sync: state pull deferred");
-            false
-        }
-    }
+    *remote
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 pub(crate) fn merge_response(steam_id64: u64, body: &[u8]) -> Option<Vec<u8>> {
@@ -345,12 +325,37 @@ pub(crate) fn merge_notification(steam_id64: u64, body: &[u8]) -> Option<Vec<u8>
 }
 
 fn merge_games(steam_id64: u64, games: &mut Vec<PlayerLastPlayedGame>) -> bool {
-    let remote = REMOTE_STATE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    let mut remote = REMOTE_STATE
+        .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current_context = remote
+        .as_ref()
+        .map(|state| state.context.clone())
+        .filter(SubscriptionContext::is_current);
+    merge_cached_games(&mut remote, current_context.as_ref(), steam_id64, games)
+}
+
+fn merge_cached_games(
+    remote: &mut Option<RemotePlaytimeState>,
+    current_context: Option<&SubscriptionContext>,
+    steam_id64: u64,
+    games: &mut Vec<PlayerLastPlayedGame>,
+) -> bool {
+    let context_matches = remote
+        .as_ref()
+        .zip(current_context)
+        .is_some_and(|(state, current)| state.context == *current);
+    if !context_matches {
+        *remote = None;
+        return false;
+    }
+    let remote = remote.as_ref().expect("validated remote playtime state");
+    if remote.context.steam_id64() != steam_id64 {
+        return false;
+    }
     let mut changed = false;
-    for ((_owner, app_id), state) in remote.iter().filter(|((owner, _), _)| *owner == steam_id64) {
+    for (app_id, state) in &remote.entries {
         let Ok(app_id_i32) = i32::try_from(*app_id) else {
             continue;
         };
@@ -403,26 +408,37 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
 
+    fn context(scope: &str, steam_id64: u64, generation: u64) -> SubscriptionContext {
+        SubscriptionContext::new(scope.into(), 42, steam_id64, generation)
+    }
+
+    fn remote_entry(steam_id64: u64, app_id: u32) -> RemotePlaytimeEntry {
+        RemotePlaytimeEntry {
+            owner_scope: String::new(),
+            owner_steam_id64: steam_id64.to_string(),
+            app_id,
+            playtime_minutes: 300,
+            playtime_2weeks_minutes: 12,
+            last_played_at: Some(1_800_000_000),
+            observed_at: 20,
+        }
+    }
+
+    fn cached_state(context: SubscriptionContext) -> Option<RemotePlaytimeState> {
+        Some(RemotePlaytimeState {
+            context,
+            entries: [(620, remote_entry(76561198000000001, 620))]
+                .into_iter()
+                .collect(),
+        })
+    }
+
     #[test]
     fn remote_playtime_is_merged_without_changing_the_observed_body() {
         let steam_id64 = 76561198000000001;
-        REMOTE_STATE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap()
-            .insert(
-                (steam_id64, 620),
-                RemotePlaytimeEntry {
-                    owner_scope: String::new(),
-                    owner_steam_id64: steam_id64.to_string(),
-                    app_id: 620,
-                    playtime_minutes: 300,
-                    playtime_2weeks_minutes: 12,
-                    last_played_at: Some(1_800_000_000),
-                    observed_at: 20,
-                },
-            );
-        let original = PlayerGetLastPlayedTimesResponse {
+        let current = context("scope-a", steam_id64, 7);
+        let mut remote = cached_state(current.clone());
+        let mut games = PlayerGetLastPlayedTimesResponse {
             games: vec![PlayerLastPlayedGame {
                 app_id: Some(620),
                 playtime_forever: Some(200),
@@ -430,15 +446,70 @@ mod tests {
                 last_playtime: Some(1_700_000_000),
                 ..Default::default()
             }],
-        }
-        .encode_to_vec();
+        };
+        let original = games.encode_to_vec();
 
-        let merged = merge_response(steam_id64, &original).unwrap();
-        let merged = PlayerGetLastPlayedTimesResponse::decode(merged.as_slice()).unwrap();
-        assert_eq!(merged.games[0].playtime_forever, Some(300));
-        assert_eq!(merged.games[0].playtime_2weeks, Some(12));
-        assert_eq!(merged.games[0].last_playtime, Some(1_800_000_000));
+        assert!(merge_cached_games(
+            &mut remote,
+            Some(&current),
+            steam_id64,
+            &mut games.games,
+        ));
+        assert_eq!(games.games[0].playtime_forever, Some(300));
+        assert_eq!(games.games[0].playtime_2weeks, Some(12));
+        assert_eq!(games.games[0].last_playtime, Some(1_800_000_000));
         let untouched = PlayerGetLastPlayedTimesResponse::decode(original.as_slice()).unwrap();
         assert_eq!(untouched.games[0].playtime_forever, Some(200));
+    }
+
+    #[test]
+    fn prior_login_playtime_is_discarded_for_the_same_account() {
+        let steam_id64 = 76561198000000001;
+        let mut remote = cached_state(context("scope-a", steam_id64, 7));
+        let current = context("scope-a", steam_id64, 8);
+        let mut games = Vec::new();
+
+        assert!(!merge_cached_games(
+            &mut remote,
+            Some(&current),
+            steam_id64,
+            &mut games,
+        ));
+        assert!(remote.is_none());
+        assert!(games.is_empty());
+    }
+
+    #[test]
+    fn prior_backend_playtime_is_discarded_for_the_same_identity() {
+        let steam_id64 = 76561198000000001;
+        let mut remote = cached_state(context("scope-a", steam_id64, 7));
+        let current = context("scope-b", steam_id64, 7);
+        let mut games = Vec::new();
+
+        assert!(!merge_cached_games(
+            &mut remote,
+            Some(&current),
+            steam_id64,
+            &mut games,
+        ));
+        assert!(remote.is_none());
+        assert!(games.is_empty());
+    }
+
+    #[test]
+    fn other_account_packet_does_not_discard_the_current_cache() {
+        let steam_id64 = 76561198000000001;
+        let current = context("scope-a", steam_id64, 7);
+        let mut remote = cached_state(current.clone());
+        let mut games = Vec::new();
+
+        assert!(!merge_cached_games(
+            &mut remote,
+            Some(&current),
+            76561198000000002,
+            &mut games,
+        ));
+        assert!(remote.is_some());
+        assert!(games.is_empty());
     }
 }

@@ -367,6 +367,7 @@ fn reload_config(
                 runtime_store,
                 "config and Lua scripts reloaded",
             );
+            crate::downsync_worker::notify_config_changed();
             true
         }
         Err(error) => {

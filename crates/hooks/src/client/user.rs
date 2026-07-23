@@ -84,6 +84,7 @@ pub(crate) fn refresh_real_steam_id(user: *mut c_void) -> Result<u64, &'static s
 
 fn publish_real_steam_id(steam_id: u64) {
     if vapor_forge_features::identity::set_authoritative_steam_id(steam_id) {
+        crate::playtime_worker::clear_remote_playtime();
         vapor_forge_features::rich_presence::reset_account_state();
         debug!(steam_id, "Steam identity refreshed from IClientUser");
     }

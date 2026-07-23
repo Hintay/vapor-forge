@@ -2,12 +2,10 @@
 
 use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 use vapor_forge_cloud_core::{CloudBackend, SchemaUploadOutcome};
-use vapor_forge_cloud_cumulus::{CumulusBackend, CumulusSettings};
-use vapor_forge_cloud_local::LocalBackend;
 use vapor_forge_sync_state::{
     Outbox, QueuedAchievementEvent, QueuedAchievementSchema, UploadIdentity,
 };
@@ -80,7 +78,7 @@ pub fn queue_schema(app_id: u32, schema_version: Option<String>, content: Vec<u8
         return;
     };
     let schema = QueuedAchievementSchema {
-        owner_scope: backend_context()
+        owner_scope: crate::cloud_backend::backend_context()
             .as_ref()
             .map(|backend| backend.endpoint_scope())
             .unwrap_or_default(),
@@ -276,14 +274,12 @@ fn upload_loop(
     unattributed: Arc<Mutex<VecDeque<QueuedAchievementEvent>>>,
     wake: mpsc::Receiver<()>,
 ) {
-    let mut last_pull = None;
-    let mut last_pulled_achievements = None;
     while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
         wake.recv_timeout(Duration::from_secs(2))
     {
         persist_current_device_descriptor(&outbox);
         for _ in 0..10 {
-            let Some(backend) = backend_context() else {
+            let Some(backend) = crate::cloud_backend::backend_context() else {
                 break;
             };
             let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
@@ -408,22 +404,6 @@ fn upload_loop(
                     }
                 }
             }
-            if last_pull.map_or(true, |last: Instant| {
-                last.elapsed() >= Duration::from_secs(60)
-            }) {
-                match backend.pull_account_state(descriptor.client_id, &identity.steam_id64) {
-                    Ok(state) => {
-                        if last_pulled_achievements.as_ref() != Some(&state.achievements) {
-                            crate::client::user_stats::queue_remote_state(
-                                state.achievements.clone(),
-                            );
-                            last_pulled_achievements = Some(state.achievements);
-                        }
-                        last_pull = Some(Instant::now());
-                    }
-                    Err(error) => warn!(%error, "achievement-sync: state pull deferred"),
-                }
-            }
             if !attempted {
                 break;
             }
@@ -456,29 +436,6 @@ fn attribute_event(
     event.owner_steam_id64.clone_from(&identity.steam_id64);
 }
 
-/// Composition root: the only place this worker names a concrete backend.
-fn backend_context() -> Option<Box<dyn CloudBackend>> {
-    let config = crate::client::install::config();
-    if config.local_cloud_configured() {
-        return match LocalBackend::open(&config.cloud.local_path) {
-            Ok(backend) => Some(Box::new(backend)),
-            Err(error) => {
-                warn!(%error, "achievement-sync: local backend unavailable");
-                None
-            }
-        };
-    }
-    if !config.cumulus_configured() {
-        return None;
-    }
-    Some(Box::new(CumulusBackend::new(CumulusSettings {
-        server_url: config.cloud.server_url.clone(),
-        token: config.cloud.token.clone(),
-        timeout_connect_ms: config.cloud.timeout_connect_ms,
-        timeout_ms: config.cloud.timeout_ms,
-    })))
-}
-
 fn upload_identity() -> Option<UploadIdentity> {
     let steam_id = vapor_forge_features::identity::steam_id();
     if steam_id == 0 {
@@ -496,7 +453,7 @@ fn upload_identity() -> Option<UploadIdentity> {
 }
 
 fn upload_context() -> Option<(Box<dyn CloudBackend>, UploadIdentity)> {
-    Some((backend_context()?, upload_identity()?))
+    Some((crate::cloud_backend::backend_context()?, upload_identity()?))
 }
 
 fn unix_now() -> i64 {

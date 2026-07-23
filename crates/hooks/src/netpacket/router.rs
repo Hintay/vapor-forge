@@ -368,6 +368,7 @@ fn capture_local_steamid(header_bytes: &[u8]) {
 
 fn observe_local_steamid(steamid: u64) {
     if identity::observe_steam_id(steamid) {
+        crate::playtime_worker::clear_remote_playtime();
         rich_presence::reset_account_state();
     }
 }

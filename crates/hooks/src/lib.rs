@@ -5,12 +5,16 @@
 pub(crate) mod achievement_worker;
 #[cfg(target_os = "linux")]
 pub(crate) mod client;
+#[cfg(target_os = "linux")]
+pub(crate) mod cloud_backend;
 #[cfg(any(
     all(target_os = "linux", debug_assertions),
     all(test, target_family = "unix")
 ))]
 #[cfg_attr(all(not(target_os = "linux"), test), allow(dead_code))]
 pub(crate) mod debug_api;
+#[cfg(target_os = "linux")]
+pub(crate) mod downsync_worker;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]

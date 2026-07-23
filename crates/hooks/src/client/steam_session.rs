@@ -262,8 +262,9 @@ impl SteamUserStatsSession {
         &self,
         app_id: u32,
         states: &[AchievementSyncState],
+        should_apply: &dyn Fn() -> bool,
     ) -> Result<(), &'static str> {
-        if states.is_empty() {
+        if states.is_empty() || !should_apply() {
             return Ok(());
         }
         let targets = super::achievement_adapters::remote_apply_targets();
@@ -276,9 +277,15 @@ impl SteamUserStatsSession {
             return Err("RequestCurrentStats was rejected before remote apply");
         }
         self.wait_for_schema(app_id, &game_id)?;
+        if !should_apply() {
+            return Ok(());
+        }
 
         let mut changed = false;
         for state in states.iter().filter(|state| state.app_id == app_id) {
+            if !should_apply() {
+                return Ok(());
+            }
             let key = CString::new(state.achievement_key.as_bytes())
                 .map_err(|_| "remote achievement key contains NUL")?;
             let mut current_unlocked = false;
@@ -300,6 +307,9 @@ impl SteamUserStatsSession {
                 && current_unlocked
                 && state.observed_at >= i64::from(current_unlock_time);
             if should_set || should_clear {
+                if !should_apply() {
+                    return Ok(());
+                }
                 // SAFETY: target membership above proves this object exposes the
                 // validated CUserStats methods, and CString/game_id are live.
                 let accepted = unsafe {
@@ -314,6 +324,9 @@ impl SteamUserStatsSession {
             }
             if let (Some(current), Some(maximum)) = (state.progress_current, state.progress_max) {
                 if targets[3] != 0 && self.vtable_contains_all(&targets[3..]) {
+                    if !should_apply() {
+                        return Ok(());
+                    }
                     // SAFETY: same validated object and arguments as above.
                     let accepted = unsafe {
                         super::achievement_adapters::apply_remote_progress(
@@ -328,7 +341,7 @@ impl SteamUserStatsSession {
                 }
             }
         }
-        if changed {
+        if changed && should_apply() {
             // SAFETY: target membership and object lifetime were validated above.
             if unsafe { super::achievement_adapters::apply_remote_store(self.stats, &game_id) } == 0
             {
