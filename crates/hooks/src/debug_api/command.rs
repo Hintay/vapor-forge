@@ -19,6 +19,8 @@ pub(crate) enum DebugCommand<'a> {
     Patterns,
     Version,
     Log(&'a str),
+    NativeInject,
+    NativeInjectSelf,
     Toast(ToastArgs<'a>),
     Unknown(&'a str),
 }
@@ -72,6 +74,8 @@ fn dispatch_local(target: DebugTarget, command: &str, json: bool) -> String {
         DebugCommand::Patterns => patterns_response(json),
         DebugCommand::Version => version_response(json),
         DebugCommand::Log(level) => log_response(level, json),
+        DebugCommand::NativeInject => native_inject_response(json),
+        DebugCommand::NativeInjectSelf => native_inject_self_response(json),
         DebugCommand::Toast(args) => queue_toast_command(target, args),
         DebugCommand::Unknown(command) => format!("err unknown command: {command}"),
     }
@@ -128,6 +132,12 @@ pub(crate) fn parse_command(command: &str) -> DebugCommand<'_> {
     }
     if trimmed == "log" {
         return DebugCommand::Log("");
+    }
+    if trimmed == "native-inject-self" || trimmed == "inject-self" {
+        return DebugCommand::NativeInjectSelf;
+    }
+    if trimmed == "native-inject" || trimmed == "inject" {
+        return DebugCommand::NativeInject;
     }
     if trimmed == "toast" {
         return DebugCommand::Toast(ToastArgs::Default);
@@ -228,6 +238,8 @@ fn help_response() -> String {
     out.push_str("  packet ...            packet capture and inspection\n");
     out.push_str("  patterns              pattern match results\n");
     out.push_str("  log [level]           query or set log level\n");
+    out.push_str("  native-inject         arm a native dispatch self-test\n");
+    out.push_str("  native-inject-self    dispatch a captured packet from our own thread\n");
     out.push_str("  dump/status           toast subsystem status\n");
     out.push_str("  toast [args]          queue a toast notification\n");
     out.push('\n');
@@ -1008,6 +1020,51 @@ fn log_response(level: &str, json_mode: bool) -> String {
             }
         }
         _ => format!("err unknown log level: {}", quote_text(level)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native dispatch self-test
+// ---------------------------------------------------------------------------
+
+/// Arm a one-shot self-test of the native injection dispatch. The next inbound
+/// packet, once dispatch context is captured, is replayed through the production
+/// injection path; the result appears in the logs (native-inject: ...).
+fn native_inject_response(json_mode: bool) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let ready = crate::client::network::arm_native_inject_selftest();
+        if json_mode {
+            format!("ok {}", json!({"armed": true, "dispatch_ready": ready}))
+        } else {
+            format!("ok armed native-inject self-test (dispatch_ready={ready}); replays next inbound packet, see logs")
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = json_mode;
+        "err native-inject is only available in the steamclient process".to_owned()
+    }
+}
+
+/// Test active dispatch from a thread we own: replay one captured inbound body
+/// from a freshly spawned thread (no RecvPkt), to check that AddWorkItem +
+/// WakeWorker deliver while the CM connection is idle.
+fn native_inject_self_response(json_mode: bool) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let detail = crate::client::network::spawn_own_thread_dispatch_test();
+        if json_mode {
+            let ok = detail.starts_with("ok");
+            format!("ok {}", json!({"ok": ok, "detail": detail}))
+        } else {
+            detail
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = json_mode;
+        "err native-inject-self is only available in the steamclient process".to_owned()
     }
 }
 

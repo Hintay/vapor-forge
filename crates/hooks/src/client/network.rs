@@ -50,8 +50,15 @@ static CM_RECEIVER: AtomicUsize = AtomicUsize::new(0);
 // The connection id read from a real incoming packet's first field.
 static CM_CONN_ID: AtomicUsize = AtomicUsize::new(0);
 static CM_CONN_ID_SET: AtomicBool = AtomicBool::new(false);
+// One-shot native-dispatch self-test, armed from the debug socket.
+static NATIVE_INJECT_ARMED: AtomicBool = AtomicBool::new(false);
 // One-shot flush of anything a source queued before dispatch context was ready.
 static WARMUP_FLUSH_DONE: AtomicBool = AtomicBool::new(false);
+// One real inbound body, captured once, replayed by the own-thread dispatch test
+// (a safe payload Steam has already handled). Gated by the atomic so the hot path
+// pays only an atomic load once captured.
+static LAST_INBOUND_CAPTURED: AtomicBool = AtomicBool::new(false);
+static LAST_INBOUND_BODY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 #[cfg(target_pointer_width = "32")]
 const WORKER_THREAD_POOL_OFFSET: usize = 0x5c;
@@ -192,6 +199,8 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // comes from the post-item hook).
     capture_dispatch_context(this, packet);
     maybe_warmup_flush();
+    capture_last_inbound_body(packet);
+    maybe_fire_armed_selftest(packet);
 
     // SAFETY: RECV_PKT_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR);
@@ -484,6 +493,96 @@ fn drain_injections() {
         // SAFETY: release the packet after synchronous dispatch has finished.
         unsafe { packet_release(packet) };
     }
+}
+
+/// Arm a one-shot native-dispatch self-test. Called from the debug socket. The
+/// next inbound packet, once dispatch context is ready, is replayed once through
+/// the production injection path. Returns whether dispatch is already ready.
+pub(crate) fn arm_native_inject_selftest() -> bool {
+    NATIVE_INJECT_ARMED.store(true, Ordering::Release);
+    dispatch_ready()
+}
+
+/// If armed and dispatch is ready, replay this inbound packet's body once through
+/// the production dispatch, then disarm. Arch-generic (reads the CNetPacket slots).
+fn maybe_fire_armed_selftest(packet: *mut c_void) {
+    if !NATIVE_INJECT_ARMED.load(Ordering::Acquire) || packet.is_null() || !dispatch_ready() {
+        return;
+    }
+    // SAFETY: packet is the live CNetPacket supplied to the RecvPkt hook.
+    let data = unsafe { *vapor_forge_steam_native_abi::cnet_packet::data_slot(packet) };
+    // SAFETY: same live CNetPacket.
+    let size = unsafe { *vapor_forge_steam_native_abi::cnet_packet::size_slot(packet) };
+    if data.is_null() || size == 0 || size as usize > 1024 * 1024 {
+        // Stay armed until a packet with a usable body arrives.
+        return;
+    }
+    if !NATIVE_INJECT_ARMED.swap(false, Ordering::AcqRel) {
+        // Another RecvPkt already claimed the armed shot.
+        return;
+    }
+    // SAFETY: data points to `size` bytes for this dispatch.
+    let body = unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec();
+    info!(
+        len = body.len(),
+        conn_id = format_args!("0x{:x}", CM_CONN_ID.load(Ordering::Acquire)),
+        worker_this = format_args!("0x{:x}", WORKER_THIS.load(Ordering::Acquire)),
+        "native-inject: self-test replaying one inbound packet through dispatch"
+    );
+    enqueue_injection(body);
+}
+
+/// Capture one real inbound body (once) for the own-thread dispatch test. Gated
+/// by an atomic so the hot RecvPkt path pays only a load after the first capture.
+fn capture_last_inbound_body(packet: *mut c_void) {
+    if LAST_INBOUND_CAPTURED.load(Ordering::Acquire) || packet.is_null() {
+        return;
+    }
+    // SAFETY: packet is the live CNetPacket supplied to the RecvPkt hook.
+    let data = unsafe { *vapor_forge_steam_native_abi::cnet_packet::data_slot(packet) };
+    // SAFETY: same live CNetPacket.
+    let size = unsafe { *vapor_forge_steam_native_abi::cnet_packet::size_slot(packet) };
+    if data.is_null() || size == 0 || size as usize > 1024 * 1024 {
+        return;
+    }
+    // SAFETY: data points to `size` bytes for the duration of this hook call.
+    let body = unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec();
+    *LAST_INBOUND_BODY.lock().unwrap() = Some(body);
+    LAST_INBOUND_CAPTURED.store(true, Ordering::Release);
+}
+
+/// Test the active-dispatch path from a thread we own: replay one captured
+/// inbound body from a freshly spawned thread (not RecvPkt, not the worker).
+/// Validates that AddWorkItem + WakeWorker can drive delivery while the CM
+/// connection is idle — the prerequisite for pumping injections off the RecvPkt
+/// cadence. Returns a status line for the debug socket.
+pub(crate) fn spawn_own_thread_dispatch_test() -> String {
+    if !dispatch_ready() {
+        return "err dispatch context not ready (needs a prior inbound packet + worker post)"
+            .to_owned();
+    }
+    let body = match LAST_INBOUND_BODY.lock().unwrap().clone() {
+        Some(body) => body,
+        None => {
+            return "err no captured inbound body yet (waiting for first inbound packet)".to_owned()
+        }
+    };
+    let len = body.len();
+    let spawned = std::thread::Builder::new()
+        .name("vf-inject-test".to_owned())
+        .spawn(move || {
+            info!(
+                len = body.len(),
+                pthread = format_args!("0x{:x}", current_pthread()),
+                "native-inject: OWN-THREAD dispatch test enqueuing (no RecvPkt)"
+            );
+            enqueue_injection(body);
+        })
+        .is_ok();
+    if !spawned {
+        return "err failed to spawn dispatch thread".to_owned();
+    }
+    format!("ok spawned own-thread dispatch of {len}B; watch logs for execute + dispatched")
 }
 
 fn resolve_steamclient_image_rva_any_segment(image_rva: usize) -> Option<usize> {

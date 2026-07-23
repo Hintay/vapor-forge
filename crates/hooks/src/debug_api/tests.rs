@@ -211,6 +211,13 @@ fn command_parser_normalizes_known_commands() {
     assert_eq!(parse_command("version"), DebugCommand::Version);
     assert_eq!(parse_command("log debug"), DebugCommand::Log("debug"));
     assert_eq!(parse_command("log"), DebugCommand::Log(""));
+    assert_eq!(parse_command("native-inject"), DebugCommand::NativeInject);
+    assert_eq!(parse_command("inject"), DebugCommand::NativeInject);
+    assert_eq!(
+        parse_command("native-inject-self"),
+        DebugCommand::NativeInjectSelf
+    );
+    assert_eq!(parse_command("inject-self"), DebugCommand::NativeInjectSelf);
     assert_eq!(
         parse_command("toast hello"),
         DebugCommand::Toast(ToastArgs::Fields("hello"))
@@ -556,4 +563,5 @@ fn help_lists_new_commands() {
     assert!(response.contains("patterns"));
     assert!(response.contains("version"));
     assert!(response.contains("log"));
+    assert!(response.contains("native-inject"));
 }
