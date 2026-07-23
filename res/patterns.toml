@@ -28,15 +28,16 @@ pattern = "E8 ? ? ? ? 83 C4 10 8D 83 ? ? ? ? 83 EC 0C 89 AB"
 
 # Public/publicbeta share the primary pattern; variants are only for steamrt implementation differences, not old releases.
 [steamclient."CSteamEngine::SetAPICallResult"]
-follow = "none"
-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC ? 8B 55 14 C7 45 ? 00 00 00 00 C7 45 ? 00 00 00 00 89 45 ? 8B 45 10 C7 45 ? 00 00 00 00 89 55 ?"
+follow = "upward"
+prologue = "E5 89 55"
+pattern = "68 BF 02 00 00 56 50 E8 ? ? ? ? 83 C4 20"
 
 [steamclient."IClientRemoteStorage::RunIPCFrame"]
 follow = "none"
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 60 05 00 00"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC ? 05 00 00 8B 45 08 8B 4D 0C 8B 7D 14 89 85 D8 FE FF FF 8B 45 10 89 8D CC FE FF FF 89 F3 89 85 ? FE FF FF"
 
 [[steamclient."IClientRemoteStorage::RunIPCFrame".variants]]
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC E0 01 00 00 8B 45 08 8B 4D 0C 89 85 ? FE FF FF 8B 45 10 89 8D ? FE FF FF 89 F3 89 85 ? FE FF FF 8D 85 ? FE FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 ? FE FF FF 83 C4 10 3D ? E8 2F 87"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC D0 01 00 00 8B 45 08 8B 4D 0C 89 85 D8 FE FF FF 8B 45 10 89 8D CC FE FF FF 89 F3 89 85 D0 FE FF FF 8D 85 F4 FE FF FF 65 8B 3D 14 00 00 00 89 7D E4 8B 7D 14 6A 04 50 51 E8 ? ? ? ? 8B 85 F4 FE FF FF 83 C4 10 3D"
 
 [steamclient."IClientAppManager::RunIPCFrame"]
 follow = "none"
@@ -133,8 +134,19 @@ pattern = "65 8B 35 14 00 00 00 89 B4 24 DC 00 00 00 8B B4 24 14 01 00 00 8B 94 
 # CConfigStore access, key reference, and SetUint64 call before using it.
 [steamclient."CConfigStore::ClientIDConfigAccess"]
 follow = "none"
-pattern = "C7 ? 80 02 00 00 00 00 00 00 8D ? 80 02 00 00 C7 ? 84 02 00 00 00 00 00 00 83 EC 08 6A 08 ? E8 ? ? ? ? 8B ? 84 02 00 00 83 C4 10 8B ? 80 02 00 00 89 ? 09 ? 74 ? 8D ? ? ? ? ? 80 ? 0E 06 00 00 00"
+pattern = "C7 86 80 02 00 00 00 00 00 00 8D BE 80 02 00 00 C7 86 84 02 00 00 00 00 00 00"
 optional = true
+
+# Newer ubuntu12 builds moved the ClientID buffer by four bytes but still unpack
+# the random 64-bit value through eax/edx. Keep this separate from the steamrt
+# SSE movq shape below so both variants stay mutually exclusive.
+[[steamclient."CConfigStore::ClientIDConfigAccess".variants]]
+pattern = "C7 86 84 02 00 00 00 00 00 00 8D BE 84 02 00 00 C7 86 88 02 00 00 00 00 00 00 83 EC 08 6A 08 57 E8 ? ? ? ? 8B 96 88 02 00 00"
+
+# steamrt writes the 64-bit ClientID value into the reserved stack area before
+# pushing the remaining SetUint64 arguments.
+[[steamclient."CConfigStore::ClientIDConfigAccess".variants]]
+pattern = "8D 83 ? ? ? ? 80 BE 12 06 00 00 00 8B 00 8D 88 60 0D 00 00 8B 80 60 0D 00 00 8B 50 2C 8D 83 ? ? ? ? 74 ? 8D 83 ? ? ? ? 83 EC 14 66 0F D6 0C 24 50 6A 01 51 FF D2"
 
 [steamclient."CUser::SpawnProcess"]
 follow = "none"

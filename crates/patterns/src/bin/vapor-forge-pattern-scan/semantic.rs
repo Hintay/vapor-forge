@@ -355,11 +355,18 @@ fn scan_semantic_coverage(module: &str, arch: SemanticArch, entries: &[&ScanEntr
     for group in group_scan_entries(entries) {
         let entry = group[0];
         if !has_semantic_validation(module, arch, &entry.name) {
-            println!(
-                "  FAIL {:<58} required (no semantic validation registered)",
-                entry.name
-            );
-            failed = true;
+            if entry.optional {
+                println!(
+                    "  WARN {:<58} optional (no semantic validation registered)",
+                    entry.name
+                );
+            } else {
+                println!(
+                    "  FAIL {:<58} required (no semantic validation registered)",
+                    entry.name
+                );
+                failed = true;
+            }
         }
     }
     failed
@@ -1509,16 +1516,29 @@ fn parse_client_id_access32(
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op0_register() == setter
         }) {
-            let args = stack_arguments.get(stack_arguments.len().checked_sub(5)?..)?;
-            if !matches!(args[3], StackArgument::Immediate(1))
-                || !matches!(args[4], StackArgument::Register(register) if Some(register) == store_register)
-            {
-                return None;
+            if stack_arguments.len() >= 5 {
+                let args = &stack_arguments[stack_arguments.len() - 5..];
+                if !matches!(args[3], StackArgument::Immediate(1))
+                    || !matches!(args[4], StackArgument::Register(register) if Some(register) == store_register)
+                {
+                    return None;
+                }
+                let StackArgument::Register(register) = args[2] else {
+                    return None;
+                };
+                key_argument = Some(register);
+            } else {
+                let args = stack_arguments.get(stack_arguments.len().checked_sub(3)?..)?;
+                if !matches!(args[1], StackArgument::Immediate(1))
+                    || !matches!(args[2], StackArgument::Register(register) if Some(register) == store_register)
+                {
+                    return None;
+                }
+                let StackArgument::Register(register) = args[0] else {
+                    return None;
+                };
+                key_argument = Some(register);
             }
-            let StackArgument::Register(register) = args[2] else {
-                return None;
-            };
-            key_argument = Some(register);
         }
     }
 
@@ -1555,9 +1575,39 @@ fn find_pic_anchor32(
 ) -> Option<u64> {
     let register_code = x86_register_code(pic_register)?;
     let start = candidate_offset.saturating_sub(0x200);
-    for call_offset in (start..candidate_offset).rev() {
+    if let Some(anchor) = find_pic_anchor32_in_range(
+        image,
+        segment,
+        register_code,
+        start,
+        candidate_offset,
+    )
+    .rev()
+    .next()
+    {
+        return Some(anchor);
+    }
+    find_pic_anchor32_in_range(
+        image,
+        segment,
+        register_code,
+        candidate_offset,
+        candidate_offset.saturating_add(0xc0),
+    )
+    .next()
+}
+
+fn find_pic_anchor32_in_range<'a>(
+    image: &'a ElfImage<'a>,
+    segment: &'a ExecutableSegment<'a>,
+    register_code: u8,
+    start: usize,
+    end: usize,
+) -> impl DoubleEndedIterator<Item = u64> + 'a {
+    let end = end.min(segment.bytes.len().saturating_sub(6));
+    (start..end).filter_map(move |call_offset| {
         if segment.bytes.get(call_offset) != Some(&0xe8) {
-            continue;
+            return None;
         }
         let relative = i32::from_le_bytes(
             segment
@@ -1577,7 +1627,7 @@ fn find_pic_anchor32(
             || image.read_u8_va(target + 2) != Some(0x24)
             || image.read_u8_va(target + 3) != Some(0xc3)
         {
-            continue;
+            return None;
         }
         let add_offset = call_offset + 5;
         let immediate = if register_code == 0 && segment.bytes.get(add_offset) == Some(&0x05) {
@@ -1599,11 +1649,10 @@ fn find_pic_anchor32(
                     .ok()?,
             )
         } else {
-            continue;
+            return None;
         };
-        return Some(u64::from((after_call as u32).wrapping_add(immediate)));
-    }
-    None
+        Some(u64::from((after_call as u32).wrapping_add(immediate)))
+    })
 }
 
 fn x86_register_code(register: iced_x86::Register) -> Option<u8> {
@@ -2620,14 +2669,20 @@ fn validate_steam_engine_init64(code: &[u8], offset: usize) -> Option<&'static s
 fn steam_engine_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x300)?;
     Some(Evidence::required([
-        ("primary vtable write", has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax))),
+        (
+            "primary vtable write",
+            has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax))
+                || has_asm64(bytes, |a| a.mov(qword_ptr(rbp), rax)),
+        ),
         (
             "secondary vtable write at +0xcf0",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0xcf0), rax)),
+            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0xcf0), rax))
+                || has_asm64(bytes, |a| a.mov(qword_ptr(rbp + 0xcf0), rax)),
         ),
         (
             "engine member initialization at +0xd28",
-            has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + 0xd28))),
+            has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + 0xd28)))
+                || has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbp + 0xd28))),
         ),
     ]))
 }
@@ -2640,19 +2695,17 @@ fn validate_set_api_call_result32(code: &[u8], offset: usize) -> Option<&'static
 }
 
 fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x520)?;
+    let bytes = bounded_tail(code, offset, 0x1000)?;
+    let current_result_map = has_x86_rm32_disp32_load(bytes, 0x14ac)
+        && has_x86_rm32_disp32_load(bytes, 0x14c0)
+        && has_asm32(bytes, |a| a.push(0x30));
+    let early_result_map = has_x86_rm32_disp32_load(bytes, 0x0b00)
+        && has_x86_rm32_disp32_load(bytes, 0x0b14)
+        && has_asm32(bytes, |a| a.push(0x1c));
     Some(Evidence::required([
         (
-            "api-call map root/index offset",
-            has_x86_rm32_disp32_load(bytes, 0x14ac),
-        ),
-        (
-            "api-call map storage offset",
-            has_x86_rm32_disp32_load(bytes, 0x14c0),
-        ),
-        (
-            "api-call node stride 0x30",
-            has_asm32(bytes, |a| a.push(0x30)),
+            "api-call result map layout",
+            current_result_map || early_result_map,
         ),
         (
             "callback object virtual dispatch",
@@ -2725,6 +2778,7 @@ fn ipc_run_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                     0x872F_E86C,
                     0x872F_E86D,
                     0x872F_E86E,
+                    0x8712_DD4B,
                     0x7A0A_85B0,
                     0x7A0A_85B2,
                     0x7A0A_85B7,
@@ -2745,7 +2799,7 @@ fn validate_ipc_run_frame64(code: &[u8], offset: usize) -> Option<&'static str> 
 }
 
 fn ipc_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x500)?;
+    let bytes = bounded_tail(code, offset, 0x7000)?;
     Some(Evidence::required([
         ("mode=4 ipc argument", has_asm64(bytes, |a| a.mov(edx, 4))),
         (
@@ -3215,18 +3269,25 @@ fn websocket_send_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
 }
 
 fn validate_ccm_recv_pkt32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(ccm_recv_pkt32_evidence(code, offset), "ccm receive packet")
+    evidence_result(
+        ccm_recv_pkt32_evidence(code, offset),
+        "packet wrapper + downstream dispatch",
+    )
 }
 
 fn ccm_recv_pkt32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x190)?;
+    let packet_arg_direct = has_asm32(bytes, |a| a.push(dword_ptr(ebp + 0x0C)));
+    let packet_arg_saved = has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
+        && has_asm32(bytes, |a| a.mov(dword_ptr(ebp - 0x30), eax))
+        && has_asm32(bytes, |a| a.push(dword_ptr(ebp - 0x30)));
     Some(Evidence::required([
         ("receive mode argument", has_asm32(bytes, |a| a.push(1))),
         (
-            "connection receive call",
-            has_asm32_call_after(bytes, |a| a.push(1), 0x20),
+            "CNetPacket argument passed to wrapper factory",
+            (packet_arg_direct || packet_arg_saved) && has_asm32_call_after(bytes, |a| a.push(1), 0x20),
         ),
-        ("packet null check", has_asm32(bytes, |a| a.test(eax, eax))),
+        ("wrapper null check", has_asm32(bytes, |a| a.test(eax, eax))),
         (
             "packet status validation",
             has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi + 0x04)))
