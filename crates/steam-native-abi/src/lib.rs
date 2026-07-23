@@ -161,26 +161,38 @@ pub mod cnet_packet {
 
     #[repr(C)]
     pub struct CNetPacketPrefix {
-        _vptr: *mut c_void,
+        pub packet_type: u32,
         pub data: *mut u8,
         pub size: u32,
+        pub refs: i32,
+        pub owned_data: *mut u8,
+        _unknown_20: *mut c_void,
+        _unknown_tail: [u32; 2],
     }
 
-    // Linux CNetPacket starts with a vptr, followed by the packet data pointer
-    // and the packet byte size.
+    // CNetPacket is not polymorphic. Native pointer alignment inserts four
+    // bytes after packet_type on x86_64.
     pub const DATA_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, data);
     pub const SIZE_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, size);
+    pub const REFS_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, refs);
+    pub const OWNED_DATA_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, owned_data);
 
     const _: () = {
         #[cfg(target_pointer_width = "32")]
         {
             assert!(DATA_OFFSET == 0x04);
             assert!(SIZE_OFFSET == 0x08);
+            assert!(REFS_OFFSET == 0x0c);
+            assert!(OWNED_DATA_OFFSET == 0x10);
+            assert!(core::mem::size_of::<CNetPacketPrefix>() == 0x20);
         }
         #[cfg(target_pointer_width = "64")]
         {
             assert!(DATA_OFFSET == 0x08);
             assert!(SIZE_OFFSET == 0x10);
+            assert!(REFS_OFFSET == 0x14);
+            assert!(OWNED_DATA_OFFSET == 0x18);
+            assert!(core::mem::size_of::<CNetPacketPrefix>() == 0x30);
         }
     };
 
@@ -653,11 +665,17 @@ mod tests {
         {
             assert_eq!(cnet_packet::DATA_OFFSET, 0x04);
             assert_eq!(cnet_packet::SIZE_OFFSET, 0x08);
+            assert_eq!(cnet_packet::REFS_OFFSET, 0x0c);
+            assert_eq!(cnet_packet::OWNED_DATA_OFFSET, 0x10);
+            assert_eq!(mem::size_of::<cnet_packet::CNetPacketPrefix>(), 0x20);
         }
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(cnet_packet::DATA_OFFSET, 0x08);
             assert_eq!(cnet_packet::SIZE_OFFSET, 0x10);
+            assert_eq!(cnet_packet::REFS_OFFSET, 0x14);
+            assert_eq!(cnet_packet::OWNED_DATA_OFFSET, 0x18);
+            assert_eq!(mem::size_of::<cnet_packet::CNetPacketPrefix>(), 0x30);
         }
     }
 

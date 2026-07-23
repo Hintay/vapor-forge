@@ -9,6 +9,7 @@ pub mod cloud_rpc;
 pub mod depot_key;
 pub mod dlc;
 pub mod identity;
+pub mod inject_wake;
 pub mod library_inject;
 pub mod manifest;
 pub mod online_patterns;

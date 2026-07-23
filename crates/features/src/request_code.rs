@@ -4,7 +4,7 @@
 //! `ContentServerDirectory.GetManifestRequestCode#1` RPCs, all without
 //! any `unsafe` code.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
@@ -92,21 +92,13 @@ pub struct CompletedFetch {
 /// Thread-safe queue of in-flight manifest code fetches.
 pub struct PendingQueue {
     list: Mutex<Vec<Pending>>,
-    /// Fast-path counter: if zero, callers can skip the lock entirely.
-    count: AtomicUsize,
 }
 
 impl PendingQueue {
     pub fn new() -> Self {
         Self {
             list: Mutex::new(Vec::new()),
-            count: AtomicUsize::new(0),
         }
-    }
-
-    /// Returns `true` if there are no pending fetches (fast atomic check).
-    pub fn is_empty(&self) -> bool {
-        self.count.load(Ordering::Acquire) == 0
     }
 
     /// Queue a new manifest code fetch. Spawns a background thread to call
@@ -145,7 +137,6 @@ impl PendingQueue {
                 return false;
             }
             list.push(pending);
-            self.count.fetch_add(1, Ordering::Release);
         }
 
         let providers: Vec<String> = config.manifest.providers.clone();
@@ -176,6 +167,9 @@ impl PendingQueue {
                 }
                 done_clone.store(true, Ordering::Release);
                 debug!(gid, code = ?code, "request_code: fetch complete");
+                // Dispatch the completed manifest response now instead of waiting
+                // for the next inbound packet.
+                crate::inject_wake::wake(crate::inject_wake::InjectionSource::Manifest);
             });
         if let Err(error) = spawn_result {
             let mut list = self.list.lock().unwrap();
@@ -184,7 +178,6 @@ impl PendingQueue {
                 .position(|pending| pending.job_id == job_id && pending.gid == gid)
             {
                 list.swap_remove(index);
-                self.count.fetch_sub(1, Ordering::Release);
             }
             warn!(job_id, gid, %error, "request_code: failed to start fetch thread");
             return false;
@@ -201,7 +194,6 @@ impl PendingQueue {
         while i < list.len() {
             if list[i].done.load(Ordering::Acquire) {
                 let entry = list.swap_remove(i);
-                self.count.fetch_sub(1, Ordering::Release);
 
                 let code = entry.result.lock().unwrap().unwrap_or(0);
                 completed.push(CompletedFetch {

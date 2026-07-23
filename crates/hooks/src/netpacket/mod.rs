@@ -3,5 +3,5 @@
 mod boundary;
 mod router;
 
-pub(crate) use boundary::{on_recv_packet, try_inject};
+pub(crate) use boundary::{drain_local, prepare_recv_packet, wake_source};
 pub(crate) use router::{decide_send_frame, is_cloud_transfer_target, SendFrameDecision};

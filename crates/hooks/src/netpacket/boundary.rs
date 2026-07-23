@@ -1,33 +1,28 @@
 use std::ffi::c_void;
 
 use tracing::info;
+use vapor_forge_features::inject_wake::InjectionSource;
 use vapor_forge_features::{achievements, request_code, rich_presence};
 use vapor_forge_packet_capture::{PacketChange, PacketDirection};
 use vapor_forge_steam_native_abi::cnet_packet;
 
 use super::router::{process_recv_frame, CLOUD_PENDING, LOCAL_RESPONSES, PENDING};
 
-/// Check for pending responses and inject them through the current carrier packet.
-///
-/// # Safety
-/// `this` and `packet` must be valid pointers as passed to `RecvPkt`.
-pub(crate) unsafe fn try_inject<F>(this: *mut c_void, packet: *mut c_void, call_original: F)
-where
-    F: Fn(*mut c_void, *mut c_void) -> *mut c_void,
-{
-    let rp_inject_due = rich_presence::tracked_app().0 != 0 && rich_presence::has_inject_pending();
-    if PENDING.is_empty()
-        && CLOUD_PENDING.is_empty()
-        && LOCAL_RESPONSES.lock().unwrap().is_empty()
-        && !achievements::has_offline_responses()
-        && !rp_inject_due
-    {
-        return;
+/// Route one source's completed responses to the native injection dispatch. The
+/// injection router (registered at install) calls this from the source's own
+/// completion point, so each fabricated response is delivered on the WebSocket
+/// worker thread the moment it is ready — no collective sweep, no wait for the
+/// next inbound packet.
+pub(crate) fn wake_source(source: InjectionSource) {
+    match source {
+        InjectionSource::Manifest => drain_manifest(),
+        InjectionSource::Cloud => drain_cloud(),
+        InjectionSource::Achievements => drain_achievements(),
+        InjectionSource::RichPresence => drain_rich_presence(),
     }
-    if packet.is_null() {
-        return;
-    }
+}
 
+fn drain_manifest() {
     for entry in PENDING.drain_completed() {
         let response = request_code::build_response_packet(
             &entry.req_hdr_bytes,
@@ -39,72 +34,74 @@ where
             gid = entry.gid,
             job_id = entry.job_id,
             code = entry.code,
-            "netpacket: injecting manifest response"
+            "netpacket: queuing manifest response"
         );
-        // SAFETY: packet is valid for this callback and restored after the call.
-        unsafe { inject_captured(this, packet, response, &call_original) };
+        capture_injected(&response);
+        crate::client::network::enqueue_injection(response);
     }
+}
 
+fn drain_cloud() {
     for response in CLOUD_PENDING.drain_completed() {
         // Cumulus upload responses contain bearer credentials and are not captured.
-        // SAFETY: packet is valid for this callback and the guard restores it.
-        let _guard = unsafe { PacketSwapGuard::new(packet, response) };
-        call_original(this, packet);
+        crate::client::network::enqueue_injection(response);
     }
+}
 
-    let local_responses = std::mem::take(&mut *LOCAL_RESPONSES.lock().unwrap());
-    for response in local_responses {
-        // SAFETY: packet is valid for this callback and restored after the call.
-        unsafe { inject_captured(this, packet, response, &call_original) };
+/// Drain locally-answered responses (privacy fallbacks, StoreStats, ownership
+/// tickets). Called directly from `queue_local_response` (already in-crate).
+pub(crate) fn drain_local() {
+    for response in std::mem::take(&mut *LOCAL_RESPONSES.lock().unwrap()) {
+        capture_injected(&response);
+        crate::client::network::enqueue_injection(response);
     }
+}
 
+fn drain_achievements() {
     for response in achievements::drain_offline_responses() {
-        // SAFETY: packet is valid for this callback and restored after the call.
-        unsafe { inject_captured(this, packet, response.packet, &call_original) };
+        capture_injected(&response.packet);
+        crate::client::network::enqueue_injection(response.packet);
     }
+}
 
-    if rp_inject_due && rich_presence::take_inject_pending() {
+fn drain_rich_presence() {
+    if rich_presence::tracked_app().0 == 0 || !rich_presence::has_inject_pending() {
+        return;
+    }
+    if rich_presence::take_inject_pending() {
         let app = rich_presence::tracked_app();
         match rich_presence::build_inject_packet(app) {
             Some(response) => {
-                info!(
-                    app = app.0,
-                    "netpacket: injecting manufactured PersonaState"
-                );
-                // SAFETY: packet is valid for this callback and restored after the call.
-                unsafe { inject_captured(this, packet, response, &call_original) };
+                info!(app = app.0, "netpacket: queuing manufactured PersonaState");
+                capture_injected(&response);
+                crate::client::network::enqueue_injection(response);
             }
+            // Re-arm without poking; the next real trigger retries.
             None => rich_presence::mark_inject_pending(),
         }
     }
 }
 
-unsafe fn inject_captured<F>(
-    this: *mut c_void,
-    packet: *mut c_void,
-    response: Vec<u8>,
-    call_original: &F,
-) where
-    F: Fn(*mut c_void, *mut c_void) -> *mut c_void,
-{
+fn capture_injected(response: &[u8]) {
     crate::packet_capture::capture(
         PacketDirection::Recv,
-        &response,
+        response,
         PacketChange::Injected,
         None,
     );
-    // SAFETY: packet is valid for this callback and the guard restores it.
-    let _guard = unsafe { PacketSwapGuard::new(packet, response) };
-    call_original(this, packet);
 }
 
-/// Read and optionally rewrite an incoming packet after Steam has processed it.
+/// Read and optionally rewrite an incoming packet before Steam processes it.
+///
+/// The returned guard owns replacement bytes and restores the original packet
+/// fields when synchronous RecvPkt dispatch returns.
 ///
 /// # Safety
-/// `packet` must be a valid `CNetPacket` pointer.
-pub(crate) unsafe fn on_recv_packet(packet: *mut c_void) {
+/// `packet` must be null or a valid `CNetPacket` pointer, and the guard must be
+/// dropped before the packet can be released.
+pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> Option<PacketSwapGuard> {
     if packet.is_null() {
-        return;
+        return None;
     }
     // SAFETY: packet is the non-null CNetPacket supplied by Steam.
     let p_data = unsafe { cnet_packet::data_slot(packet) };
@@ -115,31 +112,17 @@ pub(crate) unsafe fn on_recv_packet(packet: *mut c_void) {
     // SAFETY: both slots point into the live CNetPacket.
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
-        return;
+        return None;
     }
 
     // SAFETY: Steam's packet supplies a non-null data pointer and byte size.
     let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
-    if let Some(replacement) = process_recv_frame(bytes) {
-        // SAFETY: packet remains valid for this hook callback.
-        unsafe { replace_packet_data(packet, replacement) };
-    }
+    let replacement = process_recv_frame(bytes)?;
+    // SAFETY: caller guarantees packet remains live for the guard lifetime.
+    Some(unsafe { PacketSwapGuard::new(packet, replacement) })
 }
 
-/// Replace `CNetPacket` data with process-lifetime bytes for Steam to consume.
-///
-/// # Safety
-/// `packet` must be a valid `CNetPacket` pointer.
-unsafe fn replace_packet_data(packet: *mut c_void, data: Vec<u8>) {
-    let boxed = data.into_boxed_slice();
-    let len = boxed.len() as u32;
-    let ptr = Box::into_raw(boxed) as *mut u8;
-
-    // SAFETY: packet is valid and ptr remains allocated for process lifetime.
-    unsafe { cnet_packet::set_data(packet, ptr, len) };
-}
-
-struct PacketSwapGuard {
+pub(crate) struct PacketSwapGuard {
     p_data: *mut *mut u8,
     p_size: *mut u32,
     orig_data: *mut u8,
@@ -183,5 +166,40 @@ impl Drop for PacketSwapGuard {
             *self.p_data = self.orig_data;
             *self.p_size = self.orig_size;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_swap_guard_restores_steam_fields() {
+        let mut packet_storage = [0usize; 8];
+        let packet = packet_storage.as_mut_ptr().cast::<c_void>();
+        let mut original = [1u8, 2, 3];
+        // SAFETY: packet_storage is aligned and large enough for the native
+        // CNetPacket slots used by these accessors.
+        unsafe { cnet_packet::set_data(packet, original.as_mut_ptr(), original.len() as u32) };
+
+        {
+            // SAFETY: packet_storage remains live until the guard is dropped.
+            let _guard = unsafe { PacketSwapGuard::new(packet, vec![9, 8]) };
+            // SAFETY: packet points to the same live test storage.
+            let data = unsafe { *cnet_packet::data_slot(packet) };
+            // SAFETY: packet points to the same live test storage.
+            let size = unsafe { *cnet_packet::size_slot(packet) };
+            assert_eq!(size, 2);
+            // SAFETY: the guard owns two initialized replacement bytes.
+            assert_eq!(unsafe { std::slice::from_raw_parts(data, 2) }, [9, 8]);
+        }
+
+        assert_eq!(
+            // SAFETY: packet points to the same live test storage.
+            unsafe { *cnet_packet::data_slot(packet) },
+            original.as_mut_ptr()
+        );
+        // SAFETY: packet points to the same live test storage.
+        assert_eq!(unsafe { *cnet_packet::size_slot(packet) }, 3);
     }
 }

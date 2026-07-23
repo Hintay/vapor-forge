@@ -132,13 +132,21 @@ pub(crate) fn resolve_from_registry<F: vapor_forge_hook_engine::detour::HookFn>(
     name: &str,
     replacement: F,
 ) -> Option<PendingDetour<F>> {
+    let addr = resolve_address_from_registry(registry, code, name)?;
+    resolve_from_address(code, name, addr, replacement)
+}
+
+pub(crate) fn resolve_address_from_registry(
+    registry: &PatternRegistry,
+    code: &CodeRegion,
+    name: &str,
+) -> Option<usize> {
     let entry = registry.get(name).or_else(|| {
         warn!(hook = name, "pattern not found in registry");
         None
     })?;
 
-    let addr = detour::resolve_pattern_entry(code, name, &entry)?;
-    resolve_from_address(code, name, addr, replacement)
+    detour::resolve_pattern_entry(code, name, &entry)
 }
 
 fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
@@ -592,6 +600,19 @@ fn do_install() {
         "CCMConnection::RecvPkt",
         super::network::hk_recv_pkt as super::network::RecvPktFn,
     );
+    let d_post_work_item = resolve_from_registry(
+        &registry,
+        &code,
+        "CWorkThreadPool::PostWorkItem",
+        super::network::hk_post_work_item as super::network::WebSocketWorkerPostItemFn,
+    );
+    super::network::resolve_native_packet_functions(&registry, &code);
+    // Route each response source's completion straight to its own injection
+    // dispatch, so a fabricated response is delivered the moment it is ready
+    // instead of waiting for the next inbound packet.
+    vapor_forge_features::inject_wake::set_injection_router(Box::new(|source| {
+        crate::netpacket::wake_source(source)
+    }));
     let d_http_job_start = resolve_from_registry(
         &registry,
         &code,
@@ -643,6 +664,7 @@ fn do_install() {
             }
         };
     }
+    #[cfg_attr(not(target_pointer_width = "32"), allow(unused_mut))]
     let hook_results = vec![
         hr!("CSteamEngine::Init", d_steam_engine_init),
         hr!("CUser::CheckAppOwnership", d_ownership),
@@ -691,6 +713,7 @@ fn do_install() {
             d_send_frame
         ),
         hr!("CCMConnection::RecvPkt", d_recv_pkt),
+        hr!("CWorkThreadPool::PostWorkItem", d_post_work_item),
         hr!(super::cloud_http::HTTP_JOB_START_NAME, d_http_job_start),
         hr!("CConfigStore::WriteVdfFile", d_write_vdf),
         hr!("CUser::BuildSpawnEnvBlock", d_build_spawn_env),
@@ -809,6 +832,11 @@ fn do_install() {
             "CCMConnection::RecvPkt",
             std::ptr::addr_of_mut!(super::network::RECV_PKT_DETOUR),
             d_recv_pkt,
+        );
+        detour::store_and_finalize(
+            "CWorkThreadPool::PostWorkItem",
+            std::ptr::addr_of_mut!(super::network::POST_WORK_ITEM_DETOUR),
+            d_post_work_item,
         );
         detour::store_and_finalize(
             super::cloud_http::HTTP_JOB_START_NAME,

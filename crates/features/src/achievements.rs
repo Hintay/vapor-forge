@@ -119,7 +119,6 @@ pub struct OfflineResponse {
 }
 
 static OFFLINE_QUEUE: Mutex<Option<Vec<OfflineResponse>>> = Mutex::new(None);
-static OFFLINE_QUEUE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn queue_offline_response(app_id: AppId, job_id: u64, req_hdr: &CMsgProtoBufHeader) -> bool {
     let resp_hdr = CMsgProtoBufHeader {
@@ -138,19 +137,18 @@ fn queue_offline_response(app_id: AppId, job_id: u64, req_hdr: &CMsgProtoBufHead
     let emsg = EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG;
     let packet = assemble_raw(emsg, &hdr_bytes, &body_bytes);
 
-    let mut guard = OFFLINE_QUEUE.lock().unwrap();
-    let queue = guard.get_or_insert_with(Vec::new);
-    queue.push(OfflineResponse { packet });
-    OFFLINE_QUEUE_COUNT.store(queue.len(), Ordering::Release);
+    {
+        let mut guard = OFFLINE_QUEUE.lock().unwrap();
+        let queue = guard.get_or_insert_with(Vec::new);
+        queue.push(OfflineResponse { packet });
+    }
     debug!(
         app_id = app_id.0,
         "achievements: queued offline NO_CONNECTION response"
     );
+    // Dispatch now instead of waiting for the next inbound packet.
+    crate::inject_wake::wake(crate::inject_wake::InjectionSource::Achievements);
     true
-}
-
-pub fn has_offline_responses() -> bool {
-    OFFLINE_QUEUE_COUNT.load(Ordering::Acquire) > 0
 }
 
 pub fn drain_offline_responses() -> Vec<OfflineResponse> {
@@ -159,9 +157,7 @@ pub fn drain_offline_responses() -> Vec<OfflineResponse> {
         Some(q) => q,
         None => return Vec::new(),
     };
-    let drained = std::mem::take(queue);
-    OFFLINE_QUEUE_COUNT.store(0, Ordering::Release);
-    drained
+    std::mem::take(queue)
 }
 
 // ---------------------------------------------------------------------------

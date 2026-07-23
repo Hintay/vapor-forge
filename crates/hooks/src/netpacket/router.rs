@@ -377,12 +377,16 @@ fn capture_dropped(data: &[u8]) {
 }
 
 fn queue_local_response(packet: Vec<u8>) {
-    let mut queue = LOCAL_RESPONSES.lock().unwrap();
-    if queue.len() == MAX_LOCAL_RESPONSES {
-        queue.pop_front();
-        warn!("netpacket: local response queue full; discarded oldest response");
+    {
+        let mut queue = LOCAL_RESPONSES.lock().unwrap();
+        if queue.len() == MAX_LOCAL_RESPONSES {
+            queue.pop_front();
+            warn!("netpacket: local response queue full; discarded oldest response");
+        }
+        queue.push_back(packet);
     }
-    queue.push_back(packet);
+    // Dispatch now instead of waiting for the next inbound packet.
+    super::drain_local();
 }
 
 fn local_ownership_ticket_response(

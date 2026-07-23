@@ -37,9 +37,9 @@ static SELF_CACHE: Mutex<Option<SelfPersonaCache>> = Mutex::new(None);
 // AppId currently being played through an avatar mapping. Zero means none.
 static TRACKED_APP: AtomicU32 = AtomicU32::new(0);
 
-// Set whenever tracking changes or new rich presence KVs arrive, so try_inject
-// fires a manufactured PersonaState exactly once per change instead of on
-// every RecvPkt call.
+// Set whenever tracking changes or new rich presence KVs arrive, so the packet
+// boundary injects a manufactured PersonaState exactly once per change instead
+// of on every RecvPkt call.
 static INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct SelfPersonaCache {
@@ -76,6 +76,7 @@ pub fn on_games_played_update(app_ids: &[AppId], is_avatared: impl Fn(AppId) -> 
     let old_tracked = TRACKED_APP.swap(new_tracked, Ordering::AcqRel);
     if new_tracked != 0 && new_tracked != old_tracked {
         INJECT_PENDING.store(true, Ordering::Release);
+        crate::inject_wake::wake(crate::inject_wake::InjectionSource::RichPresence);
     }
 }
 
@@ -99,6 +100,7 @@ pub fn on_rich_presence_upload(kv_data: &[u8]) {
         .get_or_insert_with(HashMap::new)
         .insert(app, kvs);
     INJECT_PENDING.store(true, Ordering::Release);
+    crate::inject_wake::wake(crate::inject_wake::InjectionSource::RichPresence);
 }
 
 /// Cache a PersonaState packet (raw header/body bytes) as the inject template,
@@ -122,6 +124,14 @@ pub fn cache_self_persona(header: &[u8], body: &[u8]) {
         header: header.to_vec(),
         body: body.to_vec(),
     });
+
+    // An inject may have been armed earlier but failed to build for lack of this
+    // template. Now that it is cached, retry the dispatch — otherwise the pending
+    // inject would wait for the next rich-presence trigger (there is no longer a
+    // per-inbound-packet sweep to retry it).
+    if TRACKED_APP.load(Ordering::Acquire) != 0 && INJECT_PENDING.load(Ordering::Acquire) {
+        crate::inject_wake::wake(crate::inject_wake::InjectionSource::RichPresence);
+    }
 }
 
 /// Get cached rich presence KVs for an AppId, if any were captured.
@@ -149,6 +159,9 @@ pub fn take_inject_pending() -> bool {
 
 /// Re-arm the pending-inject flag. Used when an inject attempt could not
 /// complete (e.g. no self PersonaState cached yet) so it is retried later.
+/// Re-arm the pending flag without poking the dispatcher. Used by the drain's
+/// own retry path (build failed, e.g. no self PersonaState cached yet) so it
+/// does not recurse into the dispatcher; the next real trigger re-pokes.
 pub fn mark_inject_pending() {
     INJECT_PENDING.store(true, Ordering::Release);
 }

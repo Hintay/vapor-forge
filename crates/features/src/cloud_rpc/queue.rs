@@ -61,7 +61,6 @@ impl Drop for ResponseReservation {
 /// websocket thread; completed packets are drained on a later receive frame.
 pub struct CloudRpcQueue {
     pending: Mutex<Vec<PendingResponse>>,
-    count: AtomicUsize,
     workers: Box<[RpcWorker]>,
     report_worker: mpsc::SyncSender<QueuedRequest>,
     pub(super) transfer_targets: Arc<TransferTargetRegistry>,
@@ -87,6 +86,8 @@ impl CloudRpcQueue {
                         if let Some(response) = request.response {
                             let packet = build_response_packet(&response.request_header, result);
                             let _ = response.sender.send(packet);
+                            // Dispatch now rather than waiting for the next inbound packet.
+                            crate::inject_wake::wake(crate::inject_wake::InjectionSource::Cloud);
                         } else if let Err(error) = result {
                             warn!(
                                 app_id = request.app_id,
@@ -124,15 +125,10 @@ impl CloudRpcQueue {
         });
         Self {
             pending: Mutex::new(Vec::new()),
-            count: AtomicUsize::new(0),
             workers,
             report_worker,
             transfer_targets,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count.load(Ordering::Acquire) == 0
     }
 
     pub fn is_issued_transfer_target(
@@ -164,7 +160,6 @@ impl CloudRpcQueue {
             receiver,
             _reservation: reservation,
         });
-        self.count.fetch_add(1, Ordering::Release);
     }
 
     /// Queue a supported Cumulus-backed RPC. Returns false when the packet
@@ -261,12 +256,10 @@ impl CloudRpcQueue {
             match pending[index].receiver.try_recv() {
                 Ok(packet) => {
                     pending.swap_remove(index);
-                    self.count.fetch_sub(1, Ordering::Release);
                     completed.push(packet);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     pending.swap_remove(index);
-                    self.count.fetch_sub(1, Ordering::Release);
                 }
                 Err(mpsc::TryRecvError::Empty) => index += 1,
             }

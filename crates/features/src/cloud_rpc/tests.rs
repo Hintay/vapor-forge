@@ -362,7 +362,8 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         ..Default::default()
     };
     assert!(queue.intercept(CDN_REPORT, &header, &[], &cdn.encode_to_vec(), &config,));
-    assert!(queue.is_empty());
+    // A notification enqueues no response to drain.
+    assert!(queue.drain_completed().is_empty());
 
     let steam = CloudExternalStorageTransferReportNotification {
         host: Some("steamcloud-ugc.storage.googleapis.com".into()),
