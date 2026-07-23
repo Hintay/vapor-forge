@@ -81,6 +81,60 @@ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89
 [[steamclient."CCMConnection::RecvPkt".variants]]
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 8B 45 08 89 45 D4 8B 45 0C 89 FB 89 45 D0 89 C1 65 A1 14 00 00 00"
 
+[steamclient."CNetPacket::Alloc"]
+follow = "upward"
+prologue = "53 56"
+pattern = "68 BF 07 00 00 51 6A 20 50 FF 52 14"
+
+[steamclient."CNetPacket::Init"]
+follow = "none"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 2C 8B 45 1C 8B 5D 10"
+
+# steamrt stack-canary implementation shape.
+[[steamclient."CNetPacket::Init".variants]]
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 2C 8B 45 10 8B 75 08 8B 4D 18 89 45 ? 65 8B 15 14 00 00 00"
+
+[steamclient."CNetPacket::Release"]
+follow = "none"
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 7C 24 40 83 6F 0C 01 74"
+
+# steamrt stack-canary implementation shape.
+[[steamclient."CNetPacket::Release".variants]]
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 3C 8B 7C 24 50 83 6F 0C 01 74"
+
+[steamclient."CWorkThreadPool::AddWorkItem"]
+follow = "none"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 3C 8B 75 08 0F B6 86 CC 00 00 00 88 45 ? 84 C0 0F 85"
+
+# steamrt stack-canary implementation shape.
+[[steamclient."CWorkThreadPool::AddWorkItem".variants]]
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 4C 8B 45 0C 8B 75 08 89 45 ? 65 A1 14 00 00 00 89 45 ? 31 C0 0F B6 86 CC 00 00 00 84 C0 0F 85"
+
+# Wakes the worker thread after AddWorkItem: sets the event state at arg+0x04 and
+# releases any waiter. Called from the post wrapper as wake(worker+0x470, value).
+# Optional: absence degrades dispatch to the worker loop's own poll cadence.
+[steamclient."CWorkThreadPool::WakeWorker"]
+follow = "none"
+optional = true
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 1C 8B 7C 24 30 8B 74 24 34 39 77 04 74"
+
+# steamrt stack-canary implementation shape.
+[[steamclient."CWorkThreadPool::WakeWorker".variants]]
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 1C 65 8B 35 14 00 00 00 89 74 24 0C 8B 74 24 34 8B 7C 24 30 39 77 04 74"
+
+# Wrapper that constructs a CWorkItem and posts it to the worker (arg1 = worker,
+# arg2 = job); calls AddWorkItem then conditionally wakes. Hooked one-shot to
+# capture worker_this from arg1.
+[steamclient."CWorkThreadPool::PostWorkItem"]
+follow = "none"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC ? 8B 4D 0C 8B 45 08 89 FB 89 CE"
+
+# steamrt SSE arg-packing implementation shape: the (worker, job) pair is loaded
+# and packed via movd/punpckldq/movq (66 0F 6E / 66 0F 62 / 66 0F D6) instead of
+# the x87 stores the main build emits.
+[[steamclient."CWorkThreadPool::PostWorkItem".variants]]
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC ? 8B 75 0C 8B 45 08 66 0F 6E CE 89 FB 66 0F 6E D0"
+
 # CHTTPRequestJob start boundary used by the process-local cloud transfer hook.
 [steamclient."CHTTPRequestJob::Start"]
 follow = "none"

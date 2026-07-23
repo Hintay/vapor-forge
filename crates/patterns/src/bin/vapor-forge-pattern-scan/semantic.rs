@@ -127,6 +127,36 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_ccm_recv_pkt32,
     },
     SemanticCheck {
+        name: "CNetPacket::Alloc",
+        label: "CNetPacket::Alloc body",
+        validate: validate_cnet_packet_alloc32,
+    },
+    SemanticCheck {
+        name: "CNetPacket::Init",
+        label: "CNetPacket::Init body",
+        validate: validate_cnet_packet_init32,
+    },
+    SemanticCheck {
+        name: "CNetPacket::Release",
+        label: "CNetPacket::Release body",
+        validate: validate_cnet_packet_release32,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::AddWorkItem",
+        label: "CWorkThreadPool::AddWorkItem body",
+        validate: validate_work_thread_pool_add_work_item32,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::WakeWorker",
+        label: "CWorkThreadPool::WakeWorker body",
+        validate: validate_work_thread_pool_wake_worker32,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::PostWorkItem",
+        label: "CWorkThreadPool::PostWorkItem body",
+        validate: validate_work_thread_pool_post_work_item32,
+    },
+    SemanticCheck {
         name: "CHTTPRequestJob::Start",
         label: "CHTTPRequestJob::Start body",
         validate: validate_http_request_job_start32,
@@ -223,6 +253,36 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CCMConnection::RecvPkt",
         label: "CCMConnection::RecvPkt body",
         validate: validate_ccm_recv_pkt64,
+    },
+    SemanticCheck {
+        name: "CNetPacket::Alloc",
+        label: "CNetPacket::Alloc body",
+        validate: validate_cnet_packet_alloc64,
+    },
+    SemanticCheck {
+        name: "CNetPacket::Init",
+        label: "CNetPacket::Init body",
+        validate: validate_cnet_packet_init64,
+    },
+    SemanticCheck {
+        name: "CNetPacket::Release",
+        label: "CNetPacket::Release body",
+        validate: validate_cnet_packet_release64,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::AddWorkItem",
+        label: "CWorkThreadPool::AddWorkItem body",
+        validate: validate_work_thread_pool_add_work_item64,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::WakeWorker",
+        label: "CWorkThreadPool::WakeWorker body",
+        validate: validate_work_thread_pool_wake_worker64,
+    },
+    SemanticCheck {
+        name: "CWorkThreadPool::PostWorkItem",
+        label: "CWorkThreadPool::PostWorkItem body",
+        validate: validate_work_thread_pool_post_work_item64,
     },
     SemanticCheck {
         name: "CHTTPRequestJob::Start",
@@ -2283,6 +2343,19 @@ fn has_x86_push_edx_call_after(bytes: &[u8], max_distance: usize) -> bool {
     has_x86_call_after(bytes, &[0x52], max_distance)
 }
 
+fn has_x86_add_reg_imm8(bytes: &[u8], reg: u8, imm: u8) -> bool {
+    bytes
+        .windows(3)
+        .any(|w| w[0] == 0x83 && w[1] == 0xC0 + reg && w[2] == imm)
+}
+
+fn has_x86_add_eax_imm32(bytes: &[u8], imm: u32) -> bool {
+    let imm = imm.to_le_bytes();
+    bytes
+        .windows(5)
+        .any(|w| w[0] == 0x05 && w[1..5] == imm)
+}
+
 fn has_x64_rsp_store_cl(bytes: &[u8]) -> bool {
     bytes
         .windows(4)
@@ -2425,6 +2498,36 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86, "CCMConnection::RecvPkt") => ccm_recv_pkt32_evidence(code, offset),
         (SemanticArch::X86_64, "CCMConnection::RecvPkt") => ccm_recv_pkt64_evidence(code, offset),
+        (SemanticArch::X86, "CNetPacket::Alloc") => cnet_packet_alloc32_evidence(code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Alloc") => {
+            cnet_packet_alloc64_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CNetPacket::Init") => cnet_packet_init32_evidence(code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Init") => cnet_packet_init64_evidence(code, offset),
+        (SemanticArch::X86, "CNetPacket::Release") => {
+            cnet_packet_release32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CNetPacket::Release") => {
+            cnet_packet_release64_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CWorkThreadPool::AddWorkItem") => {
+            work_thread_pool_add_work_item32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CWorkThreadPool::AddWorkItem") => {
+            work_thread_pool_add_work_item64_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CWorkThreadPool::WakeWorker") => {
+            work_thread_pool_wake_worker32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CWorkThreadPool::WakeWorker") => {
+            work_thread_pool_wake_worker64_evidence(code, offset)
+        }
+        (SemanticArch::X86, "CWorkThreadPool::PostWorkItem") => {
+            work_thread_pool_post_work_item32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CWorkThreadPool::PostWorkItem") => {
+            work_thread_pool_post_work_item64_evidence(code, offset)
+        }
         (SemanticArch::X86, "CHTTPRequestJob::Start") => {
             http_request_job_start32_evidence(code, offset)
         }
@@ -3295,29 +3398,471 @@ fn ccm_recv_pkt32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 && has_x86_cmp_eax_imm32(bytes, 0x00FF_FFFE),
         ),
         (
-            "packet virtual consume",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi)))
-                && has_asm32(bytes, |a| a.mov(edx, dword_ptr(eax + 0x08)))
-                && (has_asm32(bytes, |a| a.call(dword_ptr(eax + 0x04)))
-                    || has_asm32(bytes, |a| a.jmp(eax))),
+            "original packet downstream virtual dispatch",
+            (packet_arg_direct || packet_arg_saved)
+                && has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x0C))),
         ),
     ]))
 }
 
 fn validate_ccm_recv_pkt64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(ccm_recv_pkt64_evidence(code, offset), "ccm receive packet")
+    evidence_result(
+        ccm_recv_pkt64_evidence(code, offset),
+        "packet wrapper + downstream dispatch",
+    )
 }
 
 fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x100)?;
+    let retained_in_rbp = has_asm64(bytes, |a| a.mov(rbp, rsi));
+    let retained_in_r12 = has_asm64(bytes, |a| a.mov(r12, rsi));
     Some(Evidence::required([
         ("receive mode argument", has_asm64(bytes, |a| a.mov(esi, 1))),
         (
-            "connection receive call",
+            "CNetPacket argument retained",
+            retained_in_rbp || retained_in_r12,
+        ),
+        (
+            "wrapper factory call",
             has_asm64_call_after(bytes, |a| a.mov(rdi, rbp), 0x10)
                 || has_asm64_call_after(bytes, |a| a.mov(rdi, r12), 0x10),
         ),
-        ("packet null check", has_asm64(bytes, |a| a.test(rax, rax))),
+        ("wrapper null check", has_asm64(bytes, |a| a.test(rax, rax))),
+        (
+            "original packet downstream virtual dispatch",
+            (has_asm64(bytes, |a| a.mov(rsi, rbp))
+                || has_asm64(bytes, |a| a.mov(rsi, r12)))
+                && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x18))),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_alloc32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(cnet_packet_alloc32_evidence(code, offset), "Steam allocator packet")
+}
+
+fn cnet_packet_alloc32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x80)?;
+    Some(Evidence::required([
+        ("packet allocation size 0x20", has_asm32(bytes, |a| a.push(0x20))),
+        ("allocator tag line", has_asm32(bytes, |a| a.push(0x7BF))),
+        (
+            "allocator allocation vtable slot",
+            has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14))),
+        ),
+        (
+            "packet clear/init helper",
+            has_asm32_call_after(bytes, |a| a.push(eax), 0x10),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_alloc64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(cnet_packet_alloc64_evidence(code, offset), "Steam allocator packet")
+}
+
+fn cnet_packet_alloc64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x80)?;
+    Some(Evidence::required([
+        ("packet allocation size 0x30", has_asm64(bytes, |a| a.mov(esi, 0x30))),
+        ("allocator tag line", has_asm64(bytes, |a| a.mov(ecx, 0x7BF))),
+        (
+            "allocator allocation vtable slot",
+            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28))),
+        ),
+        (
+            "packet clear/init helper",
+            has_asm64_call_after(bytes, |a| a.mov(rdi, rax), 0x10),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_init32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        cnet_packet_init32_evidence(code, offset),
+        "packet fields + refcount",
+    )
+}
+
+fn cnet_packet_init32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    Some(Evidence::required([
+        (
+            "packet argument",
+            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
+        ),
+        (
+            "packet type/data/size/owned stores",
+            has_seq(
+                bytes,
+                &[
+                    0x89, 0x06, 0x8b, 0x45, 0x10, 0x89, 0x46, 0x04, 0x8b, 0x45, 0x14,
+                    0x89, 0x46, 0x08, 0x8b, 0x45, 0x18, 0x89, 0x46, 0x10,
+                ],
+            ) || has_seq(
+                bytes,
+                &[
+                    0x89, 0x4E, 0x10, 0xC7, 0x46, 0x18, 0x00, 0x00, 0x00, 0x00,
+                    0xC7, 0x46, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x89, 0x06, 0x8B,
+                    0x45,
+                ],
+            ),
+        ),
+        (
+            "tail fields zeroed",
+            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x18), 0))
+                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x1C), 0)),
+        ),
+        (
+            "initial refcount",
+            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x0C), 1)),
+        ),
+        (
+            "copy-on-write allocation path",
+            has_asm32(bytes, |a| a.push(0x45))
+                && has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14)))
+                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x10), eax)),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_init64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        cnet_packet_init64_evidence(code, offset),
+        "packet fields + refcount",
+    )
+}
+
+fn cnet_packet_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    Some(Evidence::required([
+        (
+            "packet type/data/size/owned stores",
+            has_asm64(bytes, |a| a.mov(dword_ptr(rbx), r15d))
+                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x08), r12))
+                && has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x10), ebp))
+                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), r14)),
+        ),
+        (
+            "tail fields zeroed",
+            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x28), 0)),
+        ),
+        (
+            "initial refcount",
+            has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x14), 1)),
+        ),
+        (
+            "copy-on-write allocation path",
+            has_asm64(bytes, |a| a.mov(ecx, 0x45))
+                && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28)))
+                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), rax)),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_release32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        cnet_packet_release32_evidence(code, offset),
+        "refcount release + delayed free list",
+    )
+}
+
+fn cnet_packet_release32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x140)?;
+    Some(Evidence::required([
+        (
+            "packet argument",
+            has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x40)))
+                || has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x50))),
+        ),
+        (
+            "refcount decrement",
+            has_asm32(bytes, |a| a.sub(dword_ptr(edi + 0x0C), 1)),
+        ),
+        (
+            "zero-ref delayed free-list path",
+            has_asm32(bytes, |a| a.mov(dword_ptr(eax), edi))
+                && (has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm0))
+                    || has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm1))),
+        ),
+    ]))
+}
+
+fn validate_cnet_packet_release64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        cnet_packet_release64_evidence(code, offset),
+        "refcount release + delayed free list",
+    )
+}
+
+fn cnet_packet_release64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x140)?;
+    Some(Evidence::required([
+        (
+            "refcount decrement",
+            has_asm64(bytes, |a| a.sub(dword_ptr(rdi + 0x14), 1)),
+        ),
+        (
+            "zero-ref packet saved",
+            has_asm64(bytes, |a| a.mov(rbx, rdi))
+                && has_asm64(bytes, |a| a.mov(qword_ptr(rax), rbx)),
+        ),
+        (
+            "delayed free-list timestamp saved",
+            has_asm64(bytes, |a| a.mov(qword_ptr(rax + 0x08), r13)),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_add_work_item32(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_add_work_item32_evidence(code, offset),
+        "pool state + item enqueue",
+    )
+}
+
+fn work_thread_pool_add_work_item32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x360)?;
+    Some(Evidence::required([
+        (
+            "pool and item arguments",
+            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08)))
+                && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C))),
+        ),
+        (
+            "pool state gates",
+            has_asm32(bytes, |a| a.movzx(eax, byte_ptr(esi + 0xCC)))
+                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x60), 0))
+                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x148), 0)),
+        ),
+        (
+            "pool capacity fields",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi + 0x8C)))
+                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x14C), eax))
+                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x268), 3)),
+        ),
+        (
+            "item state checks",
+            has_asm32(bytes, |a| a.cmp(byte_ptr(eax + 0x18), 0))
+                && has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x04), 0x00FF_FFFE)),
+        ),
+        (
+            "enqueue synchronization",
+            has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0xD0)))
+                && has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0x134))),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_add_work_item64(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_add_work_item64_evidence(code, offset),
+        "pool state + item enqueue",
+    )
+}
+
+fn work_thread_pool_add_work_item64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x360)?;
+    Some(Evidence::required([
+        (
+            "pool and item arguments",
+            has_asm64(bytes, |a| a.mov(rbp, rsi)) && has_asm64(bytes, |a| a.mov(rbx, rdi)),
+        ),
+        (
+            "pool state gates",
+            (has_asm64(bytes, |a| a.movzx(r12d, byte_ptr(rdi + 0x134)))
+                || has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rdi + 0x134))))
+                && has_asm64(bytes, |a| a.cmp(byte_ptr(rdi + 0x90), 0))
+                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbx + 0x1C8), 0)),
+        ),
+        (
+            "pool capacity fields",
+            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0xC8)))
+                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x1CC), eax))
+                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x320), 3)),
+        ),
+        (
+            "item state checks",
+            has_asm64(bytes, |a| a.cmp(dword_ptr(rbp + 0x08), 0x00FF_FFFE))
+                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbp + 0x40), 0)),
+        ),
+        (
+            "enqueue synchronization",
+            has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x138)))
+                && has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x1B0))),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_wake_worker32(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_wake_worker32_evidence(code, offset),
+        "worker event wake",
+    )
+}
+
+fn work_thread_pool_wake_worker32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    Some(Evidence::required([
+        (
+            "event and state arguments",
+            has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x30)))
+                && has_asm32(bytes, |a| a.mov(esi, dword_ptr(esp + 0x34))),
+        ),
+        (
+            "event state gate",
+            has_asm32(bytes, |a| a.cmp(dword_ptr(edi + 0x04), esi)),
+        ),
+        (
+            "waiter list pointer",
+            has_asm32(bytes, |a| a.mov(ebp, dword_ptr(edi + 0x64)))
+                && has_asm32(bytes, |a| a.test(ebp, ebp)),
+        ),
+        (
+            "event state update",
+            has_asm32(bytes, |a| a.mov(dword_ptr(edi + 0x04), esi)),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_wake_worker64(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_wake_worker64_evidence(code, offset),
+        "worker event wake",
+    )
+}
+
+fn work_thread_pool_wake_worker64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x180)?;
+    Some(Evidence::required([
+        (
+            "event and state arguments",
+            has_asm64(bytes, |a| a.movsxd(rbp, esi)),
+        ),
+        (
+            "event state gate",
+            has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x08), ebp)),
+        ),
+        (
+            "waiter list pointer",
+            has_asm64(bytes, |a| a.mov(r12, qword_ptr(rdi + 0x68)))
+                && has_asm64(bytes, |a| a.test(r12, r12)),
+        ),
+        (
+            "event state update",
+            has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x08), ebp)),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_post_work_item32(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_post_work_item32_evidence(code, offset),
+        "work item construct + enqueue + wake",
+    )
+}
+
+fn work_thread_pool_post_work_item32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x240)?;
+    let worker_queue_arg = has_x86_add_reg_imm8(bytes, 0, 0x5C)
+        || has_asm32(bytes, |a| a.lea(eax, dword_ptr(eax + 0x5C)))
+        || has_asm32(bytes, |a| a.lea(edx, dword_ptr(edx + 0x5C)));
+    let wake_event_arg = has_x86_add_eax_imm32(bytes, 0x470)
+        || has_asm32(bytes, |a| a.lea(eax, dword_ptr(eax + 0x470)))
+        || has_asm32(bytes, |a| a.lea(edx, dword_ptr(edx + 0x470)));
+    Some(Evidence::required([
+        (
+            "worker and job arguments",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x08)))
+                && (has_asm32(bytes, |a| a.mov(ecx, dword_ptr(ebp + 0x0C)))
+                    || has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x0C)))),
+        ),
+        ("work item allocation size 0xb0", has_asm32(bytes, |a| a.push(0xB0))),
+        (
+            "work item dispatch type",
+            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x04), 1))
+                || has_asm32(bytes, |a| a.mov(dword_ptr(eax + 0x04), 1)),
+        ),
+        ("AddWorkItem queue argument", worker_queue_arg),
+        (
+            "AddWorkItem call receives item",
+            has_asm32_call_after(bytes, |a| a.push(esi), 0x20)
+                || has_asm32_call_after(bytes, |a| a.push(eax), 0x20),
+        ),
+        (
+            "wake suppression gate",
+            has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x474), 1))
+                || has_asm32(bytes, |a| a.cmp(dword_ptr(edx + 0x474), 1)),
+        ),
+        (
+            "WakeWorker event and state",
+            wake_event_arg && has_asm32_call_after(bytes, |a| a.push(1), 0x20),
+        ),
+    ]))
+}
+
+fn validate_work_thread_pool_post_work_item64(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        work_thread_pool_post_work_item64_evidence(code, offset),
+        "work item construct + enqueue + wake",
+    )
+}
+
+fn work_thread_pool_post_work_item64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x240)?;
+    let main_args = has_asm64(bytes, |a| a.mov(r12, rsi))
+        && has_asm64(bytes, |a| a.mov(rbx, rdi));
+    let rt_args = has_asm64(bytes, |a| a.mov(r12, rdi))
+        && (has_asm64(bytes, |a| a.mov(rbp, rsi))
+            || has_asm64(bytes, |a| a.mov(rbx, rsi)));
+    let worker_base = if main_args { rbx } else { r12 };
+    Some(Evidence::required([
+        ("known worker/job register layout", main_args || rt_args),
+        (
+            "work item allocation size 0xe8",
+            has_asm64(bytes, |a| a.mov(edi, 0xE8)),
+        ),
+        (
+            "work item dispatch type",
+            has_asm64(bytes, |a| a.mov(dword_ptr(rax + 0x08), 1)),
+        ),
+        (
+            "AddWorkItem queue argument",
+            has_asm64(bytes, |a| a.lea(rdi, qword_ptr(worker_base + 0x68))),
+        ),
+        (
+            "AddWorkItem call receives item",
+            has_asm64_call_after(bytes, |a| a.mov(rsi, rbp), 0x20)
+                || has_asm64_call_after(bytes, |a| a.mov(rsi, rbx), 0x20)
+                || has_asm64_call_after(bytes, |a| a.mov(rsi, rax), 0x20),
+        ),
+        (
+            "wake suppression gate",
+            has_asm64(bytes, |a| a.cmp(dword_ptr(worker_base + 0x5E8), 1)),
+        ),
+        (
+            "WakeWorker event and state",
+            has_asm64(bytes, |a| a.lea(rdi, qword_ptr(worker_base + 0x5E0)))
+                && has_asm64(bytes, |a| a.mov(esi, 1)),
+        ),
     ]))
 }
 
