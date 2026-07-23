@@ -1,9 +1,8 @@
-use std::fmt;
-
 use crate::{
     AccountSyncState, AchievementEvent, AchievementSchema, DeviceDescriptor, PlaytimeEntry,
     UploadIdentity,
 };
+use std::fmt;
 
 /// Result of offering a schema to a backend. Both variants are terminal: a
 /// decline is the backend refusing the payload, not a failure to retry.
@@ -11,6 +10,17 @@ use crate::{
 pub enum SchemaUploadOutcome {
     Accepted,
     Declined,
+}
+
+/// Why a [`CloudBackend::stream_account_state`] call returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// The backend cannot push state (no streaming endpoint, or an older
+    /// server that does not expose one). No down-sync is available for this
+    /// backend; callers must not turn this into a polling loop.
+    Unsupported,
+    /// The stream ended because `should_continue` returned `false`.
+    Stopped,
 }
 
 /// A backend failure reduced to what delivery scheduling needs: whether the
@@ -92,6 +102,27 @@ pub trait CloudBackend: Send + Sync {
         client_id: u64,
         steam_id64: &str,
     ) -> Result<AccountSyncState, BackendError>;
+
+    /// Stream converged account state pushed by the backend.
+    ///
+    /// Blocks running the subscription until `should_continue` returns `false`
+    /// or a fatal error occurs, invoking `on_state` with each full snapshot as
+    /// it arrives.
+    /// Transient disconnects are handled internally by reconnecting, so a
+    /// steady stream keeps the caller current without polling.
+    ///
+    /// Backends that cannot push, such as the filesystem backend, return
+    /// [`StreamOutcome::Unsupported`]. The default implementation is
+    /// `Unsupported`.
+    fn stream_account_state(
+        &self,
+        _client_id: u64,
+        _steam_id64: &str,
+        _should_continue: &dyn Fn() -> bool,
+        _on_state: &mut dyn FnMut(AccountSyncState),
+    ) -> Result<StreamOutcome, BackendError> {
+        Ok(StreamOutcome::Unsupported)
+    }
 }
 
 #[cfg(test)]

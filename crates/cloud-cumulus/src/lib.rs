@@ -3,6 +3,7 @@
 pub mod achievement;
 pub mod playtime;
 pub mod port;
+mod stream;
 
 pub use port::CumulusBackend;
 

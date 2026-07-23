@@ -6,7 +6,7 @@
 use vapor_forge_cloud_core::{
     credential_scope, endpoint_scope, AccountSyncState, AchievementEvent, AchievementSchema,
     BackendError, CloudBackend, DeviceDescriptor, PlaytimeEntry, SchemaUploadOutcome,
-    UploadIdentity,
+    StreamOutcome, UploadIdentity,
 };
 
 use crate::{
@@ -95,6 +95,28 @@ impl CloudBackend for CumulusBackend {
                 "/api/v1/device/sync-state?steam_id64={steam_id64}"
             ))
             .map_err(BackendError::from)
+    }
+
+    fn stream_account_state(
+        &self,
+        client_id: u64,
+        steam_id64: &str,
+        should_continue: &dyn Fn() -> bool,
+        on_state: &mut dyn FnMut(AccountSyncState),
+    ) -> Result<StreamOutcome, BackendError> {
+        if !steam_id64
+            .parse::<u64>()
+            .is_ok_and(|steam_id| steam_id != 0)
+        {
+            return Err(BackendError::new("invalid Steam account ID", false));
+        }
+        crate::stream::run(
+            &self.settings,
+            client_id,
+            steam_id64,
+            should_continue,
+            on_state,
+        )
     }
 }
 

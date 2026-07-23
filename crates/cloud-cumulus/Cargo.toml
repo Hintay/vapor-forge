@@ -10,5 +10,6 @@ base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 ureq.workspace = true
 vapor-forge-cloud-core = { path = "../cloud-core" }

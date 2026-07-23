@@ -7,7 +7,7 @@ mod sync;
 
 use sha2::{Digest, Sha256};
 
-pub use backend::{BackendError, CloudBackend, SchemaUploadOutcome};
+pub use backend::{BackendError, CloudBackend, SchemaUploadOutcome, StreamOutcome};
 pub use device::{
     device_descriptor, record_device_descriptor, record_local_client_id, restore_device_descriptor,
     DeviceDescriptor,
