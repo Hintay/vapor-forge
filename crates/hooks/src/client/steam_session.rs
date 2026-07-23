@@ -1,10 +1,12 @@
 use core::ffi::{c_char, c_void};
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{debug, warn};
 
 use super::user_stats::{AchievementSnapshot, AchievementState, WorkerShared};
+use vapor_forge_cloud_core::AchievementSyncState;
 
 const ENGINE_VERSION: &[u8] = b"CLIENTENGINE_INTERFACE_VERSION005\0";
 const CREATE_INTERFACE: &[u8] = b"CreateInterface\0";
@@ -18,6 +20,7 @@ const MAX_ACHIEVEMENTS: u32 = 10_000;
 const MAX_ACHIEVEMENT_KEY_LEN: usize = 255;
 const ENUMERATION_ATTEMPTS: usize = 60;
 const ENUMERATION_INTERVAL: Duration = Duration::from_millis(50);
+const USER_STATS_VTABLE_SCAN_SLOTS: usize = 32;
 
 type SteamThreadEntry = unsafe extern "C" fn(*mut c_void) -> u32;
 type CreateSimpleThreadFn =
@@ -253,6 +256,98 @@ impl SteamUserStatsSession {
             app_id,
             achievements,
         })
+    }
+
+    pub(super) fn apply_achievements(
+        &self,
+        app_id: u32,
+        states: &[AchievementSyncState],
+    ) -> Result<(), &'static str> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let targets = super::achievement_adapters::remote_apply_targets();
+        if targets[..3].contains(&0) || !self.vtable_contains_all(&targets[..3]) {
+            return Err("CUserStats apply targets are unavailable on this interface");
+        }
+        let game_id = u64::from(app_id);
+        // SAFETY: session construction validated the typed stats vtable.
+        if !unsafe { ((*self.stats_vtable).request_current_stats)(self.stats, &game_id) } {
+            return Err("RequestCurrentStats was rejected before remote apply");
+        }
+        self.wait_for_schema(app_id, &game_id)?;
+
+        let mut changed = false;
+        for state in states.iter().filter(|state| state.app_id == app_id) {
+            let key = CString::new(state.achievement_key.as_bytes())
+                .map_err(|_| "remote achievement key contains NUL")?;
+            let mut current_unlocked = false;
+            let mut current_unlock_time = 0u32;
+            // SAFETY: key and output pointers remain valid for this call.
+            if !unsafe {
+                ((*self.stats_vtable).get_achievement)(
+                    self.stats,
+                    &game_id,
+                    key.as_ptr(),
+                    &mut current_unlocked,
+                    &mut current_unlock_time,
+                )
+            } {
+                continue;
+            }
+            let should_set = state.unlocked && !current_unlocked;
+            let should_clear = !state.unlocked
+                && current_unlocked
+                && state.observed_at >= i64::from(current_unlock_time);
+            if should_set || should_clear {
+                // SAFETY: target membership above proves this object exposes the
+                // validated CUserStats methods, and CString/game_id are live.
+                let accepted = unsafe {
+                    super::achievement_adapters::apply_remote_set(
+                        self.stats,
+                        &game_id,
+                        key.as_ptr(),
+                        should_set,
+                    )
+                };
+                changed |= accepted != 0;
+            }
+            if let (Some(current), Some(maximum)) = (state.progress_current, state.progress_max) {
+                if targets[3] != 0 && self.vtable_contains_all(&targets[3..]) {
+                    // SAFETY: same validated object and arguments as above.
+                    let accepted = unsafe {
+                        super::achievement_adapters::apply_remote_progress(
+                            self.stats,
+                            &game_id,
+                            key.as_ptr(),
+                            current,
+                            maximum,
+                        )
+                    };
+                    changed |= accepted != 0;
+                }
+            }
+        }
+        if changed {
+            // SAFETY: target membership and object lifetime were validated above.
+            if unsafe { super::achievement_adapters::apply_remote_store(self.stats, &game_id) } == 0
+            {
+                return Err("StoreStats rejected remote achievement state");
+            }
+        }
+        Ok(())
+    }
+
+    fn vtable_contains_all(&self, targets: &[usize]) -> bool {
+        // SAFETY: GetIClientUserStats returned a live interface whose vtable has
+        // at least the known public method surface scanned here.
+        let slots = unsafe {
+            std::slice::from_raw_parts(
+                self.stats_vtable.cast::<usize>(),
+                USER_STATS_VTABLE_SCAN_SLOTS,
+            )
+        };
+        targets.iter().all(|target| slots.contains(target))
     }
 
     fn wait_for_schema(&self, app_id: u32, game_id: &u64) -> Result<u32, &'static str> {

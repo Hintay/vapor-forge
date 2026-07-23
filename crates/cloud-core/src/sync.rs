@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AchievementEvent {
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub owner_scope: String,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub owner_steam_id64: String,
     pub event_id: String,
     pub app_id: u32,
@@ -35,15 +35,34 @@ pub struct UploadIdentity {
     pub persona_name: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaytimeEntry {
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub owner_scope: String,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub owner_steam_id64: String,
     pub app_id: u32,
     pub playtime_minutes: u32,
     pub playtime_2weeks_minutes: u32,
     pub last_played_at: Option<i64>,
     pub observed_at: i64,
+}
+
+/// Converged achievement state returned by a backend to another device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AchievementSyncState {
+    pub app_id: u32,
+    pub achievement_key: String,
+    pub unlocked: bool,
+    pub progress_current: Option<u32>,
+    pub progress_max: Option<u32>,
+    pub observed_at: i64,
+    pub unlocked_at: Option<i64>,
+}
+
+/// Account state that can be pulled after locally observed changes are uploaded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSyncState {
+    pub achievements: Vec<AchievementSyncState>,
+    pub playtime: Vec<PlaytimeEntry>,
 }

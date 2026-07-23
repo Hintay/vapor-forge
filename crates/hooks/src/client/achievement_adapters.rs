@@ -1,4 +1,5 @@
 use core::ffi::{c_char, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracing::{debug, error};
 use vapor_forge_hook_engine::detour::Detour;
@@ -188,6 +189,83 @@ pub(crate) static mut SET_ACHIEVEMENT_DETOUR: Option<Detour<SetAchievementFn>> =
 pub(crate) static mut CLEAR_ACHIEVEMENT_DETOUR: Option<Detour<SetAchievementFn>> = None;
 pub(crate) static mut STORE_STATS_DETOUR: Option<Detour<StoreStatsFn>> = None;
 pub(crate) static mut PROGRESS_DETOUR: Option<Detour<IndicateAchievementProgressFn>> = None;
+
+static SET_ACHIEVEMENT_TARGET: AtomicUsize = AtomicUsize::new(0);
+static CLEAR_ACHIEVEMENT_TARGET: AtomicUsize = AtomicUsize::new(0);
+static STORE_STATS_TARGET: AtomicUsize = AtomicUsize::new(0);
+static PROGRESS_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn register_remote_apply_targets(
+    set_achievement: usize,
+    clear_achievement: usize,
+    store_stats: usize,
+    progress: usize,
+) {
+    SET_ACHIEVEMENT_TARGET.store(set_achievement, Ordering::Release);
+    CLEAR_ACHIEVEMENT_TARGET.store(clear_achievement, Ordering::Release);
+    STORE_STATS_TARGET.store(store_stats, Ordering::Release);
+    PROGRESS_TARGET.store(progress, Ordering::Release);
+}
+
+pub(crate) fn remote_apply_targets() -> [usize; 4] {
+    [
+        SET_ACHIEVEMENT_TARGET.load(Ordering::Acquire),
+        CLEAR_ACHIEVEMENT_TARGET.load(Ordering::Acquire),
+        STORE_STATS_TARGET.load(Ordering::Acquire),
+        PROGRESS_TARGET.load(Ordering::Acquire),
+    ]
+}
+
+pub(crate) unsafe fn apply_remote_set(
+    this: *mut c_void,
+    game_id: *const u64,
+    key: *const c_char,
+    unlocked: bool,
+) -> u8 {
+    let slot = if unlocked {
+        std::ptr::addr_of!(SET_ACHIEVEMENT_DETOUR)
+    } else {
+        std::ptr::addr_of!(CLEAR_ACHIEVEMENT_DETOUR)
+    };
+    let name = if unlocked {
+        SET_ACHIEVEMENT_NAME
+    } else {
+        CLEAR_ACHIEVEMENT_NAME
+    };
+    // SAFETY: the caller validated the live CUserStats object and arguments.
+    unsafe { original_detour(name, slot) }.map_or(0, |original| {
+        // SAFETY: same validated CUserStats ABI.
+        unsafe { original(this, game_id, key) }
+    })
+}
+
+pub(crate) unsafe fn apply_remote_progress(
+    this: *mut c_void,
+    game_id: *const u64,
+    key: *const c_char,
+    current: u32,
+    maximum: u32,
+) -> u8 {
+    // SAFETY: the caller validated the live CUserStats object and arguments.
+    unsafe { original_detour(PROGRESS_NAME, std::ptr::addr_of!(PROGRESS_DETOUR)) }.map_or(
+        0,
+        |original| {
+            // SAFETY: same validated CUserStats ABI.
+            unsafe { original(this, game_id, key, current, maximum) }
+        },
+    )
+}
+
+pub(crate) unsafe fn apply_remote_store(this: *mut c_void, game_id: *const u64) -> u8 {
+    // SAFETY: the caller validated the live CUserStats object and arguments.
+    unsafe { original_detour(STORE_STATS_NAME, std::ptr::addr_of!(STORE_STATS_DETOUR)) }.map_or(
+        0,
+        |original| {
+            // SAFETY: same validated CUserStats ABI.
+            unsafe { original(this, game_id) }
+        },
+    )
+}
 
 pub(crate) unsafe extern "C" fn hook_set_stat_int(
     this: *mut c_void,

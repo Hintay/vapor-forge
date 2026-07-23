@@ -16,7 +16,10 @@ pub use files::{
     ByteStore, ChangeList, CloudFileStore, DirectTransfer, FileEntry, FileMetadata, HttpHeader,
     HttpTarget, Quota, Transfer, UploadBlock,
 };
-pub use sync::{AchievementEvent, AchievementSchema, PlaytimeEntry, UploadIdentity};
+pub use sync::{
+    AccountSyncState, AchievementEvent, AchievementSchema, AchievementSyncState, PlaytimeEntry,
+    UploadIdentity,
+};
 
 const SCOPE_DOMAIN: &[u8] = b"vapor-forge/scope/v1";
 

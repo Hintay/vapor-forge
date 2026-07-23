@@ -506,6 +506,20 @@ fn do_install() {
         super::achievement_adapters::hook_progress
             as super::achievement_adapters::IndicateAchievementProgressFn,
     );
+    super::achievement_adapters::register_remote_apply_targets(
+        d_set_achievement
+            .as_ref()
+            .map_or(0, |detour| detour.callee_addr),
+        d_clear_achievement
+            .as_ref()
+            .map_or(0, |detour| detour.callee_addr),
+        d_store_stats
+            .as_ref()
+            .map_or(0, |detour| detour.callee_addr),
+        d_achievement_progress
+            .as_ref()
+            .map_or(0, |detour| detour.callee_addr),
+    );
     super::current_app::resolve(
         &code,
         d_achievement_progress

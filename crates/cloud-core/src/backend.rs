@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{AchievementEvent, AchievementSchema, DeviceDescriptor, PlaytimeEntry, UploadIdentity};
+use crate::{
+    AccountSyncState, AchievementEvent, AchievementSchema, DeviceDescriptor, PlaytimeEntry,
+    UploadIdentity,
+};
 
 /// Result of offering a schema to a backend. Both variants are terminal: a
 /// decline is the backend refusing the payload, not a failure to retry.
@@ -82,6 +85,13 @@ pub trait CloudBackend: Send + Sync {
         steam_id64: &str,
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError>;
+
+    /// Return the backend's converged state for one Steam account.
+    fn pull_account_state(
+        &self,
+        client_id: u64,
+        steam_id64: &str,
+    ) -> Result<AccountSyncState, BackendError>;
 }
 
 #[cfg(test)]

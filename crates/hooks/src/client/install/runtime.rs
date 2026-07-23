@@ -138,7 +138,7 @@ pub(crate) fn script_state() -> Arc<ScriptState> {
 }
 
 pub(crate) fn ensure_runtime_services_for_config(config: &RuntimeConfig) {
-    if config.cumulus_configured() {
+    if config.local_cloud_configured() || config.cumulus_configured() {
         crate::achievement_worker::ensure_started();
         crate::playtime_worker::ensure_started();
     }

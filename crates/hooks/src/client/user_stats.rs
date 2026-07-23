@@ -7,6 +7,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 use super::steam_session::{spawn_user_stats_worker, SteamUserStatsSession};
+use vapor_forge_cloud_core::AchievementSyncState;
 
 const MAX_PENDING_SNAPSHOTS: usize = 32;
 const SNAPSHOT_RETRY_LIMIT: u8 = 3;
@@ -14,6 +15,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 static WORKER: OnceLock<Mutex<Option<StatsWorker>>> = OnceLock::new();
+static REMOTE_STATES: OnceLock<Mutex<HashMap<u32, Vec<AchievementSyncState>>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub(crate) struct AchievementSnapshot {
@@ -34,6 +36,25 @@ pub(crate) fn queue_snapshot(app_id: u32) {
     }
     if let Some(worker) = worker() {
         worker.queue(app_id);
+    }
+}
+
+pub(crate) fn queue_remote_state(states: Vec<AchievementSyncState>) {
+    let mut by_app = HashMap::<u32, Vec<AchievementSyncState>>::new();
+    for state in states {
+        by_app.entry(state.app_id).or_default().push(state);
+    }
+    if by_app.is_empty() {
+        return;
+    }
+    let app_ids = by_app.keys().copied().collect::<Vec<_>>();
+    REMOTE_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .extend(by_app);
+    for app_id in app_ids {
+        queue_snapshot(app_id);
     }
 }
 
@@ -116,14 +137,22 @@ pub(super) fn run_worker(shared: &WorkerShared) {
 
     loop {
         let app_id = wait_for_snapshot(shared);
-        let established =
-            match SteamUserStatsSession::connect().and_then(|session| session.snapshot(app_id)) {
-                Ok(snapshot) => super::achievement::observe_local_snapshot(snapshot),
-                Err(error) => {
-                    warn!(app_id, error, "user-stats snapshot failed");
-                    false
+        let remote = take_remote_state(app_id);
+        let established = match SteamUserStatsSession::connect().and_then(|session| {
+            if let Some(states) = remote.as_deref() {
+                session.apply_achievements(app_id, states)?;
+            }
+            session.snapshot(app_id)
+        }) {
+            Ok(snapshot) => super::achievement::observe_local_snapshot(snapshot),
+            Err(error) => {
+                if let Some(states) = remote {
+                    restore_remote_state(app_id, states);
                 }
-            };
+                warn!(app_id, error, "user-stats snapshot failed");
+                false
+            }
+        };
         let retry_scheduled = finish_snapshot(shared, app_id, established);
         if !established {
             debug!(
@@ -134,7 +163,48 @@ pub(super) fn run_worker(shared: &WorkerShared) {
         if retry_scheduled {
             wait_for_signal(shared, SNAPSHOT_RETRY_INTERVAL);
         }
+        queue_waiting_remote(shared);
     }
+}
+
+fn take_remote_state(app_id: u32) -> Option<Vec<AchievementSyncState>> {
+    REMOTE_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&app_id)
+}
+
+fn restore_remote_state(app_id: u32, states: Vec<AchievementSyncState>) {
+    REMOTE_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(app_id)
+        .or_insert(states);
+}
+
+fn queue_waiting_remote(shared: &WorkerShared) {
+    let app_ids = REMOTE_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for app_id in app_ids {
+        if state.pending.len() >= MAX_PENDING_SNAPSHOTS {
+            break;
+        }
+        if state.tracked.insert(app_id) {
+            state.pending.push_back(app_id);
+        }
+    }
+    shared.wake.notify_one();
 }
 
 fn finish_snapshot(shared: &WorkerShared, app_id: u32, established: bool) -> bool {

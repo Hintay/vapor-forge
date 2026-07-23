@@ -583,8 +583,16 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> Option<Vec<u8>> {
         if let Some(snapshot) =
             vapor_forge_features::playtime::observe_response(&hdr, body_bytes, identity::steam_id())
         {
+            let steam_id64 = snapshot.steam_id64;
             observe_local_steamid(snapshot.steam_id64);
             crate::playtime_worker::queue(snapshot);
+            if let Some(new_body) = crate::playtime_worker::merge_response(steam_id64, body_bytes) {
+                let rewritten =
+                    vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+                final_len = Some(rewritten.len());
+                replacement = Some(rewritten);
+                change = PacketChange::Rewritten;
+            }
         }
         let observed_app_id = hdr.jobid_target.and_then(take_stats_request);
         let original_stats = PlayerGetUserStatsResponse::decode(body_bytes).ok();
@@ -628,8 +636,18 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> Option<Vec<u8>> {
                 body_bytes,
                 identity::steam_id(),
             ) {
+                let steam_id64 = snapshot.steam_id64;
                 observe_local_steamid(snapshot.steam_id64);
                 crate::playtime_worker::queue(snapshot);
+                if let Some(new_body) =
+                    crate::playtime_worker::merge_notification(steam_id64, body_bytes)
+                {
+                    let rewritten =
+                        vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &new_body);
+                    final_len = Some(rewritten.len());
+                    replacement = Some(rewritten);
+                    change = PacketChange::Rewritten;
+                }
             }
         }
     }
