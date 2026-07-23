@@ -75,7 +75,6 @@ fn changelist(
             &mut prefix_indexes,
         )?);
     }
-    let is_delta = synced != 0 && synced <= current;
     let machine_names = (!files.is_empty())
         .then(|| "Local folder".to_string())
         .into_iter()
@@ -84,7 +83,7 @@ fn changelist(
         CloudGetAppFileChangelistResponse {
             current_change_number: Some(current),
             files,
-            is_only_delta: Some(is_delta),
+            is_only_delta: Some(changes.is_delta),
             path_prefixes: prefixes,
             machine_names,
             app_build_id_hwm: Some(0),
@@ -110,8 +109,8 @@ fn begin_batch(
     if let Some(previous) = state.active_batches.remove(&app_id) {
         state.batches.remove(&previous);
     }
-    let current = store.changes_since(app_id, 0)?.current_change_number;
-    if current != base {
+    let view = store.view(app_id)?;
+    if view.change_number != base {
         return Err(AdapterError::Protocol(
             "local cloud changed after the verified changelist".into(),
         ));
@@ -125,13 +124,15 @@ fn begin_batch(
             upload_paths: request.files_to_upload.into_iter().collect(),
             delete_paths: request.files_to_delete.into_iter().collect(),
             files: HashMap::new(),
+            local_base_heads: view.heads,
+            local_files: HashMap::new(),
             conflict_resolution: None,
         },
     );
     Ok(RpcReply::ok(
         CloudBeginAppUploadBatchResponse {
             batch_id: Some(batch_id),
-            app_change_number: Some(current),
+            app_change_number: Some(view.change_number),
         }
         .encode_to_vec(),
     ))
@@ -205,8 +206,24 @@ fn commit_file_upload(state: &mut AdapterState, body: &[u8]) -> Result<RpcReply,
         .batches
         .get(&batch_id)
         .and_then(|batch| batch.files.get(&path))
+        .cloned()
         .ok_or_else(|| AdapterError::Protocol("upload was not begun for this file".into()))?;
-    let committed = request.transfer_succeeded.unwrap_or(false) && commit_upload(token).is_ok();
+    let committed = if request.transfer_succeeded.unwrap_or(false) {
+        match commit_upload(&token) {
+            Ok(staged) => {
+                state
+                    .batches
+                    .get_mut(&batch_id)
+                    .expect("batch checked above")
+                    .local_files
+                    .insert(path, staged);
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
     Ok(RpcReply::ok(
         CloudClientCommitFileUploadResponse {
             file_committed: Some(committed),
@@ -224,18 +241,27 @@ fn complete_batch(
     let app_id = required(request.app_id, "appid")?;
     let batch_id = super::adapter::find_batch_id(state, app_id, request.batch_id)?;
     if request.batch_eresult.unwrap_or_default() == super::ERESULT_OK as u32 {
-        let delete_paths = state
+        let batch = state
             .batches
             .get(&batch_id)
-            .map(|batch| batch.delete_paths.clone())
-            .unwrap_or_default();
-        for path in delete_paths {
-            store.delete(app_id, &path)?;
+            .ok_or_else(|| AdapterError::Protocol("unknown upload batch".into()))?;
+        if let Some(path) = batch
+            .upload_paths
+            .iter()
+            .find(|path| !batch.local_files.contains_key(*path))
+        {
+            return Err(AdapterError::Protocol(format!(
+                "upload batch completed before file was committed: {path}"
+            )));
         }
-        state.current_change_numbers.insert(
+        let staged = batch.local_files.values().cloned().collect::<Vec<_>>();
+        let change_number = store.commit_batch(
             app_id,
-            store.changes_since(app_id, 0)?.current_change_number,
-        );
+            &batch.local_base_heads,
+            &staged,
+            &batch.delete_paths,
+        )?;
+        state.current_change_numbers.insert(app_id, change_number);
     }
     state.active_batches.remove(&app_id);
     state.batches.remove(&batch_id);

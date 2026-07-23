@@ -6,24 +6,23 @@ use std::time::{Duration, Instant};
 
 use vapor_forge_cloud_core::{BackendError, ByteStore, FileMetadata, HttpTarget};
 
-use crate::FolderStore;
+use crate::{FolderStore, StagedFile};
 
 pub const LOCAL_TRANSFER_AUTHORITY: &str = "vapor-forge.local";
 const TRANSFER_TTL: Duration = Duration::from_secs(15 * 60);
 const TRANSFER_CAPACITY: usize = 4096;
 
 pub enum LocalTransferOutcome {
-    Upload(Result<u64, BackendError>),
+    Upload(Result<(), BackendError>),
     Download(Result<Vec<u8>, BackendError>),
 }
 
 struct UploadTransfer {
     store: FolderStore,
-    app_id: u32,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
-    result: Mutex<Option<Result<u64, BackendError>>>,
+    result: Mutex<Option<Result<StagedFile, BackendError>>>,
 }
 
 enum TransferOperation {
@@ -49,7 +48,7 @@ struct TransferRegistry {
 
 pub fn issue_upload(
     store: FolderStore,
-    app_id: u32,
+    _app_id: u32,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
@@ -60,7 +59,6 @@ pub fn issue_upload(
         expires_at: Instant::now() + TRANSFER_TTL,
         operation: TransferOperation::Upload(Arc::new(UploadTransfer {
             store,
-            app_id,
             path,
             transfer_size,
             metadata,
@@ -124,7 +122,7 @@ pub fn intercept_transfer(
             if let Ok(mut status) = upload.result.lock() {
                 *status = Some(result.clone());
             }
-            LocalTransferOutcome::Upload(result)
+            LocalTransferOutcome::Upload(result.map(|_| ()))
         }
         TransferOperation::Download {
             store,
@@ -134,7 +132,7 @@ pub fn intercept_transfer(
     })
 }
 
-pub fn commit_upload(token: &str) -> Result<u64, BackendError> {
+pub fn commit_upload(token: &str) -> Result<StagedFile, BackendError> {
     let issued = {
         let mut registry = registry()
             .lock()
@@ -159,7 +157,7 @@ pub fn commit_upload(token: &str) -> Result<u64, BackendError> {
     result
 }
 
-fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<u64, BackendError> {
+fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<StagedFile, BackendError> {
     if body.len() as u64 != upload.transfer_size {
         return Err(permanent(
             "local upload transfer size does not match declaration",
@@ -172,7 +170,7 @@ fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<u64, Bac
     };
     upload
         .store
-        .write(upload.app_id, &upload.path, &raw, &upload.metadata)
+        .stage_file(&upload.path, &raw, &upload.metadata)
 }
 
 fn decode_steam_zip(body: &[u8], raw_size: u64) -> Result<Vec<u8>, BackendError> {
@@ -300,8 +298,11 @@ mod tests {
         else {
             panic!("upload was not intercepted");
         };
-        assert_eq!(result.unwrap(), 1);
-        assert_eq!(commit_upload(&token).unwrap(), 1);
+        result.unwrap();
+        let staged = commit_upload(&token).unwrap();
+        store
+            .commit_batch(480, &[], &[staged], &std::collections::BTreeSet::new())
+            .unwrap();
 
         let target = issue_download(store.clone(), 480, "save.dat".into()).unwrap();
         let Some(LocalTransferOutcome::Download(result)) =

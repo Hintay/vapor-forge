@@ -80,6 +80,8 @@ pub(super) struct BatchState {
     pub(super) upload_paths: BTreeSet<String>,
     pub(super) delete_paths: BTreeSet<String>,
     pub(super) files: HashMap<String, String>,
+    pub(super) local_base_heads: Vec<String>,
+    pub(super) local_files: HashMap<String, vapor_forge_cloud_local::StagedFile>,
     pub(super) conflict_resolution: Option<QueuedConflictResolution>,
 }
 
@@ -242,6 +244,8 @@ pub(super) fn handle_begin_batch(
         upload_paths: request.files_to_upload.into_iter().collect(),
         delete_paths: request.files_to_delete.into_iter().collect(),
         files: HashMap::new(),
+        local_base_heads: Vec::new(),
+        local_files: HashMap::new(),
         conflict_resolution,
     };
     state.active_batches.insert(app_id, batch_id);

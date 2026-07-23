@@ -44,6 +44,8 @@ pub struct ChangeList {
     pub files: Vec<FileEntry>,
     /// Paths removed after the requested change number.
     pub deleted_paths: Vec<String>,
+    /// Whether the response contains only changes newer than the requested CN.
+    pub is_delta: bool,
 }
 
 /// Storage consumption for one app.
@@ -177,6 +179,7 @@ mod tests {
                 current_change_number: self.change_number,
                 files: Vec::new(),
                 deleted_paths: Vec::new(),
+                is_delta: false,
             })
         }
 

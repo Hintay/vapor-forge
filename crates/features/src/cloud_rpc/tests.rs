@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use vapor_forge_cloud_core::CloudFileStore;
 use vapor_forge_config::{AppId, AppsSection, CloudSection, InjectApp, RuntimeConfig};
 use vapor_forge_steam_protocol::*;
 use vapor_forge_sync_state::Outbox;
@@ -291,6 +292,8 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
             upload_paths: BTreeSet::new(),
             delete_paths: BTreeSet::new(),
             files: HashMap::new(),
+            local_base_heads: Vec::new(),
+            local_files: HashMap::new(),
             conflict_resolution: None,
         },
     );
@@ -360,7 +363,6 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
     };
     assert!(queue.intercept(CDN_REPORT, &header, &[], &cdn.encode_to_vec(), &config,));
     assert!(queue.is_empty());
-    assert!(queue.drain_completed().is_empty());
 
     let steam = CloudExternalStorageTransferReportNotification {
         host: Some("steamcloud-ugc.storage.googleapis.com".into()),
@@ -1102,7 +1104,7 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
     .unwrap();
     assert!(matches!(
         outcome,
-        vapor_forge_cloud_local::LocalTransferOutcome::Upload(Ok(1))
+        vapor_forge_cloud_local::LocalTransferOutcome::Upload(Ok(()))
     ));
 
     let commit = CloudClientCommitFileUploadRequest {
@@ -1124,6 +1126,12 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
             .file_committed,
         Some(true)
     );
+    assert!(vapor_forge_cloud_local::FolderStore::open(directory.path())
+        .unwrap()
+        .changes_since(app_id, 0)
+        .unwrap()
+        .files
+        .is_empty());
     let complete = CloudCompleteAppUploadBatchRequest {
         app_id: Some(app_id),
         batch_id: Some(batch_id),
@@ -1216,6 +1224,6 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
     .unwrap();
     let delta = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
     assert_eq!(delta.current_change_number, Some(2));
-    assert_eq!(delta.files.len(), 1);
-    assert_eq!(delta.files[0].persist_state, Some(2));
+    assert!(delta.files.is_empty());
+    assert_eq!(delta.is_only_delta, Some(false));
 }

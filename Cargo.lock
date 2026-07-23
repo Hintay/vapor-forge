@@ -1156,8 +1156,10 @@ dependencies = [
 name = "vapor-forge-cloud-local"
 version = "0.1.0"
 dependencies = [
- "rusqlite",
+ "serde",
+ "serde_json",
  "sha1",
+ "sha2",
  "tempfile",
  "vapor-forge-cloud-core",
  "zip",
