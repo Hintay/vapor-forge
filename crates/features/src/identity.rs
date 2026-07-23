@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 static LOCAL_IDENTITY: Mutex<LocalIdentity> = Mutex::new(LocalIdentity {
     steam_id64: 0,
     authoritative: false,
 });
+static IDENTITY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 struct LocalIdentity {
     steam_id64: u64,
@@ -34,23 +36,37 @@ impl LocalIdentity {
 /// Record a non-zero SteamID observed on a Steam packet. Packet observations
 /// cannot replace identity state already confirmed by IClientUser.
 pub fn observe_steam_id(steam_id64: u64) -> bool {
-    LOCAL_IDENTITY
+    let changed = LOCAL_IDENTITY
         .lock()
-        .is_ok_and(|mut identity| identity.observe(steam_id64))
+        .is_ok_and(|mut identity| identity.observe(steam_id64));
+    if changed {
+        IDENTITY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
 }
 
 /// Record the current value returned by Steam's live IClientUser::GetSteamID.
 /// Zero is meaningful and clears a stale account after logout.
 pub fn set_authoritative_steam_id(steam_id64: u64) -> bool {
-    LOCAL_IDENTITY
+    let changed = LOCAL_IDENTITY
         .lock()
-        .is_ok_and(|mut identity| identity.set_authoritative(steam_id64))
+        .is_ok_and(|mut identity| identity.set_authoritative(steam_id64));
+    if changed {
+        IDENTITY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
 }
 
 pub fn steam_id() -> u64 {
     LOCAL_IDENTITY
         .lock()
         .map_or(0, |identity| identity.steam_id64)
+}
+
+/// Monotonic identity session generation. It changes on logout and account
+/// switches even if a later login returns to the same SteamID.
+pub fn generation() -> u64 {
+    IDENTITY_GENERATION.load(Ordering::Relaxed)
 }
 
 pub fn is_valid_individual_steam_id(steam_id64: u64) -> bool {
