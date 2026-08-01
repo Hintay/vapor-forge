@@ -1,5 +1,6 @@
 use vapor_forge_packet_capture::{
-    summarize_packet, PacketChange, PacketDirection, PacketSummary, PacketType,
+    format_summary, packet_summary_json, summarize_packet, PacketChange, PacketDirection,
+    PacketSummary, PacketType, SummaryFormat,
 };
 
 use super::cli::OutputFormat;
@@ -14,11 +15,11 @@ pub(super) fn decode_offline(
     let summary = summarize_packet(0, direction, &bytes, PacketChange::Unchanged, None);
     match format {
         OutputFormat::Text => {
-            println!("{}", format_summary(&summary));
+            println!("{}", format_summary(&summary, SummaryFormat::Offline));
             Ok(())
         }
         OutputFormat::Json => {
-            println!("{}", summary_json(&summary));
+            println!("{}", packet_summary_json(&summary));
             Ok(())
         }
     }
@@ -34,7 +35,7 @@ pub(super) fn explain_offline(
     let routes = explain_routes(&summary);
     match format {
         OutputFormat::Text => {
-            println!("{}", format_summary(&summary));
+            println!("{}", format_summary(&summary, SummaryFormat::Offline));
             if routes.is_empty() {
                 println!("  explain: no known handler route");
             } else {
@@ -50,7 +51,7 @@ pub(super) fn explain_offline(
             println!(
                 "{}",
                 serde_json::json!({
-                    "summary": summary_json_value(&summary),
+                    "summary": packet_summary_json(&summary),
                     "routes": routes,
                     "runtime_state": "not-simulated",
                 })
@@ -103,50 +104,4 @@ fn explain_routes(summary: &PacketSummary) -> Vec<&'static str> {
         }
         _ => Vec::new(),
     }
-}
-
-pub(super) fn format_summary(summary: &PacketSummary) -> String {
-    let emsg = summary
-        .emsg
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned());
-    let apps = if summary.app_ids.is_empty() {
-        "-".to_owned()
-    } else {
-        format!("{:?}", summary.app_ids)
-    };
-    format!(
-        "{} emsg={} type={} app={} change={} len={}",
-        summary.direction.label(),
-        emsg,
-        summary.packet_type.label(),
-        apps,
-        summary.change.label(),
-        summary.original_len
-    )
-}
-
-fn summary_json(summary: &PacketSummary) -> String {
-    summary_json_value(summary).to_string()
-}
-
-pub(super) fn summary_json_value(summary: &PacketSummary) -> serde_json::Value {
-    serde_json::json!({
-        "id": summary.id,
-        "direction": summary.direction.label(),
-        "emsg_raw": summary.emsg_raw,
-        "emsg": summary.emsg,
-        "proto": summary.proto,
-        "type": summary.packet_type.label(),
-        "app_ids": summary.app_ids,
-        "steamid": summary.steamid,
-        "job": summary.job,
-        "eresult": summary.eresult,
-        "change": summary.change.label(),
-        "original_len": summary.original_len,
-        "final_len": summary.final_len,
-        "header_len": summary.header_len,
-        "body_len": summary.body_len,
-        "decode_error": summary.decode_error,
-    })
 }

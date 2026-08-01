@@ -8,7 +8,8 @@ use vapor_forge_features::apps::OwnershipState;
 use vapor_forge_features::request_code;
 use vapor_forge_features::valve_filter::{self, PrivacyAction};
 use vapor_forge_packet_capture::{
-    summarize_packet, PacketChange, PacketDirection, PacketSummary, PacketType,
+    format_summary, packet_summary_json, summarize_packet, PacketChange, PacketDirection,
+    PacketSummary, PacketType, SummaryFormat,
 };
 use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, EncryptedAppTicketRequest, GetAppOwnershipTicketRequest,
@@ -20,7 +21,6 @@ use vapor_forge_steam_protocol::{
 
 use super::cli::OutputFormat;
 use super::input::Input;
-use super::offline::{format_summary, summary_json_value};
 
 #[derive(Clone, Debug)]
 pub(super) struct SimulationResult {
@@ -141,7 +141,7 @@ pub(super) fn simulate_offline(
 
     match format {
         OutputFormat::Text => {
-            println!("{}", format_summary(&summary));
+            println!("{}", format_summary(&summary, SummaryFormat::Offline));
             println!(
                 "  simulate: decision={} handler={} final_len={}",
                 result.decision.label(),
@@ -164,7 +164,7 @@ pub(super) fn simulate_offline(
             println!(
                 "{}",
                 serde_json::json!({
-                    "summary": summary_json_value(&summary),
+                    "summary": packet_summary_json(&summary),
                     "simulation": simulation_json(&result),
                 })
             );
@@ -283,7 +283,7 @@ fn simulate_service_method(
         return simulate_manifest_request(&header, header_bytes, body_bytes, context);
     }
 
-    let cloud = vapor_forge_features::cloud_rpc::privacy_fallback_with_ownership(
+    let cloud = vapor_forge_cloud_rpc::privacy_fallback_with_ownership(
         method,
         body_bytes,
         context.config,
@@ -307,8 +307,7 @@ fn simulate_service_method(
     if context.config.cumulus_configured()
         && matches!(
             method,
-            vapor_forge_features::cloud_rpc::CDN_REPORT
-                | vapor_forge_features::cloud_rpc::EXTERNAL_TRANSFER_REPORT
+            vapor_forge_cloud_rpc::CDN_REPORT | vapor_forge_cloud_rpc::EXTERNAL_TRANSFER_REPORT
         )
     {
         return needs_runtime(

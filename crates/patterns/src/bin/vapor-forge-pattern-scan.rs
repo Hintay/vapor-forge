@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use iced_x86::code_asm::*;
@@ -7,13 +6,8 @@ use vapor_forge_patterns::elf::{ElfImage, ExecutableSegment};
 use vapor_forge_patterns::registry::{
     parse_toml_patterns, FollowMode, PatternDef, RuntimePatternEntry, EMBEDDED_PATTERNS,
 };
+use vapor_forge_patterns::scan::{group_variants, resolve_entry_group, PatternRef};
 use vapor_forge_patterns::vtable_scan::{self, ElfClass};
-use vapor_forge_patterns::{
-    find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
-};
-
-const FOLLOW_CALL_SCAN_BYTES: usize = 256;
-const UPWARD_SCAN_BYTES: usize = 0x10000;
 
 fn main() {
     if let Err(error) = run() {
@@ -193,6 +187,21 @@ struct ScanEntry {
     module: String,
 }
 
+impl<'a> From<&'a ScanEntry> for PatternRef<'a> {
+    fn from(entry: &'a ScanEntry) -> Self {
+        Self {
+            name: &entry.name,
+            pattern: &entry.pattern,
+            follow: entry.follow,
+            prologue: entry.prologue.as_deref(),
+            callee_pattern: entry.callee_pattern.as_deref(),
+            optional: entry.optional,
+            pic_entry: entry.pic_entry,
+            module: &entry.module,
+        }
+    }
+}
+
 impl From<&PatternDef> for ScanEntry {
     fn from(entry: &PatternDef) -> Self {
         Self {
@@ -251,7 +260,11 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
 
     let mut failed = false;
     let mut resolved = HashMap::new();
-    for group in group_scan_entries(&entries) {
+    let variants = entries
+        .iter()
+        .map(|entry| PatternRef::from(*entry))
+        .collect::<Vec<_>>();
+    for group in group_variants(&variants) {
         let entry = group[0];
         match resolve_entry_group(segment.bytes, &group) {
             Ok(result) => {
@@ -274,7 +287,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
                         group.len()
                     );
                 }
-                resolved.insert(entry.name.as_str(), result.target_offset);
+                resolved.insert(entry.name, result.target_offset);
             }
             Err(error) => {
                 let severity = if entry.optional {
@@ -285,7 +298,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
                 };
                 println!(
                     "  {:<4} {:<58} hits={} {} ({})",
-                    error.label(),
+                    error.status().label(),
                     entry.name,
                     error.match_count(),
                     severity,
@@ -344,21 +357,6 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     println!();
 
     Ok(failed)
-}
-
-fn group_scan_entries<'a>(entries: &[&'a ScanEntry]) -> Vec<Vec<&'a ScanEntry>> {
-    let mut groups: Vec<Vec<&ScanEntry>> = Vec::new();
-    for &entry in entries {
-        if let Some(group) = groups
-            .last_mut()
-            .filter(|group| group[0].name == entry.name && group[0].module == entry.module)
-        {
-            group.push(entry);
-        } else {
-            groups.push(vec![entry]);
-        }
-    }
-    groups
 }
 
 fn scan_public_wrapper_collisions(
@@ -672,252 +670,6 @@ fn split_decimal_prefix(text: &str) -> Option<(usize, &str)> {
 }
 
 include!("vapor-forge-pattern-scan/semantic.rs");
-#[derive(Clone)]
-struct ResolveResult {
-    target_offset: usize,
-    match_count: usize,
-    variant_index: usize,
-}
-
-#[derive(Debug)]
-struct VariantTarget {
-    variant_index: usize,
-    target_offset: usize,
-}
-
-#[derive(Debug)]
-enum ResolveError {
-    PatternParse(String),
-    CalleePatternParse(String),
-    NoMatch,
-    Ambiguous(usize),
-    VariantConflict(Vec<VariantTarget>),
-    Follow(String, usize),
-    MissingPrologue,
-    CalleePatternMismatch(usize),
-    PicEntryNotFound,
-}
-
-impl ResolveError {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::NoMatch => "MISS",
-            Self::Ambiguous(_) => "AMB",
-            _ => "FAIL",
-        }
-    }
-
-    fn match_count(&self) -> usize {
-        match self {
-            Self::NoMatch => 0,
-            Self::Ambiguous(count)
-            | Self::Follow(_, count)
-            | Self::CalleePatternMismatch(count) => *count,
-            Self::VariantConflict(targets) => targets.len(),
-            _ => 0,
-        }
-    }
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PatternParse(error) => write!(f, "pattern parse failed: {error}"),
-            Self::CalleePatternParse(error) => write!(f, "callee pattern parse failed: {error}"),
-            Self::NoMatch => write!(f, "pattern has no match"),
-            Self::Ambiguous(count) => write!(f, "pattern is not unique: found {count} matches"),
-            Self::VariantConflict(targets) => {
-                write!(f, "pattern variants resolve to different targets:")?;
-                for target in targets {
-                    write!(
-                        f,
-                        " variant={} text+0x{:x}",
-                        target.variant_index + 1,
-                        target.target_offset
-                    )?;
-                }
-                Ok(())
-            }
-            Self::Follow(error, _) => write!(f, "follow failed: {error}"),
-            Self::MissingPrologue => write!(f, "upward follow requires prologue bytes"),
-            Self::CalleePatternMismatch(_) => {
-                write!(f, "no call target matched callee_pattern")
-            }
-            Self::PicEntryNotFound => write!(f, "PIC entry not found before prologue"),
-        }
-    }
-}
-
-fn resolve_entry_group(
-    haystack: &[u8],
-    entries: &[&ScanEntry],
-) -> Result<ResolveResult, ResolveError> {
-    let mut best_error = None;
-    let mut successes = Vec::new();
-    for (variant_index, entry) in entries.iter().copied().enumerate() {
-        match resolve_entry(haystack, entry) {
-            Ok(mut result) => {
-                result.variant_index = variant_index;
-                successes.push(result);
-            }
-            Err(error) => {
-                best_error = Some(prefer_resolve_error(best_error.take(), error));
-            }
-        }
-    }
-    if let Some(result) = unique_successful_variant(successes)? {
-        return Ok(result);
-    }
-    Err(best_error.unwrap_or(ResolveError::NoMatch))
-}
-
-fn unique_successful_variant(
-    successes: Vec<ResolveResult>,
-) -> Result<Option<ResolveResult>, ResolveError> {
-    let Some(first) = successes.first() else {
-        return Ok(None);
-    };
-    if successes
-        .iter()
-        .all(|result| result.target_offset == first.target_offset)
-    {
-        return Ok(Some(first.clone()));
-    }
-
-    Err(ResolveError::VariantConflict(
-        successes
-            .into_iter()
-            .map(|result| VariantTarget {
-                variant_index: result.variant_index,
-                target_offset: result.target_offset,
-            })
-            .collect(),
-    ))
-}
-
-fn prefer_resolve_error(previous: Option<ResolveError>, current: ResolveError) -> ResolveError {
-    let Some(previous) = previous else {
-        return current;
-    };
-    let previous_rank = resolve_error_rank(&previous);
-    let current_rank = resolve_error_rank(&current);
-    if current_rank > previous_rank
-        || (current_rank == previous_rank && current.match_count() > previous.match_count())
-    {
-        current
-    } else {
-        previous
-    }
-}
-
-fn resolve_error_rank(error: &ResolveError) -> u8 {
-    match error {
-        ResolveError::NoMatch => 0,
-        ResolveError::Ambiguous(_) => 1,
-        _ => 2,
-    }
-}
-
-fn resolve_entry(haystack: &[u8], entry: &ScanEntry) -> Result<ResolveResult, ResolveError> {
-    let pattern = Pattern::parse(&entry.pattern)
-        .map_err(|error| ResolveError::PatternParse(error.to_string()))?;
-    let matches = pattern.find_all(haystack);
-    if matches.is_empty() {
-        return Err(ResolveError::NoMatch);
-    }
-
-    let match_count = matches.len();
-    let target_offset = match entry.follow {
-        FollowMode::None => unique_match(&matches)?,
-        FollowMode::Relative => {
-            let offset = unique_match(&matches)?;
-            let target = follow_relative_call(haystack, offset)
-                .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?;
-            if target < 0 || target as usize >= haystack.len() {
-                return Err(ResolveError::Follow(
-                    "relative target is out of bounds".to_owned(),
-                    match_count,
-                ));
-            }
-            target as usize
-        }
-        FollowMode::Upward => {
-            let offset = unique_match(&matches)?;
-            let prologue = entry
-                .prologue
-                .as_deref()
-                .ok_or(ResolveError::MissingPrologue)?;
-            find_prologue_upwards(haystack, offset, prologue, UPWARD_SCAN_BYTES)
-                .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?
-        }
-        FollowMode::Call => resolve_call_target(haystack, entry, &matches)?,
-    };
-
-    let target_offset = if entry.pic_entry {
-        find_pic_entry(haystack, target_offset).ok_or(ResolveError::PicEntryNotFound)?
-    } else {
-        target_offset
-    };
-
-    Ok(ResolveResult {
-        target_offset,
-        match_count,
-        variant_index: 0,
-    })
-}
-
-fn unique_match(matches: &[usize]) -> Result<usize, ResolveError> {
-    match matches {
-        [] => Err(ResolveError::NoMatch),
-        [offset] => Ok(*offset),
-        many => Err(ResolveError::Ambiguous(many.len())),
-    }
-}
-
-fn resolve_call_target(
-    haystack: &[u8],
-    entry: &ScanEntry,
-    matches: &[usize],
-) -> Result<usize, ResolveError> {
-    let callee_pattern = entry
-        .callee_pattern
-        .as_deref()
-        .map(Pattern::parse)
-        .transpose()
-        .map_err(|error| ResolveError::CalleePatternParse(error.to_string()))?;
-
-    for &offset in matches {
-        let Ok(target) = follow_last_call_before_ret(haystack, offset, FOLLOW_CALL_SCAN_BYTES)
-        else {
-            continue;
-        };
-        if let Some(callee_pattern) = callee_pattern.as_ref() {
-            if !callee_pattern.matches_at(haystack, target) {
-                continue;
-            }
-        }
-        return Ok(target);
-    }
-
-    if callee_pattern.is_some() {
-        Err(ResolveError::CalleePatternMismatch(matches.len()))
-    } else {
-        Err(ResolveError::Follow(
-            "no call before RET".to_owned(),
-            matches.len(),
-        ))
-    }
-}
-
-fn find_pic_entry(haystack: &[u8], prologue_offset: usize) -> Option<usize> {
-    for offset in [10usize, 11] {
-        let candidate = prologue_offset.checked_sub(offset)?;
-        if haystack.get(candidate) == Some(&0xE8) {
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 fn executable_segment(data: &[u8]) -> Result<ExecutableSegment<'_>, String> {
     ElfImage::parse(data)?.largest_executable_segment()
@@ -948,6 +700,32 @@ mod tests {
         build(&mut asm).expect("test assembly should encode");
         let bytes = asm.assemble(0).expect("test assembly should assemble");
         code[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    fn place_http_download_consumer32(code: &mut [u8], offset: usize) {
+        place_asm32(code, offset, |a| {
+            a.mov(eax, dword_ptr(edx + 0x50))?;
+            a.mov(eax, dword_ptr(eax + 0x94))?;
+            a.test(eax, eax)?;
+            a.mov(ebx, dword_ptr(edx + 0x54))?;
+            a.mov(ecx, dword_ptr(eax))?;
+            a.push(dword_ptr(ebx + 0x38))?;
+            a.push(edx)?;
+            a.push(eax)?;
+            a.call(dword_ptr(ecx + 0x18))
+        });
+    }
+
+    fn place_http_download_consumer64(code: &mut [u8], offset: usize) {
+        place_asm64(code, offset, |a| {
+            a.mov(rax, qword_ptr(rsi + 0x68))?;
+            a.mov(rdi, qword_ptr(rax + 0xe0))?;
+            a.test(rdi, rdi)?;
+            a.mov(rax, qword_ptr(rsi + 0x70))?;
+            a.mov(rdx, qword_ptr(rax + 0x50))?;
+            a.mov(rax, qword_ptr(rdi))?;
+            a.call(qword_ptr(rax + 0x30))
+        });
     }
 
     fn missing_semantic_validations(toml: &str, arch: SemanticArch) -> Vec<String> {
@@ -1032,7 +810,7 @@ mod tests {
 
     #[test]
     fn validates_http_request_job_start32_cdecl_shape() {
-        let mut code = vec![0x90; 0x200];
+        let mut code = vec![0x90; 0x300];
         let start = 0x20;
         place_asm32(&mut code, start + 0x10, |a| {
             a.mov(ebx, dword_ptr(ebp + 0x14))?;
@@ -1046,6 +824,7 @@ mod tests {
             a.mov(eax, dword_ptr(eax + 0x60))
         });
         place_asm32(&mut code, start + 0x50, |a| a.or(byte_ptr(edx + 0x46), al));
+        place_http_download_consumer32(&mut code, 0x220);
 
         assert!(http_request_job_start32_evidence(&code, start)
             .is_some_and(|evidence| evidence.is_complete()));
@@ -1057,7 +836,7 @@ mod tests {
 
     #[test]
     fn validates_http_request_job_start32_steamrt_shape() {
-        let mut code = vec![0x90; 0x200];
+        let mut code = vec![0x90; 0x300];
         let start = 0x20;
         place_asm32(&mut code, start + 0x10, |a| {
             a.mov(eax, dword_ptr(ebp + 0x10))?;
@@ -1073,6 +852,7 @@ mod tests {
             a.mov(eax, dword_ptr(ebx + 0x60))
         });
         place_asm32(&mut code, start + 0x50, |a| a.or(byte_ptr(ecx + 0x46), al));
+        place_http_download_consumer32(&mut code, 0x220);
 
         assert!(http_request_job_start32_evidence(&code, start)
             .is_some_and(|evidence| evidence.is_complete()));
@@ -1080,7 +860,7 @@ mod tests {
 
     #[test]
     fn validates_http_request_job_start64_linux_shape() {
-        let mut code = vec![0x90; 0x200];
+        let mut code = vec![0x90; 0x300];
         let start = 0x20;
         place_asm64(&mut code, start + 0x10, |a| {
             a.mov(r12, rsi)?;
@@ -1090,6 +870,7 @@ mod tests {
             a.mov(r15, qword_ptr(rsi + 0x88))?;
             a.or(byte_ptr(r12 + 0x52), al)
         });
+        place_http_download_consumer64(&mut code, 0x220);
 
         assert!(http_request_job_start64_evidence(&code, start)
             .is_some_and(|evidence| evidence.is_complete()));
@@ -1523,44 +1304,5 @@ mod tests {
             wrapper_policy("CUser::CheckAppOwnership"),
             WrapperPolicy::NotApplicable
         );
-    }
-
-    #[test]
-    fn entry_group_reports_variant_target_conflicts() {
-        let haystack = [0xAA, 0xBB, 0x90, 0xCC, 0xDD];
-        let variant_a = ScanEntry {
-            name: "Test::VariantConflict".to_owned(),
-            pattern: "AA BB".to_owned(),
-            follow: FollowMode::None,
-            prologue: None,
-            callee_pattern: None,
-            optional: false,
-            pic_entry: false,
-            module: "steamclient".to_owned(),
-        };
-        let variant_b = ScanEntry {
-            name: "Test::VariantConflict".to_owned(),
-            pattern: "CC DD".to_owned(),
-            follow: FollowMode::None,
-            prologue: None,
-            callee_pattern: None,
-            optional: false,
-            pic_entry: false,
-            module: "steamclient".to_owned(),
-        };
-        let entries = [&variant_a, &variant_b];
-
-        let result = resolve_entry_group(&haystack, &entries);
-        match result {
-            Err(ResolveError::VariantConflict(targets)) => {
-                assert_eq!(targets.len(), 2);
-                assert_eq!(targets[0].variant_index, 0);
-                assert_eq!(targets[0].target_offset, 0);
-                assert_eq!(targets[1].variant_index, 1);
-                assert_eq!(targets[1].target_offset, 3);
-            }
-            Ok(_) => panic!("variant conflict should not resolve as OK"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
     }
 }

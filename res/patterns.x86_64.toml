@@ -8,21 +8,38 @@ pattern = "41 57 41 56 ? ? ? ? 55 ? ? ? ? 48 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ?
 follow = "none"
 pattern = "41 57 41 56 41 55 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 24 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 00 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? F6 43 18 01 75 ? ? 8B ? 24 ? ? ? ? ? ?"
 
-[steamclient."CSteamEngine::Init"]
-follow = "none"
-pattern = "41 57 48 8D 35 ? ? ? ? 41 56 41 55 41 54 55 ? ? ? 53 48 81 EC ? ? ? ? 64 48 8B 04 25 28 00 00 00 48 89 ? ? ? ? ? ? 31 C0 E8 ? ? ? ? 48 8D 05 ? ? ? ? 31 D2 31 F6 48 89 45 00 48 05 ? ? 00 00 48 89 85 F0 0C 00 00 48 8D 85 28 0D 00 00"
-
-# steamrt stack-canary implementation shape.
-[[steamclient."CSteamEngine::Init".variants]]
-pattern = "41 57 48 8D 35 ? ? ? ? 41 56 41 55 41 54 55 53 48 81 EC ? ? 00 00 F3 0F 7E 05 ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 9C 24 ? ? 00 00 48 89 FB 66 0F 6F D0 0F 16 15 ? ? ? ? 0F 29 54 24 ? 48 89 DF E8 ? ? ? ? 48 8D 05 ? ? ? ? 31 D2 31 F6 48 89 03 48 05 ? ? 00 00 48 89 83 F0 0C 00 00 48 8D 83 28 0D 00 00"
-
+# API-call result storage. Ordinary builds share the wildcard implementation.
 [steamclient."CSteamEngine::SetAPICallResult"]
 follow = "none"
 pattern = "41 57 41 ? ? 41 56 4D ? ? 41 55 49 ? ? 41 54 55 48 ? ? 53 48 83 EC ? 44 8B ? C0 19 00 00 48 89 ? 24 64 4C 8B ? 25 28 00 00 00 4C 89 ? 24 ? 45 89 ?"
 
-# steamrt helper-call implementation shape, not a historical-release compatibility branch.
+# steamrt helper-call implementation shape.
 [[steamclient."CSteamEngine::SetAPICallResult".variants]]
 pattern = "41 57 41 56 49 ? ? 48 81 C7 A8 19 00 00 41 55 49 ? ? 41 54 4D ? ? 55 ? ? 53 44 ? ? 48 83 EC ? 48 89 ? 24 ? 48 ? ? E8 ? ? ? ? 4C 63 ? 4D 6B ? 38 4D 03 ? D8 19 00 00"
+
+# One-argument global internal-callback registration wrapper. Ordinary builds
+# share this wildcard shape across versions.
+[steamclient."CSteamEngine::RegisterInternalCallback"]
+follow = "none"
+pattern = "55 53 48 89 FB 48 83 EC 18 0F B6 05 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 85 DB 48 89 5C 24 08 0F 84 ? ? ? ? 48 83 7B 10 00"
+
+# steamrt adds a stack canary before the same handler checks.
+[[steamclient."CSteamEngine::RegisterInternalCallback".variants]]
+pattern = "41 54 55 53 48 83 EC 10 64 48 8B 1C 25 28 00 00 00 48 89 5C 24 08 48 89 FB 0F B6 05 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 85 DB 48 89 1C 24"
+
+# Owns the global-user IClient map wrappers. Ordinary builds use this wildcard
+# entry across versions; steamrt uses the SSE argument-store variant.
+[steamclient."CUserInterface::Init"]
+follow = "none"
+pattern = "41 54 41 89 F4 55 89 D5 53 48 89 FB 89 77 04 89 57 08 48 C7 47 10 00 00 00 00"
+
+[[steamclient."CUserInterface::Init".variants]]
+pattern = "66 0F 6E C6 66 0F 6E CA 41 54 41 89 F4 55 66 0F 62 C1 89 D5 53 48 89 FB 66 0F D6 47 04 48 C7 47 10 00 00 00 00"
+
+# Invalidates the owner before its interface wrappers are released.
+[steamclient."CUserInterface::~CUserInterface"]
+follow = "none"
+pattern = "53 8B 07 48 89 FB 85 C0 0F 85 ? ? ? ? 48 8B BB ? ? ? ? 48 85 FF"
 
 [steamclient."IClientRemoteStorage::RunIPCFrame"]
 follow = "upward"
@@ -94,30 +111,10 @@ pattern = "41 56 41 55 41 54 55 48 89 F5 53 48 83 EC 10 44 0F B6 A7 34 01 00 00 
 [[steamclient."CWorkThreadPool::AddWorkItem".variants]]
 pattern = "41 56 41 55 41 54 55 53 48 83 EC 20 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 87 34 01 00 00 84 C0 0F 85"
 
-# Wakes the worker thread after AddWorkItem: sets the event state at arg+0x08 and
-# releases any waiter. Called from the post wrapper as wake(worker+0x5e0, value).
-# Optional: absence degrades dispatch to the worker loop's own poll cadence.
-[steamclient."CWorkThreadPool::WakeWorker"]
+# Read, not hooked: source of the CNet pool global and work-item timer vtable.
+[steamclient."CWebSocketConnection::PostDelayedCloseWorkItem"]
 follow = "none"
-optional = true
-pattern = "41 55 41 54 55 48 63 EE 53 48 83 EC 18 39 6F 08 0F 84"
-
-# steamrt stack-canary implementation shape.
-[[steamclient."CWorkThreadPool::WakeWorker".variants]]
-pattern = "41 55 41 54 55 48 63 EE 53 48 83 EC 18 64 48 8B 04 25 28 00 00 00 48 89 44 24 08 31 C0 39 6F 08 74"
-
-# Wrapper that constructs a CWorkItem and posts it to the worker (rdi = worker,
-# rsi = job); calls AddWorkItem then conditionally wakes. Hooked one-shot to
-# capture worker_this from rdi.
-[steamclient."CWorkThreadPool::PostWorkItem"]
-follow = "none"
-pattern = "41 54 66 48 0F 6E D7 66 48 0F 6E CE 49 89 F4 55"
-
-# steamrt implementation shape: same movq/punpcklqdq arg-packing prologue, but a
-# different register allocation for the (worker, job) pair (r12 = rdi, rbp = rsi
-# vs r12 = rsi, rbx = rdi in the main build).
-[[steamclient."CWorkThreadPool::PostWorkItem".variants]]
-pattern = "41 54 66 48 0F 6E D7 66 48 0F 6E CE 49 89 FC 55"
+pattern = "83 7F 18 02 0F 85 ? ? ? ? 80 BF 54 01 00 00 00"
 
 # CHTTPRequestJob start boundary. The local-cloud hook first uses this as an
 # observation point; x64 request layout is validated before transfer bypass.

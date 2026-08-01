@@ -1,18 +1,32 @@
 #![forbid(unsafe_code)]
 
+mod capture;
+mod format;
+
+pub use capture::{
+    CaptureBuffer, CapturedPacket, PacketCaptureFilter, PacketCaptureMode, PacketCaptureStatus,
+    DEFAULT_CAPTURE_LIMIT, MAX_CAPTURE_LIMIT, MAX_RAW_PACKET_SIZE,
+};
+#[cfg(feature = "json")]
+pub use format::{
+    capture_filter_json, captured_packet_json, format_captured_summary_json, packet_summary_json,
+};
+pub use format::{format_capture_filter, format_summary, hex_prefix, SummaryFormat};
+
 use prost::Message;
 use vapor_forge_steam_protocol::{
+    app_id_from_game_id, legacy_store_user_stats_game_id, service_method_app_id,
     CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientPersonaState, ClientStatsUpdated,
-    ClientStoreUserStats2Request, ClientStoreUserStatsRequest, ClientStoreUserStatsResponse,
-    EncryptedAppTicketRequest, EncryptedAppTicketResponse, GetAppOwnershipTicketRequest,
-    GetAppOwnershipTicketResponse, GetManifestRequestCodeRequest, PicsProductInfoRequest,
-    PlayerGetUserStatsRequest, EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
-    EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
-    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET,
-    EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
-    EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_STATS_UPDATED,
-    EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, EMSG_STORE_USERSTATS_RESPONSE,
-    K_MSG_HDR_PROTO_FLAG, MANIFEST_REQUEST_CODE_JOB_NAME, PLAYER_GET_USER_STATS_JOB_NAME,
+    ClientStoreUserStats2Request, ClientStoreUserStatsResponse, EncryptedAppTicketRequest,
+    EncryptedAppTicketResponse, GetAppOwnershipTicketRequest, GetAppOwnershipTicketResponse,
+    GetManifestRequestCodeRequest, PicsProductInfoRequest, PlayerGetUserStatsRequest,
+    EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_ENCRYPTED_APPTICKET_REQUEST,
+    EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB,
+    EMSG_GET_APP_OWNERSHIP_TICKET, EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE,
+    EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS, EMSG_REQUEST_USERSTATS_RESPONSE,
+    EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_STATS_UPDATED, EMSG_STORE_USERSTATS,
+    EMSG_STORE_USERSTATS2, EMSG_STORE_USERSTATS_RESPONSE, K_MSG_HDR_PROTO_FLAG,
+    MANIFEST_REQUEST_CODE_JOB_NAME, PLAYER_GET_USER_STATS_JOB_NAME,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,30 +77,6 @@ impl PacketType {
             Self::Unknown => "unknown",
         }
     }
-}
-
-#[derive(Clone, prost::Message)]
-struct AppIdField1 {
-    #[prost(uint32, optional, tag = "1")]
-    app_id: Option<u32>,
-}
-
-#[derive(Clone, prost::Message)]
-struct GameIdField1 {
-    #[prost(uint64, optional, tag = "1")]
-    game_id: Option<u64>,
-}
-
-#[derive(Clone, prost::Message)]
-struct AppIdField2 {
-    #[prost(uint32, optional, tag = "2")]
-    app_id: Option<u32>,
-}
-
-#[derive(Clone, prost::Message)]
-struct AppIdField6 {
-    #[prost(uint32, optional, tag = "6")]
-    app_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,40 +215,16 @@ pub fn summarize_packet(
                     }
                 }
             } else if let Some(job) = summary.job.as_deref() {
-                let app_id = match job {
-                    "ClientMetrics.ClientAppInterfaceStatsReport#1" => {
-                        GameIdField1::decode(body_bytes)
-                            .ok()
-                            .and_then(|message| message.game_id)
-                            .map(|app_id| app_id as u32)
-                    }
-                    "PublishedFile.GetUserFiles#1" => AppIdField2::decode(body_bytes)
-                        .ok()
-                        .and_then(|message| message.app_id),
-                    "ClientMetrics.ClientCloudAppSyncStats#1"
-                    | "Player.GetGameBadgeLevels#1"
-                    | "Store.ShouldPromptForCompatibilityFeedback#1" => {
-                        AppIdField1::decode(body_bytes)
-                            .ok()
-                            .and_then(|message| message.app_id)
-                    }
-                    "UserNews.GetUserNews#1" => AppIdField6::decode(body_bytes)
-                        .ok()
-                        .and_then(|message| message.app_id),
-                    // GetActivity is account-scoped; its field 1 is a fixed64 SteamID.
-                    "UserGameActivity.GetActivity#1" => None,
-                    job if job.starts_with("Cloud.") => {
-                        vapor_forge_steam_protocol::cloud_request_app_id(job, body_bytes)
-                    }
-                    _ => None,
-                };
-                push_app_id(&mut summary.app_ids, app_id);
+                push_app_id(&mut summary.app_ids, service_method_app_id(job, body_bytes));
             }
         }
         EMSG_GAMESPLAYED | EMSG_GAMESPLAYED_WITH_DATABLOB => {
             if let Ok(msg) = CMsgClientGamesPlayed::decode(body_bytes) {
                 for game in msg.games_played {
-                    push_app_id(&mut summary.app_ids, game.game_id.map(|id| id as u32));
+                    push_app_id(
+                        &mut summary.app_ids,
+                        game.game_id.and_then(app_id_from_game_id),
+                    );
                 }
             }
         }
@@ -273,7 +239,10 @@ pub fn summarize_packet(
             if let Ok(req) =
                 vapor_forge_steam_protocol::ClientGetUserStatsRequest::decode(body_bytes)
             {
-                push_app_id(&mut summary.app_ids, req.game_id.map(|id| id as u32));
+                push_app_id(
+                    &mut summary.app_ids,
+                    req.game_id.and_then(app_id_from_game_id),
+                );
                 if summary.steamid.is_none() {
                     summary.steamid = req.steam_id_for_user;
                 }
@@ -283,29 +252,41 @@ pub fn summarize_packet(
             if let Ok(resp) =
                 vapor_forge_steam_protocol::ClientGetUserStatsResponse::decode(body_bytes)
             {
-                push_app_id(&mut summary.app_ids, resp.game_id.map(|id| id as u32));
+                push_app_id(
+                    &mut summary.app_ids,
+                    resp.game_id.and_then(app_id_from_game_id),
+                );
                 summary.eresult = resp.eresult;
             }
         }
         EMSG_STORE_USERSTATS => {
-            if let Ok(request) = ClientStoreUserStatsRequest::decode(body_bytes) {
-                push_app_id(&mut summary.app_ids, request.game_id.map(|id| id as u32));
+            if let Some(game_id) = legacy_store_user_stats_game_id(body_bytes) {
+                push_app_id(&mut summary.app_ids, app_id_from_game_id(game_id));
             }
         }
         EMSG_STORE_USERSTATS_RESPONSE => {
             if let Ok(response) = ClientStoreUserStatsResponse::decode(body_bytes) {
-                push_app_id(&mut summary.app_ids, response.game_id.map(|id| id as u32));
+                push_app_id(
+                    &mut summary.app_ids,
+                    response.game_id.and_then(app_id_from_game_id),
+                );
                 summary.eresult = response.eresult;
             }
         }
         EMSG_STORE_USERSTATS2 => {
             if let Ok(request) = ClientStoreUserStats2Request::decode(body_bytes) {
-                push_app_id(&mut summary.app_ids, request.game_id.map(|id| id as u32));
+                push_app_id(
+                    &mut summary.app_ids,
+                    request.game_id.and_then(app_id_from_game_id),
+                );
             }
         }
         EMSG_STATS_UPDATED => {
             if let Ok(response) = ClientStatsUpdated::decode(body_bytes) {
-                push_app_id(&mut summary.app_ids, response.game_id.map(|id| id as u32));
+                push_app_id(
+                    &mut summary.app_ids,
+                    response.game_id.and_then(app_id_from_game_id),
+                );
             }
         }
         EMSG_GET_APP_OWNERSHIP_TICKET => {
@@ -377,6 +358,12 @@ fn push_app_id(out: &mut Vec<u32>, app_id: Option<u32>) {
 mod tests {
     use super::*;
 
+    #[derive(Clone, prost::Message)]
+    struct LegacyStoreUserStatsRequestFixture {
+        #[prost(fixed64, optional, tag = "1")]
+        game_id: Option<u64>,
+    }
+
     #[test]
     fn summarizes_invalid_framing() {
         let summary = summarize_packet(
@@ -403,6 +390,7 @@ mod tests {
             app_id: Some(480),
             depot_id: Some(481),
             manifest_id: Some(123),
+            ..Default::default()
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
@@ -464,10 +452,8 @@ mod tests {
             jobid_source: Some(9),
             ..Default::default()
         };
-        let body = ClientStoreUserStatsRequest {
+        let body = LegacyStoreUserStatsRequestFixture {
             game_id: Some(736_260),
-            explicit_reset: Some(false),
-            stats_to_store: Vec::new(),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_STORE_USERSTATS | K_MSG_HDR_PROTO_FLAG,
@@ -487,12 +473,18 @@ mod tests {
 
     #[test]
     fn summarizes_app_interface_metrics() {
+        #[derive(Clone, prost::Message)]
+        struct ClientMetricsAppInterfaceStatsNotification {
+            #[prost(uint64, optional, tag = "1")]
+            game_id: Option<u64>,
+        }
+
         let header = CMsgProtoBufHeader {
             target_job_name: Some("ClientMetrics.ClientAppInterfaceStatsReport#1".into()),
             ..Default::default()
         };
-        let body = GameIdField1 {
-            game_id: Some(736_260),
+        let body = ClientMetricsAppInterfaceStatsNotification {
+            game_id: Some((2_u64 << 24) | 736_260),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
@@ -513,20 +505,20 @@ mod tests {
     #[test]
     fn summarizes_user_news_app_id_from_field_six() {
         #[derive(Clone, prost::Message)]
-        struct UserNewsRequest {
+        struct UserNewsGetUserNewsRequest {
             #[prost(uint32, optional, tag = "1")]
             count: Option<u32>,
             #[prost(uint32, optional, tag = "6")]
-            app_id: Option<u32>,
+            filter_app_id: Option<u32>,
         }
 
         let header = CMsgProtoBufHeader {
             target_job_name: Some("UserNews.GetUserNews#1".into()),
             ..Default::default()
         };
-        let body = UserNewsRequest {
+        let body = UserNewsGetUserNewsRequest {
             count: Some(100),
-            app_id: Some(736_260),
+            filter_app_id: Some(736_260),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
@@ -546,11 +538,17 @@ mod tests {
 
     #[test]
     fn summarizes_field_two_legacy_cloud_app_id() {
+        #[derive(Clone, prost::Message)]
+        struct CloudCommitHttpUploadRequest {
+            #[prost(uint32, optional, tag = "2")]
+            app_id: Option<u32>,
+        }
+
         let header = CMsgProtoBufHeader {
             target_job_name: Some("Cloud.CommitHTTPUpload#1".into()),
             ..Default::default()
         };
-        let body = AppIdField2 {
+        let body = CloudCommitHttpUploadRequest {
             app_id: Some(736_260),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
