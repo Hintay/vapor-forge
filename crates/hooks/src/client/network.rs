@@ -344,11 +344,14 @@ pub(crate) fn capture_dispatch_context(this: *mut c_void, packet: *mut c_void) {
     let previous_receiver = CM_RECEIVER.load(Ordering::Acquire);
     let previous_conn_set = CM_CONN_ID_SET.load(Ordering::Acquire);
     let previous_conn_id = CM_CONN_ID.load(Ordering::Acquire);
-    if (previous_receiver != 0 && previous_receiver != receiver)
-        || (previous_conn_set && previous_conn_id != conn_id)
-    {
+    let connection_changed = (previous_receiver != 0 && previous_receiver != receiver)
+        || (previous_conn_set && previous_conn_id != conn_id);
+    if connection_changed {
         INJECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
         WARMUP_FLUSH_DONE.store(false, Ordering::Release);
+        if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
+            queue.cancel_pending_conflicts();
+        }
     }
     CM_RECEIVER.store(receiver, Ordering::Release);
     CM_CONN_ID.store(conn_id, Ordering::Release);
