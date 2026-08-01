@@ -46,14 +46,24 @@ jobs:
       - name: Check lockfile
         run: cargo check --workspace --locked
 
+      - name: Architecture boundaries
+        run: scripts/check-architecture.py
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The tool binaries sit behind `tools`, so the run above never builds
+      # them. Without this they are the only unchecked code in the workspace.
+      - name: Clippy (tool binaries)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      # `--all-features` so the tool binaries' own tests actually run; without
+      # it they are compiled but never executed.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
   build:
     name: Build
