@@ -1,10 +1,13 @@
 use serde_json::json;
 use std::fmt::Write;
-use vapor_forge_packet_capture::{PacketChange, PacketDirection, PacketSummary, PacketType};
+use vapor_forge_packet_capture::{
+    capture_filter_json, captured_packet_json, format_capture_filter, format_summary, hex_prefix,
+    PacketChange, PacketDirection, PacketType, SummaryFormat,
+};
 
 use super::toast_args::{default_toast_style, parse_toast_args, toast_kind_name, toast_style_name};
 use super::{DebugTarget, DEFAULT_DURATION_MS, DEFAULT_TOAST_BODY};
-use crate::packet_capture::{CapturedPacket, PacketCaptureFilter, PacketCaptureMode};
+use crate::packet_capture::{PacketCaptureFilter, PacketCaptureMode};
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum DebugCommand<'a> {
@@ -14,6 +17,7 @@ pub(crate) enum DebugCommand<'a> {
     Config,
     Hooks,
     Apps,
+    Stats(&'a str),
     Pkg0,
     Packet(&'a str),
     Patterns,
@@ -21,6 +25,8 @@ pub(crate) enum DebugCommand<'a> {
     Log(&'a str),
     NativeInject,
     NativeInjectSelf,
+    #[cfg(debug_assertions)]
+    GameActionProbe(&'a str),
     Toast(ToastArgs<'a>),
     Unknown(&'a str),
 }
@@ -69,6 +75,7 @@ fn dispatch_local(target: DebugTarget, command: &str, json: bool) -> String {
         DebugCommand::Config => config_response(json),
         DebugCommand::Hooks => hooks_response(json),
         DebugCommand::Apps => apps_response(json),
+        DebugCommand::Stats(args) => stats_response(target, args, json),
         DebugCommand::Pkg0 => pkg0_response(json),
         DebugCommand::Packet(args) => packet_response(target, args, json),
         DebugCommand::Patterns => patterns_response(json),
@@ -76,6 +83,8 @@ fn dispatch_local(target: DebugTarget, command: &str, json: bool) -> String {
         DebugCommand::Log(level) => log_response(level, json),
         DebugCommand::NativeInject => native_inject_response(json),
         DebugCommand::NativeInjectSelf => native_inject_self_response(json),
+        #[cfg(debug_assertions)]
+        DebugCommand::GameActionProbe(args) => game_action_probe_response(target, args),
         DebugCommand::Toast(args) => queue_toast_command(target, args),
         DebugCommand::Unknown(command) => format!("err unknown command: {command}"),
     }
@@ -112,6 +121,12 @@ pub(crate) fn parse_command(command: &str) -> DebugCommand<'_> {
     if trimmed == "apps" {
         return DebugCommand::Apps;
     }
+    if trimmed == "stats" {
+        return DebugCommand::Stats("");
+    }
+    if let Some(args) = trimmed.strip_prefix("stats ") {
+        return DebugCommand::Stats(args.trim());
+    }
     if trimmed == "pkg0" {
         return DebugCommand::Pkg0;
     }
@@ -138,6 +153,14 @@ pub(crate) fn parse_command(command: &str) -> DebugCommand<'_> {
     }
     if trimmed == "native-inject" || trimmed == "inject" {
         return DebugCommand::NativeInject;
+    }
+    #[cfg(debug_assertions)]
+    if trimmed == "game-action-probe" {
+        return DebugCommand::GameActionProbe("");
+    }
+    #[cfg(debug_assertions)]
+    if let Some(args) = trimmed.strip_prefix("game-action-probe ") {
+        return DebugCommand::GameActionProbe(args.trim());
     }
     if trimmed == "toast" {
         return DebugCommand::Toast(ToastArgs::Default);
@@ -212,6 +235,36 @@ fn queue_toast_fields(args: &str) -> Result<String, String> {
     ))
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn game_action_probe_response(target: DebugTarget, args: &str) -> String {
+    if target != DebugTarget::SteamUi {
+        return "err game-action-probe is a steamui command".to_owned();
+    }
+    if args == "status" {
+        let status = crate::ui::game_action_probe::status();
+        return format!(
+            "ok hit={} native_next={:#x} active_count={} active_min={:#x} active_max={:#x}",
+            status.hit,
+            status.native_next_handle,
+            status.active_handle_count,
+            status.active_handle_min,
+            status.active_handle_max
+        );
+    }
+    if !args.is_empty() && args != "run" {
+        return "err usage: game-action-probe [run|status]".to_owned();
+    }
+
+    let handle = crate::ui::game_action_probe::arm();
+    crate::ui::toast_bridge::request_game_action_probe(handle);
+    format!("ok queued handle={handle:#x}")
+}
+
+#[cfg(all(debug_assertions, not(target_os = "linux")))]
+fn game_action_probe_response(_target: DebugTarget, _args: &str) -> String {
+    "err game-action-probe requires Linux".to_owned()
+}
+
 #[cfg(target_os = "linux")]
 fn request_target_pump(target: DebugTarget) {
     if target == DebugTarget::SteamUi {
@@ -234,12 +287,15 @@ fn help_response() -> String {
     out.push_str("  config                runtime configuration summary\n");
     out.push_str("  hooks                 installed hooks and addresses\n");
     out.push_str("  apps                  controlled apps with ownership status\n");
+    out.push_str("  stats ...             native stats calibration commands\n");
     out.push_str("  pkg0                  package injection status\n");
     out.push_str("  packet ...            packet capture and inspection\n");
     out.push_str("  patterns              pattern match results\n");
     out.push_str("  log [level]           query or set log level\n");
     out.push_str("  native-inject         arm a native dispatch self-test\n");
     out.push_str("  native-inject-self    dispatch a captured packet from our own thread\n");
+    #[cfg(debug_assertions)]
+    out.push_str("  game-action-probe     verify SteamUI-to-native game action dispatch\n");
     out.push_str("  dump/status           toast subsystem status\n");
     out.push_str("  toast [args]          queue a toast notification\n");
     out.push('\n');
@@ -480,6 +536,124 @@ fn ownership_label(state: vapor_forge_features::apps::OwnershipState) -> &'stati
 }
 
 // ---------------------------------------------------------------------------
+// Native stats calibration
+// ---------------------------------------------------------------------------
+
+fn stats_response(target: DebugTarget, args: &str, json_mode: bool) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        stats_response_linux(target, args, json_mode)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (target, args, json_mode);
+        "err stats is only available in the steamclient process on Linux".to_owned()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stats_response_linux(target: DebugTarget, args: &str, json_mode: bool) -> String {
+    if target != DebugTarget::SteamClient {
+        return "err stats is a steamclient command".to_owned();
+    }
+
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["subscribed"] => match crate::client::user_stats::subscribed_app_ids() {
+            Ok(mut app_ids) => {
+                let config = crate::client::install::config();
+                app_ids.retain(|app_id| !config.apps.inject.iter().any(|app| app.id.0 == *app_id));
+                if json_mode {
+                    format!("ok {}", json!({"app_ids": app_ids}))
+                } else {
+                    format!("ok subscribed app_ids={app_ids:?}")
+                }
+            }
+            Err(error) => format!("err {error}"),
+        },
+        // Slot 22 RequestUserStats, the entry the Steam UI uses. Reports whether
+        // Steam's stats map ended up populated, which slot 5 RequestCurrentStats
+        // does not achieve on this engine pipe.
+        ["request", app_id] => match parse_u32_arg(app_id) {
+            Ok(app_id) => match crate::client::user_stats::request_user_stats(app_id) {
+                Ok(probe) => {
+                    if json_mode {
+                        format!(
+                            "ok {}",
+                            json!({
+                                "app_id": app_id,
+                                "api_call": probe.api_call,
+                                "stats": probe.stat_count,
+                                "achievements": probe.achievement_count,
+                                "samples": probe.samples,
+                            })
+                        )
+                    } else {
+                        let mut out = format!(
+                            "ok user stats requested app_id={app_id} api_call={} stats={} achievements={}",
+                            probe.api_call, probe.stat_count, probe.achievement_count
+                        );
+                        for sample in &probe.samples {
+                            out.push_str("\n  ");
+                            out.push_str(sample);
+                        }
+                        out
+                    }
+                }
+                Err(error) => format!("err {error}"),
+            },
+            Err(error) => error,
+        },
+        ["refresh", app_id] => match parse_u32_arg(app_id) {
+            Ok(app_id) if crate::client::user_stats::queue_debug_stats_refresh(app_id) => {
+                if json_mode {
+                    format!("ok {}", json!({"queued": true, "app_id": app_id}))
+                } else {
+                    format!("ok queued native stats refresh app_id={app_id}")
+                }
+            }
+            Ok(app_id) => format!("err could not queue native stats refresh app_id={app_id}"),
+            Err(error) => error,
+        },
+        ["callbacks"] | ["callbacks", "status"] => {
+            let status = crate::client::user_stats::callback_status();
+            if json_mode {
+                format!("ok {}", json!({"status": status}))
+            } else {
+                format!("ok {status}")
+            }
+        }
+        ["callbacks", "ids"] => {
+            let ids = crate::client::user_stats::observed_ids(16);
+            if json_mode {
+                format!("ok {}", json!({"ids": ids}))
+            } else {
+                format!("ok ids {ids}")
+            }
+        }
+        // Completion state for requests owned by the worker.
+        ["worker"] | ["worker", "status"] => {
+            let status = crate::client::user_stats::completion_status();
+            if json_mode {
+                format!("ok {}", json!({"status": status}))
+            } else {
+                format!("ok {status}")
+            }
+        }
+        ["worker", "ids"] => {
+            let ids = crate::client::user_stats::observed_ids(16);
+            if json_mode {
+                format!("ok {}", json!({"ids": ids}))
+            } else {
+                format!("ok ids {ids}")
+            }
+        }
+        _ => "err usage: stats subscribed | stats request APP_ID | stats refresh APP_ID | stats callbacks [status|ids] | stats worker [status|ids]"
+            .to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pkg0
 // ---------------------------------------------------------------------------
 
@@ -628,7 +802,7 @@ fn packet_capture_status_response(json_mode: bool) -> String {
                 "limit": status.limit,
                 "len": status.len,
                 "next_id": status.next_id,
-                "filter": filter_json(&status.filter),
+                "filter": capture_filter_json(&status.filter),
             })
         );
     }
@@ -638,7 +812,7 @@ fn packet_capture_status_response(json_mode: bool) -> String {
         status.mode.label(),
         status.len,
         status.limit,
-        filter_text(&status.filter)
+        format_capture_filter(&status.filter)
     )
 }
 
@@ -665,14 +839,14 @@ fn packet_capture_on_response(tokens: &[&str], json_mode: bool) -> String {
             "ok {}",
             json!({
                 "mode": mode.label(),
-                "filter": filter_json(&filter),
+                "filter": capture_filter_json(&filter),
             })
         );
     }
     format!(
         "ok packet capture mode={} filter={}",
         mode.label(),
-        filter_text(&filter)
+        format_capture_filter(&filter)
     )
 }
 
@@ -687,7 +861,7 @@ fn packet_list_response(tokens: &[&str], json_mode: bool) -> String {
         .collect();
 
     if json_mode {
-        let values: Vec<_> = packets.iter().map(packet_json).collect();
+        let values: Vec<_> = packets.iter().map(captured_packet_json).collect();
         return format!("ok {}", serde_json::Value::Array(values));
     }
 
@@ -697,7 +871,11 @@ fn packet_list_response(tokens: &[&str], json_mode: bool) -> String {
 
     let mut out = String::from("ok\n");
     for packet in packets {
-        let _ = writeln!(out, "  {}", summary_line(&packet.summary));
+        let _ = writeln!(
+            out,
+            "  {}",
+            format_summary(&packet.summary, SummaryFormat::Captured)
+        );
     }
     out.truncate(out.trim_end().len());
     out
@@ -709,10 +887,13 @@ fn packet_show_response(id: u64, json_mode: bool) -> String {
     };
 
     if json_mode {
-        return format!("ok {}", packet_json(&packet));
+        return format!("ok {}", captured_packet_json(&packet));
     }
 
-    let mut out = format!("ok {}\n", summary_line(&packet.summary));
+    let mut out = format!(
+        "ok {}\n",
+        format_summary(&packet.summary, SummaryFormat::Captured)
+    );
     if let Some(raw) = &packet.raw {
         let _ = writeln!(out, "  raw_len: {}", raw.len());
         let _ = writeln!(out, "  raw_hex_prefix: {}", hex_prefix(raw, 96));
@@ -826,110 +1007,6 @@ fn parse_u64_arg(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|e| format!("err invalid id: {e}"))
-}
-
-fn summary_line(summary: &PacketSummary) -> String {
-    let emsg = summary
-        .emsg
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned());
-    let apps = if summary.app_ids.is_empty() {
-        "-".to_owned()
-    } else {
-        format!("{:?}", summary.app_ids)
-    };
-    let len = match summary.final_len {
-        Some(final_len) if final_len != summary.original_len => {
-            format!("{}->{final_len}", summary.original_len)
-        }
-        _ => summary.original_len.to_string(),
-    };
-    format!(
-        "#{:<4} {:<4} emsg={:<5} type={:<16} app={} change={:<13} len={}",
-        summary.id,
-        summary.direction.label(),
-        emsg,
-        summary.packet_type.label(),
-        apps,
-        summary.change.label(),
-        len
-    )
-}
-
-fn packet_json(packet: &CapturedPacket) -> serde_json::Value {
-    json!({
-        "summary": summary_json(&packet.summary),
-        "raw": packet.raw.as_ref().map(|raw| json!({
-            "len": raw.len(),
-            "hex_prefix": hex_prefix(raw, 96),
-        })),
-    })
-}
-
-fn summary_json(summary: &PacketSummary) -> serde_json::Value {
-    json!({
-        "id": summary.id,
-        "direction": summary.direction.label(),
-        "emsg_raw": summary.emsg_raw,
-        "emsg": summary.emsg,
-        "proto": summary.proto,
-        "type": summary.packet_type.label(),
-        "app_ids": summary.app_ids,
-        "steamid": summary.steamid,
-        "job": summary.job,
-        "eresult": summary.eresult,
-        "change": summary.change.label(),
-        "original_len": summary.original_len,
-        "final_len": summary.final_len,
-        "header_len": summary.header_len,
-        "body_len": summary.body_len,
-        "decode_error": summary.decode_error,
-    })
-}
-
-fn filter_json(filter: &PacketCaptureFilter) -> serde_json::Value {
-    json!({
-        "direction": filter.direction.map(PacketDirection::label),
-        "type": filter.packet_type.map(PacketType::label),
-        "emsg": filter.emsg,
-        "app_id": filter.app_id,
-        "changed": filter.changed.map(PacketChange::label),
-    })
-}
-
-fn filter_text(filter: &PacketCaptureFilter) -> String {
-    let mut parts = Vec::new();
-    if let Some(direction) = filter.direction {
-        parts.push(format!("direction={}", direction.label()));
-    }
-    if let Some(packet_type) = filter.packet_type {
-        parts.push(format!("type={}", packet_type.label()));
-    }
-    if let Some(emsg) = filter.emsg {
-        parts.push(format!("emsg={emsg}"));
-    }
-    if let Some(app_id) = filter.app_id {
-        parts.push(format!("app={app_id}"));
-    }
-    if let Some(changed) = filter.changed {
-        parts.push(format!("changed={}", changed.label()));
-    }
-    if parts.is_empty() {
-        "none".to_owned()
-    } else {
-        parts.join(",")
-    }
-}
-
-fn hex_prefix(bytes: &[u8], max: usize) -> String {
-    let mut out = String::new();
-    for byte in bytes.iter().take(max) {
-        let _ = write!(out, "{byte:02x}");
-    }
-    if bytes.len() > max {
-        out.push_str("...");
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,8 +1125,8 @@ fn native_inject_response(json_mode: bool) -> String {
 }
 
 /// Test active dispatch from a thread we own: replay one captured inbound body
-/// from a freshly spawned thread (no RecvPkt), to check that AddWorkItem +
-/// WakeWorker deliver while the CM connection is idle.
+/// from a freshly spawned thread (no RecvPkt), to check that AddWorkItem
+/// delivers while the CM connection is idle.
 fn native_inject_self_response(json_mode: bool) -> String {
     #[cfg(target_os = "linux")]
     {

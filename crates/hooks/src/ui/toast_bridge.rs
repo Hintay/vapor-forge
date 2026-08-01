@@ -1,11 +1,17 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU32;
+
 mod html_window;
 
 static PUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PRIMED: AtomicBool = AtomicBool::new(false);
 static FIRST_BOOTSTRAP_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_BOOTSTRAP_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+static GAME_ACTION_PROBE: AtomicU32 = AtomicU32::new(0);
 
 const EARLY_BOOTSTRAP_WINDOW_NS: u64 = 60_000_000_000;
 const EARLY_BOOTSTRAP_INTERVAL_NS: u64 = 250_000_000;
@@ -37,20 +43,46 @@ pub fn bootstrap() {
 
 pub fn pump() {
     let requested = PUMP_REQUESTED.swap(false, Ordering::AcqRel);
-    if !requested && !vapor_forge_features::toast::has_pending_work() {
+    #[cfg(debug_assertions)]
+    let probe_handle = GAME_ACTION_PROBE.swap(0, Ordering::AcqRel);
+    #[cfg(not(debug_assertions))]
+    let probe_handle = 0;
+    if !requested && !vapor_forge_features::toast::has_pending_work() && probe_handle == 0 {
         return;
     }
 
     let bridge_injected =
         html_window::execute_javascript(vapor_forge_features::toast::bridge_script());
     if !bridge_injected {
+        #[cfg(debug_assertions)]
+        if probe_handle != 0 {
+            GAME_ACTION_PROBE.store(probe_handle, Ordering::Release);
+        }
         return;
     }
 
     // The first successful pump only injects the bridge. The next pump may send queued toasts.
     if !BRIDGE_PRIMED.load(Ordering::Acquire) {
         BRIDGE_PRIMED.store(true, Ordering::Release);
+        #[cfg(debug_assertions)]
+        if probe_handle != 0 {
+            GAME_ACTION_PROBE.store(probe_handle, Ordering::Release);
+            PUMP_REQUESTED.store(true, Ordering::Release);
+        }
         return;
+    }
+
+    #[cfg(debug_assertions)]
+    if probe_handle != 0 {
+        let probe_handle = probe_handle as i32;
+        let script = format!(
+            "try {{ SteamClient.Apps.ContinueGameAction({}, 'KeepRemote'); }} catch (e) {{ console.log('[VaporForgeUI] game action probe failed: ' + e); }}",
+            probe_handle
+        );
+        if !html_window::execute_javascript(&script) {
+            GAME_ACTION_PROBE.store(probe_handle as u32, Ordering::Release);
+            PUMP_REQUESTED.store(true, Ordering::Release);
+        }
     }
 
     let toasts = vapor_forge_features::toast::take_pending();
@@ -71,6 +103,12 @@ pub fn pump() {
 
 #[cfg(debug_assertions)]
 pub fn request_pump() {
+    PUMP_REQUESTED.store(true, Ordering::Release);
+}
+
+#[cfg(debug_assertions)]
+pub fn request_game_action_probe(handle: i32) {
+    GAME_ACTION_PROBE.store(handle as u32, Ordering::Release);
     PUMP_REQUESTED.store(true, Ordering::Release);
 }
 
