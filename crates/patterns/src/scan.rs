@@ -10,6 +10,39 @@ const UPWARD_SCAN_BYTES: usize = 0x10000;
 
 pub use crate::elf::ElfClass;
 
+/// Borrowed view of one pattern variant.
+///
+/// The resolve pipeline below is written against this rather than against
+/// [`PatternDef`] so it can serve both the build-time embedded table and
+/// patterns a tool loaded from a file at run time, without either side owning
+/// the other's storage.
+#[derive(Clone, Copy, Debug)]
+pub struct PatternRef<'a> {
+    pub name: &'a str,
+    pub pattern: &'a str,
+    pub follow: FollowMode,
+    pub prologue: Option<&'a [u8]>,
+    pub callee_pattern: Option<&'a str>,
+    pub optional: bool,
+    pub pic_entry: bool,
+    pub module: &'a str,
+}
+
+impl<'a> From<&'a PatternDef> for PatternRef<'a> {
+    fn from(entry: &'a PatternDef) -> Self {
+        Self {
+            name: entry.name,
+            pattern: entry.pattern,
+            follow: entry.follow,
+            prologue: entry.prologue,
+            callee_pattern: entry.callee_pattern,
+            optional: entry.optional,
+            pic_entry: entry.pic_entry,
+            module: entry.module,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModuleScanReport {
     pub module: String,
@@ -49,7 +82,7 @@ impl ModuleScanReport {
 
 #[derive(Clone, Debug)]
 pub struct PatternScanEntry {
-    pub name: &'static str,
+    pub name: String,
     pub optional: bool,
     pub status: PatternScanStatus,
     pub match_count: usize,
@@ -87,7 +120,11 @@ pub fn scan_module(module: &str, path: &Path) -> Result<ModuleScanReport, String
         return Err(format!("no embedded patterns for module {module:?}"));
     }
 
-    let entries = group_pattern_defs(&patterns)
+    let variants = patterns
+        .iter()
+        .map(|entry| PatternRef::from(*entry))
+        .collect::<Vec<_>>();
+    let entries = group_variants(&variants)
         .into_iter()
         .map(|group| scan_entry_group(segment.bytes, &group))
         .collect();
@@ -103,8 +140,9 @@ pub fn scan_module(module: &str, path: &Path) -> Result<ModuleScanReport, String
     })
 }
 
-fn group_pattern_defs<'a>(entries: &[&'a PatternDef]) -> Vec<Vec<&'a PatternDef>> {
-    let mut groups: Vec<Vec<&PatternDef>> = Vec::new();
+/// Group consecutive variants that share a name and module.
+pub fn group_variants<'a>(entries: &[PatternRef<'a>]) -> Vec<Vec<PatternRef<'a>>> {
+    let mut groups: Vec<Vec<PatternRef<'a>>> = Vec::new();
     for &entry in entries {
         if let Some(group) = groups
             .last_mut()
@@ -118,11 +156,11 @@ fn group_pattern_defs<'a>(entries: &[&'a PatternDef]) -> Vec<Vec<&'a PatternDef>
     groups
 }
 
-fn scan_entry_group(haystack: &[u8], entries: &[&'static PatternDef]) -> PatternScanEntry {
+fn scan_entry_group(haystack: &[u8], entries: &[PatternRef<'_>]) -> PatternScanEntry {
     let entry = entries[0];
     match resolve_entry_group(haystack, entries) {
         Ok(result) => PatternScanEntry {
-            name: entry.name,
+            name: entry.name.to_owned(),
             optional: entry.optional,
             status: PatternScanStatus::Ok,
             match_count: result.match_count,
@@ -130,7 +168,7 @@ fn scan_entry_group(haystack: &[u8], entries: &[&'static PatternDef]) -> Pattern
             error: None,
         },
         Err(error) => PatternScanEntry {
-            name: entry.name,
+            name: entry.name.to_owned(),
             optional: entry.optional,
             status: error.status(),
             match_count: error.match_count(),
@@ -140,21 +178,34 @@ fn scan_entry_group(haystack: &[u8], entries: &[&'static PatternDef]) -> Pattern
     }
 }
 
-#[derive(Clone)]
-struct ResolveResult {
-    target_offset: usize,
-    match_count: usize,
+#[derive(Clone, Debug)]
+pub struct ResolveResult {
+    pub target_offset: usize,
+    pub match_count: usize,
+    /// Index of the variant within its group that produced this result.
+    pub variant_index: usize,
 }
 
-fn resolve_entry_group(
+/// Where one variant of a conflicting group resolved to.
+#[derive(Clone, Copy, Debug)]
+pub struct VariantTarget {
+    pub variant_index: usize,
+    pub target_offset: usize,
+}
+
+/// Resolve every variant of one pattern group and require them to agree.
+pub fn resolve_entry_group(
     haystack: &[u8],
-    entries: &[&'static PatternDef],
+    entries: &[PatternRef<'_>],
 ) -> Result<ResolveResult, ResolveError> {
     let mut best_error = None;
     let mut successes = Vec::new();
-    for entry in entries {
+    for (variant_index, entry) in entries.iter().enumerate() {
         match resolve_entry(haystack, entry) {
-            Ok(result) => successes.push(result),
+            Ok(mut result) => {
+                result.variant_index = variant_index;
+                successes.push(result);
+            }
             Err(error) => best_error = Some(prefer_resolve_error(best_error.take(), error)),
         }
     }
@@ -180,7 +231,10 @@ fn unique_successful_variant(
     Err(ResolveError::VariantConflict(
         successes
             .into_iter()
-            .map(|result| result.target_offset)
+            .map(|result| VariantTarget {
+                variant_index: result.variant_index,
+                target_offset: result.target_offset,
+            })
             .collect(),
     ))
 }
@@ -209,12 +263,12 @@ fn resolve_error_rank(error: &ResolveError) -> u8 {
 }
 
 #[derive(Debug)]
-enum ResolveError {
+pub enum ResolveError {
     PatternParse(String),
     CalleePatternParse(String),
     NoMatch,
     Ambiguous(usize),
-    VariantConflict(Vec<usize>),
+    VariantConflict(Vec<VariantTarget>),
     Follow(String, usize),
     MissingPrologue,
     CalleePatternMismatch(usize),
@@ -222,7 +276,7 @@ enum ResolveError {
 }
 
 impl ResolveError {
-    fn status(&self) -> PatternScanStatus {
+    pub fn status(&self) -> PatternScanStatus {
         match self {
             Self::NoMatch => PatternScanStatus::Miss,
             Self::Ambiguous(_) => PatternScanStatus::Ambiguous,
@@ -230,7 +284,7 @@ impl ResolveError {
         }
     }
 
-    fn match_count(&self) -> usize {
+    pub fn match_count(&self) -> usize {
         match self {
             Self::NoMatch => 0,
             Self::Ambiguous(count)
@@ -252,7 +306,12 @@ impl fmt::Display for ResolveError {
             Self::VariantConflict(targets) => {
                 write!(f, "pattern variants resolve to different targets:")?;
                 for target in targets {
-                    write!(f, " text+0x{target:x}")?;
+                    write!(
+                        f,
+                        " variant={} text+0x{:x}",
+                        target.variant_index + 1,
+                        target.target_offset
+                    )?;
                 }
                 Ok(())
             }
@@ -266,7 +325,7 @@ impl fmt::Display for ResolveError {
     }
 }
 
-fn resolve_entry(haystack: &[u8], entry: &PatternDef) -> Result<ResolveResult, ResolveError> {
+fn resolve_entry(haystack: &[u8], entry: &PatternRef<'_>) -> Result<ResolveResult, ResolveError> {
     let pattern = Pattern::parse(entry.pattern)
         .map_err(|error| ResolveError::PatternParse(error.to_string()))?;
     let matches = pattern.find_all(haystack);
@@ -307,6 +366,7 @@ fn resolve_entry(haystack: &[u8], entry: &PatternDef) -> Result<ResolveResult, R
     Ok(ResolveResult {
         target_offset,
         match_count,
+        variant_index: 0,
     })
 }
 
@@ -320,7 +380,7 @@ fn unique_match(matches: &[usize]) -> Result<usize, ResolveError> {
 
 fn resolve_call_target(
     haystack: &[u8],
-    entry: &PatternDef,
+    entry: &PatternRef<'_>,
     matches: &[usize],
 ) -> Result<usize, ResolveError> {
     let callee_pattern = entry
@@ -354,12 +414,29 @@ fn resolve_call_target(
 
 fn find_pic_entry(haystack: &[u8], prologue_offset: usize) -> Option<usize> {
     for offset in [10usize, 11] {
-        let candidate = prologue_offset.checked_sub(offset)?;
-        if haystack.get(candidate) == Some(&0xE8) {
+        let Some(candidate) = prologue_offset.checked_sub(offset) else {
+            continue;
+        };
+        if is_pic_preamble(haystack, candidate, offset) {
             return Some(candidate);
         }
     }
-    None
+    haystack
+        .get(prologue_offset..prologue_offset + 3)
+        .is_some_and(|bytes| bytes == [0x55, 0x89, 0xe5])
+        .then_some(prologue_offset)
+}
+
+fn is_pic_preamble(haystack: &[u8], offset: usize, len: usize) -> bool {
+    let Some(bytes) = haystack.get(offset..offset + len) else {
+        return false;
+    };
+    bytes[0] == 0xe8
+        && match len {
+            10 => bytes[5] == 0x05,
+            11 => bytes[5] == 0x81 && matches!(bytes[6], 0xc1 | 0xc3 | 0xc5 | 0xc6 | 0xc7),
+            _ => false,
+        }
 }
 
 fn executable_segment(data: &[u8]) -> Result<ExecutableSegment<'_>, String> {
@@ -395,15 +472,37 @@ mod tests {
     #[test]
     fn entry_group_reports_variant_target_conflicts() {
         let haystack = [0xAA, 0xBB, 0x90, 0xCC, 0xDD];
-        let entries = [&VARIANT_A, &VARIANT_B];
+        let entries = [PatternRef::from(&VARIANT_A), PatternRef::from(&VARIANT_B)];
 
-        let result = resolve_entry_group(&haystack, &entries);
-        match result {
-            Err(ResolveError::VariantConflict(targets)) => {
-                assert_eq!(targets, vec![0, 3]);
+        match resolve_entry_group(&haystack, &entries) {
+            Err(error @ ResolveError::VariantConflict(_)) => {
+                let ResolveError::VariantConflict(targets) = &error else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    targets
+                        .iter()
+                        .map(|target| (target.variant_index, target.target_offset))
+                        .collect::<Vec<_>>(),
+                    vec![(0, 0), (1, 3)]
+                );
+                // The message names the offending variant, not just the offset.
+                assert_eq!(
+                    error.to_string(),
+                    "pattern variants resolve to different targets: variant=1 text+0x0 variant=2 text+0x3"
+                );
             }
             Ok(_) => panic!("variant conflict should not resolve as OK"),
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn pic_entry_supports_both_x86_compiler_layouts() {
+        let external_preamble = [0xe8, 0, 0, 0, 0, 0x05, 0, 0, 0, 0, 0x55, 0x89, 0xe5, 0x57];
+        assert_eq!(find_pic_entry(&external_preamble, 10), Some(0));
+
+        let inline_preamble = [0x55, 0x89, 0xe5, 0x57, 0xe8, 0, 0, 0, 0];
+        assert_eq!(find_pic_entry(&inline_preamble, 0), Some(0));
     }
 }

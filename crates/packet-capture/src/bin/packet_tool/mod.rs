@@ -76,10 +76,15 @@ mod tests {
     use vapor_forge_features::apps::OwnershipState;
     use vapor_forge_packet_capture::PacketDirection;
     use vapor_forge_steam_protocol::{
-        CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientStoreUserStatsRequest,
-        GetManifestRequestCodeRequest, EMSG_GAMESPLAYED, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
-        EMSG_STORE_USERSTATS, K_MSG_HDR_PROTO_FLAG,
+        CMsgClientGamesPlayed, CMsgProtoBufHeader, GetManifestRequestCodeRequest, EMSG_GAMESPLAYED,
+        EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_STORE_USERSTATS, K_MSG_HDR_PROTO_FLAG,
     };
+
+    #[derive(Clone, prost::Message)]
+    struct LegacyStoreUserStatsRequestFixture {
+        #[prost(fixed64, optional, tag = "1")]
+        game_id: Option<u64>,
+    }
 
     fn controlled_config(app_id: u32) -> RuntimeConfig {
         let mut config = RuntimeConfig::default();
@@ -166,11 +171,13 @@ mod tests {
             eresult: None,
             transport_error: None,
             seq_num: None,
+            ..Default::default()
         };
         let body = GetManifestRequestCodeRequest {
             app_id: Some(480),
             depot_id: Some(481),
             manifest_id: Some(123),
+            ..Default::default()
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_SERVICE_METHOD_CALL_FROM_CLIENT | K_MSG_HDR_PROTO_FLAG,
@@ -191,10 +198,8 @@ mod tests {
 
     #[test]
     fn simulate_store_stats_requires_runtime_ownership() {
-        let body = ClientStoreUserStatsRequest {
+        let body = LegacyStoreUserStatsRequestFixture {
             game_id: Some(736_260),
-            explicit_reset: Some(false),
-            stats_to_store: Vec::new(),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_STORE_USERSTATS | K_MSG_HDR_PROTO_FLAG,
@@ -217,6 +222,7 @@ mod tests {
                 game_id: Some(736_260),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_GAMESPLAYED | K_MSG_HDR_PROTO_FLAG,
@@ -243,10 +249,8 @@ mod tests {
         let avatars = HashMap::new();
         let donors = HashMap::new();
         let context = SimulationContext::complete(&config, &ownership, &avatars, &donors);
-        let body = ClientStoreUserStatsRequest {
+        let body = LegacyStoreUserStatsRequestFixture {
             game_id: Some(u64::from(app_id.0)),
-            explicit_reset: Some(false),
-            stats_to_store: Vec::new(),
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_STORE_USERSTATS | K_MSG_HDR_PROTO_FLAG,
@@ -273,6 +277,7 @@ mod tests {
                 game_id: Some(u64::from(app_id.0)),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let packet = vapor_forge_steam_protocol::assemble_raw(
             EMSG_GAMESPLAYED | K_MSG_HDR_PROTO_FLAG,

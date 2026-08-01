@@ -5,6 +5,8 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+use vapor_forge_packet_capture::format_captured_summary_json;
+
 use super::cli::{filter_suffix, Filters, OutputFormat};
 
 pub(super) fn watch(socket: &str, filters: Filters, interval: Duration) -> Result<(), String> {
@@ -30,40 +32,12 @@ pub(super) fn watch(socket: &str, filters: Filters, interval: Duration) -> Resul
             if id <= last_id {
                 continue;
             }
-            println!("{}", format_summary_json(summary));
+            println!("{}", format_captured_summary_json(summary));
             last_id = last_id.max(id);
         }
 
         std::thread::sleep(interval);
     }
-}
-
-fn format_summary_json(summary: &serde_json::Value) -> String {
-    let id = summary
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let direction = summary
-        .get("direction")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("-");
-    let emsg = summary
-        .get("emsg")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned());
-    let packet_type = summary
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("-");
-    let changed = summary
-        .get("change")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("-");
-    let app_ids = summary.get("app_ids").unwrap_or(&serde_json::Value::Null);
-    format!(
-        "#{id:<4} {direction:<4} emsg={emsg:<5} type={packet_type:<16} app={app_ids} change={changed}"
-    )
 }
 
 pub(super) fn send_debug_command(socket: &str, command: &str) -> Result<String, String> {

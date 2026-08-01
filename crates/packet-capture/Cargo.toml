@@ -9,10 +9,13 @@ autobins = false
 [features]
 default = []
 tools = [
-    "dep:serde_json",
+    "json",
     "dep:vapor-forge-config",
+    "dep:vapor-forge-cloud-rpc",
     "dep:vapor-forge-features",
+    "dep:vapor-forge-tool-support",
 ]
+json = ["dep:serde_json"]
 
 [[bin]]
 name = "vapor-forge-packet-tool"
@@ -24,4 +27,6 @@ prost.workspace = true
 serde_json = { workspace = true, optional = true }
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-config = { path = "../config", optional = true }
+vapor-forge-cloud-rpc = { path = "../cloud-rpc", optional = true }
 vapor-forge-features = { path = "../features", optional = true }
+vapor-forge-tool-support = { path = "../tool-support", optional = true }
