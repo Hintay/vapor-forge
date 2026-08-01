@@ -3,12 +3,16 @@
 use prost::Message;
 
 mod adapter;
+mod conflict_ui;
 mod http;
 mod local;
 mod protocol;
 mod queue;
 mod transfer_targets;
 
+pub use conflict_ui::{
+    ConflictDialog, ConflictDialogCandidate, ConflictSubmitResult, ConflictUiAck, ConflictUiContext,
+};
 pub use protocol::{privacy_fallback, privacy_fallback_with_ownership};
 pub use queue::{CloudRpcQueue, CompletedResponse, ResponsePermit};
 
@@ -37,6 +41,10 @@ pub const EXIT_SYNC_DONE: &str = "Cloud.SignalAppExitSyncDone#1";
 pub const CONFLICT_RESOLUTION: &str = "Cloud.ClientConflictResolution#1";
 pub const CDN_REPORT: &str = "Cloud.CDNReport#1";
 pub const EXTERNAL_TRANSFER_REPORT: &str = "Cloud.ExternalStorageTransferReport#1";
+
+pub fn conflict_ui_scope(config: &vapor_forge_config::RuntimeConfig) -> [u8; 32] {
+    http::CloudSettings::from_config(config).conflict_scope()
+}
 
 const ERESULT_OK: i32 = 1;
 const ERESULT_FAIL: i32 = 2;

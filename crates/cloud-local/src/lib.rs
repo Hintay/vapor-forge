@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
+mod gc;
 mod store;
 mod sync;
 mod transfer;
 
-pub use store::{FolderStore, StagedFile, StoreView};
+pub use gc::LocalGcCoordinator;
+pub use store::{
+    CommitIdentity, FolderStore, GcReport, GcRoots, KeepLocalResolution, ManifestCandidate,
+    SessionPeer, StagedFile, StoreView,
+};
 pub use sync::LocalBackend;
 pub use transfer::{
     commit_upload, intercept_transfer, issue_download, issue_upload, transfer_contract,

@@ -1,14 +1,16 @@
+use super::conflict_ui::LocalConflictCoordinator;
 use super::http::*;
 use super::protocol::RpcReply;
 use super::transfer_targets::{CloudStateScope, TransferTargetRegistry};
 use super::*;
 use prost::Message;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 use vapor_forge_cloud_core::{device_descriptor, CloudBackend};
+use vapor_forge_cloud_local::LocalGcCoordinator;
 use vapor_forge_core::unix_now;
 use vapor_forge_steam_protocol::*;
 use vapor_forge_sync_journal::{
@@ -21,12 +23,16 @@ pub(super) struct AdapterState {
     pub(super) client_change_numbers: HashMap<u32, u64>,
     pub(super) active_batches: HashMap<u32, u64>,
     pub(super) batches: HashMap<u64, BatchState>,
+    pub(super) local_apps: HashMap<u32, LocalAppState>,
+    pub(super) local_sessions: HashSet<u32>,
     pub(super) files: HashMap<(u32, String), CumulusFile>,
     /// Shared with every other journal user in this process; structsy allows
     /// only one open database per file, so this is never opened here directly.
     pub(super) journal: Option<Arc<SyncJournal>>,
     pub(super) transfer_targets: Arc<TransferTargetRegistry>,
     pub(super) principal_scope: Option<String>,
+    pub(super) local_gc: Arc<LocalGcCoordinator>,
+    pub(super) local_conflicts: Arc<LocalConflictCoordinator>,
 }
 
 impl Default for AdapterState {
@@ -36,7 +42,11 @@ impl Default for AdapterState {
 }
 
 impl AdapterState {
-    pub(super) fn with_transfer_targets(transfer_targets: Arc<TransferTargetRegistry>) -> Self {
+    pub(super) fn with_transfer_targets_gc_and_conflicts(
+        transfer_targets: Arc<TransferTargetRegistry>,
+        local_gc: Arc<LocalGcCoordinator>,
+        local_conflicts: Arc<LocalConflictCoordinator>,
+    ) -> Self {
         let journal = default_sync_journal_path().and_then(|path| match open_journal(&path) {
             Ok(journal) => Some(journal),
             Err(error) => {
@@ -44,12 +54,33 @@ impl AdapterState {
                 None
             }
         });
-        Self::with_transfer_targets_and_journal(transfer_targets, journal)
+        Self::with_transfer_targets_journal_gc_and_conflicts(
+            transfer_targets,
+            journal,
+            local_gc,
+            local_conflicts,
+        )
     }
 
     pub(super) fn with_transfer_targets_and_journal(
         transfer_targets: Arc<TransferTargetRegistry>,
         journal: Option<Arc<SyncJournal>>,
+    ) -> Self {
+        let local_gc = Arc::new(LocalGcCoordinator::new());
+        let local_conflicts = LocalConflictCoordinator::new(Arc::clone(&local_gc));
+        Self::with_transfer_targets_journal_gc_and_conflicts(
+            transfer_targets,
+            journal,
+            local_gc,
+            local_conflicts,
+        )
+    }
+
+    fn with_transfer_targets_journal_gc_and_conflicts(
+        transfer_targets: Arc<TransferTargetRegistry>,
+        journal: Option<Arc<SyncJournal>>,
+        local_gc: Arc<LocalGcCoordinator>,
+        local_conflicts: Arc<LocalConflictCoordinator>,
     ) -> Self {
         Self {
             scope: None,
@@ -57,10 +88,14 @@ impl AdapterState {
             client_change_numbers: HashMap::new(),
             active_batches: HashMap::new(),
             batches: HashMap::new(),
+            local_apps: HashMap::new(),
+            local_sessions: HashSet::new(),
             files: HashMap::new(),
             journal,
             transfer_targets,
             principal_scope: None,
+            local_gc,
+            local_conflicts,
         }
     }
 
@@ -72,10 +107,13 @@ impl AdapterState {
         if self.scope.is_some() {
             warn!("cloud-rpc: Cumulus scope changed; discarded transient adapter state");
         }
+        self.unregister_local_batches();
         self.current_change_numbers.clear();
         self.client_change_numbers.clear();
         self.active_batches.clear();
         self.batches.clear();
+        self.local_apps.clear();
+        self.local_sessions.clear();
         self.files.clear();
         self.principal_scope = None;
         self.scope = Some(scope);
@@ -86,6 +124,14 @@ impl AdapterState {
             .as_ref()
             .expect("adapter scope prepared before RPC dispatch")
     }
+
+    fn unregister_local_batches(&self) {
+        for (batch_id, batch) in &self.batches {
+            if batch.local_identity.is_some() {
+                self.local_gc.unregister_batch(*batch_id);
+            }
+        }
+    }
 }
 
 pub(super) struct BatchState {
@@ -95,7 +141,29 @@ pub(super) struct BatchState {
     pub(super) files: HashMap<String, String>,
     pub(super) local_base_heads: Vec<String>,
     pub(super) local_files: HashMap<String, vapor_forge_cloud_local::StagedFile>,
+    pub(super) local_identity: Option<vapor_forge_cloud_local::CommitIdentity>,
+    pub(super) local_resolution_heads: Option<Vec<String>>,
     pub(super) conflict_resolution: Option<Queued<ConflictResolutionEvent>>,
+}
+
+pub(super) struct LocalAppState {
+    pub(super) identity: vapor_forge_cloud_local::CommitIdentity,
+    pub(super) verified_heads: Vec<String>,
+    pub(super) conflict: Option<LocalConflictState>,
+    pub(super) pending_keep_local: Option<LocalKeepLocal>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalConflictState {
+    pub(super) heads: Vec<String>,
+    pub(super) local_head: Option<String>,
+    pub(super) remote_head: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalKeepLocal {
+    pub(super) heads: Vec<String>,
+    pub(super) selected_head: String,
 }
 
 pub(super) fn execute_rpc(
@@ -268,6 +336,8 @@ pub(super) fn handle_begin_batch(
         files: HashMap::new(),
         local_base_heads: Vec::new(),
         local_files: HashMap::new(),
+        local_identity: None,
+        local_resolution_heads: None,
         conflict_resolution,
     };
     state.active_batches.insert(app_id, batch_id);

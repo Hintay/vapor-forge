@@ -1,7 +1,12 @@
 use super::adapter::{execute_rpc, AdapterState};
+use super::conflict_ui::{
+    ConflictDialog, ConflictSubmitResult, ConflictUiAck, ConflictUiContext,
+    LocalConflictCoordinator,
+};
 use super::http::{AdapterError, CloudSettings};
 use super::protocol::{
     build_response_packet, is_cumulus_transfer_report, method_expects_response, request_app_id,
+    RpcReply,
 };
 use super::transfer_targets::TransferTargetRegistry;
 use super::*;
@@ -43,6 +48,24 @@ pub(super) struct QueuedRequest {
     pub(super) body: Vec<u8>,
     pub(super) settings: CloudSettings,
     pub(super) response: Option<QueuedResponse>,
+    pub(super) context_epoch: u64,
+}
+
+fn complete_request(request: QueuedRequest, result: Result<RpcReply, AdapterError>) {
+    if let Some(response) = request.response {
+        let packet = build_response_packet(&response.request_header, result);
+        let _ = response.sender.send(packet);
+        vapor_forge_features::inject_wake::wake(
+            vapor_forge_features::inject_wake::InjectionSource::Cloud,
+        );
+    } else if let Err(error) = result {
+        warn!(
+            app_id = request.app_id,
+            method = request.method,
+            %error,
+            "cloud-rpc: notification failed"
+        );
+    }
 }
 
 pub(super) struct RpcWorker {
@@ -79,41 +102,48 @@ pub struct CloudRpcQueue {
     workers: Box<[RpcWorker]>,
     report_worker: mpsc::SyncSender<QueuedRequest>,
     pub(super) transfer_targets: Arc<TransferTargetRegistry>,
+    local_conflicts: Arc<LocalConflictCoordinator>,
+    context_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CloudRpcQueue {
     pub fn new() -> Self {
         let transfer_targets = Arc::new(TransferTargetRegistry::default());
+        let local_gc = Arc::new(vapor_forge_cloud_local::LocalGcCoordinator::new());
+        let local_conflicts = LocalConflictCoordinator::new(Arc::clone(&local_gc));
+        let context_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let outstanding_responses = Arc::new(AtomicUsize::new(0));
         let workers = (0..RPC_WORKER_SHARDS)
             .map(|_| {
                 let worker_transfer_targets = Arc::clone(&transfer_targets);
+                let worker_local_gc = Arc::clone(&local_gc);
+                let worker_local_conflicts = Arc::clone(&local_conflicts);
                 let (sender, receiver) = mpsc::sync_channel::<QueuedRequest>(RPC_CHANNEL_CAPACITY);
+                let worker_context_epoch = Arc::clone(&context_epoch);
                 let worker_outstanding_responses = Arc::clone(&outstanding_responses);
                 std::thread::spawn(move || {
-                    let mut state = AdapterState::with_transfer_targets(worker_transfer_targets);
+                    let mut state = AdapterState::with_transfer_targets_gc_and_conflicts(
+                        worker_transfer_targets,
+                        worker_local_gc,
+                        Arc::clone(&worker_local_conflicts),
+                    );
                     while let Ok(request) = receiver.recv() {
+                        if request.context_epoch != worker_context_epoch.load(Ordering::Acquire) {
+                            complete_request(
+                                request,
+                                Err(AdapterError::Protocol(
+                                    "cloud request context changed before completion".into(),
+                                )),
+                            );
+                            continue;
+                        }
                         let result = execute_rpc(
                             &mut state,
                             &request.settings,
                             &request.method,
                             &request.body,
                         );
-                        if let Some(response) = request.response {
-                            let packet = build_response_packet(&response.request_header, result);
-                            let _ = response.sender.send(packet);
-                            // Dispatch now rather than waiting for the next inbound packet.
-                            vapor_forge_features::inject_wake::wake(
-                                vapor_forge_features::inject_wake::InjectionSource::Cloud,
-                            );
-                        } else if let Err(error) = result {
-                            warn!(
-                                app_id = request.app_id,
-                                method = request.method,
-                                %error,
-                                "cloud-rpc: notification failed"
-                            );
-                        }
+                        complete_request(request, result);
                     }
                 });
                 RpcWorker {
@@ -146,6 +176,49 @@ impl CloudRpcQueue {
             workers,
             report_worker,
             transfer_targets,
+            local_conflicts,
+            context_epoch,
+        }
+    }
+
+    pub fn conflict_ui_revision(&self) -> u64 {
+        self.local_conflicts.revision()
+    }
+
+    pub fn conflict_dialogs(&self, context: ConflictUiContext) -> Vec<ConflictDialog> {
+        self.local_conflicts.dialogs(context)
+    }
+
+    pub fn submit_conflict_choice(
+        &self,
+        token: &str,
+        context: ConflictUiContext,
+    ) -> ConflictSubmitResult {
+        self.local_conflicts.submit(token, context)
+    }
+
+    pub fn conflict_acks(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
+        self.local_conflicts.acks(context)
+    }
+
+    pub fn acknowledge_conflict_acks(&self, context: ConflictUiContext, tokens: &[String]) {
+        self.local_conflicts.acknowledge_acks(context, tokens);
+    }
+
+    pub fn retry_conflict_ui_context(&self, context: ConflictUiContext) {
+        self.local_conflicts.retry_context(context);
+    }
+
+    pub fn invalidate_conflict_ui_context(&self) {
+        self.local_conflicts.invalidate_ui_context();
+    }
+
+    pub fn cancel_pending_conflicts(&self) {
+        self.context_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.local_conflicts.cancel_pending() {
+            vapor_forge_features::inject_wake::wake(
+                vapor_forge_features::inject_wake::InjectionSource::Cloud,
+            );
         }
     }
 
@@ -188,6 +261,7 @@ impl CloudRpcQueue {
                     body: body.to_vec(),
                     settings: CloudSettings::from_config(config),
                     response: None,
+                    context_epoch: 0,
                 })
                 .is_err()
             {
@@ -228,6 +302,7 @@ impl CloudRpcQueue {
                     sender: sender.clone(),
                     request_header: request_header.clone(),
                 }),
+                context_epoch: self.context_epoch.load(Ordering::Acquire),
             };
             if worker.sender.try_send(request).is_err() {
                 warn!(app_id, method, "cloud-rpc: request queue unavailable");
@@ -246,6 +321,7 @@ impl CloudRpcQueue {
                 body: body.to_vec(),
                 settings,
                 response: None,
+                context_epoch: self.context_epoch.load(Ordering::Acquire),
             };
             if self.worker(app_id).sender.try_send(request).is_err() {
                 warn!(app_id, method, "cloud-rpc: notification queue unavailable");

@@ -1,6 +1,7 @@
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use vapor_forge_cloud_core::device_descriptor;
 use vapor_forge_cloud_cumulus::{
     CumulusClient as SharedCumulusClient, CumulusSettings, STEAM_CLIENT_ID_HEADER,
@@ -32,6 +33,16 @@ impl CloudSettings {
             timeout_connect_ms: config.cloud.timeout_connect_ms,
             timeout_ms: config.cloud.timeout_ms,
         }
+    }
+
+    pub(super) fn conflict_scope(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"vapor-local-cloud-conflict\0");
+        digest.update(self.local_path.trim().as_bytes());
+        digest.update([0]);
+        digest.update(self.steam_id64.unwrap_or_default().to_le_bytes());
+        digest.update(self.steam_client_id.unwrap_or_default().to_le_bytes());
+        digest.finalize().into()
     }
 }
 

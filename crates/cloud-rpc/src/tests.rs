@@ -5,11 +5,12 @@ use super::queue::*;
 use super::transfer_targets::*;
 use super::*;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use vapor_forge_cloud_core::CloudFileStore;
+use vapor_forge_cloud_core::{ByteStore, CloudFileStore};
 use vapor_forge_config::{AppId, AppsSection, CloudSection, InjectApp, RuntimeConfig};
 use vapor_forge_steam_protocol::*;
 
@@ -271,6 +272,7 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
                 timeout_ms: 1,
             },
             response: None,
+            context_epoch: 1,
         })
         .unwrap();
     assert_eq!(receiver.try_recv().unwrap().method, COMPLETE_BATCH);
@@ -306,6 +308,8 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
             files: HashMap::new(),
             local_base_heads: Vec::new(),
             local_files: HashMap::new(),
+            local_identity: None,
+            local_resolution_heads: None,
             conflict_resolution: None,
         },
     );
@@ -1284,4 +1288,699 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
     assert_eq!(delta.current_change_number, Some(2));
     assert!(delta.files.is_empty());
     assert_eq!(delta.is_only_delta, Some(false));
+}
+
+fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
+    CloudSettings {
+        local_path: path.to_string_lossy().into_owned(),
+        server_url: String::new(),
+        token: String::new(),
+        steam_client_id: Some(client_id),
+        steam_id64: Some(76_561_198_000_000_001),
+        bind_device: false,
+        timeout_connect_ms: 1,
+        timeout_ms: 1,
+    }
+}
+
+fn create_local_manifest_heads(
+    path: &std::path::Path,
+    app_id: u32,
+    heads: &[(u64, &str, u64, &[u8], &str)],
+) -> vapor_forge_cloud_local::FolderStore {
+    const ACCOUNT: u64 = 76_561_198_000_000_001;
+    let store = vapor_forge_cloud_local::FolderStore::open_account(path, ACCOUNT).unwrap();
+    let root = store
+        .stage_file(
+            "save.dat",
+            b"root",
+            &vapor_forge_cloud_core::FileMetadata {
+                sha1: "dc76e9f0c0006e8f919e0c515c66dbba3982f785".into(),
+                raw_size: 4,
+                mtime: 1,
+                platforms_to_sync: u32::MAX,
+            },
+        )
+        .unwrap();
+    store
+        .commit_batch(
+            app_id,
+            &[],
+            &[root],
+            &BTreeSet::new(),
+            &vapor_forge_cloud_local::CommitIdentity {
+                client_id: 1,
+                machine_name: "root".into(),
+            },
+            None,
+        )
+        .unwrap();
+
+    let root_id = store.view(app_id).unwrap().head_ids().remove(0);
+    let directory = path.join(format!("commits/saves/{ACCOUNT}/{app_id}"));
+    let root_bytes = std::fs::read(directory.join(format!("{root_id}.json"))).unwrap();
+    let root_manifest = serde_json::from_slice::<serde_json::Value>(&root_bytes).unwrap();
+    for (client_id, machine_name, revision, contents, sha1) in heads {
+        let staged = store
+            .stage_file(
+                "save.dat",
+                contents,
+                &vapor_forge_cloud_core::FileMetadata {
+                    sha1: (*sha1).into(),
+                    raw_size: contents.len() as u64,
+                    mtime: *revision as i64,
+                    platforms_to_sync: u32::MAX,
+                },
+            )
+            .unwrap();
+        let mut manifest = root_manifest.clone();
+        manifest["revision"] = serde_json::json!(revision);
+        manifest["parents"] = serde_json::json!([root_id.clone()]);
+        manifest["client_id"] = serde_json::json!(client_id);
+        manifest["machine_name"] = serde_json::json!(machine_name);
+        manifest["created_at_ms"] = serde_json::json!(revision * 1_000);
+        manifest["nonce"] = serde_json::json!(format!("branch-{client_id}-{revision}"));
+        manifest["files"]["save.dat"] = serde_json::json!({
+            "sha1": staged.blob_sha1,
+            "raw_size": staged.metadata.raw_size,
+            "mtime": staged.metadata.mtime,
+            "platforms_to_sync": staged.metadata.platforms_to_sync,
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let id = bytes_to_hex(&Sha256::digest(&bytes));
+        std::fs::write(directory.join(format!("{id}.json")), bytes).unwrap();
+    }
+    store
+}
+
+fn local_conflict_context(settings: &CloudSettings) -> ConflictUiContext {
+    ConflictUiContext {
+        steam_id64: settings.steam_id64.unwrap(),
+        identity_generation: 1,
+        connection_generation: 1,
+        window_generation: 1,
+        cloud_scope: settings.conflict_scope(),
+    }
+}
+
+#[test]
+fn two_mapped_heads_use_the_remote_manifest_as_the_stock_cloud_side() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store = create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"remote",
+                "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+            ),
+        ],
+    );
+    assert_eq!(store.view(app_id).unwrap().heads.len(), 2);
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let request = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(2),
+    };
+
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &request.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(2));
+    assert_eq!(response.is_only_delta, Some(false));
+    assert_eq!(response.files.len(), 1);
+    assert_eq!(
+        response.files[0].sha_file,
+        Some(hex_to_bytes("41ffe5457d1a557c3317f2e5216ceaa355223d39").unwrap())
+    );
+    assert!(state
+        .local_conflicts
+        .dialogs(local_conflict_context(&settings))
+        .is_empty());
+}
+
+#[test]
+fn identical_manifest_heads_are_closed_before_the_changelist_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store = create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let request = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(2),
+    };
+
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &request.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(3));
+    assert_eq!(response.is_only_delta, Some(false));
+    assert_eq!(store.view(app_id).unwrap().heads.len(), 1);
+    assert!(state
+        .local_conflicts
+        .dialogs(local_conflict_context(&settings))
+        .is_empty());
+}
+
+#[test]
+fn stock_cloud_choice_publishes_the_remote_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store = create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"remote",
+                "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let changelist = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &changelist.encode_to_vec(),
+    )
+    .unwrap();
+    let launch = CloudAppLaunchIntentRequest {
+        app_id: Some(app_id),
+        client_id: Some(7),
+        machine_name: Some("deck".into()),
+        ignore_pending_operations: Some(false),
+        os_type: Some(1),
+        device_type: Some(2),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        LAUNCH_INTENT,
+        &launch.encode_to_vec(),
+    )
+    .unwrap();
+
+    let choice = CloudClientConflictResolutionNotification {
+        app_id: Some(app_id),
+        chose_local_files: Some(false),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        CONFLICT_RESOLUTION,
+        &choice.encode_to_vec(),
+    )
+    .unwrap();
+
+    let resolved = store.view(app_id).unwrap();
+    assert_eq!(resolved.heads.len(), 1);
+    assert_eq!(resolved.current_change_number, Some(3));
+    assert_eq!(store.read(app_id, "save.dat").unwrap(), b"remote");
+}
+
+#[test]
+fn stock_local_choice_is_committed_by_the_normal_upload_batch() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store = create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"remote",
+                "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let changelist = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &changelist.encode_to_vec(),
+    )
+    .unwrap();
+    let choice = CloudClientConflictResolutionNotification {
+        app_id: Some(app_id),
+        chose_local_files: Some(true),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        CONFLICT_RESOLUTION,
+        &choice.encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(store.view(app_id).unwrap().heads.len(), 2);
+
+    let begin = CloudBeginAppUploadBatchRequest {
+        app_id: Some(app_id),
+        machine_name: Some("deck".into()),
+        files_to_upload: vec!["save.dat".into()],
+        files_to_delete: Vec::new(),
+        client_id: Some(7),
+        app_build_id: Some(1),
+    };
+    let reply = execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+    let batch_id = CloudBeginAppUploadBatchResponse::decode(reply.body.as_slice())
+        .unwrap()
+        .batch_id
+        .unwrap();
+    let contents = b"chosen";
+    let upload = CloudClientBeginFileUploadRequest {
+        app_id: Some(app_id),
+        file_size: Some(contents.len() as u32),
+        raw_file_size: Some(contents.len() as u32),
+        file_sha: Some(hex_to_bytes("3fe69382869530ce0a86f97d9955b14a70552f80").unwrap()),
+        timestamp: Some(3),
+        filename: Some("save.dat".into()),
+        platforms_to_sync: Some(u32::MAX),
+        cell_id: None,
+        can_encrypt: Some(false),
+        is_shared_file: Some(false),
+        deprecated_realm: None,
+        upload_batch_id: Some(batch_id),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        BEGIN_FILE_UPLOAD,
+        &upload.encode_to_vec(),
+    )
+    .unwrap();
+    let target = CloudClientBeginFileUploadResponse::decode(reply.body.as_slice())
+        .unwrap()
+        .block_requests
+        .remove(0);
+    assert!(matches!(
+        vapor_forge_cloud_local::intercept_transfer(
+            target.url_host.as_deref().unwrap(),
+            target.url_path.as_deref().unwrap(),
+            contents,
+        ),
+        Some(vapor_forge_cloud_local::LocalTransferOutcome::Upload(
+            Ok(())
+        ))
+    ));
+    let commit = CloudClientCommitFileUploadRequest {
+        transfer_succeeded: Some(true),
+        app_id: Some(app_id),
+        file_sha: upload.file_sha,
+        filename: Some("save.dat".into()),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        COMMIT_FILE_UPLOAD,
+        &commit.encode_to_vec(),
+    )
+    .unwrap();
+    let complete = CloudCompleteAppUploadBatchRequest {
+        app_id: Some(app_id),
+        batch_id: Some(batch_id),
+        batch_eresult: Some(super::ERESULT_OK as u32),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        COMPLETE_BATCH,
+        &complete.encode_to_vec(),
+    )
+    .unwrap();
+
+    let resolved = store.view(app_id).unwrap();
+    assert_eq!(resolved.heads.len(), 1);
+    assert_eq!(resolved.current_change_number, Some(3));
+    assert_eq!(store.read(app_id, "save.dat").unwrap(), contents);
+}
+
+#[test]
+fn two_unmapped_heads_wait_for_the_multi_candidate_resolver() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                8,
+                "desktop",
+                2,
+                b"desktop",
+                "3b5a9f7948a58d58bd432360863a719c95485504",
+            ),
+            (
+                9,
+                "laptop",
+                2,
+                b"laptop",
+                "e068381bbd9eec031347912c57dac0f67479ba23",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let request = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &request.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(1));
+    assert_eq!(response.is_only_delta, Some(false));
+    assert!(response.files.is_empty());
+    let dialogs = state
+        .local_conflicts
+        .dialogs(local_conflict_context(&settings));
+    assert!(dialogs.is_empty());
+}
+
+#[test]
+fn regressed_stock_cloud_head_waits_for_the_multi_candidate_resolver() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                4,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"remote",
+                "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let request = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(3),
+    };
+
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &request.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(3));
+    assert_eq!(response.is_only_delta, Some(false));
+    assert!(response.files.is_empty());
+    assert!(state
+        .local_conflicts
+        .dialogs(local_conflict_context(&settings))
+        .is_empty());
+}
+
+#[test]
+fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store = create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"desktop",
+                "3b5a9f7948a58d58bd432360863a719c95485504",
+            ),
+            (
+                9,
+                "laptop",
+                2,
+                b"laptop",
+                "e068381bbd9eec031347912c57dac0f67479ba23",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let identity = vapor_forge_cloud_local::CommitIdentity {
+        client_id: 7,
+        machine_name: "deck".into(),
+    };
+    store
+        .launch_session(app_id, &identity, Some(1), Some(2), false)
+        .unwrap();
+    store.exit_session(app_id, &identity).unwrap();
+    let claim_path = directory.path().join(format!(
+        "sessions/{}/{app_id}/claims/7.json",
+        settings.steam_id64.unwrap()
+    ));
+    let claim_before = std::fs::read(&claim_path).unwrap();
+    let mut state = AdapterState::default();
+    let changelist = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &changelist.encode_to_vec(),
+    )
+    .unwrap();
+    let response = CloudGetAppFileChangelistResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.current_change_number, Some(1));
+    assert!(response.files.is_empty());
+
+    let launch = CloudAppLaunchIntentRequest {
+        app_id: Some(app_id),
+        client_id: Some(7),
+        machine_name: Some("deck".into()),
+        ignore_pending_operations: Some(false),
+        os_type: Some(1),
+        device_type: Some(2),
+    };
+
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        LAUNCH_INTENT,
+        &launch.encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(reply.eresult, super::ERESULT_TOO_MANY_PENDING);
+    let response = CloudAppLaunchIntentResponse::decode(reply.body.as_slice()).unwrap();
+    assert_eq!(response.pending_remote_operations.len(), 1);
+    assert_eq!(
+        response.pending_remote_operations[0]
+            .machine_name
+            .as_deref(),
+        Some("Multiple saved versions")
+    );
+    assert_eq!(std::fs::read(&claim_path).unwrap(), claim_before);
+    let dialogs = state
+        .local_conflicts
+        .dialogs(local_conflict_context(&settings));
+    assert_eq!(dialogs.len(), 1);
+    assert_eq!(dialogs[0].candidates.len(), 3);
+    let cancel = dialogs[0].cancel_token.clone();
+    assert_eq!(
+        state
+            .local_conflicts
+            .submit(&cancel, local_conflict_context(&settings)),
+        ConflictSubmitResult::Accepted
+    );
+    let exit = CloudAppExitSyncDoneNotification {
+        app_id: Some(app_id),
+        client_id: Some(7),
+        uploads_completed: Some(false),
+        uploads_required: Some(false),
+    };
+    execute_rpc(&mut state, &settings, EXIT_SYNC_DONE, &exit.encode_to_vec()).unwrap();
+    assert_eq!(std::fs::read(claim_path).unwrap(), claim_before);
+}
+
+#[test]
+fn local_session_claims_drive_steam_pending_operations() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = |client_id| CloudSettings {
+        local_path: directory.path().to_string_lossy().into_owned(),
+        server_url: String::new(),
+        token: String::new(),
+        steam_client_id: Some(client_id),
+        steam_id64: Some(76_561_198_000_000_001),
+        bind_device: false,
+        timeout_connect_ms: 1,
+        timeout_ms: 1,
+    };
+    let mut first_state = AdapterState::default();
+    let mut second_state = AdapterState::default();
+    let launch = |client_id, machine_name: &str, ignore_pending| CloudAppLaunchIntentRequest {
+        app_id: Some(480),
+        client_id: Some(client_id),
+        machine_name: Some(machine_name.into()),
+        ignore_pending_operations: Some(ignore_pending),
+        os_type: Some(1),
+        device_type: Some(2),
+    };
+
+    let first = execute_rpc(
+        &mut first_state,
+        &settings(7),
+        LAUNCH_INTENT,
+        &launch(7, "deck", false).encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(first.eresult, super::ERESULT_OK);
+
+    let blocked = execute_rpc(
+        &mut second_state,
+        &settings(8),
+        LAUNCH_INTENT,
+        &launch(8, "desktop", false).encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(blocked.eresult, super::ERESULT_TOO_MANY_PENDING);
+    let blocked = CloudAppLaunchIntentResponse::decode(blocked.body.as_slice()).unwrap();
+    assert_eq!(blocked.pending_remote_operations.len(), 1);
+    assert_eq!(blocked.pending_remote_operations[0].operation, Some(1));
+    assert_eq!(blocked.pending_remote_operations[0].client_id, Some(7));
+
+    let overridden = execute_rpc(
+        &mut second_state,
+        &settings(8),
+        LAUNCH_INTENT,
+        &launch(8, "desktop", true).encode_to_vec(),
+    )
+    .unwrap();
+    assert_eq!(overridden.eresult, super::ERESULT_OK);
+
+    let suspend = CloudAppSessionSuspendRequest {
+        app_id: Some(480),
+        client_id: Some(8),
+        machine_name: Some("desktop".into()),
+        cloud_sync_completed: Some(true),
+    };
+    execute_rpc(
+        &mut second_state,
+        &settings(8),
+        SUSPEND_SESSION,
+        &suspend.encode_to_vec(),
+    )
+    .unwrap();
+    let resume = CloudAppSessionResumeRequest {
+        app_id: Some(480),
+        client_id: Some(8),
+    };
+    execute_rpc(
+        &mut second_state,
+        &settings(8),
+        RESUME_SESSION,
+        &resume.encode_to_vec(),
+    )
+    .unwrap();
+    let exit = CloudAppExitSyncDoneNotification {
+        app_id: Some(480),
+        client_id: Some(8),
+        uploads_completed: Some(true),
+        uploads_required: Some(false),
+    };
+    execute_rpc(
+        &mut second_state,
+        &settings(8),
+        EXIT_SYNC_DONE,
+        &exit.encode_to_vec(),
+    )
+    .unwrap();
 }
