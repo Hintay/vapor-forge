@@ -336,8 +336,19 @@ mod tests {
         result.unwrap();
         let staged = commit_upload(&token).unwrap();
         assert_eq!(transfer_contract(&target.host, &target.path), None);
+        let identity = crate::CommitIdentity {
+            client_id: 7,
+            machine_name: "deck".into(),
+        };
         store
-            .commit_batch(480, &[], &[staged], &std::collections::BTreeSet::new())
+            .commit_batch(
+                480,
+                &[],
+                &[staged],
+                &std::collections::BTreeSet::new(),
+                &identity,
+                None,
+            )
             .unwrap();
 
         let target = issue_download(store.clone(), 480, "save.dat".into()).unwrap();
