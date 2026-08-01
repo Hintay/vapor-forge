@@ -16,17 +16,22 @@ pub(super) fn request_app_id(method: &str, body: &[u8]) -> Option<u32> {
 /// explicitly unowned apps are both protected so startup races cannot expose
 /// an AppID before the ownership snapshot is ready.
 pub fn privacy_fallback(method: &str, body: &[u8], config: &RuntimeConfig) -> Option<(u32, bool)> {
-    privacy_fallback_with_ownership(method, body, config, crate::apps::actual_ownership)
+    privacy_fallback_with_ownership(
+        method,
+        body,
+        config,
+        vapor_forge_features::apps::actual_ownership,
+    )
 }
 
 pub fn privacy_fallback_with_ownership(
     method: &str,
     body: &[u8],
     config: &RuntimeConfig,
-    ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
+    ownership: impl FnOnce(AppId) -> vapor_forge_features::apps::OwnershipState,
 ) -> Option<(u32, bool)> {
     let app_id = request_app_id(method, body)?;
-    crate::apps::classify_app_with_ownership(config, AppId(app_id), ownership)
+    vapor_forge_features::apps::classify_app_with_ownership(config, AppId(app_id), ownership)
         .requires_injected_ownership()
         .then_some((app_id, method_expects_response(method)))
 }
@@ -150,6 +155,7 @@ pub(super) fn build_response_packet(
         eresult: Some(eresult),
         transport_error: None,
         seq_num: None,
+        ..Default::default()
     };
     vapor_forge_steam_protocol::assemble_raw(
         EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG,

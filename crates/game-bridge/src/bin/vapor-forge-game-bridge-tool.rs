@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use vapor_forge_game_bridge as proto;
 use vapor_forge_game_bridge::{Message, TOKEN_LEN};
+use vapor_forge_tool_support::{hex_compact, parse_hex_dump, parse_u32};
 
 fn main() {
     if let Err(error) = run() {
@@ -203,10 +204,6 @@ fn parse_message(args: &[String]) -> Result<Message, String> {
             section_name: fields.string_required("section", 1)?,
         }),
         "ack" => Ok(Message::Ack),
-        "set-delegate" => Ok(Message::SetDelegate {
-            app_id: fields.app_id_required()?,
-            enable: fields.bool_required("enable", 1)?,
-        }),
         "-h" | "--help" => Err(message_usage()),
         other => Err(format!("unknown message {other:?}\n{}", message_usage())),
     }
@@ -325,8 +322,7 @@ fn message_app_id(message: &Message) -> Option<u32> {
         | Message::DenuvoDetected { app_id }
         | Message::DllLoaded { app_id, .. }
         | Message::DllInjectResult { app_id, .. }
-        | Message::PeSection { app_id, .. }
-        | Message::SetDelegate { app_id, .. } => Some(*app_id),
+        | Message::PeSection { app_id, .. } => Some(*app_id),
         Message::Ack => None,
     }
 }
@@ -338,19 +334,6 @@ fn parse_token(value: &str) -> Result<[u8; TOKEN_LEN], String> {
             TOKEN_LEN * 2
         )
     })
-}
-
-fn parse_u32(value: &str) -> Result<u32, String> {
-    if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        u32::from_str_radix(hex, 16).map_err(|error| format!("invalid u32 {value:?}: {error}"))
-    } else {
-        value
-            .parse::<u32>()
-            .map_err(|error| format!("invalid u32 {value:?}: {error}"))
-    }
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -365,56 +348,6 @@ fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'
     args.get(index)
         .map(String::as_str)
         .ok_or_else(|| format!("{flag} requires a value"))
-}
-
-fn parse_hex_dump(input: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-
-    for line in input.lines() {
-        let line = strip_offset(line.trim());
-        for raw in line.split_whitespace() {
-            let token = raw
-                .trim_matches(|c: char| matches!(c, ',' | ';' | '[' | ']' | '{' | '}' | '(' | ')'));
-            if token.is_empty() || token.ends_with(':') {
-                continue;
-            }
-            let token = token
-                .rsplit_once('=')
-                .map(|(_, value)| value)
-                .unwrap_or(token);
-            let token = token
-                .strip_prefix("0x")
-                .or_else(|| token.strip_prefix("0X"))
-                .unwrap_or(token);
-            if token.len() == 2 && token.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-                out.push(byte_from_hex(token)?);
-            } else if token.len() > 2
-                && token.len() % 2 == 0
-                && token.as_bytes().iter().all(u8::is_ascii_hexdigit)
-            {
-                for index in (0..token.len()).step_by(2) {
-                    out.push(byte_from_hex(&token[index..index + 2])?);
-                }
-            }
-        }
-    }
-
-    if out.is_empty() {
-        Err("hex input did not contain any bytes".to_owned())
-    } else {
-        Ok(out)
-    }
-}
-
-fn strip_offset(line: &str) -> &str {
-    let Some((prefix, rest)) = line.split_once(':') else {
-        return line;
-    };
-    if !prefix.is_empty() && prefix.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        rest
-    } else {
-        line
-    }
 }
 
 fn decode_frames(bytes: &[u8]) -> Result<Vec<Message>, String> {
@@ -432,19 +365,6 @@ fn decode_frames(bytes: &[u8]) -> Result<Vec<Message>, String> {
     }
 
     Ok(messages)
-}
-
-fn byte_from_hex(hex: &str) -> Result<u8, String> {
-    u8::from_str_radix(hex, 16).map_err(|error| format!("invalid hex byte {hex:?}: {error}"))
-}
-
-fn hex_compact(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 fn format_message(message: &Message) -> String {
@@ -467,9 +387,6 @@ fn format_message(message: &Message) -> String {
             section_name,
         } => format!("PeSection app_id={app_id} section={section_name:?}"),
         Message::Ack => "Ack".to_owned(),
-        Message::SetDelegate { app_id, enable } => {
-            format!("SetDelegate app_id={app_id} enable={enable}")
-        }
     }
 }
 
@@ -491,8 +408,7 @@ fn message_usage() -> String {
         "  dll-loaded APP_ID NAME\n",
         "  dll-inject-result APP_ID true|false\n",
         "  pe-section APP_ID SECTION\n",
-        "  ack\n",
-        "  set-delegate APP_ID true|false"
+        "  ack"
     )
     .to_owned()
 }

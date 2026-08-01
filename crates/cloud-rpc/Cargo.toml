@@ -1,0 +1,25 @@
+[package]
+name = "vapor-forge-cloud-rpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+vapor-forge-cloud-core = { path = "../cloud-core" }
+vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
+vapor-forge-cloud-local = { path = "../cloud-local" }
+vapor-forge-config = { path = "../config" }
+vapor-forge-core = { path = "../runtime-core" }
+vapor-forge-features = { path = "../features" }
+vapor-forge-steam-protocol = { path = "../steam-protocol" }
+vapor-forge-sync-journal = { path = "../sync-journal" }
+
+[dev-dependencies]
+tempfile = "3"

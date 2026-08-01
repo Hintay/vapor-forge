@@ -5,13 +5,14 @@ use super::*;
 use prost::Message;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 use vapor_forge_cloud_core::{device_descriptor, CloudBackend};
+use vapor_forge_core::unix_now;
 use vapor_forge_steam_protocol::*;
-use vapor_forge_sync_state::{
-    default_outbox_path, new_conflict_event_id, Outbox, QueuedConflictResolution,
+use vapor_forge_sync_journal::{
+    default_sync_journal_path, new_conflict_event_id, ConflictResolutionEvent, Queued, SyncJournal,
 };
 
 pub(super) struct AdapterState {
@@ -21,24 +22,34 @@ pub(super) struct AdapterState {
     pub(super) active_batches: HashMap<u32, u64>,
     pub(super) batches: HashMap<u64, BatchState>,
     pub(super) files: HashMap<(u32, String), CumulusFile>,
-    pub(super) conflict_outbox_path: Option<PathBuf>,
+    /// Shared with every other journal user in this process; structsy allows
+    /// only one open database per file, so this is never opened here directly.
+    pub(super) journal: Option<Arc<SyncJournal>>,
     pub(super) transfer_targets: Arc<TransferTargetRegistry>,
+    pub(super) principal_scope: Option<String>,
 }
 
 impl Default for AdapterState {
     fn default() -> Self {
-        Self::with_transfer_targets_and_outbox(Arc::new(TransferTargetRegistry::default()), None)
+        Self::with_transfer_targets_and_journal(Arc::new(TransferTargetRegistry::default()), None)
     }
 }
 
 impl AdapterState {
     pub(super) fn with_transfer_targets(transfer_targets: Arc<TransferTargetRegistry>) -> Self {
-        Self::with_transfer_targets_and_outbox(transfer_targets, default_outbox_path())
+        let journal = default_sync_journal_path().and_then(|path| match open_journal(&path) {
+            Ok(journal) => Some(journal),
+            Err(error) => {
+                warn!(%error, path = %path.display(), "cloud-rpc: conflict journal unavailable");
+                None
+            }
+        });
+        Self::with_transfer_targets_and_journal(transfer_targets, journal)
     }
 
-    pub(super) fn with_transfer_targets_and_outbox(
+    pub(super) fn with_transfer_targets_and_journal(
         transfer_targets: Arc<TransferTargetRegistry>,
-        conflict_outbox_path: Option<PathBuf>,
+        journal: Option<Arc<SyncJournal>>,
     ) -> Self {
         Self {
             scope: None,
@@ -47,8 +58,9 @@ impl AdapterState {
             active_batches: HashMap::new(),
             batches: HashMap::new(),
             files: HashMap::new(),
-            conflict_outbox_path,
+            journal,
             transfer_targets,
+            principal_scope: None,
         }
     }
 
@@ -65,6 +77,7 @@ impl AdapterState {
         self.active_batches.clear();
         self.batches.clear();
         self.files.clear();
+        self.principal_scope = None;
         self.scope = Some(scope);
     }
 
@@ -82,7 +95,7 @@ pub(super) struct BatchState {
     pub(super) files: HashMap<String, String>,
     pub(super) local_base_heads: Vec<String>,
     pub(super) local_files: HashMap<String, vapor_forge_cloud_local::StagedFile>,
-    pub(super) conflict_resolution: Option<QueuedConflictResolution>,
+    pub(super) conflict_resolution: Option<Queued<ConflictResolutionEvent>>,
 }
 
 pub(super) fn execute_rpc(
@@ -112,13 +125,22 @@ pub(super) fn execute_rpc(
         backend.ensure_device_bound(&descriptor)?;
     }
     let client = CumulusClient::new(settings)?;
-    let conflict_scope = backend.credential_scope();
-    if let Err(error) = deliver_ready_conflicts(state, &client, &conflict_scope) {
-        warn!(%error, "cloud-rpc: deferred conflict report failed");
-    }
     match method {
         GET_CHANGELIST => handle_changelist(state, &client, body),
-        BEGIN_BATCH => handle_begin_batch(state, &client, &conflict_scope, body),
+        BEGIN_BATCH => {
+            let conflict_scope = backend.principal_scope()?;
+            state.principal_scope = Some(conflict_scope.clone());
+            if let Some(journal) = state.journal.as_deref() {
+                journal.attribute_pending_conflicts(
+                    state.scope().credential_fingerprint(),
+                    &conflict_scope,
+                )?;
+            }
+            if let Err(error) = deliver_ready_conflicts(state, &client, &conflict_scope) {
+                warn!(%error, "cloud-rpc: deferred conflict report failed");
+            }
+            handle_begin_batch(state, &client, &conflict_scope, body)
+        }
         BEGIN_FILE_UPLOAD => handle_begin_file_upload(state, &client, body),
         COMMIT_FILE_UPLOAD => handle_commit_file_upload(state, &client, body),
         COMPLETE_BATCH | COMPLETE_BATCH_BLOCKING => handle_complete_batch(state, &client, body),
@@ -129,7 +151,7 @@ pub(super) fn execute_rpc(
         SUSPEND_SESSION => handle_suspend(&client, body),
         RESUME_SESSION => handle_resume(&client, body),
         EXIT_SYNC_DONE => handle_exit(&client, body),
-        CONFLICT_RESOLUTION => handle_conflict_resolution(state, &client, &conflict_scope, body),
+        CONFLICT_RESOLUTION => handle_conflict_resolution(state, &backend, &client, body),
         CDN_REPORT => handle_cdn_report(&client, body),
         EXTERNAL_TRANSFER_REPORT => handle_external_transfer_report(&client, body),
         _ => Err(AdapterError::Protocol("unsupported cloud method".into())),
@@ -235,8 +257,8 @@ pub(super) fn handle_begin_batch(
         }),
     )?;
     let batch_id = parse_batch_id(&response.batch_id)?;
-    let conflict_resolution = match state.conflict_outbox_path.as_deref() {
-        Some(path) => Outbox::open(path)?.pending_local_conflict(conflict_scope, app_id, base)?,
+    let conflict_resolution = match state.journal.as_deref() {
+        Some(journal) => journal.pending_local_conflict(conflict_scope, app_id, base)?,
         None => None,
     };
     let batch = BatchState {
@@ -443,11 +465,11 @@ pub(super) fn handle_complete_batch(
             .batches
             .get(&batch_id)
             .and_then(|batch| batch.conflict_resolution.as_ref())
-            .map(|resolution| {
+            .map(|queued| {
                 json!({
-                    "event_id": resolution.event_id,
-                    "base_change_number": signed_bits(resolution.base_change_number),
-                    "resolution": resolution.resolution,
+                    "event_id": queued.value.event_id,
+                    "base_change_number": signed_bits(queued.value.base_change_number),
+                    "resolution": queued.value.resolution,
                 })
             });
         let commit: CumulusCommit = client.post_json(
@@ -466,8 +488,8 @@ pub(super) fn handle_complete_batch(
             .get(&batch_id)
             .and_then(|batch| batch.conflict_resolution.as_ref())
         {
-            if let Some(path) = state.conflict_outbox_path.as_deref() {
-                Outbox::open(path)?.mark_conflict_delivered(resolution)?;
+            if let Some(journal) = state.journal.as_deref() {
+                journal.acknowledge(resolution)?;
             }
         }
     }
@@ -649,8 +671,8 @@ pub(super) fn handle_exit(client: &CumulusClient, body: &[u8]) -> Result<RpcRepl
 
 pub(super) fn handle_conflict_resolution(
     state: &mut AdapterState,
+    backend: &impl CloudBackend,
     client: &CumulusClient,
-    conflict_scope: &str,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     let request = CloudClientConflictResolutionNotification::decode(body)?;
@@ -669,8 +691,8 @@ pub(super) fn handle_conflict_resolution(
         .ok_or_else(|| {
             AdapterError::Protocol("conflict reported before a verified changelist".into())
         })?;
-    let resolution = QueuedConflictResolution {
-        owner_scope: conflict_scope.to_string(),
+    let resolution = ConflictResolutionEvent {
+        owner_scope: state.scope().credential_fingerprint().to_owned(),
         event_id: new_conflict_event_id(),
         app_id,
         base_change_number,
@@ -682,13 +704,28 @@ pub(super) fn handle_conflict_resolution(
         },
         machine_name: device_descriptor().map(|descriptor| descriptor.machine_name),
     };
-    let path = state
-        .conflict_outbox_path
+    let journal = state
+        .journal
         .as_deref()
-        .ok_or_else(|| AdapterError::Protocol("conflict outbox path is unavailable".into()))?;
-    Outbox::open(path)?.enqueue_conflict(&resolution, unix_time())?;
+        .ok_or_else(|| AdapterError::Protocol("conflict journal is unavailable".into()))?;
+    journal.enqueue_conflict(&resolution, unix_now())?;
+
+    let conflict_scope = match backend.principal_scope() {
+        Ok(scope) => scope,
+        Err(error) => {
+            warn!(app_id, %error, "cloud-rpc: conflict persisted pending principal lookup");
+            return Ok(RpcReply::ok(Vec::new()));
+        }
+    };
+    state.principal_scope = Some(conflict_scope.clone());
+    if let Err(error) =
+        journal.attribute_pending_conflicts(state.scope().credential_fingerprint(), &conflict_scope)
+    {
+        warn!(app_id, %error, "cloud-rpc: conflict persisted pending scope attribution");
+        return Ok(RpcReply::ok(Vec::new()));
+    }
     if resolution.resolution == "kept_cloud" {
-        if let Err(error) = deliver_ready_conflicts(state, client, conflict_scope) {
+        if let Err(error) = deliver_ready_conflicts(state, client, &conflict_scope) {
             warn!(app_id, %error, "cloud-rpc: kept-cloud report queued for retry");
         }
     }
@@ -700,12 +737,12 @@ pub(super) fn deliver_ready_conflicts(
     client: &CumulusClient,
     conflict_scope: &str,
 ) -> Result<(), AdapterError> {
-    let Some(path) = state.conflict_outbox_path.as_deref() else {
+    let Some(journal) = state.journal.as_deref() else {
         return Ok(());
     };
-    let outbox = Outbox::open(path)?;
-    let now = unix_time();
-    for resolution in outbox.pending_cloud_conflicts(now, conflict_scope)? {
+    let now = unix_now();
+    for queued in journal.pending_cloud_conflicts(now, conflict_scope)? {
+        let resolution = &queued.value;
         let result = client.post_json_unit(
             &format!("/api/v1/apps/{}/conflicts/kept-cloud", resolution.app_id),
             &json!({
@@ -715,9 +752,9 @@ pub(super) fn deliver_ready_conflicts(
             }),
         );
         match result {
-            Ok(()) => outbox.mark_conflict_delivered(&resolution)?,
+            Ok(()) => journal.acknowledge(&queued)?,
             Err(error) => {
-                outbox.mark_conflict_failed(&resolution, now)?;
+                journal.defer(&queued, now)?;
                 return Err(error);
             }
         }
@@ -725,12 +762,13 @@ pub(super) fn deliver_ready_conflicts(
     Ok(())
 }
 
-pub(super) fn unix_time() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
+/// Open the shared journal handle for `path`.
+///
+/// Always goes through the process-wide registry: structsy keeps an exclusive
+/// lock per open database, so a private open here would fail whenever another
+/// subsystem already holds the same file.
+fn open_journal(path: &Path) -> Result<Arc<SyncJournal>, AdapterError> {
+    Ok(vapor_forge_sync_journal::shared(path)?)
 }
 
 pub(super) fn handle_cdn_report(

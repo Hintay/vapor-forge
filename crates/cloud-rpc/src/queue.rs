@@ -5,7 +5,6 @@ use super::protocol::{
 };
 use super::transfer_targets::TransferTargetRegistry;
 use super::*;
-use prost::Message;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use tracing::warn;
@@ -14,7 +13,23 @@ use vapor_forge_steam_protocol::*;
 
 struct PendingResponse {
     receiver: mpsc::Receiver<Vec<u8>>,
-    _reservation: ResponseReservation,
+    fallback: Vec<u8>,
+    response_generation: u64,
+    reservation: ResponsePermit,
+}
+
+/// A completed response together with the capacity permit that remains live
+/// until the native injection path dispatches or rejects it as stale.
+pub struct CompletedResponse {
+    pub packet: Vec<u8>,
+    pub response_generation: u64,
+    permit: ResponsePermit,
+}
+
+impl CompletedResponse {
+    pub fn into_parts(self) -> (Vec<u8>, u64, ResponsePermit) {
+        (self.packet, self.response_generation, self.permit)
+    }
 }
 
 pub(super) struct QueuedResponse {
@@ -36,29 +51,29 @@ pub(super) struct RpcWorker {
 }
 
 impl RpcWorker {
-    pub(super) fn try_reserve_response(&self) -> Option<ResponseReservation> {
+    pub(super) fn try_reserve_response(&self) -> Option<ResponsePermit> {
         self.outstanding_responses
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < RPC_QUEUE_CAPACITY).then_some(queued + 1)
             })
             .ok()?;
-        Some(ResponseReservation {
+        Some(ResponsePermit {
             outstanding: Arc::clone(&self.outstanding_responses),
         })
     }
 }
 
-pub(super) struct ResponseReservation {
+pub struct ResponsePermit {
     pub(super) outstanding: Arc<AtomicUsize>,
 }
 
-impl Drop for ResponseReservation {
+impl Drop for ResponsePermit {
     fn drop(&mut self) {
         self.outstanding.fetch_sub(1, Ordering::AcqRel);
     }
 }
 /// Thread-safe queue used by the network hook. HTTP never runs on Steam's
-/// websocket thread; completed packets are drained on a later receive frame.
+/// websocket thread; each completion wakes its native injection source.
 pub struct CloudRpcQueue {
     pending: Mutex<Vec<PendingResponse>>,
     workers: Box<[RpcWorker]>,
@@ -69,11 +84,12 @@ pub struct CloudRpcQueue {
 impl CloudRpcQueue {
     pub fn new() -> Self {
         let transfer_targets = Arc::new(TransferTargetRegistry::default());
+        let outstanding_responses = Arc::new(AtomicUsize::new(0));
         let workers = (0..RPC_WORKER_SHARDS)
             .map(|_| {
                 let worker_transfer_targets = Arc::clone(&transfer_targets);
                 let (sender, receiver) = mpsc::sync_channel::<QueuedRequest>(RPC_CHANNEL_CAPACITY);
-                let outstanding_responses = Arc::new(AtomicUsize::new(0));
+                let worker_outstanding_responses = Arc::clone(&outstanding_responses);
                 std::thread::spawn(move || {
                     let mut state = AdapterState::with_transfer_targets(worker_transfer_targets);
                     while let Ok(request) = receiver.recv() {
@@ -87,7 +103,9 @@ impl CloudRpcQueue {
                             let packet = build_response_packet(&response.request_header, result);
                             let _ = response.sender.send(packet);
                             // Dispatch now rather than waiting for the next inbound packet.
-                            crate::inject_wake::wake(crate::inject_wake::InjectionSource::Cloud);
+                            vapor_forge_features::inject_wake::wake(
+                                vapor_forge_features::inject_wake::InjectionSource::Cloud,
+                            );
                         } else if let Err(error) = result {
                             warn!(
                                 app_id = request.app_id,
@@ -100,7 +118,7 @@ impl CloudRpcQueue {
                 });
                 RpcWorker {
                     sender,
-                    outstanding_responses,
+                    outstanding_responses: worker_outstanding_responses,
                 }
             })
             .collect::<Vec<_>>()
@@ -131,22 +149,6 @@ impl CloudRpcQueue {
         }
     }
 
-    pub fn is_issued_transfer_target(
-        &self,
-        config: &RuntimeConfig,
-        authority: &str,
-        path: &str,
-    ) -> bool {
-        if !config.cumulus_configured() {
-            return false;
-        }
-        self.transfer_targets.contains(
-            &super::transfer_targets::CloudStateScope::from_config(config),
-            authority,
-            path,
-        )
-    }
-
     pub(super) fn worker(&self, app_id: u32) -> &RpcWorker {
         &self.workers[app_id as usize % self.workers.len()]
     }
@@ -154,11 +156,15 @@ impl CloudRpcQueue {
     pub(super) fn track_response(
         &self,
         receiver: mpsc::Receiver<Vec<u8>>,
-        reservation: ResponseReservation,
+        fallback: Vec<u8>,
+        response_generation: u64,
+        reservation: ResponsePermit,
     ) {
         self.pending.lock().unwrap().push(PendingResponse {
             receiver,
-            _reservation: reservation,
+            fallback,
+            response_generation,
+            reservation,
         });
     }
 
@@ -171,12 +177,8 @@ impl CloudRpcQueue {
         _request_header_bytes: &[u8],
         body: &[u8],
         config: &RuntimeConfig,
+        response_generation: u64,
     ) -> bool {
-        if (config.local_cloud_configured() || config.cumulus_configured())
-            && method == LAUNCH_INTENT
-        {
-            capture_device_descriptor(body);
-        }
         if is_cumulus_transfer_report(method, body, config, &self.transfer_targets) {
             if self
                 .report_worker
@@ -197,7 +199,8 @@ impl CloudRpcQueue {
             return false;
         };
         if (!config.local_cloud_configured() && !config.cumulus_configured())
-            || !crate::apps::classify_app(config, AppId(app_id)).is_confirmed_unowned()
+            || !vapor_forge_features::apps::classify_app(config, AppId(app_id))
+                .is_confirmed_unowned()
         {
             return false;
         }
@@ -230,8 +233,12 @@ impl CloudRpcQueue {
                 warn!(app_id, method, "cloud-rpc: request queue unavailable");
                 let packet = build_response_packet(request_header, Err(AdapterError::Overloaded));
                 let _ = sender.send(packet);
+                vapor_forge_features::inject_wake::wake(
+                    vapor_forge_features::inject_wake::InjectionSource::Cloud,
+                );
             }
-            self.track_response(receiver, reservation);
+            let fallback = build_response_packet(request_header, Err(AdapterError::Overloaded));
+            self.track_response(receiver, fallback, response_generation, reservation);
         } else {
             let request = QueuedRequest {
                 app_id,
@@ -248,39 +255,33 @@ impl CloudRpcQueue {
         true
     }
 
-    pub fn drain_completed(&self) -> Vec<Vec<u8>> {
+    pub fn drain_completed(&self) -> Vec<CompletedResponse> {
         let mut pending = self.pending.lock().unwrap();
         let mut completed = Vec::new();
         let mut index = 0;
         while index < pending.len() {
             match pending[index].receiver.try_recv() {
                 Ok(packet) => {
-                    pending.swap_remove(index);
-                    completed.push(packet);
+                    let entry = pending.swap_remove(index);
+                    completed.push(CompletedResponse {
+                        packet,
+                        response_generation: entry.response_generation,
+                        permit: entry.reservation,
+                    });
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    pending.swap_remove(index);
+                    let entry = pending.swap_remove(index);
+                    completed.push(CompletedResponse {
+                        packet: entry.fallback,
+                        response_generation: entry.response_generation,
+                        permit: entry.reservation,
+                    });
                 }
                 Err(mpsc::TryRecvError::Empty) => index += 1,
             }
         }
         completed
     }
-}
-
-fn capture_device_descriptor(body: &[u8]) {
-    let Ok(request) = CloudAppLaunchIntentRequest::decode(body) else {
-        return;
-    };
-    let Some(client_id) = request.client_id.filter(|client_id| *client_id != 0) else {
-        return;
-    };
-    vapor_forge_cloud_core::record_device_descriptor(vapor_forge_cloud_core::DeviceDescriptor {
-        client_id,
-        machine_name: request.machine_name.unwrap_or_default(),
-        os_type: request.os_type.map(i64::from),
-        device_type: request.device_type.map(i64::from),
-    });
 }
 
 impl Default for CloudRpcQueue {

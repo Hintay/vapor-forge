@@ -11,40 +11,52 @@ const TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct CloudStateScope {
-    credential_scope: String,
+    credential_fingerprint: String,
+    steam_id64: Option<u64>,
 }
 
 impl CloudStateScope {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
         if config.local_cloud_configured() {
-            return Self::local(&config.cloud.local_path);
+            return Self::local(
+                &config.cloud.local_path,
+                Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
+            );
         }
         Self {
-            credential_scope: vapor_forge_cloud_core::credential_scope(
+            credential_fingerprint: vapor_forge_cloud_core::credential_fingerprint(
                 &config.cloud.server_url,
                 &config.cloud.token,
             ),
+            steam_id64: Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
         }
     }
 
     pub(super) fn from_settings(settings: &CloudSettings) -> Self {
         if !settings.local_path.is_empty() {
-            return Self::local(&settings.local_path);
+            return Self::local(&settings.local_path, settings.steam_id64);
         }
         Self {
-            credential_scope: vapor_forge_cloud_core::credential_scope(
+            credential_fingerprint: vapor_forge_cloud_core::credential_fingerprint(
                 &settings.server_url,
                 &settings.token,
             ),
+            steam_id64: settings.steam_id64,
         }
     }
 
-    fn local(path: &str) -> Self {
+    pub(super) fn credential_fingerprint(&self) -> &str {
+        &self.credential_fingerprint
+    }
+
+    fn local(path: &str, steam_id64: Option<u64>) -> Self {
         Self {
-            credential_scope: vapor_forge_cloud_core::endpoint_scope(&format!(
-                "file://{}",
-                path.trim()
+            credential_fingerprint: vapor_forge_cloud_core::endpoint_scope(&format!(
+                "file://{}/accounts/{}",
+                path.trim(),
+                steam_id64.unwrap_or(0)
             )),
+            steam_id64,
         }
     }
 }

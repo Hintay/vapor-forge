@@ -12,7 +12,18 @@ use std::time::Duration;
 use vapor_forge_cloud_core::CloudFileStore;
 use vapor_forge_config::{AppId, AppsSection, CloudSection, InjectApp, RuntimeConfig};
 use vapor_forge_steam_protocol::*;
-use vapor_forge_sync_state::Outbox;
+
+#[derive(Clone, prost::Message)]
+struct CloudBeginHttpUploadRequestFixture {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudCommitHttpUploadRequestFixture {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
 
 fn one_response_server(body: &str) -> (String, mpsc::Receiver<String>) {
     use std::io::{Read, Write};
@@ -98,6 +109,8 @@ fn scripted_server(responses: &[(u16, &str)]) -> (String, mpsc::Receiver<String>
     (format!("http://{address}"), receiver)
 }
 
+const PRINCIPAL_RESPONSE: &str = r#"{"principal_id":"user:42"}"#;
+
 fn put_upload_block(block: &CloudFileUploadBlockDetails, body: &[u8]) {
     use std::io::{Read, Write};
 
@@ -145,11 +158,8 @@ fn response_routes_to_request_job() {
     let request = CMsgProtoBufHeader {
         steamid: Some(7),
         jobid_source: Some(99),
-        jobid_target: None,
         target_job_name: Some(GET_CHANGELIST.into()),
-        eresult: None,
-        transport_error: None,
-        seq_num: None,
+        ..Default::default()
     };
     let packet = build_response_packet(&request, Ok(RpcReply::ok(vec![1, 2, 3])));
     let (_, header, body) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
@@ -195,7 +205,7 @@ fn recognizes_only_decoded_cloud_methods() {
 
 #[test]
 fn recognizes_legacy_app_cloud_methods() {
-    let field_one = AppIdField1Request { app_id: Some(480) }.encode_to_vec();
+    let field_one = CloudBeginHttpUploadRequestFixture { app_id: Some(480) }.encode_to_vec();
     for method in [
         BEGIN_HTTP_UPLOAD,
         BEGIN_UGC_UPLOAD,
@@ -206,7 +216,7 @@ fn recognizes_legacy_app_cloud_methods() {
         assert_eq!(request_app_id(method, &field_one), Some(480), "{method}");
     }
 
-    let field_two = AppIdField2Request { app_id: Some(480) }.encode_to_vec();
+    let field_two = CloudCommitHttpUploadRequestFixture { app_id: Some(480) }.encode_to_vec();
     for method in [
         COMMIT_HTTP_UPLOAD,
         COMMIT_UGC_UPLOAD,
@@ -255,6 +265,7 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
                 server_url: "http://127.0.0.1".into(),
                 token: "token".into(),
                 steam_client_id: Some(7),
+                steam_id64: Some(76_561_198_000_000_001),
                 bind_device: false,
                 timeout_connect_ms: 1,
                 timeout_ms: 1,
@@ -274,6 +285,7 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
         server_url: "https://cloud-a.example".into(),
         token: "token-a".into(),
         steam_client_id: Some(7),
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
         timeout_ms: 1,
@@ -318,16 +330,21 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
 #[test]
 fn response_reservation_is_held_until_the_response_is_drained() {
     let outstanding = Arc::new(AtomicUsize::new(1));
-    let reservation = ResponseReservation {
+    let reservation = ResponsePermit {
         outstanding: Arc::clone(&outstanding),
     };
     let (sender, receiver) = mpsc::channel();
     let queue = CloudRpcQueue::new();
-    queue.track_response(receiver, reservation);
+    queue.track_response(receiver, vec![9], 17, reservation);
     sender.send(vec![1, 2, 3]).unwrap();
 
     assert_eq!(outstanding.load(Ordering::Acquire), 1);
-    assert_eq!(queue.drain_completed(), vec![vec![1, 2, 3]]);
+    let completed = queue.drain_completed();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].packet, vec![1, 2, 3]);
+    assert_eq!(completed[0].response_generation, 17);
+    assert_eq!(outstanding.load(Ordering::Acquire), 1);
+    drop(completed);
     assert_eq!(outstanding.load(Ordering::Acquire), 0);
 }
 
@@ -355,13 +372,14 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         &[],
         &external.encode_to_vec(),
         &config,
+        0,
     ));
 
     let cdn = CloudCdnReportNotification {
         url: Some("https://CLOUD.EXAMPLE:8443/base/api/v1/files/1/content".into()),
         ..Default::default()
     };
-    assert!(queue.intercept(CDN_REPORT, &header, &[], &cdn.encode_to_vec(), &config,));
+    assert!(queue.intercept(CDN_REPORT, &header, &[], &cdn.encode_to_vec(), &config, 0,));
     // A notification enqueues no response to drain.
     assert!(queue.drain_completed().is_empty());
 
@@ -376,6 +394,7 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         &[],
         &steam.encode_to_vec(),
         &config,
+        0,
     ));
 
     queue.transfer_targets.register(
@@ -394,6 +413,7 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         &[],
         &issued.encode_to_vec(),
         &config,
+        0,
     ));
     let unissued = CloudExternalStorageTransferReportNotification {
         host: Some("bucket.example".into()),
@@ -406,6 +426,7 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         &[],
         &unissued.encode_to_vec(),
         &config,
+        0,
     ));
 }
 
@@ -417,6 +438,7 @@ fn forwards_cumulus_transfer_reports_to_cumulus() {
         server_url,
         token: "report-token".into(),
         steam_client_id: None,
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
@@ -475,7 +497,9 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
             200,
             r#"{"current_change_number":0,"app_buildid_hwm":0,"basis":"full","changed":[],"deleted":[]}"#,
         ),
+        (200, PRINCIPAL_RESPONSE),
         (200, r#"{"batch_id":"42","app_change_number":1}"#),
+        (200, PRINCIPAL_RESPONSE),
         (204, ""),
         (200, r#"{"batch_id":"43","app_change_number":1}"#),
     ]);
@@ -484,6 +508,7 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
         server_url,
         token: "batch-token".into(),
         steam_client_id: None,
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
@@ -508,7 +533,7 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
     execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
     execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
 
-    let lines = (0..4)
+    let lines = (0..6)
         .map(|_| {
             captured
                 .recv_timeout(Duration::from_secs(1))
@@ -523,7 +548,9 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
         lines,
         [
             "GET /api/v1/apps/480/changelist?synced_change_number=0 HTTP/1.1",
+            "GET /api/v1/device/principal HTTP/1.1",
             "POST /api/v1/steam/apps/480/upload-batches HTTP/1.1",
+            "GET /api/v1/device/principal HTTP/1.1",
             "DELETE /api/v1/upload-batches/42 HTTP/1.1",
             "POST /api/v1/steam/apps/480/upload-batches HTTP/1.1",
         ]
@@ -535,15 +562,20 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
 #[test]
 fn conflict_results_are_reported_or_bound_to_the_next_batch() {
     let directory = tempfile::tempdir().unwrap();
-    let outbox_path = directory.path().join("conflicts.db");
+    let journal =
+        vapor_forge_sync_journal::shared(&directory.path().join("conflicts.redb")).unwrap();
     let (server_url, captured) = scripted_server(&[
         (
             200,
             r#"{"current_change_number":2,"app_buildid_hwm":0,"basis":"delta","changed":[],"deleted":[]}"#,
         ),
+        (200, PRINCIPAL_RESPONSE),
         (200, "{}"),
+        (200, PRINCIPAL_RESPONSE),
+        (200, PRINCIPAL_RESPONSE),
         (200, r#"{"batch_id":"42","app_change_number":3}"#),
         (204, ""),
+        (200, PRINCIPAL_RESPONSE),
         (200, r#"{"batch_id":"43","app_change_number":3}"#),
     ]);
     let settings = CloudSettings {
@@ -551,12 +583,13 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         server_url,
         token: "conflict-token".into(),
         steam_client_id: None,
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
     };
     let mut state = AdapterState {
-        conflict_outbox_path: Some(outbox_path.clone()),
+        journal: Some(Arc::clone(&journal)),
         ..Default::default()
     };
     let changelist = CloudGetAppFileChangelistRequest {
@@ -584,6 +617,8 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         &kept_cloud.encode_to_vec(),
     )
     .unwrap();
+    let principal = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(principal.starts_with("GET /api/v1/device/principal HTTP/1.1"));
     let report = captured.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(report.starts_with("POST /api/v1/apps/480/conflicts/kept-cloud HTTP/1.1"));
     assert!(report.contains(r#""base_change_number":1"#));
@@ -604,12 +639,16 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         &kept_local.encode_to_vec(),
     )
     .unwrap();
+    let principal = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(principal.starts_with("GET /api/v1/device/principal HTTP/1.1"));
     let begin = CloudBeginAppUploadBatchRequest {
         app_id: Some(480),
         machine_name: Some("deck".into()),
         ..Default::default()
     };
     execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+    let principal = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(principal.starts_with("GET /api/v1/device/principal HTTP/1.1"));
     let begin_request = captured.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(begin_request.starts_with("POST /api/v1/steam/apps/480/upload-batches"));
     let resolution = state
@@ -617,11 +656,11 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         .get(&42)
         .and_then(|batch| batch.conflict_resolution.as_ref())
         .unwrap();
-    assert_eq!(resolution.base_change_number, 1);
-    assert_eq!(resolution.remote_change_number, 2);
-    assert_eq!(resolution.resolution, "kept_local");
+    assert_eq!(resolution.value.base_change_number, 1);
+    assert_eq!(resolution.value.remote_change_number, 2);
+    assert_eq!(resolution.value.resolution, "kept_local");
     assert_eq!(
-        Outbox::open(&outbox_path).unwrap().conflict_len().unwrap(),
+        journal.conflict_len().unwrap(),
         1,
         "binding a local choice to a batch must not remove it"
     );
@@ -638,13 +677,17 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         &failed.encode_to_vec(),
     )
     .unwrap();
+    let abort = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(abort.starts_with("DELETE /api/v1/upload-batches/42 HTTP/1.1"));
     assert_eq!(
-        Outbox::open(&outbox_path).unwrap().conflict_len().unwrap(),
+        journal.conflict_len().unwrap(),
         1,
         "an aborted batch must retain the local choice"
     );
 
     execute_rpc(&mut state, &settings, BEGIN_BATCH, &begin.encode_to_vec()).unwrap();
+    let principal = captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(principal.starts_with("GET /api/v1/device/principal HTTP/1.1"));
     assert!(state
         .batches
         .get(&43)
@@ -683,8 +726,8 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
     };
 
     assert_eq!(
-        crate::apps::actual_ownership(app_id),
-        crate::apps::OwnershipState::Unknown
+        vapor_forge_features::apps::actual_ownership(app_id),
+        vapor_forge_features::apps::OwnershipState::Unknown
     );
     assert!(!CloudRpcQueue::new().intercept(
         QUOTA_USAGE,
@@ -692,13 +735,14 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
         &header.encode_to_vec(),
         &request,
         &config,
+        0,
     ));
     assert_eq!(
         privacy_fallback(QUOTA_USAGE, &request, &config),
         Some((app_id.0, true))
     );
 
-    let legacy_request = AppIdField2Request {
+    let legacy_request = CloudCommitHttpUploadRequestFixture {
         app_id: Some(app_id.0),
     }
     .encode_to_vec();
@@ -728,7 +772,7 @@ fn actually_owned_apps_stay_on_steam() {
         },
         ..Default::default()
     };
-    crate::apps::record_actual_ownership(app_id, true);
+    vapor_forge_features::apps::record_actual_ownership(app_id, true);
     let request = CloudClientGetAppQuotaUsageRequest {
         app_id: Some(app_id.0),
     }
@@ -745,9 +789,10 @@ fn actually_owned_apps_stay_on_steam() {
         &header.encode_to_vec(),
         &request,
         &config,
+        0,
     ));
 
-    let legacy_request = AppIdField1Request {
+    let legacy_request = CloudBeginHttpUploadRequestFixture {
         app_id: Some(app_id.0),
     }
     .encode_to_vec();
@@ -780,6 +825,7 @@ fn changelist_http_response_maps_to_steam_rpc() {
         server_url,
         token: "secret-token".into(),
         steam_client_id: Some(11_047_413_376_560_171_870),
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
@@ -836,6 +882,7 @@ fn download_uses_external_descriptor_without_cumulus_bearer() {
         server_url,
         token: "cumulus-secret".into(),
         steam_client_id: None,
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
@@ -896,6 +943,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
             200,
             r#"{"current_change_number":0,"app_buildid_hwm":0,"basis":"full","changed":[],"deleted":[]}"#,
         ),
+        (200, PRINCIPAL_RESPONSE),
         (200, r#"{"batch_id":"42","app_change_number":1}"#),
         (
             200,
@@ -910,6 +958,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
         server_url,
         token: "lifecycle-token".into(),
         steam_client_id: Some(7),
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
         timeout_ms: 2000,
@@ -1005,7 +1054,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
     assert!(!state.active_batches.contains_key(&480));
     assert!(state.batches.is_empty());
 
-    let requests = (0..6)
+    let requests = (0..7)
         .map(|_| captured.recv_timeout(Duration::from_secs(1)).unwrap())
         .collect::<Vec<_>>();
     let request_lines = requests
@@ -1016,6 +1065,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
         request_lines,
         [
             "GET /api/v1/apps/480/changelist?synced_change_number=0 HTTP/1.1",
+            "GET /api/v1/device/principal HTTP/1.1",
             "POST /api/v1/steam/apps/480/upload-batches HTTP/1.1",
             "POST /api/v1/steam/upload-batches/42/files HTTP/1.1",
             "PUT /api/v1/upload-batches/42/files/file-1/blocks/0 HTTP/1.1",
@@ -1026,9 +1076,12 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
     assert!(requests.iter().all(|request| request
         .to_ascii_lowercase()
         .contains("authorization: bearer lifecycle-token")));
-    assert!(requests.iter().all(|request| request
-        .to_ascii_lowercase()
-        .contains("x-cumulus-steam-client-id: 7")));
+    assert!(requests
+        .iter()
+        .filter(|request| !request.starts_with("GET /api/v1/device/principal "))
+        .all(|request| request
+            .to_ascii_lowercase()
+            .contains("x-cumulus-steam-client-id: 7")));
 }
 
 #[test]
@@ -1039,6 +1092,7 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(7),
+        steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
         timeout_ms: 1,
@@ -1127,12 +1181,15 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
             .file_committed,
         Some(true)
     );
-    assert!(vapor_forge_cloud_local::FolderStore::open(directory.path())
-        .unwrap()
-        .changes_since(app_id, 0)
-        .unwrap()
-        .files
-        .is_empty());
+    assert!(vapor_forge_cloud_local::FolderStore::open_account(
+        directory.path(),
+        settings.steam_id64.unwrap(),
+    )
+    .unwrap()
+    .changes_since(app_id, 0)
+    .unwrap()
+    .files
+    .is_empty());
     let complete = CloudCompleteAppUploadBatchRequest {
         app_id: Some(app_id),
         batch_id: Some(batch_id),

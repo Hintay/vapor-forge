@@ -1,13 +1,13 @@
 [workspace]
 members = [
     "crates/audit-loader",
-    "crates/sync-state",
+    "crates/sync-journal",
     "crates/cloud-core",
     "crates/cloud-cumulus",
     "crates/cloud-local",
+    "crates/cloud-rpc",
     "crates/diagnostics",
     "crates/features",
-    "crates/hook-boundary",
     "crates/hooks",
     "crates/game-bridge",
     "crates/memory",
@@ -19,18 +19,19 @@ members = [
     "crates/scripting",
     "crates/steam-native-abi",
     "crates/steam-protocol",
+    "crates/tool-support",
     "crates/hook-engine",
     "crates/proton-inject",
 ]
 default-members = [
     "crates/audit-loader",
-    "crates/sync-state",
+    "crates/sync-journal",
     "crates/cloud-core",
     "crates/cloud-cumulus",
     "crates/cloud-local",
+    "crates/cloud-rpc",
     "crates/diagnostics",
     "crates/features",
-    "crates/hook-boundary",
     "crates/hooks",
     "crates/game-bridge",
     "crates/memory",
@@ -42,6 +43,7 @@ default-members = [
     "crates/scripting",
     "crates/steam-native-abi",
     "crates/steam-protocol",
+    "crates/tool-support",
     "crates/hook-engine",
     "crates/proton-inject",
 ]
@@ -57,7 +59,9 @@ rust-version = "1.80"
 arc-swap = "1.9"
 base64 = "0.22"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "code_asm"] }
-inotify = "0.11"
+# The `stream` default feature pulls tokio + futures; the watcher only uses the
+# blocking API, and this library is injected into Steam's process.
+inotify = { version = "0.11", default-features = false }
 keyvalues-parser = "0.2.4"
 libc = "0.2"
 mlua = { version = "0.10", features = ["luajit", "vendored", "send"] }
@@ -66,7 +70,7 @@ object = { version = "0.39.1", default-features = false, features = ["read"] }
 once_cell = "1"
 prost = "0.14"
 retour = "0.4.0-alpha.4"
-rusqlite = { version = "0.37", features = ["bundled"] }
+structsy = { version = "0.5", features = ["derive"] }
 sha1 = "0.10"
 sha2 = "0.10"
 ureq = "3"

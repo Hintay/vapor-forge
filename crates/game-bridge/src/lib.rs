@@ -1,11 +1,11 @@
-//! Framed IPC protocol shared by Proton game-process helpers and the Steam
+//! Shared framed wire protocol from Proton game-process helpers to the Steam
 //! runtime hook.
 //!
-//! The bridge authenticates each connection with a per-launch token and carries
-//! runtime diagnostics, injection results, and Denuvo signals. Wire format:
-//! `[u32 len][u8 msg_type][payload...]`. `len` covers the
-//! message type and payload, but not its own four-byte field. Multi-byte integers
-//! are little-endian.
+//! The hooks-side server authenticates each `Hello` with a reusable per-launch
+//! token. After that handshake, helpers report runtime diagnostics, injection
+//! results, and Denuvo signals. Wire format: `[u32 len][u8 msg_type][payload...]`.
+//! `len` covers the message type and payload, but not its own four-byte field.
+//! Multi-byte integers are little-endian.
 
 #![forbid(unsafe_code)]
 
@@ -35,7 +35,6 @@ const MSG_DLL_LOADED: u8 = 0x03;
 const MSG_DLL_INJECT_RESULT: u8 = 0x04;
 const MSG_PE_SECTION: u8 = 0x05;
 const MSG_ACK: u8 = 0x80;
-const MSG_SET_DELEGATE: u8 = 0x81;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -62,10 +61,6 @@ pub enum Message {
     },
     // Server -> Client
     Ack,
-    SetDelegate {
-        app_id: u32,
-        enable: bool,
-    },
 }
 
 // -----------------------------------------------------------------------
@@ -112,11 +107,6 @@ impl Message {
             }
             Message::Ack => {
                 payload.push(MSG_ACK);
-            }
-            Message::SetDelegate { app_id, enable } => {
-                payload.push(MSG_SET_DELEGATE);
-                payload.extend_from_slice(&app_id.to_le_bytes());
-                payload.push(if *enable { 1 } else { 0 });
             }
         }
         let len = payload.len() as u32;
@@ -249,14 +239,6 @@ pub fn decode_payload(buf: &[u8]) -> Result<Message, DecodeError> {
             })
         }
         MSG_ACK => Ok(Message::Ack),
-        MSG_SET_DELEGATE => {
-            if data.len() < 5 {
-                return Err(DecodeError::TooShort);
-            }
-            let app_id = u32::from_le_bytes(data[..4].try_into().unwrap());
-            let enable = data[4] != 0;
-            Ok(Message::SetDelegate { app_id, enable })
-        }
         _ => Err(DecodeError::UnknownType(msg_type)),
     }
 }
@@ -369,17 +351,6 @@ mod tests {
     #[test]
     fn ack_round_trip() {
         let msg = Message::Ack;
-        let bytes = msg.encode();
-        let decoded = decode_payload(&bytes[4..]).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn set_delegate_round_trip() {
-        let msg = Message::SetDelegate {
-            app_id: 480,
-            enable: true,
-        };
         let bytes = msg.encode();
         let decoded = decode_payload(&bytes[4..]).unwrap();
         assert_eq!(msg, decoded);

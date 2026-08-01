@@ -8,12 +8,14 @@ autobins = false
 
 [features]
 default = []
-tools = []
+tools = ["dep:vapor-forge-tool-support"]
 
 [[bin]]
 name = "vapor-forge-game-bridge-tool"
 path = "src/bin/vapor-forge-game-bridge-tool.rs"
 required-features = ["tools"]
 
-# No external dependencies. Pure Rust, buildable for any target (i686 / x86_64).
+# No external dependencies in the injected build. Pure Rust, buildable for
+# any target (i686 / x86_64); the tool binary alone pulls the shared parser.
 [dependencies]
+vapor-forge-tool-support = { path = "../tool-support", optional = true }

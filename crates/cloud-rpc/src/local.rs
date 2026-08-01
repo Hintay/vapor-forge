@@ -15,7 +15,11 @@ pub(super) fn execute_local_rpc(
     method: &str,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
-    let store = FolderStore::open(&settings.local_path)?;
+    let steam_id64 = settings
+        .steam_id64
+        .filter(|steam_id64| *steam_id64 != 0)
+        .ok_or_else(|| AdapterError::Protocol("local cloud account is unavailable".into()))?;
+    let store = FolderStore::open_account(&settings.local_path, steam_id64)?;
     match method {
         GET_CHANGELIST => changelist(state, &store, body),
         BEGIN_BATCH => begin_batch(state, &store, body),
@@ -32,13 +36,24 @@ pub(super) fn execute_local_rpc(
         RESUME_SESSION => {
             empty_response::<CloudAppSessionResumeRequest, CloudAppSessionResumeResponse>(body)
         }
-        EXIT_SYNC_DONE | CONFLICT_RESOLUTION | CDN_REPORT | EXTERNAL_TRANSFER_REPORT => {
-            Ok(RpcReply::ok(Vec::new()))
-        }
+        CONFLICT_RESOLUTION => conflict_resolution(state, &store, body),
+        EXIT_SYNC_DONE | CDN_REPORT | EXTERNAL_TRANSFER_REPORT => Ok(RpcReply::ok(Vec::new())),
         _ => Err(AdapterError::Protocol(
             "unsupported local cloud method".into(),
         )),
     }
+}
+
+fn conflict_resolution(
+    state: &mut AdapterState,
+    store: &FolderStore,
+    body: &[u8],
+) -> Result<RpcReply, AdapterError> {
+    let request = CloudClientConflictResolutionNotification::decode(body)?;
+    let app_id = required(request.app_id, "appid")?;
+    let change_number = store.converge_app(app_id)?;
+    state.current_change_numbers.insert(app_id, change_number);
+    Ok(RpcReply::ok(Vec::new()))
 }
 
 fn changelist(

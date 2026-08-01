@@ -14,6 +14,7 @@ pub(super) struct CloudSettings {
     pub(super) server_url: String,
     pub(super) token: String,
     pub(super) steam_client_id: Option<u64>,
+    pub(super) steam_id64: Option<u64>,
     pub(super) bind_device: bool,
     pub(super) timeout_connect_ms: u64,
     pub(super) timeout_ms: u64,
@@ -26,6 +27,7 @@ impl CloudSettings {
             server_url: config.cloud.server_url.trim().to_string(),
             token: config.cloud.token.trim().to_string(),
             steam_client_id: device_descriptor().map(|descriptor| descriptor.client_id),
+            steam_id64: Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
             bind_device: true,
             timeout_connect_ms: config.cloud.timeout_connect_ms,
             timeout_ms: config.cloud.timeout_ms,
@@ -345,8 +347,8 @@ pub(super) enum AdapterError {
     Json(#[from] serde_json::Error),
     #[error("invalid protobuf: {0}")]
     Protobuf(#[from] prost::DecodeError),
-    #[error("conflict outbox failed: {0}")]
-    Outbox(#[from] vapor_forge_sync_state::OutboxError),
+    #[error("sync store failed: {0}")]
+    Store(#[from] vapor_forge_sync_journal::SyncJournalError),
     #[error("Cumulus client failed: {0}")]
     Client(#[from] vapor_forge_cloud_cumulus::CumulusError),
     #[error("cloud backend failed: {0}")]
