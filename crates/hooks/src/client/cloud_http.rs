@@ -41,7 +41,7 @@ struct HttpLayout {
     job_request: usize,
     job_response: usize,
     response_status: usize,
-    download_run_vtable: usize,
+    download_body_vtable: usize,
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -56,7 +56,7 @@ const HTTP_LAYOUTS: &[HttpLayout] = &[HttpLayout {
     job_request: 0x68,
     job_response: 0x70,
     response_status: 0x0c,
-    download_run_vtable: 0x30,
+    download_body_vtable: 0x38,
 }];
 
 #[cfg(target_pointer_width = "32")]
@@ -71,7 +71,7 @@ const HTTP_LAYOUTS: &[HttpLayout] = &[HttpLayout {
     job_request: 0x50,
     job_response: 0x54,
     response_status: 0x08,
-    download_run_vtable: 0x18,
+    download_body_vtable: 0x1c,
 }];
 
 pub(crate) unsafe extern "C" fn hk_http_job_start(
@@ -247,8 +247,7 @@ unsafe fn admit_local_transfer(
     })
 }
 
-/// Minimal view matching the head of Steam's CUtlBuffer: data pointer, then the
-/// put (write length) field the download callback reads.
+/// Minimal `CUtlBuffer` view used by the streaming body callback.
 #[repr(C)]
 struct UtlBufferView {
     data: *const u8,
@@ -256,12 +255,12 @@ struct UtlBufferView {
     put: i32,
 }
 
-type DownloadRun = unsafe extern "C" fn(*mut c_void, *mut c_void, *const UtlBufferView);
+type DownloadBody = unsafe extern "C" fn(*mut c_void, *mut c_void, *const UtlBufferView);
 
 #[derive(Clone, Copy)]
 struct DownloadHandler {
     handler: *mut c_void,
-    run: DownloadRun,
+    body: DownloadBody,
 }
 
 /// Validate and capture the download handler's virtual Run method.
@@ -271,9 +270,9 @@ fn prepare_download_handler(layout: &HttpLayout, handler: usize) -> Option<Downl
     }
     let pointer_size = std::mem::size_of::<usize>();
     let vtable: usize = read_process_value(handler)?;
-    let vtable_len = layout.download_run_vtable.checked_add(pointer_size)?;
-    let run_slot = vtable.checked_add(layout.download_run_vtable)?;
-    let run_address: usize = read_process_value(run_slot)?;
+    let vtable_len = layout.download_body_vtable.checked_add(pointer_size)?;
+    let body_slot = vtable.checked_add(layout.download_body_vtable)?;
+    let body_address: usize = read_process_value(body_slot)?;
     let valid = vapor_forge_memory::current_process_ranges_match(&[
         vapor_forge_memory::ProcessRangeQuery {
             address: handler,
@@ -292,7 +291,7 @@ fn prepare_download_handler(layout: &HttpLayout, handler: usize) -> Option<Downl
             file_backed: true,
         },
         vapor_forge_memory::ProcessRangeQuery {
-            address: run_address,
+            address: body_address,
             len: 1,
             read: Some(true),
             write: None,
@@ -304,17 +303,32 @@ fn prepare_download_handler(layout: &HttpLayout, handler: usize) -> Option<Downl
     if !valid {
         return None;
     }
-    // SAFETY: `run_address` is the executable vtable slot Steam uses for
-    // Run(handler, handle, buffer) on this architecture.
-    let run: DownloadRun = unsafe { std::mem::transmute(run_address) };
+    #[cfg(debug_assertions)]
+    log_download_handler(handler, vtable, body_address);
+    // SAFETY: `body_address` is the executable streaming body slot for
+    // `(handler, request_handle, CUtlBuffer&)` on this architecture.
+    let body: DownloadBody = unsafe { std::mem::transmute(body_address) };
     Some(DownloadHandler {
         handler: handler as *mut c_void,
-        run,
+        body,
     })
 }
 
-/// Hand a downloaded body to Steam's admitted callback so its existing
-/// decompress / SHA / write-file path runs unchanged.
+#[cfg(debug_assertions)]
+fn log_download_handler(handler: usize, vtable: usize, run: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::AcqRel) {
+        info!(
+            handler = format_args!("{handler:#x}"),
+            vtable = format_args!("{vtable:#x}"),
+            run = format_args!("{run:#x}"),
+            "cloud-http-layout: download handler"
+        );
+    }
+}
+
+/// Hand a downloaded body to Steam's admitted streaming callback.
 unsafe fn invoke_download_handler(
     handle: *mut c_void,
     handler: DownloadHandler,
@@ -328,9 +342,9 @@ unsafe fn invoke_download_handler(
         reserved: [0; 12],
         put,
     };
-    // SAFETY: `handler` is the live polymorphic object, `handle` is live, and
-    // `buffer` outlives the call. Run copies it into Steam's destination buffer.
-    unsafe { (handler.run)(handler.handler, handle, &buffer) };
+    // SAFETY: `handler` and `handle` belong to the admitted live request, and
+    // the buffer view remains readable for the synchronous callback.
+    unsafe { (handler.body)(handler.handler, handle, &buffer) };
     Ok(())
 }
 
