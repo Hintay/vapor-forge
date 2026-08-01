@@ -83,6 +83,13 @@ pub struct GcReport {
     pub candidate_manifests: Vec<String>,
     pub retained_blobs: Vec<String>,
     pub candidate_blobs: Vec<String>,
+    pub inspected_roots: GcRoots,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GcSweep {
+    pub deleted_manifests: usize,
+    pub deleted_blobs: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +123,6 @@ struct SaveManifest {
     client_id: u64,
     machine_name: String,
     created_at_ms: u64,
-    nonce: String,
     files: BTreeMap<String, StoredFile>,
 }
 
@@ -591,7 +597,62 @@ impl FolderStore {
             candidate_manifests,
             retained_blobs: retained_blobs.into_iter().collect(),
             candidate_blobs,
+            inspected_roots: active.clone(),
         })
+    }
+
+    pub(crate) fn sweep_gc(
+        &self,
+        report: &GcReport,
+        active: &GcRoots,
+    ) -> Result<Option<GcSweep>, BackendError> {
+        if report.inspected_roots != *active {
+            return Ok(None);
+        }
+        let retained_manifests = unique_items(&report.retained_manifests)?;
+        let candidate_manifests = unique_items(&report.candidate_manifests)?;
+        let retained_blobs = unique_items(&report.retained_blobs)?;
+        let candidate_blobs = unique_items(&report.candidate_blobs)?;
+        if !retained_manifests.is_disjoint(&candidate_manifests)
+            || !retained_blobs.is_disjoint(&candidate_blobs)
+        {
+            return Err(permanent("invalid local cloud GC report"));
+        }
+
+        let _lock = self.lock_repository()?;
+        let manifest_root = self.root.join("commits/saves");
+        let current_manifests = collect_manifest_paths(&manifest_root, &manifest_root)?;
+        let expected_manifests = retained_manifests
+            .union(&candidate_manifests)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_blobs = collect_blob_objects(&self.root.join("blobs/sha1"))?;
+        let expected_blobs = retained_blobs
+            .union(&candidate_blobs)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if current_manifests != expected_manifests || current_blobs != expected_blobs {
+            return Ok(None);
+        }
+        if active.manifest_ids.iter().any(|id| {
+            candidate_manifests
+                .iter()
+                .any(|path| manifest_id(path).ok() == Some(id.as_str()))
+        }) || !active.blob_sha1s.is_disjoint(&candidate_blobs)
+        {
+            return Ok(None);
+        }
+
+        for path in &candidate_manifests {
+            remove_if_exists(&manifest_root.join(path))?;
+        }
+        for sha1 in &candidate_blobs {
+            remove_if_exists(&self.blob_path(sha1)?)?;
+        }
+        Ok(Some(GcSweep {
+            deleted_manifests: candidate_manifests.len(),
+            deleted_blobs: candidate_blobs.len(),
+        }))
     }
 
     fn publish_manifest(
@@ -613,7 +674,6 @@ impl FolderStore {
             client_id: identity.client_id,
             machine_name: identity.machine_name.clone(),
             created_at_ms: unix_millis(),
-            nonce: next_nonce(),
             files,
         };
         let bytes = serde_json::to_vec(&manifest).map_err(json_error)?;
@@ -1117,13 +1177,7 @@ fn validate_identity(identity: &CommitIdentity) -> Result<(), BackendError> {
 }
 
 fn validate_manifest(id: &str, app_id: u32, manifest: &SaveManifest) -> Result<(), BackendError> {
-    if manifest.version != FORMAT_VERSION
-        || manifest.app_id != app_id
-        || manifest.revision == 0
-        || manifest.nonce.is_empty()
-        || manifest.nonce.len() > 255
-        || manifest.nonce.contains('\0')
-    {
+    if manifest.version != FORMAT_VERSION || manifest.app_id != app_id || manifest.revision == 0 {
         return Err(permanent("invalid local cloud manifest"));
     }
     validate_identity(&CommitIdentity {
@@ -1423,6 +1477,85 @@ fn collect_manifest_objects(
     Ok(())
 }
 
+fn collect_manifest_paths(root: &Path, directory: &Path) -> Result<BTreeSet<String>, BackendError> {
+    if !directory.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let mut paths = BTreeSet::new();
+    collect_manifest_paths_inner(root, directory, &mut paths)?;
+    Ok(paths)
+}
+
+fn collect_manifest_paths_inner(
+    root: &Path,
+    directory: &Path,
+    paths: &mut BTreeSet<String>,
+) -> Result<(), BackendError> {
+    for entry in std::fs::read_dir(directory).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let file_type = entry.file_type().map_err(io_error)?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_manifest_paths_inner(root, &path, paths)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(incomplete("local cloud manifest namespace is incomplete"));
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| incomplete("local cloud manifest name is not UTF-8"))?;
+        if name.starts_with(".syncthing.") && name.ends_with(".tmp") {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            return Err(incomplete("local cloud manifest namespace is incomplete"));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| permanent("local cloud manifest escaped its namespace"))?;
+        let components = relative
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| incomplete("local cloud manifest path is not UTF-8"))?;
+        let app_component = match components.as_slice() {
+            [app_id, _] => *app_id,
+            [account, app_id, _] if account.parse::<u64>().is_ok_and(|account| account != 0) => {
+                *app_id
+            }
+            _ => return Err(permanent("invalid local cloud manifest path")),
+        };
+        let app_id = app_component
+            .parse::<u32>()
+            .map_err(|_| permanent("invalid local cloud manifest AppID"))?;
+        if app_id == 0 {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| incomplete("local cloud manifest has no UTF-8 id"))?;
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(incomplete("local cloud manifest identity is invalid"));
+        }
+        let key = components.join("/");
+        if !paths.insert(key) {
+            return Err(permanent("duplicate local cloud manifest path"));
+        }
+    }
+    Ok(())
+}
+
+fn unique_items(items: &[String]) -> Result<BTreeSet<String>, BackendError> {
+    let unique = items.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.len() != items.len() {
+        return Err(permanent("invalid local cloud GC report"));
+    }
+    Ok(unique)
+}
+
 fn manifest_scope(path: &str) -> Result<String, BackendError> {
     Path::new(path)
         .parent()
@@ -1592,7 +1725,6 @@ mod tests {
             client_id: identity.client_id,
             machine_name: identity.machine_name.clone(),
             created_at_ms,
-            nonce: format!("test-{}-{created_at_ms}", identity.client_id),
             files,
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
@@ -1691,6 +1823,26 @@ mod tests {
                 .read(480, "Game/save.dat")
                 .unwrap(),
             contents
+        );
+    }
+
+    #[test]
+    fn manifest_id_hashes_json_without_nonce() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        commit_file(&store, 480, "save.dat", b"save", 1, &identity(7, "deck"));
+        let path = std::fs::read_dir(store.commit_dir(480))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let bytes = std::fs::read(&path).unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert!(value.get("nonce").is_none());
+        assert_eq!(
+            path.file_stem().unwrap().to_str().unwrap(),
+            hex_digest::<Sha256>(&bytes)
         );
     }
 
@@ -2054,6 +2206,94 @@ mod tests {
             .unwrap();
         assert!(report.candidate_manifests.is_empty());
         assert!(report.candidate_blobs.is_empty());
+    }
+
+    #[test]
+    fn gc_sweep_deletes_old_manifest_and_blob() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        let owner = identity(7, "deck");
+        for (contents, mtime) in [(b"one".as_slice(), 1), (b"two", 2), (b"three", 3)] {
+            commit_file(&store, 480, "save.dat", contents, mtime, &owner);
+        }
+        let resolved = store.resolve_app(480).unwrap();
+        let current = resolved.heads[0].clone();
+        let previous = resolved.manifests[&current].parents[0].clone();
+        let oldest = resolved.manifests[&previous].parents[0].clone();
+        let oldest_blob = resolved.manifests[&oldest].files["save.dat"].sha1.clone();
+        let current_blob = resolved.manifests[&current].files["save.dat"].sha1.clone();
+        let roots = GcRoots::default();
+        let report = store.inspect_gc(&roots).unwrap();
+
+        let sweep = store.sweep_gc(&report, &roots).unwrap().unwrap();
+        assert_eq!(sweep.deleted_manifests, 1);
+        assert_eq!(sweep.deleted_blobs, 1);
+        assert!(!store
+            .commit_dir(480)
+            .join(format!("{oldest}.json"))
+            .exists());
+        assert!(!store.blob_path(&oldest_blob).unwrap().exists());
+        assert!(store
+            .commit_dir(480)
+            .join(format!("{current}.json"))
+            .exists());
+        assert!(store
+            .commit_dir(480)
+            .join(format!("{previous}.json"))
+            .exists());
+        assert!(store.blob_path(&current_blob).unwrap().exists());
+        assert_eq!(store.read(480, "save.dat").unwrap(), b"three");
+    }
+
+    #[test]
+    fn gc_sweep_aborts_when_inventory_or_roots_change() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        let owner = identity(7, "deck");
+        for (contents, mtime) in [(b"one".as_slice(), 1), (b"two", 2), (b"three", 3)] {
+            commit_file(&store, 480, "save.dat", contents, mtime, &owner);
+        }
+        let roots = GcRoots::default();
+        let report = store.inspect_gc(&roots).unwrap();
+        let candidate_path = store
+            .root()
+            .join("commits/saves")
+            .join(&report.candidate_manifests[0]);
+        let candidate_blob = store.blob_path(&report.candidate_blobs[0]).unwrap();
+
+        let changed_roots = GcRoots {
+            manifest_ids: BTreeSet::new(),
+            blob_sha1s: BTreeSet::from([report.candidate_blobs[0].clone()]),
+        };
+        assert!(store.sweep_gc(&report, &changed_roots).unwrap().is_none());
+        assert!(candidate_path.exists());
+        assert!(candidate_blob.exists());
+
+        commit_file(&store, 480, "save.dat", b"four", 4, &owner);
+        assert!(store.sweep_gc(&report, &roots).unwrap().is_none());
+        assert!(candidate_path.exists());
+        assert!(candidate_blob.exists());
+    }
+
+    #[test]
+    fn gc_sweep_retains_blobs_shared_by_another_app() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        let owner = identity(7, "deck");
+        for (contents, mtime) in [(b"shared".as_slice(), 1), (b"two", 2), (b"three", 3)] {
+            commit_file(&store, 480, "save.dat", contents, mtime, &owner);
+        }
+        commit_file(&store, 481, "save.dat", b"shared", 1, &owner);
+        let shared_blob = hex_digest::<Sha1>(b"shared");
+        let roots = GcRoots::default();
+        let report = store.inspect_gc(&roots).unwrap();
+
+        assert!(!report.candidate_blobs.contains(&shared_blob));
+        let sweep = store.sweep_gc(&report, &roots).unwrap().unwrap();
+        assert_eq!(sweep.deleted_manifests, 1);
+        assert_eq!(sweep.deleted_blobs, 0);
+        assert!(store.blob_path(&shared_blob).unwrap().exists());
+        assert_eq!(store.read(481, "save.dat").unwrap(), b"shared");
     }
 
     #[test]

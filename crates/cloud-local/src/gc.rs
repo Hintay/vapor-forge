@@ -1,7 +1,7 @@
 use crate::{FolderStore, GcRoots};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tracing::{debug, warn};
 
 struct ActiveBatch {
@@ -16,21 +16,20 @@ struct InspectionRequest {
 }
 
 pub struct LocalGcCoordinator {
-    active: Mutex<HashMap<u64, ActiveBatch>>,
+    active: Arc<Mutex<HashMap<u64, ActiveBatch>>>,
     sender: mpsc::Sender<InspectionRequest>,
 }
 
 impl LocalGcCoordinator {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel::<InspectionRequest>();
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let worker_active = Arc::clone(&active);
         std::thread::Builder::new()
             .name("vapor-local-cloud-gc".into())
-            .spawn(move || run_inspections(receiver))
+            .spawn(move || run_inspections(receiver, worker_active))
             .expect("local cloud GC worker must start");
-        Self {
-            active: Mutex::new(HashMap::new()),
-            sender,
-        }
+        Self { active, sender }
     }
 
     pub fn register_batch(&self, batch_id: u64, store: &FolderStore, manifest_ids: &[String]) {
@@ -67,17 +66,7 @@ impl LocalGcCoordinator {
 
     fn roots_for(&self, repository: &std::path::Path) -> GcRoots {
         let active = self.active.lock().unwrap();
-        let mut roots = GcRoots::default();
-        for batch in active
-            .values()
-            .filter(|batch| batch.repository == repository)
-        {
-            roots
-                .manifest_ids
-                .extend(batch.manifest_ids.iter().cloned());
-            roots.blob_sha1s.extend(batch.blob_sha1s.iter().cloned());
-        }
-        roots
+        roots_for(&active, repository)
     }
 }
 
@@ -87,7 +76,10 @@ impl Default for LocalGcCoordinator {
     }
 }
 
-fn run_inspections(receiver: mpsc::Receiver<InspectionRequest>) {
+fn run_inspections(
+    receiver: mpsc::Receiver<InspectionRequest>,
+    active: Arc<Mutex<HashMap<u64, ActiveBatch>>>,
+) {
     while let Ok(first) = receiver.recv() {
         let mut pending = BTreeMap::from([(first.store.root().to_owned(), first)]);
         while let Ok(request) = receiver.try_recv() {
@@ -95,15 +87,39 @@ fn run_inspections(receiver: mpsc::Receiver<InspectionRequest>) {
         }
         for request in pending.into_values() {
             match request.store.inspect_gc(&request.roots) {
-                Ok(report) => debug!(
-                    retained_manifests = report.retained_manifests.len(),
-                    candidate_manifests = report.candidate_manifests.len(),
-                    retained_blobs = report.retained_blobs.len(),
-                    candidate_blobs = report.candidate_blobs.len(),
-                    "local cloud GC inspection completed"
-                ),
+                Ok(report) => {
+                    let active = active.lock().unwrap();
+                    let current_roots = roots_for(&active, request.store.root());
+                    match request.store.sweep_gc(&report, &current_roots) {
+                        Ok(Some(sweep)) => debug!(
+                            retained_manifests = report.retained_manifests.len(),
+                            deleted_manifests = sweep.deleted_manifests,
+                            retained_blobs = report.retained_blobs.len(),
+                            deleted_blobs = sweep.deleted_blobs,
+                            "local cloud GC completed"
+                        ),
+                        Ok(None) => debug!("local cloud GC state changed before deletion"),
+                        Err(error) => {
+                            warn!(%error, "local cloud GC deletion failed closed")
+                        }
+                    }
+                }
                 Err(error) => warn!(%error, "local cloud GC inspection failed closed"),
             }
         }
     }
+}
+
+fn roots_for(active: &HashMap<u64, ActiveBatch>, repository: &std::path::Path) -> GcRoots {
+    let mut roots = GcRoots::default();
+    for batch in active
+        .values()
+        .filter(|batch| batch.repository == repository)
+    {
+        roots
+            .manifest_ids
+            .extend(batch.manifest_ids.iter().cloned());
+        roots.blob_sha1s.extend(batch.blob_sha1s.iter().cloned());
+    }
+    roots
 }

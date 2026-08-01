@@ -1359,7 +1359,6 @@ fn create_local_manifest_heads(
         manifest["client_id"] = serde_json::json!(client_id);
         manifest["machine_name"] = serde_json::json!(machine_name);
         manifest["created_at_ms"] = serde_json::json!(revision * 1_000);
-        manifest["nonce"] = serde_json::json!(format!("branch-{client_id}-{revision}"));
         manifest["files"]["save.dat"] = serde_json::json!({
             "sha1": staged.blob_sha1,
             "raw_size": staged.metadata.raw_size,

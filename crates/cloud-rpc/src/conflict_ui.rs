@@ -590,7 +590,6 @@ mod tests {
             manifest["client_id"] = serde_json::json!(client_id);
             manifest["machine_name"] = serde_json::json!(machine_name);
             manifest["created_at_ms"] = serde_json::json!(client_id * 1_000);
-            manifest["nonce"] = serde_json::json!(format!("test-{client_id}"));
             let bytes = serde_json::to_vec(&manifest).unwrap();
             let id = Sha256::digest(&bytes)
                 .iter()
