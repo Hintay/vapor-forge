@@ -16,12 +16,13 @@ const FORMAT_FILE: &str = "format.json";
 #[derive(Clone)]
 pub struct FolderStore {
     root: PathBuf,
+    account: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StagedFile {
     pub path: String,
-    pub blob_sha256: String,
+    pub blob_sha1: String,
     pub metadata: FileMetadata,
 }
 
@@ -38,8 +39,7 @@ struct Format {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct StoredFile {
-    blob_sha256: String,
-    steam_sha1: String,
+    sha1: String,
     raw_size: u64,
     mtime: i64,
     platforms_to_sync: u32,
@@ -64,13 +64,24 @@ struct ResolvedApp {
 
 impl FolderStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, BackendError> {
+        Self::open_inner(root, None)
+    }
+
+    pub fn open_account(root: impl AsRef<Path>, steam_id64: u64) -> Result<Self, BackendError> {
+        if steam_id64 == 0 {
+            return Err(permanent("local cloud account is unavailable"));
+        }
+        Self::open_inner(root, Some(steam_id64.to_string()))
+    }
+
+    fn open_inner(root: impl AsRef<Path>, account: Option<String>) -> Result<Self, BackendError> {
         let root = root.as_ref();
         if root.as_os_str().is_empty() {
             return Err(permanent("local cloud path is empty"));
         }
         std::fs::create_dir_all(root).map_err(io_error)?;
         let root = root.canonicalize().map_err(io_error)?;
-        let store = Self { root };
+        let store = Self { root, account };
         store.initialize()?;
         Ok(store)
     }
@@ -95,11 +106,11 @@ impl FolderStore {
     ) -> Result<StagedFile, BackendError> {
         validate_cloud_path(path)?;
         validate_metadata(contents, metadata)?;
-        let blob_sha256 = hex_digest::<Sha256>(contents);
-        self.publish_blob(&blob_sha256, contents)?;
+        let blob_sha1 = metadata.sha1.to_ascii_lowercase();
+        self.publish_blob(&blob_sha1, contents)?;
         Ok(StagedFile {
             path: path.to_owned(),
-            blob_sha256,
+            blob_sha1,
             metadata: metadata.clone(),
         })
     }
@@ -126,22 +137,21 @@ impl FolderStore {
         }
         for file in staged {
             validate_cloud_path(&file.path)?;
-            let blob = self.blob_path(&file.blob_sha256)?;
+            let blob = self.blob_path(&file.blob_sha1)?;
             if !blob.is_file() {
                 return Err(permanent("staged local cloud blob is unavailable"));
             }
             files.insert(
                 file.path.clone(),
                 StoredFile {
-                    blob_sha256: file.blob_sha256.clone(),
-                    steam_sha1: file.metadata.sha1.clone(),
+                    sha1: file.blob_sha1.clone(),
                     raw_size: file.metadata.raw_size,
                     mtime: file.metadata.mtime,
                     platforms_to_sync: file.metadata.platforms_to_sync,
                 },
             );
         }
-        if files == original_files {
+        if files == original_files && resolved.heads.len() <= 1 {
             return Ok(resolved.valid.len() as u64);
         }
 
@@ -163,7 +173,18 @@ impl FolderStore {
         Ok(current.valid.len() as u64)
     }
 
+    /// Publish a deterministic merge commit when replicated folders produced
+    /// concurrent heads, even when Steam has no file changes of its own.
+    pub fn converge_app(&self, app_id: u32) -> Result<u64, BackendError> {
+        let view = self.view(app_id)?;
+        if view.heads.len() <= 1 {
+            return Ok(view.change_number);
+        }
+        self.commit_batch(app_id, &view.heads, &[], &BTreeSet::new())
+    }
+
     fn initialize(&self) -> Result<(), BackendError> {
+        std::fs::create_dir_all(self.root.join("blobs/sha1")).map_err(io_error)?;
         std::fs::create_dir_all(self.root.join("blobs/sha256")).map_err(io_error)?;
         std::fs::create_dir_all(self.root.join("commits/saves")).map_err(io_error)?;
         std::fs::create_dir_all(self.root.join("records")).map_err(io_error)?;
@@ -186,26 +207,22 @@ impl FolderStore {
     }
 
     fn commit_dir(&self, app_id: u32) -> PathBuf {
-        self.root.join("commits/saves").join(app_id.to_string())
+        let mut directory = self.root.join("commits/saves");
+        if let Some(account) = &self.account {
+            directory.push(account);
+        }
+        directory.join(app_id.to_string())
     }
 
     fn blob_path(&self, hash: &str) -> Result<PathBuf, BackendError> {
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(permanent("invalid local cloud blob hash"));
         }
-        Ok(self.root.join("blobs/sha256").join(&hash[..2]).join(hash))
+        Ok(self.root.join("blobs/sha1").join(&hash[..2]).join(hash))
     }
 
     fn publish_blob(&self, hash: &str, contents: &[u8]) -> Result<(), BackendError> {
-        let path = self.blob_path(hash)?;
-        if path.exists() {
-            let existing = std::fs::read(&path).map_err(io_error)?;
-            if hex_digest::<Sha256>(&existing) != hash {
-                return Err(permanent("local cloud blob hash collision"));
-            }
-            return Ok(());
-        }
-        atomic_publish(&path, contents)
+        atomic_publish(&self.blob_path(hash)?, contents)
     }
 
     fn resolve_app(&self, app_id: u32) -> Result<ResolvedApp, BackendError> {
@@ -271,21 +288,7 @@ impl FolderStore {
             .cloned()
             .collect::<Vec<_>>();
         heads.sort();
-        let files = match heads.as_slice() {
-            [] => BTreeMap::new(),
-            [head] => valid[head].files.clone(),
-            _ => {
-                let first = &valid[&heads[0]].files;
-                if heads.iter().all(|head| &valid[head].files == first) {
-                    first.clone()
-                } else {
-                    return Err(BackendError::new(
-                        "local cloud contains concurrent save commits",
-                        false,
-                    ));
-                }
-            }
-        };
+        let files = merge_head_files(&valid, &heads);
         Ok(ResolvedApp {
             valid,
             heads,
@@ -294,7 +297,7 @@ impl FolderStore {
     }
 
     fn blob_ready(&self, file: &StoredFile) -> bool {
-        self.blob_path(&file.blob_sha256)
+        self.blob_path(&file.sha1)
             .ok()
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() == file.raw_size)
@@ -305,11 +308,11 @@ impl FolderStore {
         app_id: u32,
         files: &BTreeMap<String, StoredFile>,
     ) -> Result<(), BackendError> {
-        let root = self
-            .root
-            .join("checkouts")
-            .join(device_id())
-            .join(app_id.to_string());
+        let mut root = self.root.join("checkouts").join(device_id());
+        if let Some(account) = &self.account {
+            root.push(account);
+        }
+        root.push(app_id.to_string());
         std::fs::create_dir_all(&root).map_err(io_error)?;
         for (path, file) in files {
             let destination = joined_cloud_path(&root, path)?;
@@ -320,15 +323,137 @@ impl FolderStore {
     }
 
     fn read_blob(&self, file: &StoredFile) -> Result<Vec<u8>, BackendError> {
-        let bytes = std::fs::read(self.blob_path(&file.blob_sha256)?).map_err(io_error)?;
-        if bytes.len() as u64 != file.raw_size
-            || hex_digest::<Sha256>(&bytes) != file.blob_sha256
-            || hex_digest::<Sha1>(&bytes) != file.steam_sha1
-        {
+        let bytes = std::fs::read(self.blob_path(&file.sha1)?).map_err(io_error)?;
+        if bytes.len() as u64 != file.raw_size || hex_digest::<Sha1>(&bytes) != file.sha1 {
             return Err(permanent("local cloud blob failed integrity verification"));
         }
         Ok(bytes)
     }
+}
+
+fn merge_head_files(
+    valid: &HashMap<String, SaveCommit>,
+    heads: &[String],
+) -> BTreeMap<String, StoredFile> {
+    match heads {
+        [] => return BTreeMap::new(),
+        [head] => return valid[head].files.clone(),
+        _ => {}
+    }
+
+    let base = nearest_common_ancestor(valid, heads)
+        .and_then(|id| valid.get(&id))
+        .map(|commit| &commit.files);
+
+    let mut paths = BTreeSet::new();
+    if let Some(base) = base {
+        paths.extend(base.keys().cloned());
+    }
+    for head in heads {
+        paths.extend(valid[head].files.keys().cloned());
+    }
+
+    let mut merged = BTreeMap::new();
+    for path in paths {
+        let base_value = base.and_then(|files| files.get(&path));
+        let changed = heads
+            .iter()
+            .filter(|head| valid[*head].files.get(&path) != base_value)
+            .collect::<Vec<_>>();
+        let selected = match changed.as_slice() {
+            [] => base_value,
+            [head] => valid[*head].files.get(&path),
+            _ => {
+                let first = valid[changed[0]].files.get(&path);
+                if changed
+                    .iter()
+                    .all(|head| valid[*head].files.get(&path) == first)
+                {
+                    first
+                } else {
+                    let winner = changed
+                        .into_iter()
+                        .max_by(|left, right| compare_commits(valid, left, right))
+                        .expect("changed heads are non-empty");
+                    valid[winner].files.get(&path)
+                }
+            }
+        };
+        if let Some(file) = selected {
+            merged.insert(path, file.clone());
+        }
+    }
+    merged
+}
+
+fn nearest_common_ancestor(
+    valid: &HashMap<String, SaveCommit>,
+    heads: &[String],
+) -> Option<String> {
+    let distances = heads
+        .iter()
+        .map(|head| ancestor_distances(valid, head))
+        .collect::<Vec<_>>();
+    let first = distances.first()?;
+    first
+        .keys()
+        .filter(|candidate| {
+            distances[1..]
+                .iter()
+                .all(|distance| distance.contains_key(*candidate))
+        })
+        .min_by(|left, right| {
+            ancestor_distance_metric(&distances, left)
+                .cmp(&ancestor_distance_metric(&distances, right))
+                .then_with(|| left.cmp(right))
+        })
+        .cloned()
+}
+
+fn ancestor_distances(valid: &HashMap<String, SaveCommit>, head: &str) -> HashMap<String, usize> {
+    let mut distances = HashMap::from([(head.to_owned(), 0usize)]);
+    let mut pending = std::collections::VecDeque::from([(head.to_owned(), 0usize)]);
+    while let Some((id, distance)) = pending.pop_front() {
+        let Some(commit) = valid.get(&id) else {
+            continue;
+        };
+        let parent_distance = distance.saturating_add(1);
+        for parent in &commit.parents {
+            let should_visit = match distances.get(parent) {
+                Some(current) => parent_distance < *current,
+                None => true,
+            };
+            if should_visit {
+                distances.insert(parent.clone(), parent_distance);
+                pending.push_back((parent.clone(), parent_distance));
+            }
+        }
+    }
+    distances
+}
+
+fn ancestor_distance_metric(
+    distances: &[HashMap<String, usize>],
+    candidate: &str,
+) -> (usize, usize) {
+    distances.iter().fold((0, 0), |(maximum, total), map| {
+        let distance = map[candidate];
+        (maximum.max(distance), total.saturating_add(distance))
+    })
+}
+
+fn compare_commits(
+    valid: &HashMap<String, SaveCommit>,
+    left: &str,
+    right: &str,
+) -> std::cmp::Ordering {
+    let left_commit = &valid[left];
+    let right_commit = &valid[right];
+    left_commit
+        .created_at_ms
+        .cmp(&right_commit.created_at_ms)
+        .then_with(|| left_commit.device_id.cmp(&right_commit.device_id))
+        .then_with(|| left.cmp(right))
 }
 
 impl ByteStore for FolderStore {
@@ -365,7 +490,7 @@ impl CloudFileStore for FolderStore {
             .map(|(path, file)| FileEntry {
                 path,
                 metadata: FileMetadata {
-                    sha1: file.steam_sha1,
+                    sha1: file.sha1,
                     raw_size: file.raw_size,
                     mtime: file.mtime,
                     platforms_to_sync: file.platforms_to_sync,
@@ -484,7 +609,7 @@ pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
     }
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
     let parent = path
         .parent()
         .ok_or_else(|| permanent("local cloud checkout has no parent directory"))?;
@@ -585,6 +710,29 @@ mod tests {
         }
     }
 
+    fn publish_commit(
+        store: &FolderStore,
+        app_id: u32,
+        parents: Vec<String>,
+        device_id: &str,
+        created_at_ms: u64,
+        files: BTreeMap<String, StoredFile>,
+    ) -> String {
+        let commit = SaveCommit {
+            version: FORMAT_VERSION,
+            app_id,
+            parents,
+            device_id: device_id.into(),
+            created_at_ms,
+            nonce: format!("test-{device_id}-{created_at_ms}"),
+            files,
+        };
+        let bytes = serde_json::to_vec(&commit).unwrap();
+        let id = hex_digest::<Sha256>(&bytes);
+        atomic_publish(&store.commit_dir(app_id).join(format!("{id}.json")), &bytes).unwrap();
+        id
+    }
+
     #[test]
     fn immutable_commits_survive_reopen() {
         let temporary = tempfile::tempdir().unwrap();
@@ -647,6 +795,27 @@ mod tests {
     }
 
     #[test]
+    fn blobs_are_addressed_by_the_sha1_steam_supplied() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(directory.path()).unwrap();
+        let contents = b"save data";
+        let metadata = metadata(contents, 10);
+
+        let staged = store.stage_file("save.dat", contents, &metadata).unwrap();
+
+        assert_eq!(staged.blob_sha1, metadata.sha1);
+        assert!(directory
+            .path()
+            .join("blobs/sha1")
+            .join(&metadata.sha1[..2])
+            .join(&metadata.sha1)
+            .is_file());
+        // Re-staging identical contents must not fail, and must not need a
+        // second digest pass to prove it.
+        assert!(store.stage_file("save.dat", contents, &metadata).is_ok());
+    }
+
+    #[test]
     fn rejects_escape_paths_and_bad_hashes() {
         let temporary = tempfile::tempdir().unwrap();
         let store = FolderStore::open(temporary.path()).unwrap();
@@ -656,5 +825,150 @@ mod tests {
         let mut wrong = metadata(b"save", 10);
         wrong.sha1 = "0".repeat(40);
         assert!(store.write(480, "save.dat", b"save", &wrong).is_err());
+    }
+
+    #[test]
+    fn account_scopes_do_not_share_save_manifests_or_checkouts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = FolderStore::open_account(temporary.path(), 76_561_198_000_000_001).unwrap();
+        let second = FolderStore::open_account(temporary.path(), 76_561_198_000_000_002).unwrap();
+
+        first
+            .write(480, "save.dat", b"first", &metadata(b"first", 1))
+            .unwrap();
+        second
+            .write(480, "save.dat", b"second", &metadata(b"second", 2))
+            .unwrap();
+
+        assert_eq!(first.read(480, "save.dat").unwrap(), b"first");
+        assert_eq!(second.read(480, "save.dat").unwrap(), b"second");
+        assert!(temporary
+            .path()
+            .join("commits/saves/76561198000000001/480")
+            .is_dir());
+        assert!(temporary
+            .path()
+            .join("commits/saves/76561198000000002/480")
+            .is_dir());
+    }
+
+    #[test]
+    fn divergent_heads_merge_changes_and_deletions_then_converge() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        for (path, contents) in [
+            ("shared.dat", b"base".as_slice()),
+            ("deleted.dat", b"delete".as_slice()),
+        ] {
+            store
+                .write(480, path, contents, &metadata(contents, 1))
+                .unwrap();
+        }
+        let base = store.resolve_app(480).unwrap();
+        let parent = base.heads[0].clone();
+
+        let mut left = base.files.clone();
+        for (path, contents) in [
+            ("left.dat", b"left".as_slice()),
+            ("shared.dat", b"left-shared".as_slice()),
+        ] {
+            let staged = store
+                .stage_file(path, contents, &metadata(contents, 20))
+                .unwrap();
+            left.insert(
+                path.into(),
+                StoredFile {
+                    sha1: staged.blob_sha1,
+                    raw_size: staged.metadata.raw_size,
+                    mtime: staged.metadata.mtime,
+                    platforms_to_sync: staged.metadata.platforms_to_sync,
+                },
+            );
+        }
+        publish_commit(&store, 480, vec![parent.clone()], "left", 20, left);
+
+        let mut right = base.files;
+        right.remove("deleted.dat");
+        for (path, contents) in [
+            ("right.dat", b"right".as_slice()),
+            ("shared.dat", b"right-shared".as_slice()),
+        ] {
+            let staged = store
+                .stage_file(path, contents, &metadata(contents, 30))
+                .unwrap();
+            right.insert(
+                path.into(),
+                StoredFile {
+                    sha1: staged.blob_sha1,
+                    raw_size: staged.metadata.raw_size,
+                    mtime: staged.metadata.mtime,
+                    platforms_to_sync: staged.metadata.platforms_to_sync,
+                },
+            );
+        }
+        publish_commit(&store, 480, vec![parent], "right", 30, right);
+
+        let merged = store.resolve_app(480).unwrap();
+        assert_eq!(merged.heads.len(), 2);
+        assert!(merged.files.contains_key("left.dat"));
+        assert!(merged.files.contains_key("right.dat"));
+        assert!(!merged.files.contains_key("deleted.dat"));
+        assert_eq!(store.read(480, "shared.dat").unwrap(), b"right-shared");
+
+        store.converge_app(480).unwrap();
+        assert_eq!(store.view(480).unwrap().heads.len(), 1);
+    }
+
+    #[test]
+    fn merge_base_uses_graph_distance_when_clocks_move_backwards() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+
+        let root_file = store
+            .stage_file("save.dat", b"root", &metadata(b"root", 1))
+            .unwrap();
+        let root_files = BTreeMap::from([(
+            root_file.path,
+            StoredFile {
+                sha1: root_file.blob_sha1,
+                raw_size: root_file.metadata.raw_size,
+                mtime: root_file.metadata.mtime,
+                platforms_to_sync: root_file.metadata.platforms_to_sync,
+            },
+        )]);
+        let root = publish_commit(&store, 480, Vec::new(), "root", 1_000, root_files.clone());
+
+        let shared_file = store
+            .stage_file("save.dat", b"shared", &metadata(b"shared", 2))
+            .unwrap();
+        let mut shared_files = root_files;
+        shared_files.insert(
+            shared_file.path,
+            StoredFile {
+                sha1: shared_file.blob_sha1,
+                raw_size: shared_file.metadata.raw_size,
+                mtime: shared_file.metadata.mtime,
+                platforms_to_sync: shared_file.metadata.platforms_to_sync,
+            },
+        );
+        let shared = publish_commit(&store, 480, vec![root], "shared", 10, shared_files.clone());
+
+        let left_file = store
+            .stage_file("save.dat", b"left", &metadata(b"left", 3))
+            .unwrap();
+        let mut left_files = shared_files.clone();
+        left_files.insert(
+            left_file.path,
+            StoredFile {
+                sha1: left_file.blob_sha1,
+                raw_size: left_file.metadata.raw_size,
+                mtime: left_file.metadata.mtime,
+                platforms_to_sync: left_file.metadata.platforms_to_sync,
+            },
+        );
+        publish_commit(&store, 480, vec![shared.clone()], "left", 20, left_files);
+        publish_commit(&store, 480, vec![shared], "right", 30, shared_files);
+
+        assert_eq!(store.read(480, "save.dat").unwrap(), b"left");
     }
 }

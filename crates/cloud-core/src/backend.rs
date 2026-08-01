@@ -1,8 +1,11 @@
 use crate::{
-    AccountSyncState, AchievementEvent, AchievementSchema, DeviceDescriptor, PlaytimeEntry,
-    UploadIdentity,
+    AccountPlaytimeSnapshot, AccountStatsWakeup, AccountSyncState, AchievementSchema,
+    AppStatsQuery, AppStatsResult, DeviceDescriptor, PlaytimeEntry, PlaytimeSession,
+    SteamAppSnapshot, SteamStateUploadResult, UploadIdentity,
 };
 use std::fmt;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Result of offering a schema to a backend. Both variants are terminal: a
 /// decline is the backend refusing the payload, not a failure to retry.
@@ -12,15 +15,127 @@ pub enum SchemaUploadOutcome {
     Declined,
 }
 
-/// Why a [`CloudBackend::stream_account_state`] call returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamOutcome {
-    /// The backend cannot push state (no streaming endpoint, or an older
-    /// server that does not expose one). No down-sync is available for this
-    /// backend; callers must not turn this into a polling loop.
     Unsupported,
-    /// The stream ended because `should_continue` returned `false`.
     Stopped,
+}
+
+#[derive(Clone)]
+pub struct StreamCancellation {
+    inner: Arc<StreamCancellationInner>,
+}
+
+struct StreamCancellationInner {
+    state: Mutex<StreamCancellationState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct StreamCancellationState {
+    cancelled: bool,
+    revision: u64,
+}
+
+impl StreamCancellation {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(StreamCancellationInner {
+                state: Mutex::new(StreamCancellationState::default()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    pub fn cancel(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.cancelled {
+            state.cancelled = true;
+            state.revision = state.revision.wrapping_add(1);
+            self.inner.changed.notify_all();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revision
+    }
+
+    /// Wake a stream forwarder after its reader produced a message.
+    pub fn signal_activity(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.revision = state.revision.wrapping_add(1);
+        self.inner.changed.notify_all();
+    }
+
+    pub fn wait_for_activity(&self, previous: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.cancelled && state.revision == previous {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Wait for cancellation or for a transport retry delay to expire.
+    pub fn wait_cancelled_timeout(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !state.cancelled {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let waited = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = waited.0;
+            if waited.1.timed_out() {
+                break;
+            }
+        }
+        state.cancelled
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Default for StreamCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A backend failure reduced to what delivery scheduling needs: whether the
@@ -41,7 +156,7 @@ impl BackendError {
         }
     }
 
-    /// Whether the outbox should schedule another attempt instead of giving up.
+    /// Whether the journal should schedule another attempt instead of giving up.
     pub fn is_retryable(&self) -> bool {
         self.retryable
     }
@@ -67,22 +182,24 @@ pub trait CloudBackend: Send + Sync {
     /// against the same destination does not orphan pending rows.
     fn endpoint_scope(&self) -> String;
 
-    /// Partition key covering destination *and* credentials.
+    /// Stable partition key covering destination and authenticated principal,
+    /// but not the bearer token itself.
     ///
-    /// Used where data belongs to the authenticated principal, so changing
-    /// credentials isolates old rows instead of mixing them. Backends decide
-    /// which credential fields participate; [`crate::credential_scope`] and
-    /// [`crate::endpoint_scope`] provide the digests.
-    fn credential_scope(&self) -> String;
+    /// Used where data belongs to the authenticated principal. Token rotation
+    /// for the same principal must not orphan pending rows, while switching to
+    /// another principal must isolate state. Backends may need to authenticate
+    /// to discover their stable principal id.
+    fn principal_scope(&self) -> Result<String, BackendError>;
+
+    /// Runtime-only fingerprint of the configured destination and credential.
+    ///
+    /// This must change when a bearer token changes and is used to reject
+    /// in-flight results after config reloads. It must not be used as a durable
+    /// owner scope for journal rows.
+    fn credential_fingerprint(&self) -> String;
 
     /// Register this device with the backend before uploading on its behalf.
     fn ensure_device_bound(&self, descriptor: &DeviceDescriptor) -> Result<(), BackendError>;
-
-    fn upload_achievement_events(
-        &self,
-        identity: &UploadIdentity,
-        events: &[AchievementEvent],
-    ) -> Result<(), BackendError>;
 
     fn upload_achievement_schema(
         &self,
@@ -96,6 +213,19 @@ pub trait CloudBackend: Send + Sync {
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError>;
 
+    fn upload_playtime_sessions(
+        &self,
+        client_id: u64,
+        steam_id64: &str,
+        sessions: &[PlaytimeSession],
+    ) -> Result<(), BackendError>;
+
+    fn upload_steam_app_snapshot(
+        &self,
+        identity: &UploadIdentity,
+        snapshot: &SteamAppSnapshot,
+    ) -> Result<SteamStateUploadResult, BackendError>;
+
     /// Return the backend's converged state for one Steam account.
     fn pull_account_state(
         &self,
@@ -103,23 +233,37 @@ pub trait CloudBackend: Send + Sync {
         steam_id64: &str,
     ) -> Result<AccountSyncState, BackendError>;
 
-    /// Stream converged account state pushed by the backend.
-    ///
-    /// Blocks running the subscription until `should_continue` returns `false`
-    /// or a fatal error occurs, invoking `on_state` with each full snapshot as
-    /// it arrives.
-    /// Transient disconnects are handled internally by reconnecting, so a
-    /// steady stream keeps the caller current without polling.
-    ///
-    /// Backends that cannot push, such as the filesystem backend, return
-    /// [`StreamOutcome::Unsupported`]. The default implementation is
-    /// `Unsupported`.
-    fn stream_account_state(
+    /// Conditionally return one app's authoritative stats using the CRC last
+    /// issued by this backend. The schema version guards wire-id mappings.
+    fn pull_app_stats(
+        &self,
+        client_id: u64,
+        steam_id64: &str,
+        query: &AppStatsQuery,
+    ) -> Result<AppStatsResult, BackendError>;
+
+    /// Stream committed playtime snapshots until the runtime context expires.
+    /// Implementations reconnect transient transport failures internally and
+    /// invoke `on_snapshot` only with complete authoritative snapshots.
+    fn stream_playtime(
         &self,
         _client_id: u64,
         _steam_id64: &str,
-        _should_continue: &dyn Fn() -> bool,
-        _on_state: &mut dyn FnMut(AccountSyncState),
+        _cancellation: &StreamCancellation,
+        _on_snapshot: &mut dyn FnMut(AccountPlaytimeSnapshot),
+    ) -> Result<StreamOutcome, BackendError> {
+        Ok(StreamOutcome::Unsupported)
+    }
+
+    /// Stream wakeup-only stats notifications. Implementations must not carry
+    /// achievements or stat values here; callers re-enter Steam's native
+    /// RequestCurrentStats path for the actual state merge.
+    fn stream_stats_wakeup(
+        &self,
+        _client_id: u64,
+        _steam_id64: &str,
+        _cancellation: &StreamCancellation,
+        _on_wakeup: &mut dyn FnMut(AccountStatsWakeup),
     ) -> Result<StreamOutcome, BackendError> {
         Ok(StreamOutcome::Unsupported)
     }
@@ -137,5 +281,19 @@ mod tests {
 
         let permanent = BackendError::new("malformed payload", false);
         assert!(!permanent.is_retryable());
+    }
+
+    #[test]
+    fn stream_cancellation_wakes_blocked_forwarders() {
+        let cancellation = StreamCancellation::new();
+        let waiter = cancellation.clone();
+        let revision = waiter.revision();
+        let thread = std::thread::spawn(move || {
+            waiter.wait_for_activity(revision);
+            waiter.is_cancelled()
+        });
+
+        cancellation.cancel();
+        assert!(thread.join().unwrap());
     }
 }

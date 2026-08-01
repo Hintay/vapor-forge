@@ -6,9 +6,15 @@ use vapor_forge_config::{AppId, RuntimeConfig};
 
 pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool) -> bool {
     let controlled = crate::apps::classify_app(config, app_id).requires_injected_ownership();
-    if controlled && config.cumulus_configured() {
+    #[cfg(debug_assertions)]
+    log_cloud_gate(app_id, controlled, original, config);
+    // Steam answers false for an app the account has no license for, so a
+    // controlled app's cloud has to be asserted here whichever backend serves
+    // it. Answering with Steam's own value leaves the game believing it has no
+    // cloud storage even though every sync request is being served.
+    if controlled && (config.cumulus_configured() || config.local_cloud_configured()) {
         if !original {
-            info!(app_id = app_id.0, "feat: Cumulus cloud enabled");
+            info!(app_id = app_id.0, "feat: cloud enabled by backend");
         }
         return true;
     }
@@ -19,6 +25,29 @@ pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool
         return false;
     }
     original
+}
+
+/// Report what Steam itself answered for an app, once per app. Whether the gate
+/// needs to be forced open depends entirely on that value, and it is not
+/// observable from the outside.
+#[cfg(debug_assertions)]
+fn log_cloud_gate(app_id: AppId, controlled: bool, original: bool, config: &RuntimeConfig) {
+    static SEEN: Mutex<Option<HashSet<AppId>>> = Mutex::new(None);
+    let first = SEEN
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(app_id);
+    if first {
+        info!(
+            app_id = app_id.0,
+            controlled,
+            steam_answered = original,
+            local = config.local_cloud_configured(),
+            cumulus = config.cumulus_configured(),
+            "feat: cloud gate"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +298,21 @@ mod tests {
         let config = controlled_config(CloudSection {
             server_url: "https://cloud.example.com".into(),
             token: "device-token".into(),
+            ..Default::default()
+        });
+
+        assert!(on_is_cloud_enabled(&config, TEST_APP_ID, false));
+    }
+
+    #[test]
+    fn a_local_folder_backend_forces_the_gate_open_too() {
+        // Steam answers false for an app the account has no license for, so a
+        // controlled app served by the folder store has to be asserted open the
+        // same way Cumulus is. Leaving it to Steam is what made a game report
+        // that it had no cloud save directory while every sync request for it
+        // was being served.
+        let config = controlled_config(CloudSection {
+            local_path: "/tmp/vapor-forge-cloud".into(),
             ..Default::default()
         });
 

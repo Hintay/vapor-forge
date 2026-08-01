@@ -17,6 +17,12 @@ pub enum LocalTransferOutcome {
     Download(Result<Vec<u8>, BackendError>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalTransferContract {
+    Upload { transfer_size: u64 },
+    Download,
+}
+
 struct UploadTransfer {
     store: FolderStore,
     path: String,
@@ -130,6 +136,23 @@ pub fn intercept_transfer(
             path,
         } => LocalTransferOutcome::Download(store.read(app_id, &path)),
     })
+}
+
+/// Describe an issued local target without consuming it.
+pub fn transfer_contract(authority: &str, path: &str) -> Option<LocalTransferContract> {
+    if !authority.eq_ignore_ascii_case(LOCAL_TRANSFER_AUTHORITY) {
+        return None;
+    }
+    let (kind, token) = parse_target(path)?;
+    let mut registry = registry().lock().ok()?;
+    remove_expired(&mut registry, Instant::now());
+    match (&registry.by_token.get(token)?.operation, kind) {
+        (TransferOperation::Upload(upload), "upload") => Some(LocalTransferContract::Upload {
+            transfer_size: upload.transfer_size,
+        }),
+        (TransferOperation::Download { .. }, "download") => Some(LocalTransferContract::Download),
+        _ => None,
+    }
 }
 
 pub fn commit_upload(token: &str) -> Result<StagedFile, BackendError> {
@@ -293,6 +316,18 @@ mod tests {
             metadata(contents),
         )
         .unwrap();
+        let expected_upload = LocalTransferContract::Upload {
+            transfer_size: contents.len() as u64,
+        };
+        assert_eq!(
+            transfer_contract(&target.host, &target.path),
+            Some(expected_upload)
+        );
+        assert_eq!(
+            transfer_contract(&target.host, &target.path),
+            Some(expected_upload),
+            "probing a transfer contract must not consume it"
+        );
         let Some(LocalTransferOutcome::Upload(result)) =
             intercept_transfer(&target.host, &target.path, contents)
         else {
@@ -300,16 +335,22 @@ mod tests {
         };
         result.unwrap();
         let staged = commit_upload(&token).unwrap();
+        assert_eq!(transfer_contract(&target.host, &target.path), None);
         store
             .commit_batch(480, &[], &[staged], &std::collections::BTreeSet::new())
             .unwrap();
 
         let target = issue_download(store.clone(), 480, "save.dat".into()).unwrap();
+        assert_eq!(
+            transfer_contract(&target.host, &target.path),
+            Some(LocalTransferContract::Download)
+        );
         let Some(LocalTransferOutcome::Download(result)) =
             intercept_transfer(&target.host, &target.path, &[])
         else {
             panic!("download was not intercepted");
         };
+        assert_eq!(transfer_contract(&target.host, &target.path), None);
         assert_eq!(result.unwrap(), contents);
         assert_eq!(store.changes_since(480, 0).unwrap().files.len(), 1);
     }

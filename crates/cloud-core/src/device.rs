@@ -10,10 +10,11 @@ pub struct DeviceDescriptor {
 
 static DEVICE_DESCRIPTOR: OnceLock<Mutex<Option<DeviceDescriptor>>> = OnceLock::new();
 
-pub fn record_device_descriptor(descriptor: DeviceDescriptor) {
-    if let Ok(mut current) = DEVICE_DESCRIPTOR.get_or_init(|| Mutex::new(None)).lock() {
-        merge_device_descriptor(&mut current, descriptor);
-    }
+pub fn record_device_descriptor(descriptor: DeviceDescriptor) -> bool {
+    let Ok(mut current) = DEVICE_DESCRIPTOR.get_or_init(|| Mutex::new(None)).lock() else {
+        return false;
+    };
+    merge_device_descriptor(&mut current, descriptor)
 }
 
 pub fn device_descriptor() -> Option<DeviceDescriptor> {
@@ -57,9 +58,13 @@ fn update_local_client_id(current: &mut Option<DeviceDescriptor>, client_id: u64
     });
 }
 
-fn merge_device_descriptor(current: &mut Option<DeviceDescriptor>, mut incoming: DeviceDescriptor) {
+fn merge_device_descriptor(
+    current: &mut Option<DeviceDescriptor>,
+    mut incoming: DeviceDescriptor,
+) -> bool {
+    let previous = current.clone();
     if incoming.client_id == 0 {
-        return;
+        return false;
     }
     let has_machine_name =
         !incoming.machine_name.trim().is_empty() && incoming.machine_name != "unknown";
@@ -68,14 +73,14 @@ fn merge_device_descriptor(current: &mut Option<DeviceDescriptor>, mut incoming:
             incoming.machine_name = local_machine_name();
         }
         *current = Some(incoming);
-        return;
+        return *current != previous;
     };
     if existing.client_id != incoming.client_id {
         if !has_machine_name {
             incoming.machine_name = local_machine_name();
         }
         *existing = incoming;
-        return;
+        return *current != previous;
     }
     if has_machine_name {
         existing.machine_name = incoming.machine_name;
@@ -86,6 +91,7 @@ fn merge_device_descriptor(current: &mut Option<DeviceDescriptor>, mut incoming:
     if incoming.device_type.is_some() {
         existing.device_type = incoming.device_type;
     }
+    *current != previous
 }
 
 fn local_machine_name() -> String {
@@ -141,7 +147,7 @@ mod tests {
             os_type: Some(1),
             device_type: None,
         });
-        merge_device_descriptor(
+        assert!(merge_device_descriptor(
             &mut current,
             DeviceDescriptor {
                 client_id: 7,
@@ -149,10 +155,22 @@ mod tests {
                 os_type: None,
                 device_type: Some(2),
             },
-        );
+        ));
         let current = current.unwrap();
         assert_eq!(current.machine_name, "deck");
         assert_eq!(current.os_type, Some(1));
         assert_eq!(current.device_type, Some(2));
+    }
+
+    #[test]
+    fn merging_identical_launch_metadata_is_not_a_context_change() {
+        let descriptor = DeviceDescriptor {
+            client_id: 7,
+            machine_name: "deck".into(),
+            os_type: Some(1),
+            device_type: Some(2),
+        };
+        let mut current = Some(descriptor.clone());
+        assert!(!merge_device_descriptor(&mut current, descriptor));
     }
 }

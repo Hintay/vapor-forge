@@ -1,5 +1,5 @@
 use serde::Serialize;
-use vapor_forge_cloud_core::PlaytimeEntry;
+use vapor_forge_cloud_core::{PlaytimeEntry, PlaytimeSession};
 
 use crate::{CumulusClient, CumulusError, CumulusSettings};
 
@@ -7,6 +7,12 @@ use crate::{CumulusClient, CumulusError, CumulusSettings};
 struct UploadRequest<'a> {
     steam_id64: &'a str,
     apps: &'a [PlaytimeEntry],
+}
+
+#[derive(Serialize)]
+struct SessionUploadRequest<'a> {
+    steam_id64: &'a str,
+    sessions: &'a [PlaytimeSession],
 }
 
 pub fn upload(
@@ -23,6 +29,24 @@ pub fn upload(
         &UploadRequest {
             steam_id64,
             apps: entries,
+        },
+    )
+}
+
+pub fn upload_sessions(
+    settings: &CumulusSettings,
+    client_id: u64,
+    steam_id64: &str,
+    sessions: &[PlaytimeSession],
+) -> Result<(), CumulusError> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    CumulusClient::new(settings, Some(client_id)).post_json_unit(
+        "/api/v1/device/playtime-sessions",
+        &SessionUploadRequest {
+            steam_id64,
+            sessions,
         },
     )
 }

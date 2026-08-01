@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub mod achievement;
+mod device_stream;
 pub mod playtime;
 pub mod port;
-mod stream;
 
 pub use port::CumulusBackend;
 
@@ -12,7 +12,9 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use vapor_forge_cloud_core::{credential_scope, DeviceDescriptor};
+use vapor_forge_cloud_core::{
+    credential_fingerprint, principal_scope as scope_for_principal, DeviceDescriptor,
+};
 
 pub const STEAM_CLIENT_ID_HEADER: &str = "x-cumulus-steam-client-id";
 
@@ -148,6 +150,20 @@ impl CumulusClient {
 
 static BOUND_DEVICES: OnceLock<Mutex<HashSet<(String, DeviceDescriptor)>>> = OnceLock::new();
 
+#[derive(serde::Deserialize)]
+struct DevicePrincipalResponse {
+    principal_id: String,
+}
+
+pub fn principal_scope(settings: &CumulusSettings) -> Result<String, CumulusError> {
+    let response: DevicePrincipalResponse =
+        CumulusClient::new(settings, None).get_json("/api/v1/device/principal")?;
+    Ok(scope_for_principal(
+        &settings.server_url,
+        &response.principal_id,
+    ))
+}
+
 #[derive(Serialize)]
 struct DeviceBindingRequest<'a> {
     client_id: &'a str,
@@ -160,7 +176,7 @@ pub fn ensure_device_bound(
     settings: &CumulusSettings,
     descriptor: &DeviceDescriptor,
 ) -> Result<(), CumulusError> {
-    let scope = credential_scope(&settings.server_url, &settings.token);
+    let scope = credential_fingerprint(&settings.server_url, &settings.token);
     let cache_key = (scope, descriptor.clone());
     if BOUND_DEVICES
         .get_or_init(|| Mutex::new(HashSet::new()))
