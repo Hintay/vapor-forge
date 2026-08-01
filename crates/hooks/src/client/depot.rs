@@ -124,15 +124,20 @@ pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
             unsafe { extract_depot_id_from_raw(key_name) }
         {
             let ss = script_state();
-            if let Some(key) =
-                vapor_forge_features::depot_key::provide_key(DepotId(depot_id_raw), &ss.depot_keys)
-            {
+            let served =
+                vapor_forge_features::depot_key::provide_key(DepotId(depot_id_raw), &ss.depot_keys);
+            #[cfg(debug_assertions)]
+            log_depot_key_request(depot_id_raw, served.is_some(), ss.depot_keys.len());
+            if let Some(key) = served {
                 // SAFETY: key_buf has key_size capacity >= 32, we write 32 bytes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(key.as_ptr(), key_buf, 32);
                 }
                 return 32;
             }
+        } else {
+            #[cfg(debug_assertions)]
+            log_depot_key_unparsed(key_name);
         }
     }
 
@@ -176,4 +181,40 @@ pub(crate) unsafe fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u3
     let id_bytes = &before_tag[id_start..];
     let id_str = std::str::from_utf8(id_bytes).ok()?;
     id_str.parse().ok()
+}
+
+/// Report each depot key Steam asks for and whether the scripts could answer,
+/// once per depot. Nothing on this path logged before, so an unanswered request
+/// was indistinguishable from the hook never being reached at all.
+#[cfg(debug_assertions)]
+fn log_depot_key_request(depot_id: u32, served: bool, configured: usize) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let first = SEEN
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(depot_id);
+    if first {
+        info!(depot_id, served, configured, "depot: key request");
+    }
+}
+
+/// A key name whose depot id could not be parsed never reaches the script
+/// lookup, so it is worth seeing verbatim.
+#[cfg(debug_assertions)]
+fn log_depot_key_unparsed(key_name: *const i8) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: the caller checked the pointer is non-null, and Steam passes a
+    // NUL-terminated key name.
+    let name = unsafe { core::ffi::CStr::from_ptr(key_name) };
+    info!(
+        name = %name.to_string_lossy(),
+        "depot: key name did not yield a depot id"
+    );
 }

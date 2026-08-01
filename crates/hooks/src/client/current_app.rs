@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use tracing::{debug, error};
 
-use vapor_forge_hook_engine::detour::CodeRegion;
+use crate::pattern_resolver::CodeRegion;
 
 type CurrentAppIdFn = unsafe extern "C" fn(*mut c_void) -> u32;
 
@@ -15,8 +15,17 @@ struct CurrentAppResolver {
 
 static RESOLVER: OnceLock<CurrentAppResolver> = OnceLock::new();
 
-pub(crate) fn resolve(code: &CodeRegion, stats_adapter: Option<usize>) {
-    let Some(stats_adapter) = stats_adapter else {
+pub(crate) fn resolve(code: &CodeRegion) {
+    let slots = crate::vtable_scan::slots_of("IClientUserStats", "IndicateAchievementProgress");
+    if slots.len() != 1 {
+        error!(
+            found = slots.len(),
+            "current IPC AppID resolver source slot lookup failed"
+        );
+        return;
+    }
+    let Some(stats_adapter) = crate::vtable_scan::method_address("CUserStats", slots[0]) else {
+        error!("current IPC AppID resolver source was not found");
         return;
     };
     let Some((engine_slot, helper)) = parse_resolver(code, stats_adapter) else {

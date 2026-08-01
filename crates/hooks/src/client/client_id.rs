@@ -11,9 +11,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register}
 use tracing::{debug, info, warn};
 use vapor_forge_patterns::registry::PatternRegistry;
 
-#[cfg(target_pointer_width = "32")]
-use vapor_forge_hook_engine::detour;
-use vapor_forge_hook_engine::detour::CodeRegion;
+use crate::pattern_resolver::CodeRegion;
 
 #[cfg(target_pointer_width = "32")]
 const ACCESS_PATTERN: &str = "CConfigStore::ClientIDConfigAccess";
@@ -91,7 +89,9 @@ fn resolve_x86(registry: &PatternRegistry, code: &CodeRegion) {
         );
         return;
     };
-    let Some(site_address) = detour::resolve_pattern_entry(code, ACCESS_PATTERN, &entry) else {
+    let Some(site_address) =
+        crate::pattern_resolver::resolve_pattern_entry(code, ACCESS_PATTERN, &entry)
+    else {
         return;
     };
     let Some(site_offset) = site_address.checked_sub(code.base) else {
@@ -206,6 +206,12 @@ fn refresh_device_descriptor_x86() {
     };
 
     vapor_forge_cloud_core::record_local_client_id(client_id);
+    crate::achievement_worker::notify_context_changed();
+    crate::playtime_worker::notify_context_changed();
+    crate::playtime_downlink_worker::notify_context_changed();
+    crate::stats_wakeup_worker::notify_context_changed();
+    crate::client::user_stats::notify_context_changed();
+    crate::netpacket::notify_stats_context_changed();
     CAPTURE_STATE.store(CAPTURE_COMPLETE, Ordering::Release);
     info!(client_id, "Steam ClientID read from CConfigStore");
 }
@@ -448,10 +454,7 @@ fn add_x86_displacement(address: usize, displacement: i32) -> usize {
 
 #[cfg(target_pointer_width = "32")]
 fn unix_time_seconds() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32
+    vapor_forge_core::unix_now() as u32
 }
 
 #[cfg(target_pointer_width = "32")]

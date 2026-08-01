@@ -5,7 +5,7 @@ use vapor_forge_config::AppId;
 use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_patterns::registry::PatternRegistry;
 
-use vapor_forge_hook_engine::detour::{self, CodeRegion};
+use crate::pattern_resolver::CodeRegion;
 use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::install::{config, IPC_SERVER};
@@ -343,10 +343,11 @@ pub(crate) fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegi
         Some(e) => e,
         None => return,
     };
-    let call_addr = match detour::resolve_pattern_entry(code, "SetEnvString", &entry) {
-        Some(a) => a,
-        None => return,
-    };
+    let call_addr =
+        match crate::pattern_resolver::resolve_pattern_entry(code, "SetEnvString", &entry) {
+            Some(a) => a,
+            None => return,
+        };
     // SAFETY: call_addr is a validated code address.
     let f: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
     // SAFETY: hook installation is single-threaded and publishes this slot once.

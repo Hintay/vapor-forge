@@ -13,7 +13,7 @@ use vapor_forge_steam_native_abi::{
     ProcessPendingLicenseUpdatesFn,
 };
 
-use vapor_forge_hook_engine::detour::CodeRegion;
+use crate::pattern_resolver::CodeRegion;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -265,7 +265,7 @@ fn resolve_raw_address(registry: &PatternRegistry, code: &CodeRegion, name: &str
         }
     };
 
-    vapor_forge_hook_engine::detour::resolve_pattern_entry(code, name, &entry)
+    crate::pattern_resolver::resolve_pattern_entry(code, name, &entry)
 }
 
 /// Get the resolved GetPackageInfo function address (for hooking).
@@ -345,10 +345,14 @@ pub(crate) fn cuser_captured() -> bool {
 /// # Safety
 /// `this` must be the live CUser receiver for the active Steam callback.
 pub(crate) unsafe fn capture_cuser(this: *mut c_void) {
-    if CUSER_PTR.load(Ordering::Acquire) == 0 {
-        CUSER_PTR.store(this as usize, Ordering::Release);
-        debug!("package: captured CUser at 0x{:x}", this as usize);
+    let previous = CUSER_PTR.swap(this as usize, Ordering::AcqRel);
+    if previous != this as usize {
+        debug!("package: updated CUser at 0x{:x}", this as usize);
     }
+}
+
+pub(crate) fn reset_account_state() {
+    CUSER_PTR.store(0, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

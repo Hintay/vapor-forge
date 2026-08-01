@@ -6,6 +6,7 @@ use vapor_forge_config::AppId;
 use vapor_forge_hook_engine::detour::Detour;
 
 use super::install::{config, effective_ticket_mode, runtime_snapshot, TICKET_CACHE};
+use crate::pattern_resolver::CodeRegion;
 use vapor_forge_hook_engine::original::detour_or_return;
 
 pub(crate) const TICKET_EXT_DATA_NAME: &str = "IClientUser::GetAppOwnershipTicketExtendedData";
@@ -36,7 +37,7 @@ pub(crate) type IsSubscribedInTicketFn =
 const USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE: u8 = 0;
 
 pub(crate) fn resolve_adapter_implementation(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
+    code: &crate::pattern_resolver::CodeRegion,
     name: &str,
     entry: usize,
     check_ownership: Option<usize>,
@@ -65,38 +66,25 @@ pub(crate) fn resolve_adapter_implementation(
     }
 }
 
-fn resolve_get_enc_implementation(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-) -> Option<usize> {
+fn resolve_get_enc_implementation(code: &CodeRegion, entry: usize) -> Option<usize> {
     let target = get_enc_thunk_target(code, entry)?;
     let offset = target.checked_sub(code.base)?;
     validate_get_enc(code.bytes, offset).then_some(target)
 }
 
 #[cfg(target_pointer_width = "32")]
-fn get_enc_thunk_target(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-) -> Option<usize> {
+fn get_enc_thunk_target(code: &CodeRegion, entry: usize) -> Option<usize> {
     const ADJUST_THIS: &[u8] = &[0x81, 0x6c, 0x24, 0x04, 0xd4, 0x18, 0x00, 0x00];
     relative_tail_jump_after(code, entry, ADJUST_THIS)
 }
 
 #[cfg(target_pointer_width = "64")]
-fn get_enc_thunk_target(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-) -> Option<usize> {
+fn get_enc_thunk_target(code: &CodeRegion, entry: usize) -> Option<usize> {
     const ADJUST_THIS: &[u8] = &[0x48, 0x81, 0xef, 0xd0, 0x1f, 0x00, 0x00];
     relative_tail_jump_after(code, entry, ADJUST_THIS)
 }
 
-fn relative_tail_jump_after(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-    prefix: &[u8],
-) -> Option<usize> {
+fn relative_tail_jump_after(code: &CodeRegion, entry: usize, prefix: &[u8]) -> Option<usize> {
     let offset = entry.checked_sub(code.base)?;
     let jump = offset.checked_add(prefix.len())?;
     let bytes = code.bytes.get(offset..jump.checked_add(5)?)?;
@@ -116,10 +104,7 @@ fn relative_tail_jump_after(
 }
 
 #[cfg(target_pointer_width = "32")]
-fn validate_is_subscribed_wrapper_abi(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-) -> bool {
+fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
     let Some(offset) = entry.checked_sub(code.base) else {
         return false;
     };
@@ -138,10 +123,7 @@ fn validate_is_subscribed_wrapper_abi(
 }
 
 #[cfg(target_pointer_width = "64")]
-fn validate_is_subscribed_wrapper_abi(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-) -> bool {
+fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 
     let Some(offset) = entry.checked_sub(code.base) else {
@@ -196,7 +178,7 @@ fn validate_is_subscribed_wrapper_abi(
 }
 
 pub(crate) fn validate_direct_adapter_entry(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
+    code: &CodeRegion,
     name: &str,
     target: usize,
     check_ownership: Option<usize>,
@@ -213,18 +195,11 @@ pub(crate) fn validate_direct_adapter_entry(
             .and_then(|address| address.checked_sub(code.base))
             .is_some_and(|check| validate_update_ticket(code.bytes, offset, check)),
         IS_SUBSCRIBED_IN_TICKET_NAME => validate_is_subscribed(code.bytes, offset),
-        // GetEncryptedAppTicket resolves via resolve_get_enc_implementation.
-        _ if name == super::eticket::REQUEST_ENCRYPTED_NAME => {
-            validate_request_enc(code.bytes, offset)
-        }
         _ => false,
     }
 }
 
-fn ticket_ext_semantics_are_reachable(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    target: usize,
-) -> bool {
+fn ticket_ext_semantics_are_reachable(code: &CodeRegion, target: usize) -> bool {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 
     #[cfg(target_pointer_width = "32")]
@@ -354,11 +329,7 @@ fn reachable_instruction_offsets(bytes: &[u8], ip: usize) -> std::collections::H
     reachable
 }
 
-fn direct_branch_targets(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    entry: usize,
-    max_len: usize,
-) -> Vec<usize> {
+fn direct_branch_targets(code: &CodeRegion, entry: usize, max_len: usize) -> Vec<usize> {
     use iced_x86::{Decoder, DecoderOptions, FlowControl};
 
     let Some(offset) = entry.checked_sub(code.base) else {
@@ -482,46 +453,6 @@ fn validate_is_subscribed(code: &[u8], offset: usize) -> bool {
     status_filter
         && (old_returns || current_returns)
         && !has_seq(bytes, &[0x41, 0x89, 0x95, 0x60, 0x1f, 0x00, 0x00])
-}
-
-#[cfg(target_pointer_width = "32")]
-fn validate_request_enc(code: &[u8], offset: usize) -> bool {
-    let Some(bytes) = bounded_tail(code, offset, 0x160) else {
-        return false;
-    };
-    ordered_reachable_sequences(
-        bytes,
-        offset,
-        &[
-            &[0x68, 0x70, 0x01, 0x00, 0x00],
-            &[0x2d, 0xd4, 0x18, 0x00, 0x00],
-            &[0xc7, 0x86, 0x6c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            &[0x89, 0x86, 0x68, 0x01, 0x00, 0x00],
-            &[0x68, 0x7a, 0x07, 0x00, 0x00],
-            &[0xff, 0x52, 0x14],
-        ],
-    )
-}
-
-#[cfg(target_pointer_width = "64")]
-fn validate_request_enc(code: &[u8], offset: usize) -> bool {
-    let Some(bytes) = bounded_tail(code, offset, 0x160) else {
-        return false;
-    };
-    ordered_reachable_sequences(
-        bytes,
-        offset,
-        &[
-            &[0x48, 0x8d, 0xaf, 0x30, 0xe0, 0xff, 0xff],
-            &[0xbf, 0xe8, 0x01, 0x00, 0x00],
-            &[0x48, 0x89, 0xab, 0xd8, 0x01, 0x00, 0x00],
-            &[
-                0x48, 0xc7, 0x83, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ],
-            &[0xb9, 0x7a, 0x07, 0x00, 0x00],
-            &[0xff, 0x50, 0x28],
-        ],
-    )
 }
 
 #[cfg(target_pointer_width = "32")]
@@ -1202,8 +1133,8 @@ mod tests {
 
 #[cfg(test)]
 mod eticket_lowering_tests {
-    use super::{resolve_adapter_implementation, validate_get_enc, validate_request_enc};
-    use vapor_forge_hook_engine::detour::CodeRegion;
+    use super::{resolve_adapter_implementation, validate_get_enc};
+    use crate::pattern_resolver::CodeRegion;
 
     const BASE: usize = 0x10_0000;
     const IMPL_OFFSET: usize = 0x80;
@@ -1254,32 +1185,13 @@ mod eticket_lowering_tests {
     #[cfg(target_pointer_width = "64")]
     mod x64 {
         use super::{
-            body, call_region, code_region, get_thunk_region, resolve_adapter_implementation,
-            validate_get_enc, validate_request_enc, BASE, IMPL_OFFSET,
+            body, call_region, get_thunk_region, resolve_adapter_implementation, validate_get_enc,
+            BASE, IMPL_OFFSET,
         };
 
-        const ADJUST_THIS: &[u8] = &[0x48, 0x8d, 0xaf, 0x30, 0xe0, 0xff, 0xff];
-        const ALLOC_JOB: &[u8] = &[0xbf, 0xe8, 0x01, 0x00, 0x00];
-        const JOB_OWNER: &[u8] = &[0x48, 0x89, 0xab, 0xd8, 0x01, 0x00, 0x00];
-        const JOB_MESSAGE_ZERO: &[u8] = &[
-            0x48, 0xc7, 0x83, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        const EMSG_ETICKET_REQUEST: &[u8] = &[0xb9, 0x7a, 0x07, 0x00, 0x00];
-        const CM_BUILDER_CALL: &[u8] = &[0xff, 0x50, 0x28];
         const NODE_STRIDE: &[u8] = &[0x48, 0x8d, 0x14, 0x52, 0x48, 0xc1, 0xe2, 0x05];
         const TICKET_PAYLOAD: &[u8] = &[0x4c, 0x8d, 0x6a, 0x20];
         const GET_THUNK_ADJUST: &[u8] = &[0x48, 0x81, 0xef, 0xd0, 0x1f, 0x00, 0x00];
-
-        fn request_body() -> Vec<u8> {
-            body(&[
-                ADJUST_THIS,
-                ALLOC_JOB,
-                JOB_OWNER,
-                JOB_MESSAGE_ZERO,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ])
-        }
 
         fn public_get_body() -> Vec<u8> {
             body(&[
@@ -1288,48 +1200,6 @@ mod eticket_lowering_tests {
                 NODE_STRIDE,
                 TICKET_PAYLOAD,
             ])
-        }
-
-        #[test]
-        fn request_enc_accepts_full_shape() {
-            let bytes = request_body();
-            assert!(validate_request_enc(&bytes, 0));
-            let code = code_region(bytes);
-            assert_eq!(
-                resolve_adapter_implementation(
-                    &code,
-                    super::super::super::eticket::REQUEST_ENCRYPTED_NAME,
-                    BASE,
-                    None,
-                ),
-                Some(BASE)
-            );
-        }
-
-        #[test]
-        fn request_enc_rejects_missing_owner_link() {
-            let bytes = body(&[
-                ADJUST_THIS,
-                ALLOC_JOB,
-                JOB_MESSAGE_ZERO,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ]);
-            assert!(!validate_request_enc(&bytes, 0));
-        }
-
-        #[test]
-        fn request_enc_rejects_anchors_after_return() {
-            let bytes = body(&[
-                ADJUST_THIS,
-                ALLOC_JOB,
-                &[0xc3],
-                JOB_OWNER,
-                JOB_MESSAGE_ZERO,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ]);
-            assert!(!validate_request_enc(&bytes, 0));
         }
 
         #[test]
@@ -1417,31 +1287,13 @@ mod eticket_lowering_tests {
     #[cfg(target_pointer_width = "32")]
     mod x86 {
         use super::{
-            body, call_region, code_region, get_thunk_region, resolve_adapter_implementation,
-            validate_get_enc, validate_request_enc, BASE, IMPL_OFFSET,
+            body, call_region, get_thunk_region, resolve_adapter_implementation, validate_get_enc,
+            BASE, IMPL_OFFSET,
         };
 
-        const ALLOC_JOB: &[u8] = &[0x68, 0x70, 0x01, 0x00, 0x00];
-        const ADJUST_THIS: &[u8] = &[0x2d, 0xd4, 0x18, 0x00, 0x00];
-        const JOB_MESSAGE_ZERO: &[u8] =
-            &[0xc7, 0x86, 0x6c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        const JOB_OWNER: &[u8] = &[0x89, 0x86, 0x68, 0x01, 0x00, 0x00];
-        const EMSG_ETICKET_REQUEST: &[u8] = &[0x68, 0x7a, 0x07, 0x00, 0x00];
-        const CM_BUILDER_CALL: &[u8] = &[0xff, 0x52, 0x14];
         const NODE_STRIDE: &[u8] = &[0x6b, 0xd2, 0x44];
         const TICKET_PAYLOAD: &[u8] = &[0x8d, 0x7a, 0x18];
         const GET_THUNK_ADJUST: &[u8] = &[0x81, 0x6c, 0x24, 0x04, 0xd4, 0x18, 0x00, 0x00];
-
-        fn request_body() -> Vec<u8> {
-            body(&[
-                ALLOC_JOB,
-                ADJUST_THIS,
-                JOB_MESSAGE_ZERO,
-                JOB_OWNER,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ])
-        }
 
         fn public_get_body() -> Vec<u8> {
             body(&[
@@ -1450,48 +1302,6 @@ mod eticket_lowering_tests {
                 NODE_STRIDE,
                 TICKET_PAYLOAD,
             ])
-        }
-
-        #[test]
-        fn request_enc_accepts_full_shape() {
-            let bytes = request_body();
-            assert!(validate_request_enc(&bytes, 0));
-            let code = code_region(bytes);
-            assert_eq!(
-                resolve_adapter_implementation(
-                    &code,
-                    super::super::super::eticket::REQUEST_ENCRYPTED_NAME,
-                    BASE,
-                    None,
-                ),
-                Some(BASE)
-            );
-        }
-
-        #[test]
-        fn request_enc_rejects_missing_owner_link() {
-            let bytes = body(&[
-                ALLOC_JOB,
-                ADJUST_THIS,
-                JOB_MESSAGE_ZERO,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ]);
-            assert!(!validate_request_enc(&bytes, 0));
-        }
-
-        #[test]
-        fn request_enc_rejects_anchors_after_return() {
-            let bytes = body(&[
-                ALLOC_JOB,
-                ADJUST_THIS,
-                &[0xc3],
-                JOB_MESSAGE_ZERO,
-                JOB_OWNER,
-                EMSG_ETICKET_REQUEST,
-                CM_BUILDER_CALL,
-            ]);
-            assert!(!validate_request_enc(&bytes, 0));
         }
 
         #[test]

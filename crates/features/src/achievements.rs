@@ -1,14 +1,14 @@
 //! Achievement/stats schema interception.
 //!
-//! For controlled apps, outgoing stats requests have their SteamID rewritten
-//! to a reference account so the server returns a valid schema. Incoming
-//! responses have stat values cleared (schema is preserved) so Steam keeps
-//! metadata but falls back to local cache for actual stats.
+//! For controlled apps, outgoing stats requests are redirected to a donor
+//! account only to fetch Valve's authoritative schema. The hooks crate then
+//! drops the donor response, combines that schema with backend-authoritative
+//! stats when available, and injects a response for Steam's original job.
 //!
 //! Schema retrieval supports both ServiceMethod (EMsg 151/147) and legacy
-//! EMsg 818/819. Both paths replace the requested SteamID with a reference
-//! account and clear the cached schema hash/CRC to request a full schema, then
-//! remove that account's actual stats from the response.
+//! EMsg 818/819. Donor requests clear cached schema/stats tokens so Valve sends
+//! full schema data; donor stat values must never be passed through as the
+//! controlled account's state.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -116,6 +116,7 @@ pub fn has_legacy_pending() -> bool {
 
 pub struct OfflineResponse {
     pub packet: Vec<u8>,
+    pub generation: u64,
 }
 
 static OFFLINE_QUEUE: Mutex<Option<Vec<OfflineResponse>>> = Mutex::new(None);
@@ -129,6 +130,7 @@ fn queue_offline_response(app_id: AppId, job_id: u64, req_hdr: &CMsgProtoBufHead
         eresult: Some(ERESULT_NO_CONNECTION),
         transport_error: None,
         seq_num: None,
+        ..Default::default()
     };
     let resp_body = PlayerGetUserStatsResponse::default();
 
@@ -140,7 +142,10 @@ fn queue_offline_response(app_id: AppId, job_id: u64, req_hdr: &CMsgProtoBufHead
     {
         let mut guard = OFFLINE_QUEUE.lock().unwrap();
         let queue = guard.get_or_insert_with(Vec::new);
-        queue.push(OfflineResponse { packet });
+        queue.push(OfflineResponse {
+            packet,
+            generation: crate::inject_wake::injection_generation(),
+        });
     }
     debug!(
         app_id = app_id.0,
@@ -216,7 +221,9 @@ pub fn plan_send_service_stats(
         };
     }
 
-    let was_probe = req.sha_schema.take().is_some();
+    let had_sha_schema = req.sha_schema.take().is_some();
+    let had_crc_schema = req.crc_schema.take().is_some();
+    let was_probe = had_sha_schema || had_crc_schema;
     let donor_steam_id = get_ref_steamid(stat_steam_ids, app_id);
     req.steamid = Some(donor_steam_id);
     StatsSendPlan::Rewrite {
@@ -237,7 +244,7 @@ pub fn plan_send_legacy_stats(
     let Ok(mut req) = ClientGetUserStatsRequest::decode(body_bytes) else {
         return StatsSendPlan::Pass;
     };
-    let Some(app_id) = req.game_id.map(|game_id| AppId(game_id as u32)) else {
+    let Some(app_id) = req.game_id.and_then(app_id_from_game_id).map(AppId) else {
         return StatsSendPlan::Pass;
     };
     if !should_redirect_with_ownership(app_id, config, ownership) {
@@ -391,7 +398,7 @@ pub fn on_recv_legacy_stats(
     config: &RuntimeConfig,
 ) -> Option<(Vec<u8>, Option<CapturedAchievementSchema>)> {
     let mut response = ClientGetUserStatsResponse::decode(body_bytes).ok()?;
-    let app_id = AppId(response.game_id? as u32);
+    let app_id = AppId(app_id_from_game_id(response.game_id?)?);
     if !should_redirect_with_ownership(app_id, config, crate::apps::actual_ownership) {
         return None;
     }
@@ -403,7 +410,7 @@ pub fn on_recv_legacy_stats(
         .filter(|schema| !schema.is_empty())
         .map(|schema| CapturedAchievementSchema {
             app_id: app_id.0,
-            schema_version: response.crc_stats.map(|crc| format!("crc32:{crc:08x}")),
+            schema_version: None,
             content: schema.clone(),
         });
     response.stats.clear();
@@ -466,6 +473,10 @@ mod tests {
         let response_header = CMsgProtoBufHeader {
             jobid_target: Some(job_id),
             eresult: Some(2),
+            routing_app_id: Some(480),
+            debug_source: Some("cm".into()),
+            forward_to_system_id: vec![7, 8],
+            ip_addr: Some(MsgProtoBufHeaderIpAddress::V6(vec![0; 16])),
             ..Default::default()
         };
         let response = PlayerGetUserStatsResponse {
@@ -474,6 +485,7 @@ mod tests {
             stats: vec![PlayerStatsEntry {
                 stat_id: Some(7),
                 stat_value: Some(42),
+                unlock_times: Vec::new(),
             }],
             ..Default::default()
         };
@@ -488,6 +500,13 @@ mod tests {
         let header = CMsgProtoBufHeader::decode(header.as_slice()).unwrap();
         let body = PlayerGetUserStatsResponse::decode(body.as_slice()).unwrap();
         assert_eq!(header.eresult, Some(ERESULT_OK));
+        assert_eq!(header.routing_app_id, Some(480));
+        assert_eq!(header.debug_source.as_deref(), Some("cm"));
+        assert_eq!(header.forward_to_system_id, vec![7, 8]);
+        assert!(matches!(
+            header.ip_addr,
+            Some(MsgProtoBufHeaderIpAddress::V6(ref value)) if value == &[0; 16]
+        ));
         assert!(body.stats.is_empty());
         assert_eq!(body.schema, response.schema);
     }
@@ -563,6 +582,7 @@ mod tests {
             appid: Some(app_id.0),
             steamid: Some(76561198000000001),
             sha_schema: Some(vec![1, 2, 3]),
+            crc_schema: Some(0x1234_5678),
             ..Default::default()
         };
         let donors = HashMap::from([(app_id, donor)]);
@@ -587,6 +607,7 @@ mod tests {
         assert_eq!(job_id, Some(91));
         assert_eq!(rewritten.steamid, Some(donor));
         assert_eq!(rewritten.sha_schema, None);
+        assert_eq!(rewritten.crc_schema, None);
     }
 
     #[test]

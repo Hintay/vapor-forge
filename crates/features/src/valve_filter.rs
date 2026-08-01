@@ -7,10 +7,11 @@ use prost::Message;
 use std::collections::HashMap;
 use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_steam_protocol::{
-    assemble_raw, CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientStatsUpdated,
-    ClientStoreUserStats2Request, ClientStoreUserStatsRequest, ClientStoreUserStatsResponse,
-    EMSG_SERVICE_METHOD_RESPONSE, EMSG_STATS_UPDATED, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2,
-    EMSG_STORE_USERSTATS_RESPONSE, ERESULT_OK, K_MSG_HDR_PROTO_FLAG,
+    app_id_from_game_id, assemble_raw, legacy_store_user_stats_game_id, service_method_app_id,
+    CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientStatsUpdated, ClientStoreUserStats2Request,
+    ClientStoreUserStatsResponse, EMSG_SERVICE_METHOD_RESPONSE, EMSG_STATS_UPDATED,
+    EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, EMSG_STORE_USERSTATS_RESPONSE, ERESULT_OK,
+    K_MSG_HDR_PROTO_FLAG,
 };
 
 pub const APP_INTERFACE_METRICS: &str = "ClientMetrics.ClientAppInterfaceStatsReport#1";
@@ -27,18 +28,6 @@ pub enum PrivacyAction {
 pub struct GamesPlayedFilter {
     pub body: Option<Vec<u8>>,
     pub blocked_rich_presence_app: Option<AppId>,
-}
-
-#[derive(Clone, prost::Message)]
-struct AppIdField1 {
-    #[prost(uint32, optional, tag = "1")]
-    app_id: Option<u32>,
-}
-
-#[derive(Clone, prost::Message)]
-struct GameIdField1 {
-    #[prost(uint64, optional, tag = "1")]
-    game_id: Option<u64>,
 }
 
 fn protected_with_ownership(
@@ -81,7 +70,10 @@ pub fn filter_games_played_with_runtime(
             filtered.push(game);
             continue;
         };
-        let app_id = AppId(game_id as u32);
+        let Some(app_id) = app_id_from_game_id(game_id).map(AppId) else {
+            filtered.push(game);
+            continue;
+        };
         if let Some(avatar_id) = avatar(app_id) {
             game.game_id = Some(avatar_id.0 as u64);
             changed = true;
@@ -130,20 +122,11 @@ pub fn service_method_action_with_ownership(
         return PrivacyAction::Pass;
     };
 
-    let app_id = match method {
-        APP_INTERFACE_METRICS => {
-            let Some(app_id) = GameIdField1::decode(body).ok().and_then(|msg| msg.game_id) else {
-                return PrivacyAction::Pass;
-            };
-            app_id as u32
-        }
-        CLOUD_SYNC_METRICS => {
-            let Some(app_id) = AppIdField1::decode(body).ok().and_then(|msg| msg.app_id) else {
-                return PrivacyAction::Pass;
-            };
-            app_id
-        }
-        _ => return PrivacyAction::Pass,
+    if !matches!(method, APP_INTERFACE_METRICS | CLOUD_SYNC_METRICS) {
+        return PrivacyAction::Pass;
+    }
+    let Some(app_id) = service_method_app_id(method, body) else {
+        return PrivacyAction::Pass;
     };
 
     if !protected_with_ownership(config, app_id, ownership) {
@@ -177,13 +160,12 @@ pub fn store_stats_action_with_ownership(
 ) -> PrivacyAction {
     match emsg {
         EMSG_STORE_USERSTATS => {
-            let Ok(request) = ClientStoreUserStatsRequest::decode(body) else {
+            let Some(game_id) = legacy_store_user_stats_game_id(body) else {
                 return PrivacyAction::Pass;
             };
-            let Some(game_id) = request.game_id else {
+            let Some(app_id) = app_id_from_game_id(game_id) else {
                 return PrivacyAction::Pass;
             };
-            let app_id = game_id as u32;
             if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
@@ -191,6 +173,7 @@ pub fn store_stats_action_with_ownership(
                 game_id: Some(game_id),
                 eresult: Some(ERESULT_OK),
                 crc_stats: None,
+                stats_failed_validation: Vec::new(),
                 stats_out_of_date: Some(false),
             };
             PrivacyAction::Respond {
@@ -209,7 +192,9 @@ pub fn store_stats_action_with_ownership(
             let Some(game_id) = request.game_id else {
                 return PrivacyAction::Pass;
             };
-            let app_id = game_id as u32;
+            let Some(app_id) = app_id_from_game_id(game_id) else {
+                return PrivacyAction::Pass;
+            };
             if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
@@ -238,6 +223,7 @@ pub fn service_response(header_bytes: &[u8], body: Vec<u8>, eresult: i32) -> Vec
         eresult: Some(eresult),
         transport_error: None,
         seq_num: None,
+        ..Default::default()
     };
     assemble_raw(
         EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG,
@@ -256,6 +242,7 @@ pub fn emsg_response(emsg: u32, header_bytes: &[u8], body: Vec<u8>) -> Vec<u8> {
         eresult: Some(ERESULT_OK),
         transport_error: None,
         seq_num: None,
+        ..Default::default()
     };
     assemble_raw(
         emsg | K_MSG_HDR_PROTO_FLAG,
@@ -268,6 +255,28 @@ pub fn emsg_response(emsg: u32, header_bytes: &[u8], body: Vec<u8>) -> Vec<u8> {
 mod tests {
     use super::*;
     use vapor_forge_config::{AppsSection, InjectApp};
+
+    #[derive(Clone, prost::Message)]
+    struct LegacyStoreUserStatsRequestFixture {
+        #[prost(fixed64, optional, tag = "1")]
+        game_id: Option<u64>,
+        #[prost(bool, optional, tag = "2")]
+        explicit_reset: Option<bool>,
+        #[prost(message, repeated, tag = "3")]
+        stats_to_store: Vec<vapor_forge_steam_protocol::StoreUserStatsEntry>,
+    }
+
+    #[derive(Clone, prost::Message)]
+    struct ClientMetricsAppInterfaceStatsNotification {
+        #[prost(uint64, optional, tag = "1")]
+        game_id: Option<u64>,
+    }
+
+    #[derive(Clone, prost::Message)]
+    struct ClientMetricsCloudAppSyncStatsNotification {
+        #[prost(uint32, optional, tag = "1")]
+        app_id: Option<u32>,
+    }
 
     fn config(app_id: u32) -> RuntimeConfig {
         RuntimeConfig {
@@ -295,8 +304,21 @@ mod tests {
     #[test]
     fn metrics_for_unknown_controlled_app_are_dropped() {
         let header = header(APP_INTERFACE_METRICS);
-        let body = GameIdField1 {
-            game_id: Some(736_260),
+        let body = ClientMetricsAppInterfaceStatsNotification {
+            game_id: Some((2_u64 << 24) | 736_260),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            service_method_action(&header, &header.encode_to_vec(), &body, &config(736_260)),
+            PrivacyAction::Drop { app_id: 736_260 }
+        );
+    }
+
+    #[test]
+    fn cloud_sync_metrics_for_unknown_controlled_app_are_dropped() {
+        let header = header(CLOUD_SYNC_METRICS);
+        let body = ClientMetricsCloudAppSyncStatsNotification {
+            app_id: Some(736_260),
         }
         .encode_to_vec();
         assert_eq!(
@@ -307,10 +329,6 @@ mod tests {
 
     #[test]
     fn read_only_app_queries_pass_through() {
-        let body = AppIdField1 {
-            app_id: Some(736_261),
-        }
-        .encode_to_vec();
         for method in [
             "Player.GetGameBadgeLevels#1",
             "PublishedFile.GetUserFiles#1",
@@ -320,7 +338,7 @@ mod tests {
         ] {
             let header = header(method);
             assert_eq!(
-                service_method_action(&header, &header.encode_to_vec(), &body, &config(736_261)),
+                service_method_action(&header, &header.encode_to_vec(), &[], &config(736_261)),
                 PrivacyAction::Pass,
                 "{method} should pass through"
             );
@@ -330,7 +348,7 @@ mod tests {
     #[test]
     fn store_stats_is_acknowledged_without_valve() {
         let header = header("store-stats").encode_to_vec();
-        let request = ClientStoreUserStatsRequest {
+        let request = LegacyStoreUserStatsRequestFixture {
             game_id: Some(736_262),
             explicit_reset: Some(false),
             stats_to_store: vec![vapor_forge_steam_protocol::StoreUserStatsEntry {
@@ -361,6 +379,7 @@ mod tests {
                 game_id: Some(736_263),
                 ..Default::default()
             }],
+            ..Default::default()
         }
         .encode_to_vec();
         let result = filter_games_played(&body, &config(736_263), &HashMap::new()).unwrap();
@@ -377,19 +396,36 @@ mod tests {
         let body = CMsgClientGamesPlayed {
             games_played: vec![vapor_forge_steam_protocol::GamePlayed {
                 game_id: Some(736_264),
+                vr_hmd_vendor: Some("vendor".into()),
+                compat_tool_cmd: Some("pressure-vessel".into()),
+                process_id_list: vec![vapor_forge_steam_protocol::GamePlayedProcessInfo {
+                    process_id: Some(10),
+                    process_id_parent: Some(1),
+                    parent_is_steam: Some(true),
+                }],
                 ..Default::default()
             }],
+            client_os_type: Some(20),
+            cloud_gaming_platform: Some(3),
+            recent_reauthentication: Some(true),
         }
         .encode_to_vec();
         let avatars = HashMap::from([(AppId(736_264), AppId(480))]);
         let result = filter_games_played(&body, &config(736_264), &avatars).unwrap();
         assert_eq!(result.blocked_rich_presence_app, None);
+        let rewritten = CMsgClientGamesPlayed::decode(result.body.unwrap().as_slice()).unwrap();
+        assert_eq!(rewritten.games_played[0].game_id, Some(480));
         assert_eq!(
-            CMsgClientGamesPlayed::decode(result.body.unwrap().as_slice())
-                .unwrap()
-                .games_played[0]
-                .game_id,
-            Some(480)
+            rewritten.games_played[0].vr_hmd_vendor.as_deref(),
+            Some("vendor")
         );
+        assert_eq!(
+            rewritten.games_played[0].compat_tool_cmd.as_deref(),
+            Some("pressure-vessel")
+        );
+        assert_eq!(rewritten.games_played[0].process_id_list.len(), 1);
+        assert_eq!(rewritten.client_os_type, Some(20));
+        assert_eq!(rewritten.cloud_gaming_platform, Some(3));
+        assert_eq!(rewritten.recent_reauthentication, Some(true));
     }
 }

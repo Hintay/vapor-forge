@@ -26,6 +26,11 @@ impl LocalIdentity {
         if steam_id64 != 0 && !is_valid_individual_steam_id(steam_id64) {
             return false;
         }
+        // Before login, GetSteamID legitimately returns zero. Do not let that
+        // initial value suppress the first account-bearing network packet.
+        if steam_id64 == 0 && self.steam_id64 == 0 && !self.authoritative {
+            return false;
+        }
         let changed = self.steam_id64 != steam_id64;
         self.steam_id64 = steam_id64;
         self.authoritative = true;
@@ -116,5 +121,19 @@ mod tests {
         assert_eq!(identity.steam_id64, 0);
         assert!(!identity.authoritative);
         assert!(identity.observe(76561198106179127));
+    }
+
+    #[test]
+    fn pre_login_zero_does_not_block_first_packet_identity() {
+        let mut identity = LocalIdentity {
+            steam_id64: 0,
+            authoritative: false,
+        };
+        let account = 76561198106179127;
+
+        assert!(!identity.set_authoritative(0));
+        assert!(!identity.authoritative);
+        assert!(identity.observe(account));
+        assert_eq!(identity.steam_id64, account);
     }
 }

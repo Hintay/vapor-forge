@@ -367,7 +367,6 @@ fn reload_config(
                 runtime_store,
                 "config and Lua scripts reloaded",
             );
-            crate::downsync_worker::notify_config_changed();
             true
         }
         Err(error) => {
@@ -447,6 +446,12 @@ fn finalize_snapshot(
     let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
     let service_config = Arc::clone(&snapshot.config);
     runtime_store.store(Arc::new(snapshot));
+    crate::achievement_worker::notify_context_changed();
+    crate::playtime_worker::notify_context_changed();
+    crate::playtime_downlink_worker::notify_context_changed();
+    crate::stats_wakeup_worker::notify_context_changed();
+    crate::client::user_stats::notify_context_changed();
+    crate::netpacket::notify_stats_context_changed();
     crate::client::install::ensure_runtime_services_for_config(&service_config);
 
     crate::client::package::queue_reload(controlled);

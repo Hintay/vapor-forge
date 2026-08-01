@@ -40,6 +40,9 @@ pub(crate) unsafe extern "C" fn hk_check_app_ownership(
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, out) };
 
+    // SAFETY: `this` is the live CUser receiver for this hook callback.
+    unsafe { super::package::capture_cuser(this) };
+
     // This is the first stable post-login CUser boundary. Starting the Steam-owned
     // worker here avoids creating a thread from inside the audit loader callback.
     super::user_stats::ensure_worker_started();
@@ -57,8 +60,6 @@ unsafe { original(this, app_id, out) };
         return result;
     }
 
-    // SAFETY: `this` is the live CUser receiver for this hook callback.
-    unsafe { super::package::capture_cuser(this) };
     // SAFETY: this scope exists only for the dynamic extent of this callback.
     let mut package_scope = unsafe { super::package::SteamPackageHookScope::enter() };
     let mut package_access = super::package::SteamPackageAccess::from_hook(&mut package_scope);

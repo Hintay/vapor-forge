@@ -7,14 +7,14 @@ pub(crate) mod achievement_worker;
 pub(crate) mod client;
 #[cfg(target_os = "linux")]
 pub(crate) mod cloud_backend;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod context_signal;
 #[cfg(any(
     all(target_os = "linux", debug_assertions),
     all(test, target_family = "unix")
 ))]
 #[cfg_attr(all(not(target_os = "linux"), test), allow(dead_code))]
 pub(crate) mod debug_api;
-#[cfg(target_os = "linux")]
-pub(crate) mod downsync_worker;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]
@@ -24,13 +24,25 @@ pub(crate) mod netpacket;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod packet_capture;
 #[cfg(target_os = "linux")]
+pub(crate) mod pattern_resolver;
+#[cfg(target_os = "linux")]
+pub(crate) mod playtime_downlink_worker;
+#[cfg(target_os = "linux")]
 pub(crate) mod playtime_worker;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod stats_merge;
+#[cfg(target_os = "linux")]
+pub(crate) mod stats_wakeup_worker;
+#[cfg(target_os = "linux")]
+pub(crate) mod sync_journal;
 #[cfg(target_os = "linux")]
 pub(crate) mod ui;
 #[cfg(target_os = "linux")]
 pub(crate) mod vtable_scan;
 #[cfg(target_os = "linux")]
 pub(crate) mod watcher;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod work_item_site;
 
 #[cfg(target_os = "linux")]
 pub use client::install::{

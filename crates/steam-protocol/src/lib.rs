@@ -4,21 +4,175 @@
 
 pub const MANIFEST_REQUEST_CODE_JOB_NAME: &str = "ContentServerDirectory.GetManifestRequestCode#1";
 pub const PLAYER_GET_USER_STATS_JOB_NAME: &str = "Player.GetUserStats#1";
+pub const PLAYER_RECORD_DISCONNECTED_PLAYTIME_JOB_NAME: &str =
+    "Player.RecordDisconnectedPlaytime#1";
 
 #[derive(Clone, prost::Message)]
-pub struct CloudAppIdField1 {
+struct CloudBeginHttpUploadWireView {
     #[prost(uint32, optional, tag = "1")]
-    pub app_id: Option<u32>,
+    app_id: Option<u32>,
 }
 
 #[derive(Clone, prost::Message)]
-pub struct CloudAppIdField2 {
-    #[prost(uint32, optional, tag = "2")]
-    pub app_id: Option<u32>,
+struct CloudBeginUgcUploadWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
 }
 
-pub type AppIdField1Request = CloudAppIdField1;
-pub type AppIdField2Request = CloudAppIdField2;
+#[derive(Clone, prost::Message)]
+struct CloudGetSingleFileInfoWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudShareFileWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudEnumerateUserFilesWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudCommitHttpUploadWireView {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudCommitUgcUploadWireView {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudGetFileDetailsWireView {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct CloudDeleteWireView {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+// Private projections of published Steam protobuf messages. Prost ignores
+// fields not declared here, so callers get the AppID semantics they need
+// without exposing incomplete message definitions as public protocol types.
+#[derive(Clone, prost::Message)]
+struct ClientMetricsAppInterfaceStatsWireView {
+    #[prost(uint64, optional, tag = "1")]
+    game_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+struct ClientMetricsCloudAppSyncStatsWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct PlayerGetGameBadgeLevelsWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct PublishedFileGetUserFilesWireView {
+    #[prost(uint32, optional, tag = "2")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct SteamDeckCompatibilityShouldPromptWireView {
+    #[prost(uint32, optional, tag = "1")]
+    app_id: Option<u32>,
+}
+
+#[derive(Clone, prost::Message)]
+struct UserNewsGetUserNewsWireView {
+    #[prost(uint32, optional, tag = "6")]
+    filter_app_id: Option<u32>,
+}
+
+// No current public Steam protobuf declares the EMsg 820 request. Runtime
+// packets establish its fixed64 game_id at field 1; keep that projection
+// private instead of presenting an inferred request as a complete schema.
+#[derive(Clone, prost::Message)]
+struct LegacyStoreUserStatsRequestWireView {
+    #[prost(fixed64, optional, tag = "1")]
+    game_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+struct ClientLogOnResponseWireView {
+    #[prost(int32, optional, tag = "1")]
+    eresult: Option<i32>,
+    #[prost(fixed64, optional, tag = "20")]
+    client_supplied_steam_id: Option<u64>,
+}
+
+/// Decode an AppID from a known Steam service-method request.
+///
+/// Each method is decoded according to its published protobuf message rather
+/// than by assuming that a field number has the same meaning across methods.
+pub fn service_method_app_id(method: &str, body: &[u8]) -> Option<u32> {
+    use prost::Message;
+
+    let app_id = match method {
+        "ClientMetrics.ClientAppInterfaceStatsReport#1" => {
+            let game_id = ClientMetricsAppInterfaceStatsWireView::decode(body)
+                .ok()?
+                .game_id?;
+            return app_id_from_game_id(game_id);
+        }
+        "ClientMetrics.ClientCloudAppSyncStats#1" => {
+            ClientMetricsCloudAppSyncStatsWireView::decode(body)
+                .ok()?
+                .app_id
+        }
+        "Player.GetGameBadgeLevels#1" => {
+            PlayerGetGameBadgeLevelsWireView::decode(body).ok()?.app_id
+        }
+        "PublishedFile.GetUserFiles#1" => {
+            PublishedFileGetUserFilesWireView::decode(body).ok()?.app_id
+        }
+        "Store.ShouldPromptForCompatibilityFeedback#1" => {
+            SteamDeckCompatibilityShouldPromptWireView::decode(body)
+                .ok()?
+                .app_id
+        }
+        "UserNews.GetUserNews#1" => {
+            UserNewsGetUserNewsWireView::decode(body)
+                .ok()?
+                .filter_app_id
+        }
+        method if method.starts_with("Cloud.") => return cloud_request_app_id(method, body),
+        _ => return None,
+    }?;
+
+    (app_id != 0).then_some(app_id)
+}
+
+/// Extract the low 24-bit Steam AppID component from a 64-bit `CGameID`.
+pub fn app_id_from_game_id(game_id: u64) -> Option<u32> {
+    let app_id = game_id as u32 & 0x00ff_ffff;
+    (app_id != 0).then_some(app_id)
+}
+
+/// Decode the CGameID inferred from an EMsg 820 request.
+pub fn legacy_store_user_stats_game_id(body: &[u8]) -> Option<u64> {
+    use prost::Message;
+
+    LegacyStoreUserStatsRequestWireView::decode(body)
+        .ok()?
+        .game_id
+}
 
 /// Decode the AppID carried by a Steam `Cloud.*#1` request.
 ///
@@ -28,15 +182,15 @@ pub fn cloud_request_app_id(method: &str, body: &[u8]) -> Option<u32> {
     use prost::Message;
 
     let app_id = match method {
-        "Cloud.BeginHTTPUpload#1"
-        | "Cloud.BeginUGCUpload#1"
-        | "Cloud.GetSingleFileInfo#1"
-        | "Cloud.ShareFile#1"
-        | "Cloud.EnumerateUserFiles#1" => CloudAppIdField1::decode(body).ok()?.app_id,
-        "Cloud.CommitHTTPUpload#1"
-        | "Cloud.CommitUGCUpload#1"
-        | "Cloud.GetFileDetails#1"
-        | "Cloud.Delete#1" => CloudAppIdField2::decode(body).ok()?.app_id,
+        "Cloud.BeginHTTPUpload#1" => CloudBeginHttpUploadWireView::decode(body).ok()?.app_id,
+        "Cloud.BeginUGCUpload#1" => CloudBeginUgcUploadWireView::decode(body).ok()?.app_id,
+        "Cloud.GetSingleFileInfo#1" => CloudGetSingleFileInfoWireView::decode(body).ok()?.app_id,
+        "Cloud.ShareFile#1" => CloudShareFileWireView::decode(body).ok()?.app_id,
+        "Cloud.EnumerateUserFiles#1" => CloudEnumerateUserFilesWireView::decode(body).ok()?.app_id,
+        "Cloud.CommitHTTPUpload#1" => CloudCommitHttpUploadWireView::decode(body).ok()?.app_id,
+        "Cloud.CommitUGCUpload#1" => CloudCommitUgcUploadWireView::decode(body).ok()?.app_id,
+        "Cloud.GetFileDetails#1" => CloudGetFileDetailsWireView::decode(body).ok()?.app_id,
+        "Cloud.Delete#1" => CloudDeleteWireView::decode(body).ok()?.app_id,
         "Cloud.GetAppFileChangelist#1" => {
             CloudGetAppFileChangelistRequest::decode(body).ok()?.app_id
         }
@@ -104,6 +258,10 @@ pub const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 /// EMsg for server-initiated service notifications.
 pub const EMSG_SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
 
+/// Successful CM login response and server-initiated logout.
+pub const EMSG_CLIENT_LOG_ON_RESPONSE: u32 = 751;
+pub const EMSG_CLIENT_LOGGED_OFF: u32 = 757;
+
 /// Bit 31 indicates protobuf framing.
 pub const K_MSG_HDR_PROTO_FLAG: u32 = 0x8000_0000;
 
@@ -143,9 +301,29 @@ pub fn assemble_raw(emsg_raw: u32, header_bytes: &[u8], body_bytes: &[u8]) -> Ve
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, prost::Message)]
+pub struct CMsgGcRoutingProtoBufHeader {
+    #[prost(uint64, optional, tag = "1")]
+    pub dst_gc_id_queue: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub dst_gc_dir_index: Option<u32>,
+}
+
+#[derive(Clone, prost::Oneof)]
+pub enum MsgProtoBufHeaderIpAddress {
+    #[prost(uint32, tag = "15")]
+    V4(u32),
+    #[prost(bytes, tag = "29")]
+    V6(Vec<u8>),
+}
+
+#[derive(Clone, prost::Message)]
 pub struct CMsgProtoBufHeader {
     #[prost(fixed64, optional, tag = "1")]
     pub steamid: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub client_session_id: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub routing_app_id: Option<u32>,
     #[prost(fixed64, optional, tag = "10")]
     pub jobid_source: Option<u64>,
     #[prost(fixed64, optional, tag = "11")]
@@ -154,10 +332,77 @@ pub struct CMsgProtoBufHeader {
     pub target_job_name: Option<String>,
     #[prost(int32, optional, tag = "13")]
     pub eresult: Option<i32>,
+    #[prost(string, optional, tag = "14")]
+    pub error_message: Option<String>,
+    #[prost(uint32, optional, tag = "16")]
+    pub auth_account_flags: Option<u32>,
     #[prost(int32, optional, tag = "17")]
     pub transport_error: Option<i32>,
+    #[prost(uint64, optional, tag = "18")]
+    pub message_id: Option<u64>,
+    #[prost(uint32, optional, tag = "19")]
+    pub publisher_group_id: Option<u32>,
+    #[prost(uint32, optional, tag = "20")]
+    pub system_id: Option<u32>,
+    #[prost(uint32, optional, tag = "22")]
+    pub token_source: Option<u32>,
+    #[prost(bool, optional, tag = "23")]
+    pub admin_spoofing_user: Option<bool>,
     #[prost(int32, optional, tag = "24")]
     pub seq_num: Option<i32>,
+    #[prost(uint32, optional, tag = "25")]
+    pub webapi_key_id: Option<u32>,
+    #[prost(bool, optional, tag = "26")]
+    pub is_from_external_source: Option<bool>,
+    #[prost(uint32, repeated, packed = "false", tag = "27")]
+    pub forward_to_system_id: Vec<u32>,
+    #[prost(uint32, optional, tag = "28")]
+    pub cm_system_id: Option<u32>,
+    #[prost(uint32, optional, tag = "31")]
+    pub launcher_type: Option<u32>,
+    #[prost(uint32, optional, tag = "32")]
+    pub realm: Option<u32>,
+    #[prost(int32, optional, tag = "33")]
+    pub timeout_ms: Option<i32>,
+    #[prost(string, optional, tag = "34")]
+    pub debug_source: Option<String>,
+    #[prost(uint32, optional, tag = "35")]
+    pub debug_source_string_index: Option<u32>,
+    #[prost(uint64, optional, tag = "36")]
+    pub token_id: Option<u64>,
+    #[prost(message, optional, tag = "37")]
+    pub routing_gc: Option<CMsgGcRoutingProtoBufHeader>,
+    #[prost(int32, optional, tag = "38")]
+    pub session_disposition: Option<i32>,
+    #[prost(string, optional, tag = "39")]
+    pub wg_token: Option<String>,
+    #[prost(string, optional, tag = "40")]
+    pub webui_auth_key: Option<String>,
+    #[prost(int32, repeated, packed = "false", tag = "41")]
+    pub exclude_client_session_ids: Vec<i32>,
+    #[prost(fixed64, optional, tag = "43")]
+    pub admin_request_spoofing_steamid: Option<u64>,
+    #[prost(bool, optional, tag = "44")]
+    pub is_valve_dedicated_server: Option<bool>,
+    #[prost(fixed64, optional, tag = "45")]
+    pub trace_tag: Option<u64>,
+    #[prost(oneof = "MsgProtoBufHeaderIpAddress", tags = "15, 29")]
+    pub ip_addr: Option<MsgProtoBufHeaderIpAddress>,
+}
+
+/// Return the local account carried by a successful CM login response.
+pub fn successful_logon_steam_id(header: &[u8], body: &[u8]) -> Option<u64> {
+    use prost::Message;
+
+    let response = ClientLogOnResponseWireView::decode(body).ok()?;
+    if response.eresult.unwrap_or(2) != ERESULT_OK {
+        return None;
+    }
+    let steam_id = CMsgProtoBufHeader::decode(header)
+        .ok()
+        .and_then(|header| header.steamid)
+        .or(response.client_supplied_steam_id)?;
+    (steam_id != 0).then_some(steam_id)
 }
 
 #[derive(Clone, prost::Message)]
@@ -168,6 +413,10 @@ pub struct GetManifestRequestCodeRequest {
     pub depot_id: Option<u32>,
     #[prost(uint64, optional, tag = "3")]
     pub manifest_id: Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub app_branch: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    pub branch_password_hash: Option<String>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -622,6 +871,12 @@ pub struct PicsProductInfoRequest {
     pub meta_data_only: Option<bool>,
     #[prost(uint32, optional, tag = "4")]
     pub num_prev_failed: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub obsolete_supports_package_tokens: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub sequence_number: Option<u32>,
+    #[prost(bool, optional, tag = "7")]
+    pub single_response: Option<bool>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -657,6 +912,8 @@ pub struct PlayerGetUserStatsRequest {
     pub sha_schema: Option<Vec<u8>>,
     #[prost(uint32, optional, tag = "4")]
     pub crc_stats: Option<u32>,
+    /// Published wire field. The current Steam x64 request path does not
+    /// populate it, so callers must not use it as schema freshness state.
     #[prost(uint32, optional, tag = "5")]
     pub crc_schema: Option<u32>,
 }
@@ -672,6 +929,8 @@ pub struct PlayerGetUserStatsResponse {
     pub schema: Option<Vec<u8>>,
     #[prost(message, repeated, tag = "4")]
     pub stats: Vec<PlayerStatsEntry>,
+    /// Published wire field retained for protocol fidelity. Runtime response
+    /// synthesis intentionally leaves it absent.
     #[prost(uint32, optional, tag = "5")]
     pub crc_schema: Option<u32>,
 }
@@ -682,11 +941,125 @@ pub struct PlayerStatsEntry {
     pub stat_id: Option<u32>,
     #[prost(uint32, optional, tag = "2")]
     pub stat_value: Option<u32>,
+    #[prost(message, repeated, tag = "3")]
+    pub unlock_times: Vec<PlayerAchievementUnlockTime>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PlayerAchievementUnlockTime {
+    #[prost(uint32, optional, tag = "1")]
+    pub achievement_bit: Option<u32>,
+    #[prost(fixed32, optional, tag = "2")]
+    pub unlock_time: Option<u32>,
+}
+
+/// Steam's "unlocked, real time unknown" sentinel for a per-bit unlock time.
+///
+/// A valid rtime32 (2007-10-10) that the client backfills when it knows a bit is
+/// set but has no authoritative timestamp. It is the encoding to emit downstream
+/// for an unlocked achievement whose time we do not know: the alternative, an
+/// absent time, cannot be represented in the wire form at all.
+pub const ACHIEVEMENT_UNLOCK_TIME_UNKNOWN: u32 = 1_191_999_600;
+
+/// Stats token for one app, derived from the state the Steam client will see.
+///
+/// The input is the canonical wire bytes of the `Player.GetUserStats#1` response's
+/// repeated `stats` field, and nothing else. Everything invisible to the client
+/// has to stay out, `observed_at` above all: the client reads this number as "has
+/// my cache changed", so folding an observation timestamp in makes every
+/// re-observation of unchanged state look like a change and forces a pointless
+/// refetch.
+///
+/// A backend that issues its own token always wins over this function, because the
+/// client hands the token back and that backend compares it against its own
+/// record. This is for backends that issue none, where the token has to be a
+/// deterministic function of content so that every reader derives the same one.
+///
+/// Kept byte-compatible with `steam_stats_wire.rs` in the Cumulus server so both
+/// sides name the same state with the same number. The tests below duplicate that
+/// crate's vectors deliberately.
+pub fn stats_crc(stats: &[PlayerStatsEntry]) -> u32 {
+    stats_crc32c(&canonical_stats_wire_bytes(stats))
+}
+
+/// CRC-32C (Castagnoli): reflected polynomial, inverted seed, inverted result.
+fn stats_crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
+        }
+    }
+    !crc
+}
+
+/// Field 4 of the response, re-encoded one entry at a time in a fixed order so
+/// that equal state always produces equal bytes. Entry order and per-entry unlock
+/// time order are both normalized, because neither is guaranteed by whoever built
+/// the list.
+fn canonical_stats_wire_bytes(stats: &[PlayerStatsEntry]) -> Vec<u8> {
+    use prost::Message;
+
+    let mut bytes = Vec::new();
+    for entry in sorted_player_stats(stats) {
+        let entry = entry.encode_to_vec();
+        bytes.push(0x22);
+        encode_stats_varint(entry.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&entry);
+    }
+    bytes
+}
+
+fn encode_stats_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn sorted_player_stats(stats: &[PlayerStatsEntry]) -> Vec<PlayerStatsEntry> {
+    let mut stats = stats.to_vec();
+    stats.sort_by_key(|entry| entry.stat_id.unwrap_or(u32::MAX));
+    for entry in &mut stats {
+        entry
+            .unlock_times
+            .sort_by_key(|time| time.achievement_bit.unwrap_or(u32::MAX));
+    }
+    stats
 }
 
 // ---------------------------------------------------------------------------
 // Native Steam playtime snapshots
 // ---------------------------------------------------------------------------
+
+/// `CPlayer_RecordDisconnectedPlaytime_Request`.
+#[derive(Clone, prost::Message)]
+pub struct PlayerRecordDisconnectedPlaytimeRequest {
+    #[prost(message, repeated, tag = "3")]
+    pub play_sessions: Vec<PlayerPlayHistory>,
+}
+
+/// `CPlayer_RecordDisconnectedPlaytime_Request.PlayHistory`.
+#[derive(Clone, prost::Message)]
+pub struct PlayerPlayHistory {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub session_time_start: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub seconds: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub offline: Option<bool>,
+    #[prost(uint32, optional, tag = "5")]
+    pub owner: Option<u32>,
+}
+
+/// Empty `CPlayer_RecordDisconnectedPlaytime_Response`.
+#[derive(Clone, prost::Message)]
+pub struct PlayerRecordDisconnectedPlaytimeResponse {}
 
 #[derive(Clone, prost::Message)]
 pub struct PlayerGetLastPlayedTimesResponse {
@@ -782,19 +1155,267 @@ pub struct LegacyStatsEntry {
 pub struct AchievementBlock {
     #[prost(uint32, optional, tag = "1")]
     pub achievement_id: Option<u32>,
-    #[prost(fixed32, repeated, tag = "2")]
+    #[prost(fixed32, repeated, packed = "false", tag = "2")]
     pub unlock_time: Vec<u32>,
 }
 
-/// EMsg 820 outgoing: commit local stats to Steam.
-#[derive(Clone, prost::Message)]
-pub struct ClientStoreUserStatsRequest {
-    #[prost(fixed64, optional, tag = "1")]
-    pub game_id: Option<u64>,
-    #[prost(bool, optional, tag = "2")]
-    pub explicit_reset: Option<bool>,
-    #[prost(message, repeated, tag = "3")]
-    pub stats_to_store: Vec<StoreUserStatsEntry>,
+/// Mapping from a Steam stats schema achievement key to the wire-level bit
+/// used by `Player.GetUserStats#1` / `CMsgClientGetUserStatsResponse`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AchievementBitMapping {
+    pub stat_id: u32,
+    pub achievement_bit: u32,
+    pub key: String,
+}
+
+/// Mapping from a Steam stats schema ordinary stat key to the wire-level stat id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatMapping {
+    pub stat_id: u32,
+    pub key: String,
+    pub value_type: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AchievementSchemaError {
+    Truncated,
+    InvalidUtf8,
+    UnsupportedType(u8),
+    LimitExceeded,
+    MissingRoot,
+}
+
+const ACHIEVEMENT_SCHEMA_MAX_DEPTH: usize = 32;
+const ACHIEVEMENT_SCHEMA_MAX_ENTRIES: usize = 100_000;
+
+#[derive(Clone, Debug)]
+enum AchievementSchemaValue {
+    Object(std::collections::HashMap<String, AchievementSchemaValue>),
+    String(String),
+    Int(i64),
+    Other,
+}
+
+impl AchievementSchemaValue {
+    fn object(&self) -> Option<&std::collections::HashMap<String, AchievementSchemaValue>> {
+        match self {
+            Self::Object(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn int(&self) -> Option<i64> {
+        match self {
+            Self::Int(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+struct AchievementSchemaParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    entries: usize,
+}
+
+impl<'a> AchievementSchemaParser<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            entries: 0,
+        }
+    }
+
+    fn byte(&mut self) -> Result<u8, AchievementSchemaError> {
+        let value = *self
+            .bytes
+            .get(self.position)
+            .ok_or(AchievementSchemaError::Truncated)?;
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], AchievementSchemaError> {
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(AchievementSchemaError::LimitExceeded)?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(AchievementSchemaError::Truncated)?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn cstring(&mut self) -> Result<String, AchievementSchemaError> {
+        let rest = self
+            .bytes
+            .get(self.position..)
+            .ok_or(AchievementSchemaError::Truncated)?;
+        let length = rest
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(AchievementSchemaError::Truncated)?;
+        let value = std::str::from_utf8(&rest[..length])
+            .map_err(|_| AchievementSchemaError::InvalidUtf8)?
+            .to_owned();
+        self.position += length + 1;
+        Ok(value)
+    }
+
+    fn object(
+        &mut self,
+        depth: usize,
+    ) -> Result<std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError>
+    {
+        if depth > ACHIEVEMENT_SCHEMA_MAX_DEPTH {
+            return Err(AchievementSchemaError::LimitExceeded);
+        }
+        let mut result = std::collections::HashMap::new();
+        loop {
+            let kind = self.byte()?;
+            if kind == 8 {
+                break;
+            }
+            self.entries += 1;
+            if self.entries > ACHIEVEMENT_SCHEMA_MAX_ENTRIES {
+                return Err(AchievementSchemaError::LimitExceeded);
+            }
+            let key = self.cstring()?;
+            let value = match kind {
+                0 => AchievementSchemaValue::Object(self.object(depth + 1)?),
+                1 => AchievementSchemaValue::String(self.cstring()?),
+                2 => AchievementSchemaValue::Int(i32::from_le_bytes(
+                    self.take(4)?.try_into().expect("four bytes were requested"),
+                ) as i64),
+                3 | 4 | 6 => {
+                    self.take(4)?;
+                    AchievementSchemaValue::Other
+                }
+                5 => {
+                    let units = u16::from_le_bytes(
+                        self.take(2)?.try_into().expect("two bytes were requested"),
+                    ) as usize;
+                    self.take(units.saturating_mul(2))?;
+                    AchievementSchemaValue::Other
+                }
+                7 => AchievementSchemaValue::Int(u64::from_le_bytes(
+                    self.take(8)?
+                        .try_into()
+                        .expect("eight bytes were requested"),
+                ) as i64),
+                other => return Err(AchievementSchemaError::UnsupportedType(other)),
+            };
+            result.insert(key, value);
+        }
+        Ok(result)
+    }
+}
+
+/// Parse the binary KeyValues stats schema returned by Steam and return the
+/// achievement bit identifiers used by stats sync packets.
+pub fn parse_achievement_bit_mappings(
+    bytes: &[u8],
+) -> Result<Vec<AchievementBitMapping>, AchievementSchemaError> {
+    let root = parse_achievement_schema_root(bytes)?;
+    let stats = schema_stats(&root)?;
+    let mut mappings = Vec::new();
+    for (stat_key, stat) in stats {
+        let Ok(stat_id) = stat_key.parse::<u32>() else {
+            continue;
+        };
+        let Some(bits) = stat
+            .object()
+            .and_then(|stat| stat.get("bits"))
+            .and_then(AchievementSchemaValue::object)
+        else {
+            continue;
+        };
+        for (bit_key, achievement) in bits {
+            let Ok(achievement_bit) = bit_key.parse::<u32>() else {
+                continue;
+            };
+            let Some(key) = achievement
+                .object()
+                .and_then(|achievement| achievement.get("name"))
+                .and_then(AchievementSchemaValue::string)
+                .filter(|key| !key.trim().is_empty())
+            else {
+                continue;
+            };
+            mappings.push(AchievementBitMapping {
+                stat_id,
+                achievement_bit,
+                key: key.to_owned(),
+            });
+        }
+    }
+    mappings.sort_by_key(|mapping| (mapping.stat_id, mapping.achievement_bit));
+    Ok(mappings)
+}
+
+/// Parse the binary KeyValues stats schema returned by Steam and return the
+/// ordinary stat identifiers used by stats sync packets.
+pub fn parse_stat_mappings(bytes: &[u8]) -> Result<Vec<StatMapping>, AchievementSchemaError> {
+    let root = parse_achievement_schema_root(bytes)?;
+    let stats = schema_stats(&root)?;
+    let mut mappings = Vec::new();
+    for (stat_key, stat) in stats {
+        let Ok(stat_id) = stat_key.parse::<u32>() else {
+            continue;
+        };
+        let Some(stat) = stat.object() else {
+            continue;
+        };
+        if stat.get("bits").is_some() {
+            continue;
+        }
+        let Some(key) = stat
+            .get("name")
+            .and_then(AchievementSchemaValue::string)
+            .filter(|key| !key.trim().is_empty())
+        else {
+            continue;
+        };
+        mappings.push(StatMapping {
+            stat_id,
+            key: key.to_owned(),
+            value_type: stat
+                .get("type")
+                .and_then(AchievementSchemaValue::int)
+                .or_else(|| stat.get("display").and_then(AchievementSchemaValue::int)),
+        });
+    }
+    mappings.sort_by_key(|mapping| mapping.stat_id);
+    Ok(mappings)
+}
+
+fn parse_achievement_schema_root(
+    bytes: &[u8],
+) -> Result<std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError> {
+    let mut parser = AchievementSchemaParser::new(bytes);
+    if parser.byte()? != 0 {
+        return Err(AchievementSchemaError::MissingRoot);
+    }
+    let _root_name = parser.cstring()?;
+    parser.object(0)
+}
+
+fn schema_stats(
+    root: &std::collections::HashMap<String, AchievementSchemaValue>,
+) -> Result<&std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError> {
+    root.get("stats")
+        .and_then(AchievementSchemaValue::object)
+        .ok_or(AchievementSchemaError::MissingRoot)
 }
 
 #[derive(Clone, prost::Message)]
@@ -814,8 +1435,18 @@ pub struct ClientStoreUserStatsResponse {
     pub eresult: Option<i32>,
     #[prost(uint32, optional, tag = "3")]
     pub crc_stats: Option<u32>,
+    #[prost(message, repeated, tag = "4")]
+    pub stats_failed_validation: Vec<StoreUserStatsFailedValidation>,
     #[prost(bool, optional, tag = "5")]
     pub stats_out_of_date: Option<bool>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct StoreUserStatsFailedValidation {
+    #[prost(uint32, optional, tag = "1")]
+    pub stat_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub reverted_stat_value: Option<u32>,
 }
 
 /// EMsg 5466 outgoing: commit stats for a specific Steam user.
@@ -881,6 +1512,36 @@ pub const EMSG_GAMESPLAYED_WITH_DATABLOB: u32 = 5410;
 pub struct CMsgClientGamesPlayed {
     #[prost(message, repeated, tag = "1")]
     pub games_played: Vec<GamePlayed>,
+    #[prost(uint32, optional, tag = "2")]
+    pub client_os_type: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub cloud_gaming_platform: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub recent_reauthentication: Option<bool>,
+}
+
+#[derive(Clone, prost::Oneof)]
+pub enum IpAddressValue {
+    #[prost(fixed32, tag = "1")]
+    V4(u32),
+    #[prost(bytes, tag = "2")]
+    V6(Vec<u8>),
+}
+
+#[derive(Clone, prost::Message)]
+pub struct CMsgIpAddress {
+    #[prost(oneof = "IpAddressValue", tags = "1, 2")]
+    pub ip: Option<IpAddressValue>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct GamePlayedProcessInfo {
+    #[prost(uint32, optional, tag = "1")]
+    pub process_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub process_id_parent: Option<u32>,
+    #[prost(bool, optional, tag = "3")]
+    pub parent_is_steam: Option<bool>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -909,6 +1570,46 @@ pub struct GamePlayed {
     pub game_flags: Option<u32>,
     #[prost(uint32, optional, tag = "12")]
     pub owner_id: Option<u32>,
+    #[prost(string, optional, tag = "13")]
+    pub vr_hmd_vendor: Option<String>,
+    #[prost(string, optional, tag = "14")]
+    pub vr_hmd_model: Option<String>,
+    #[prost(uint32, optional, tag = "15")]
+    pub launch_option_type: Option<u32>,
+    #[prost(int32, optional, tag = "16")]
+    pub primary_controller_type: Option<i32>,
+    #[prost(string, optional, tag = "17")]
+    pub primary_steam_controller_serial: Option<String>,
+    #[prost(uint32, optional, tag = "18")]
+    pub total_steam_controller_count: Option<u32>,
+    #[prost(uint32, optional, tag = "19")]
+    pub total_non_steam_controller_count: Option<u32>,
+    #[prost(uint64, optional, tag = "20")]
+    pub controller_workshop_file_id: Option<u64>,
+    #[prost(uint32, optional, tag = "21")]
+    pub launch_source: Option<u32>,
+    #[prost(uint32, optional, tag = "22")]
+    pub vr_hmd_runtime: Option<u32>,
+    #[prost(message, optional, tag = "23")]
+    pub game_ip_address: Option<CMsgIpAddress>,
+    #[prost(uint32, optional, tag = "24")]
+    pub controller_connection_type: Option<u32>,
+    #[prost(int32, optional, tag = "25")]
+    pub game_os_platform: Option<i32>,
+    #[prost(uint32, optional, tag = "26")]
+    pub game_build_id: Option<u32>,
+    #[prost(uint32, optional, tag = "27")]
+    pub compat_tool_id: Option<u32>,
+    #[prost(string, optional, tag = "28")]
+    pub compat_tool_cmd: Option<String>,
+    #[prost(uint32, optional, tag = "29")]
+    pub compat_tool_build_id: Option<u32>,
+    #[prost(string, optional, tag = "30")]
+    pub beta_name: Option<String>,
+    #[prost(uint32, optional, tag = "31")]
+    pub dlc_context: Option<u32>,
+    #[prost(message, repeated, tag = "32")]
+    pub process_id_list: Vec<GamePlayedProcessInfo>,
 }
 
 /// EResult constants
@@ -946,6 +1647,22 @@ pub struct PersonaStateKV {
 }
 
 #[derive(Clone, prost::Message)]
+pub struct PersonaStateClanData {
+    #[prost(uint32, optional, tag = "1")]
+    pub ogg_app_id: Option<u32>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_group_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+pub struct PersonaStateOtherGameData {
+    #[prost(uint64, optional, tag = "1")]
+    pub gameid: Option<u64>,
+    #[prost(message, repeated, tag = "2")]
+    pub rich_presence: Vec<PersonaStateKV>,
+}
+
+#[derive(Clone, prost::Message)]
 pub struct PersonaStateFriend {
     #[prost(fixed64, optional, tag = "1")]
     pub friendid: Option<u64>,
@@ -953,14 +1670,68 @@ pub struct PersonaStateFriend {
     pub persona_state: Option<u32>,
     #[prost(uint32, optional, tag = "3")]
     pub game_played_app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub game_server_ip: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub game_server_port: Option<u32>,
     #[prost(uint32, optional, tag = "6")]
     pub persona_state_flags: Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    pub online_session_instances: Option<u32>,
+    #[prost(bool, optional, tag = "10")]
+    pub persona_set_by_user: Option<bool>,
+    #[prost(string, optional, tag = "15")]
+    pub player_name: Option<String>,
+    #[prost(uint32, optional, tag = "20")]
+    pub query_port: Option<u32>,
+    #[prost(fixed64, optional, tag = "25")]
+    pub steamid_source: Option<u64>,
+    #[prost(bytes = "vec", optional, tag = "31")]
+    pub avatar_hash: Option<Vec<u8>>,
+    #[prost(uint32, optional, tag = "45")]
+    pub last_logoff: Option<u32>,
+    #[prost(uint32, optional, tag = "46")]
+    pub last_logon: Option<u32>,
+    #[prost(uint32, optional, tag = "47")]
+    pub last_seen_online: Option<u32>,
+    #[prost(uint32, optional, tag = "50")]
+    pub clan_rank: Option<u32>,
     #[prost(string, optional, tag = "55")]
     pub game_name: Option<String>,
     #[prost(fixed64, optional, tag = "56")]
     pub gameid: Option<u64>,
+    #[prost(bytes = "vec", optional, tag = "60")]
+    pub game_data_blob: Option<Vec<u8>>,
+    #[prost(message, optional, tag = "64")]
+    pub clan_data: Option<PersonaStateClanData>,
+    #[prost(string, optional, tag = "65")]
+    pub clan_tag: Option<String>,
     #[prost(message, repeated, tag = "71")]
     pub rich_presence: Vec<PersonaStateKV>,
+    #[prost(fixed64, optional, tag = "72")]
+    pub broadcast_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "73")]
+    pub game_lobby_id: Option<u64>,
+    #[prost(uint32, optional, tag = "74")]
+    pub watching_broadcast_account_id: Option<u32>,
+    #[prost(uint32, optional, tag = "75")]
+    pub watching_broadcast_app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "76")]
+    pub watching_broadcast_viewers: Option<u32>,
+    #[prost(string, optional, tag = "77")]
+    pub watching_broadcast_title: Option<String>,
+    #[prost(bool, optional, tag = "78")]
+    pub is_community_banned: Option<bool>,
+    #[prost(bool, optional, tag = "79")]
+    pub player_name_pending_review: Option<bool>,
+    #[prost(bool, optional, tag = "80")]
+    pub avatar_pending_review: Option<bool>,
+    #[prost(bool, optional, tag = "81")]
+    pub on_steam_deck: Option<bool>,
+    #[prost(message, repeated, tag = "82")]
+    pub other_game_data: Vec<PersonaStateOtherGameData>,
+    #[prost(uint32, optional, tag = "83")]
+    pub gaming_device_type: Option<u32>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -975,13 +1746,114 @@ pub struct ClientPersonaState {
 pub struct ClientRichPresenceUpload {
     #[prost(bytes = "vec", optional, tag = "1")]
     pub rich_presence_kv: Option<Vec<u8>>,
-    #[prost(fixed64, repeated, tag = "2")]
+    #[prost(fixed64, repeated, packed = "false", tag = "2")]
     pub steamid_broadcast: Vec<u64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    const TEST_APP_ID: u32 = 736_260;
+
+    /// Shared fixture with `steam_stats_wire.rs` in the Cumulus server. Both sides
+    /// must name this state with the same number, or a client that switches
+    /// backends is told its cache is stale forever.
+    fn cumulus_shared_fixture() -> Vec<PlayerStatsEntry> {
+        vec![PlayerStatsEntry {
+            stat_id: Some(11),
+            stat_value: Some(3),
+            unlock_times: vec![PlayerAchievementUnlockTime {
+                achievement_bit: Some(1),
+                unlock_time: Some(10),
+            }],
+        }]
+    }
+
+    #[test]
+    fn stats_crc32c_uses_castagnoli_parameters() {
+        assert_eq!(stats_crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
+    fn canonical_stats_wire_bytes_are_the_response_stats_field() {
+        assert_eq!(
+            canonical_stats_wire_bytes(&cumulus_shared_fixture()),
+            vec![
+                0x22, 0x0d, 0x08, 0x0b, 0x10, 0x03, 0x1a, 0x07, 0x08, 0x01, 0x15, 0x0a, 0x00, 0x00,
+                0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn stats_crc_matches_the_cumulus_shared_fixture() {
+        assert_eq!(stats_crc(&cumulus_shared_fixture()), 0xc1f9_5243);
+        assert_eq!(stats_crc(&[]), 0);
+    }
+
+    #[test]
+    fn successful_logon_uses_the_authenticated_header_identity() {
+        let header_steam_id = 76_561_198_106_179_127;
+        let header = CMsgProtoBufHeader {
+            steamid: Some(header_steam_id),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let body = ClientLogOnResponseWireView {
+            eresult: Some(ERESULT_OK),
+            client_supplied_steam_id: Some(76_561_198_000_000_001),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            successful_logon_steam_id(&header, &body),
+            Some(header_steam_id)
+        );
+    }
+
+    #[test]
+    fn unsuccessful_logon_does_not_publish_an_identity() {
+        let body = ClientLogOnResponseWireView {
+            eresult: Some(2),
+            client_supplied_steam_id: Some(76_561_198_106_179_127),
+        }
+        .encode_to_vec();
+
+        assert_eq!(successful_logon_steam_id(&[], &body), None);
+    }
+
+    #[test]
+    fn stats_crc_is_independent_of_the_order_the_entries_were_built_in() {
+        let ordered = vec![
+            PlayerStatsEntry {
+                stat_id: Some(7),
+                stat_value: Some(1),
+                unlock_times: vec![
+                    PlayerAchievementUnlockTime {
+                        achievement_bit: Some(2),
+                        unlock_time: Some(200),
+                    },
+                    PlayerAchievementUnlockTime {
+                        achievement_bit: Some(5),
+                        unlock_time: Some(500),
+                    },
+                ],
+            },
+            PlayerStatsEntry {
+                stat_id: Some(9),
+                stat_value: Some(4),
+                unlock_times: Vec::new(),
+            },
+        ];
+        let mut shuffled = ordered.clone();
+        shuffled.reverse();
+        shuffled[1].unlock_times.reverse();
+
+        assert_eq!(stats_crc(&ordered), stats_crc(&shuffled));
+        assert_ne!(stats_crc(&ordered), stats_crc(&cumulus_shared_fixture()));
+    }
 
     #[test]
     fn unpack_assemble_roundtrip() {
@@ -1024,5 +1896,258 @@ mod tests {
         let (_, h, b) = unpack_raw(&packet).unwrap();
         assert_eq!(h, b"header_data");
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn service_method_app_id_uses_each_published_message_schema() {
+        let app_interface = ClientMetricsAppInterfaceStatsWireView {
+            game_id: Some((2_u64 << 24) | u64::from(TEST_APP_ID)),
+        }
+        .encode_to_vec();
+        let cloud_sync = ClientMetricsCloudAppSyncStatsWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let badge_levels = PlayerGetGameBadgeLevelsWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let user_files = PublishedFileGetUserFilesWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let compatibility = SteamDeckCompatibilityShouldPromptWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let user_news = UserNewsGetUserNewsWireView {
+            filter_app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+
+        for (method, body) in [
+            (
+                "ClientMetrics.ClientAppInterfaceStatsReport#1",
+                app_interface.as_slice(),
+            ),
+            (
+                "ClientMetrics.ClientCloudAppSyncStats#1",
+                cloud_sync.as_slice(),
+            ),
+            ("Player.GetGameBadgeLevels#1", badge_levels.as_slice()),
+            ("PublishedFile.GetUserFiles#1", user_files.as_slice()),
+            (
+                "Store.ShouldPromptForCompatibilityFeedback#1",
+                compatibility.as_slice(),
+            ),
+            ("UserNews.GetUserNews#1", user_news.as_slice()),
+        ] {
+            assert_eq!(service_method_app_id(method, body), Some(TEST_APP_ID));
+        }
+    }
+
+    #[test]
+    fn service_method_app_id_preserves_method_specific_field_meaning() {
+        let field_one = PlayerGetGameBadgeLevelsWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            service_method_app_id("PublishedFile.GetUserFiles#1", &field_one),
+            None
+        );
+        assert_eq!(
+            service_method_app_id("UserNews.GetUserNews#1", &field_one),
+            None
+        );
+        assert_eq!(service_method_app_id("Unknown.Method#1", &field_one), None);
+        assert_eq!(
+            service_method_app_id("Player.GetGameBadgeLevels#1", &[0x08, 0x80]),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_request_app_id_uses_each_published_message_schema() {
+        let begin_http = CloudBeginHttpUploadWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let begin_ugc = CloudBeginUgcUploadWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let single_file = CloudGetSingleFileInfoWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let share_file = CloudShareFileWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let enumerate = CloudEnumerateUserFilesWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let commit_http = CloudCommitHttpUploadWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let commit_ugc = CloudCommitUgcUploadWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let file_details = CloudGetFileDetailsWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        let delete = CloudDeleteWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+
+        for (method, body) in [
+            ("Cloud.BeginHTTPUpload#1", begin_http.as_slice()),
+            ("Cloud.BeginUGCUpload#1", begin_ugc.as_slice()),
+            ("Cloud.GetSingleFileInfo#1", single_file.as_slice()),
+            ("Cloud.ShareFile#1", share_file.as_slice()),
+            ("Cloud.EnumerateUserFiles#1", enumerate.as_slice()),
+            ("Cloud.CommitHTTPUpload#1", commit_http.as_slice()),
+            ("Cloud.CommitUGCUpload#1", commit_ugc.as_slice()),
+            ("Cloud.GetFileDetails#1", file_details.as_slice()),
+            ("Cloud.Delete#1", delete.as_slice()),
+        ] {
+            assert_eq!(cloud_request_app_id(method, body), Some(TEST_APP_ID));
+        }
+    }
+
+    #[test]
+    fn service_method_app_id_rejects_zero_and_delegates_cloud_requests() {
+        let zero = PlayerGetGameBadgeLevelsWireView { app_id: Some(0) }.encode_to_vec();
+        assert_eq!(
+            service_method_app_id("Player.GetGameBadgeLevels#1", &zero),
+            None
+        );
+
+        let cloud = CloudCommitHttpUploadWireView {
+            app_id: Some(TEST_APP_ID),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            service_method_app_id("Cloud.CommitHTTPUpload#1", &cloud),
+            Some(TEST_APP_ID)
+        );
+    }
+
+    #[test]
+    fn legacy_store_user_stats_reads_only_the_inferred_game_id() {
+        let game_id = (2_u64 << 24) | u64::from(TEST_APP_ID);
+        let mut body = vec![0x09];
+        body.extend_from_slice(&game_id.to_le_bytes());
+        body.extend_from_slice(&[0x10, 0x01]);
+
+        assert_eq!(legacy_store_user_stats_game_id(&body), Some(game_id));
+        assert_eq!(legacy_store_user_stats_game_id(&[0x10, 0x01]), None);
+        assert_eq!(legacy_store_user_stats_game_id(&[0x09, 0x01]), None);
+    }
+
+    fn kv_string(out: &mut Vec<u8>, key: &str, value: &str) {
+        out.push(1);
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        out.extend_from_slice(value.as_bytes());
+        out.push(0);
+    }
+
+    fn kv_object(out: &mut Vec<u8>, key: &str, body: impl FnOnce(&mut Vec<u8>)) {
+        out.push(0);
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        body(out);
+        out.push(8);
+    }
+
+    fn kv_int(out: &mut Vec<u8>, key: &str, value: i32) {
+        out.push(2);
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn parses_achievement_bit_mappings_from_binary_keyvalues_schema() {
+        let mut schema = Vec::new();
+        kv_object(&mut schema, "620", |root| {
+            kv_object(root, "stats", |stats| {
+                kv_object(stats, "11", |stat| {
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "0", |achievement| {
+                            kv_string(achievement, "name", "ACH_FIRST");
+                        });
+                        kv_object(bits, "3", |achievement| {
+                            kv_string(achievement, "name", "ACH_THIRD");
+                        });
+                    });
+                });
+                kv_object(stats, "12", |stat| {
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "1", |achievement| {
+                            kv_string(achievement, "name", "ACH_OTHER");
+                        });
+                    });
+                });
+            });
+        });
+
+        assert_eq!(
+            parse_achievement_bit_mappings(&schema).unwrap(),
+            vec![
+                AchievementBitMapping {
+                    stat_id: 11,
+                    achievement_bit: 0,
+                    key: "ACH_FIRST".into(),
+                },
+                AchievementBitMapping {
+                    stat_id: 11,
+                    achievement_bit: 3,
+                    key: "ACH_THIRD".into(),
+                },
+                AchievementBitMapping {
+                    stat_id: 12,
+                    achievement_bit: 1,
+                    key: "ACH_OTHER".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_ordinary_stat_mappings_from_binary_keyvalues_schema() {
+        let mut schema = Vec::new();
+        kv_object(&mut schema, "620", |root| {
+            kv_object(root, "stats", |stats| {
+                kv_object(stats, "11", |stat| {
+                    kv_string(stat, "name", "STAT_SCORE");
+                    kv_int(stat, "type", 1);
+                });
+                kv_object(stats, "12", |stat| {
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "0", |achievement| {
+                            kv_string(achievement, "name", "ACH_FIRST");
+                        });
+                    });
+                });
+            });
+        });
+
+        assert_eq!(
+            parse_stat_mappings(&schema).unwrap(),
+            vec![StatMapping {
+                stat_id: 11,
+                key: "STAT_SCORE".into(),
+                value_type: Some(1),
+            }]
+        );
     }
 }

@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 use tracing::{debug, info};
 use vapor_forge_config::{AppAvatarRule, AppId};
+use vapor_forge_steam_protocol::app_id_from_game_id;
 
 // Runtime flag-driven mappings (set at LaunchApp, per-launch).
 // Writes happen on Steam main thread; reads on IPC threads.
@@ -50,7 +51,9 @@ pub fn rewrite_games_played(
     let mut changed = false;
     for game in &mut msg.games_played {
         if let Some(gid) = game.game_id {
-            let app_id = AppId(gid as u32);
+            let Some(app_id) = app_id_from_game_id(gid).map(AppId) else {
+                continue;
+            };
             if let Some(avatar) = get_avatar(app_id, static_map) {
                 game.game_id = Some(avatar.0 as u64);
                 changed = true;
@@ -112,7 +115,7 @@ pub fn on_launch_app(app_id: AppId, rules: &[AppAvatarRule], launch_opts: &str) 
         if rule.exclude.contains(&app_id) {
             continue;
         }
-        if !flag_appears_in(launch_opts, &rule.flag) {
+        if !crate::launch_options::flag_appears_in(launch_opts, &rule.flag) {
             continue;
         }
 
@@ -131,52 +134,33 @@ pub fn on_launch_app(app_id: AppId, rules: &[AppAvatarRule], launch_opts: &str) 
     }
 }
 
-/// Word-boundary substring match for launch option flags.
-///
-/// A match is valid when the needle is surrounded by whitespace, quotes, or
-/// string boundaries, preventing "-onlinefixfoo" from matching "-onlinefix".
-fn flag_appears_in(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    let mut pos = 0;
-    while pos + n.len() <= h.len() {
-        if let Some(found) = haystack[pos..].find(needle) {
-            let abs = pos + found;
-            let before = if abs > 0 { h[abs - 1] } else { b' ' };
-            let after_pos = abs + n.len();
-            let after = if after_pos < h.len() { h[after_pos] } else { 0 };
-            let sep = |b: u8| matches!(b, b' ' | b'\t' | b'"' | b'\'' | 0);
-            if sep(before) && sep(after) {
-                return true;
-            }
-            pos = abs + n.len();
-        } else {
-            break;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn flag_word_boundary() {
-        assert!(flag_appears_in("-onlinefix -other", "-onlinefix"));
-        assert!(flag_appears_in("-onlinefix", "-onlinefix"));
-        assert!(!flag_appears_in("-onlinefixfoo", "-onlinefix"));
-        assert!(!flag_appears_in("foo-onlinefix", "-onlinefix"));
-        assert!(flag_appears_in("\"-onlinefix\"", "-onlinefix"));
-    }
+    use prost::Message;
+    use vapor_forge_steam_protocol::{CMsgClientGamesPlayed, GamePlayed};
 
     #[test]
     fn get_avatar_wildcard() {
         // Wildcard AppId(0) should match any app not explicitly listed.
         let map = HashMap::from([(AppId(0), AppId(480))]);
         assert_eq!(get_avatar(AppId(12345), &map), Some(AppId(480)));
+    }
+
+    #[test]
+    fn rewrite_games_played_extracts_app_id_from_cgameid() {
+        let source = CMsgClientGamesPlayed {
+            games_played: vec![GamePlayed {
+                game_id: Some((2_u64 << 24) | 736_260),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let map = HashMap::from([(AppId(736_260), AppId(480))]);
+
+        let rewritten = rewrite_games_played(&source.encode_to_vec(), &map).unwrap();
+        let decoded = CMsgClientGamesPlayed::decode(rewritten.as_slice()).unwrap();
+
+        assert_eq!(decoded.games_played[0].game_id, Some(480));
     }
 }

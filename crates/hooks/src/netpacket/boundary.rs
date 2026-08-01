@@ -6,13 +6,12 @@ use vapor_forge_features::{achievements, request_code, rich_presence};
 use vapor_forge_packet_capture::{PacketChange, PacketDirection};
 use vapor_forge_steam_native_abi::cnet_packet;
 
-use super::router::{process_recv_frame, CLOUD_PENDING, LOCAL_RESPONSES, PENDING};
+use super::router::{
+    process_recv_frame, RecvFrameDecision, CLOUD_PENDING, LOCAL_RESPONSES, PENDING,
+};
 
 /// Route one source's completed responses to the native injection dispatch. The
-/// injection router (registered at install) calls this from the source's own
-/// completion point, so each fabricated response is delivered on the WebSocket
-/// worker thread the moment it is ready — no collective sweep, no wait for the
-/// next inbound packet.
+/// injection router calls this from the source's own completion point.
 pub(crate) fn wake_source(source: InjectionSource) {
     match source {
         InjectionSource::Manifest => drain_manifest(),
@@ -37,14 +36,17 @@ fn drain_manifest() {
             "netpacket: queuing manifest response"
         );
         capture_injected(&response);
-        crate::client::network::enqueue_injection(response);
+        crate::client::network::enqueue_injection_for_generation(
+            response,
+            entry.response_generation,
+        );
     }
 }
 
 fn drain_cloud() {
     for response in CLOUD_PENDING.drain_completed() {
         // Cumulus upload responses contain bearer credentials and are not captured.
-        crate::client::network::enqueue_injection(response);
+        crate::client::network::enqueue_cloud_injection(response);
     }
 }
 
@@ -52,15 +54,21 @@ fn drain_cloud() {
 /// tickets). Called directly from `queue_local_response` (already in-crate).
 pub(crate) fn drain_local() {
     for response in std::mem::take(&mut *LOCAL_RESPONSES.lock().unwrap()) {
-        capture_injected(&response);
-        crate::client::network::enqueue_injection(response);
+        capture_injected(&response.packet);
+        crate::client::network::enqueue_injection_for_generation(
+            response.packet,
+            response.generation,
+        );
     }
 }
 
 fn drain_achievements() {
     for response in achievements::drain_offline_responses() {
         capture_injected(&response.packet);
-        crate::client::network::enqueue_injection(response.packet);
+        crate::client::network::enqueue_injection_for_generation(
+            response.packet,
+            response.generation,
+        );
     }
 }
 
@@ -91,6 +99,14 @@ fn capture_injected(response: &[u8]) {
     );
 }
 
+pub(crate) fn queue_playtime_notification(
+    packet: Vec<u8>,
+    context: crate::client::playtime_downlink::RuntimeKey,
+) {
+    capture_injected(&packet);
+    crate::client::network::enqueue_playtime_injection(packet, context);
+}
+
 /// Read and optionally rewrite an incoming packet before Steam processes it.
 ///
 /// The returned guard owns replacement bytes and restores the original packet
@@ -99,9 +115,9 @@ fn capture_injected(response: &[u8]) {
 /// # Safety
 /// `packet` must be null or a valid `CNetPacket` pointer, and the guard must be
 /// dropped before the packet can be released.
-pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> Option<PacketSwapGuard> {
+pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> PreparedRecvPacket {
     if packet.is_null() {
-        return None;
+        return PreparedRecvPacket::Pass;
     }
     // SAFETY: packet is the non-null CNetPacket supplied by Steam.
     let p_data = unsafe { cnet_packet::data_slot(packet) };
@@ -112,14 +128,25 @@ pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> Option<PacketSw
     // SAFETY: both slots point into the live CNetPacket.
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
-        return None;
+        return PreparedRecvPacket::Pass;
     }
 
     // SAFETY: Steam's packet supplies a non-null data pointer and byte size.
     let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
-    let replacement = process_recv_frame(bytes)?;
-    // SAFETY: caller guarantees packet remains live for the guard lifetime.
-    Some(unsafe { PacketSwapGuard::new(packet, replacement) })
+    match process_recv_frame(bytes) {
+        RecvFrameDecision::Pass => PreparedRecvPacket::Pass,
+        RecvFrameDecision::Drop => PreparedRecvPacket::Drop,
+        RecvFrameDecision::Rewrite(replacement) => {
+            // SAFETY: caller guarantees packet remains live for the guard lifetime.
+            PreparedRecvPacket::Rewrite(unsafe { PacketSwapGuard::new(packet, replacement) })
+        }
+    }
+}
+
+pub(crate) enum PreparedRecvPacket {
+    Pass,
+    Drop,
+    Rewrite(PacketSwapGuard),
 }
 
 pub(crate) struct PacketSwapGuard {

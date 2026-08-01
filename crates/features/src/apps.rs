@@ -1,24 +1,53 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tracing::info;
 use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
-static ACTUAL_OWNERSHIP: Mutex<Option<HashMap<AppId, bool>>> = Mutex::new(None);
+struct AccountState {
+    actual_ownership: Option<HashMap<AppId, bool>>,
+    license_sync_complete: bool,
+}
 
-/// Set to true after Steam has completed its initial license sync (the first
-/// `GetSubscribedApps` response). Until then, `on_check_ownership` refuses to
-/// spoof so we don't poison `ACTUAL_OWNERSHIP` with a fake positive before
-/// Steam has had a chance to report the genuine ownership.
-static LICENSE_SYNC_COMPLETE: AtomicBool = AtomicBool::new(false);
+impl AccountState {
+    const fn new() -> Self {
+        Self {
+            actual_ownership: None,
+            license_sync_complete: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.actual_ownership = None;
+        self.license_sync_complete = false;
+    }
+}
+
+static ACCOUNT_STATE: Mutex<AccountState> = Mutex::new(AccountState::new());
 
 pub fn mark_license_sync_complete() {
-    LICENSE_SYNC_COMPLETE.store(true, Ordering::Release);
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .license_sync_complete = true;
 }
 
 pub fn license_sync_complete() -> bool {
-    LICENSE_SYNC_COMPLETE.load(Ordering::Acquire)
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .license_sync_complete
+}
+
+/// Discard state learned from the previous Steam account.
+///
+/// Ownership and license synchronization are account-scoped even though this
+/// crate lives for the lifetime of the Steam process.
+pub fn reset_account_state() {
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .reset();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,9 +106,10 @@ impl AppAuthority {
 
 /// Return the genuine ownership result captured before pkg0 could affect it.
 pub fn actual_ownership(app_id: AppId) -> OwnershipState {
-    match ACTUAL_OWNERSHIP
+    match ACCOUNT_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .actual_ownership
         .as_ref()
         .and_then(|ownership| ownership.get(&app_id).copied())
     {
@@ -122,9 +152,10 @@ pub fn original_result_is_genuinely_owned(observation: OwnershipObservation) -> 
 
 /// Record an ownership result obtained before the app is added to pkg0.
 pub fn record_actual_ownership(app_id: AppId, owned: bool) {
-    ACTUAL_OWNERSHIP
+    ACCOUNT_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .actual_ownership
         .get_or_insert_with(HashMap::new)
         .insert(app_id, owned);
 }
@@ -137,7 +168,7 @@ pub fn decide_check_ownership(
     if config.is_controlled_app(app_id) && observation.original_result == 0 {
         // Don't grant spoofed ownership until Steam has finished its initial
         // license sync — otherwise a DRM racing us to `CheckAppOwnership`
-        // during startup latches a fake positive into `ACTUAL_OWNERSHIP`
+        // during startup latches a fake positive into the ownership cache
         // before Steam has said anything, and later real ownership can't
         // demote it back.
         if !license_sync_complete() {
@@ -235,13 +266,15 @@ mod tests {
         }
     }
 
-    // `LICENSE_SYNC_COMPLETE` is process-global; tests that touch it must
+    // The license-sync latch is process-global; tests that touch it must
     // serialize through this guard so they don't observe each other's mutations.
     static SYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn inject_sets_ownership_when_original_is_zero() {
-        let _guard = SYNC_TEST_LOCK.lock().unwrap();
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         mark_license_sync_complete();
         let config = config_with_inject(&[480]);
         let decision = decide_check_ownership(&config, AppId(480), observation(0));
@@ -252,8 +285,13 @@ mod tests {
 
     #[test]
     fn spoof_deferred_until_license_sync_completes() {
-        let _guard = SYNC_TEST_LOCK.lock().unwrap();
-        LICENSE_SYNC_COMPLETE.store(false, Ordering::Release);
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        ACCOUNT_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .license_sync_complete = false;
         let config = config_with_inject(&[912_345]);
         let decision = decide_check_ownership(&config, AppId(912_345), observation(0));
         // No spoof while license sync is pending.
@@ -326,6 +364,23 @@ mod tests {
     }
 
     #[test]
+    fn account_reset_clears_ownership_and_license_latch() {
+        let app_id = AppId(246_813_584);
+        let mut state = AccountState::new();
+
+        state
+            .actual_ownership
+            .get_or_insert_with(HashMap::new)
+            .insert(app_id, true);
+        state.license_sync_complete = true;
+
+        state.reset();
+
+        assert!(state.actual_ownership.is_none());
+        assert!(!state.license_sync_complete);
+    }
+
+    #[test]
     fn non_controlled_app_passes_through() {
         let config = config_with_inject(&[480]);
         let decision = decide_check_ownership(&config, AppId(999), observation(0));
@@ -353,6 +408,9 @@ mod tests {
 
     #[test]
     fn subscribed_apps_appends_inject_ids() {
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let config = config_with_inject(&[480, 730]);
         let mut buf = [0u32; 10];
         buf[0] = 100;
@@ -364,6 +422,9 @@ mod tests {
 
     #[test]
     fn subscribed_apps_stops_at_buffer_limit() {
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let config = config_with_inject(&[480, 730, 440]);
         let mut buf = [0u32; 2];
         let count = on_get_subscribed_apps(&config, &mut buf, 1);

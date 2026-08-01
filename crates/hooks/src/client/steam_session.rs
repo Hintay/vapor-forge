@@ -1,26 +1,30 @@
 use core::ffi::{c_char, c_void};
-use std::ffi::CString;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
-use super::user_stats::{AchievementSnapshot, AchievementState, WorkerShared};
-use vapor_forge_cloud_core::AchievementSyncState;
+use super::callback_dispatch::USER_STATS_RECEIVED;
+use super::callback_notify;
+use super::steam_context::CapturedInterfaces;
+use super::user_stats::{
+    AchievementSnapshot, AchievementState, SnapshotLayout, SnapshotStatKind, StatState,
+    WorkerShared,
+};
+use vapor_forge_features::playtime::{PlaytimeGame, PlaytimeSnapshot};
 
-const ENGINE_VERSION: &[u8] = b"CLIENTENGINE_INTERFACE_VERSION005\0";
-const CREATE_INTERFACE: &[u8] = b"CreateInterface\0";
-const STEAMCLIENT_SONAME: &[u8] = b"steamclient.so\0";
 const TIER0_SONAME: &[u8] = b"libtier0_s.so\0";
 const CREATE_SIMPLE_THREAD: &[u8] = b"_ZN16SteamThreadTools18CreateSimpleThreadEPFjPvES0_Pjj\0";
 const RELEASE_THREAD_HANDLE: &[u8] = b"ReleaseThreadHandle\0";
 const THREAD_SET_DEBUG_NAME: &[u8] = b"ThreadSetDebugName\0";
 const THREAD_NAME: &[u8] = b"vapor-user-stats\0";
 const MAX_ACHIEVEMENTS: u32 = 10_000;
+const MAX_STATS: u32 = 10_000;
 const MAX_ACHIEVEMENT_KEY_LEN: usize = 255;
-const ENUMERATION_ATTEMPTS: usize = 60;
-const ENUMERATION_INTERVAL: Duration = Duration::from_millis(50);
-const USER_STATS_VTABLE_SCAN_SLOTS: usize = 32;
+const MAX_SUBSCRIBED_APPS: u32 = 100_000;
+/// `k_EResultOK`.
+pub(super) const ERESULT_OK: i32 = 1;
+/// Bounds one callback batch without dropping the remaining events.
+pub(super) const MAX_DRAIN_PER_TICK: usize = 256;
 
 type SteamThreadEntry = unsafe extern "C" fn(*mut c_void) -> u32;
 type CreateSimpleThreadFn =
@@ -28,54 +32,89 @@ type CreateSimpleThreadFn =
 type ReleaseThreadHandleFn = unsafe extern "C" fn(usize) -> bool;
 type ThreadSetDebugNameFn = unsafe extern "C" fn(*const c_char);
 
-type CreateInterfaceFn = unsafe extern "C" fn(*const c_char, *mut i32) -> *mut c_void;
-type CreatePipeFn = unsafe extern "C" fn(*mut c_void) -> i32;
-type ReleasePipeFn = unsafe extern "C" fn(*mut c_void, i32) -> bool;
-type ConnectUserFn = unsafe extern "C" fn(*mut c_void, i32) -> i32;
-type ReleaseUserFn = unsafe extern "C" fn(*mut c_void, i32, i32);
-type RunFrameFn = unsafe extern "C" fn(*mut c_void);
-type GetClientUserFn = unsafe extern "C" fn(*mut c_void, i32, i32) -> *mut c_void;
-type GetUserStatsFn = unsafe extern "C" fn(*mut c_void, i32, i32, *const c_char) -> *mut c_void;
+type GetSubscribedAppsFn = unsafe extern "C" fn(*mut c_void, *mut u32, u32, u8) -> u32;
+// Read-only playtime accessors, never detoured: playtime is corrected at the
+// ingest side. See docs/developer/steam-playtime-source-analysis.md.
+type BGetAppMinutesPlayedFn = unsafe extern "C" fn(*mut c_void, u32, *mut i32, *mut i32) -> bool;
+type GetAppLastPlayedTimeFn = unsafe extern "C" fn(*mut c_void, u32) -> u32;
 type GetNumStatsFn = unsafe extern "C" fn(*mut c_void, *const u64) -> u32;
+type GetStatNameFn = unsafe extern "C" fn(*mut c_void, *const u64, u32) -> *const c_char;
+type GetStatTypeFn = unsafe extern "C" fn(*mut c_void, *const u64, *const c_char) -> i32;
+type GetStatIntFn = unsafe extern "C" fn(*mut c_void, *const u64, *const c_char, *mut i32) -> bool;
+type GetStatFloatFn =
+    unsafe extern "C" fn(*mut c_void, *const u64, *const c_char, *mut f32) -> bool;
 type GetNumAchievementsFn = unsafe extern "C" fn(*mut c_void, *const u64) -> u32;
 type GetAchievementNameFn = unsafe extern "C" fn(*mut c_void, *const u64, u32) -> *const c_char;
-type RequestCurrentStatsFn = unsafe extern "C" fn(*mut c_void, *const u64) -> bool;
+/// Slot 22. It names the user and returns the completion handle.
+type RequestUserStatsFn = unsafe extern "C" fn(*mut c_void, u64, *const u64) -> u64;
 type GetAchievementFn =
     unsafe extern "C" fn(*mut c_void, *const u64, *const c_char, *mut bool, *mut u32) -> bool;
 
-#[repr(C)]
-struct ClientEngine005VTable {
-    create_steam_pipe: CreatePipeFn,
-    release_steam_pipe: ReleasePipeFn,
-    _slot_2: usize,
-    connect_to_global_user: ConnectUserFn,
-    _slots_4_5: [usize; 2],
-    release_user: ReleaseUserFn,
-    _slot_7: usize,
-    get_client_user: GetClientUserFn,
-    _slots_9_18: [usize; 10],
-    run_frame: RunFrameFn,
-    _slot_20: usize,
-    get_client_user_stats: GetUserStatsFn,
+/// What one `RequestUserStats` probe observed.
+#[cfg(any(debug_assertions, test))]
+pub(crate) struct UserStatsProbe {
+    pub(crate) api_call: u64,
+    pub(crate) stat_count: u32,
+    pub(crate) achievement_count: u32,
+    pub(crate) samples: Vec<String>,
 }
 
+/// Slot layout of Steam's `IClientUserStats` interface vtable.
+///
+/// Slot 6 is `DeprecatedPublic_RequestCurrentStats`, which sits between
+/// `RequestCurrentStats` and `GetStat(int32)`. Omitting it shifted every later
+/// accessor down by one: `get_stat_int` reached
+/// `DeprecatedPublic_RequestCurrentStats`, which ignores the trailing arguments
+/// and leaves the output untouched, so every integer stat read back as zero, and
+/// `get_stat_float` reached `GetStat(int32)`, which writes an `i32` bit pattern
+/// into an `f32`. The padding run happened to keep `get_achievement` correct.
+///
+/// Slots below were read off the live interface vtable, whose entries name
+/// themselves: 0 GetNumStats, 1 GetStatName, 2 GetStatType,
+/// 3 GetNumAchievements, 4 GetAchievementName, 5 RequestCurrentStats,
+/// 6 DeprecatedPublic_RequestCurrentStats, 7 GetStat(int32), 8 GetStat(float),
+/// 9 SetStat(int32), 10 SetStat(float), 11 UpdateAvgRateStat, 12 GetAchievement,
+/// 13 SetAchievement, 14 ClearAchievement, 15 GetAchievementProgress,
+/// 16 StoreStats, 17 GetAchievementIcon, 18 BGetAchievementIconURL,
+/// 19 GetAchievementDisplayAttribute, 20 IndicateAchievementProgress,
+/// 21 SetMaxStatsLoaded, 22 RequestUserStats.
+///
+/// The same order was independently recovered from the 64-bit build, where the
+/// interface vtable sits at 0x2b0a2b8 and its 55 method-name strings form a closed
+/// block, so no slot in this range is unaccounted for.
 #[repr(C)]
 struct ClientUserStatsVTable {
     get_num_stats: GetNumStatsFn,
-    _slots_1_2: [usize; 2],
+    get_stat_name: GetStatNameFn,
+    get_stat_type: GetStatTypeFn,
     get_num_achievements: GetNumAchievementsFn,
     get_achievement_name: GetAchievementNameFn,
-    request_current_stats: RequestCurrentStatsFn,
-    _slots_6_11: [usize; 6],
+    /// `RequestCurrentStats`. Slot 22 is used because it returns a handle.
+    _request_current_stats: usize,
+    _deprecated_request_current_stats: usize,
+    get_stat_int: GetStatIntFn,
+    get_stat_float: GetStatFloatFn,
+    /// `SetStat(int32)`, `SetStat(float)`, `UpdateAvgRateStat`. Average-rate
+    /// stats have their own setter here, so a float setter alone cannot cover
+    /// them.
+    _setters_9_11: [usize; 3],
     get_achievement: GetAchievementFn,
+    /// 13 SetAchievement, 14 ClearAchievement, 15 GetAchievementProgress,
+    /// 16 StoreStats, 17 GetAchievementIcon, 18 BGetAchievementIconURL,
+    /// 19 GetAchievementDisplayAttribute, 20 IndicateAchievementProgress,
+    /// 21 SetMaxStatsLoaded.
+    _slots_13_21: [usize; 9],
+    request_user_stats: RequestUserStatsFn,
 }
 
-struct WorkerContext {
-    shared: Arc<WorkerShared>,
+struct SteamThreadContext {
+    name: &'static [u8],
+    entry: Box<dyn FnOnce() + Send>,
     set_debug_name: Option<ThreadSetDebugNameFn>,
 }
 
-pub(super) fn spawn_user_stats_worker(shared: Arc<WorkerShared>) -> bool {
+/// Run `entry` on a SteamThreadTools thread. `name` must be NUL-terminated.
+fn spawn_steam_thread(name: &'static [u8], entry: impl FnOnce() + Send + 'static) -> bool {
     let Some(module) = LoadedModule::open(TIER0_SONAME) else {
         return false;
     };
@@ -89,12 +128,13 @@ pub(super) fn spawn_user_stats_worker(shared: Arc<WorkerShared>) -> bool {
         return false;
     };
 
-    let context = Box::new(WorkerContext {
-        shared,
+    let context = Box::new(SteamThreadContext {
+        name,
+        entry: Box::new(entry),
         set_debug_name,
     });
     let raw_context = Box::into_raw(context);
-    // SAFETY: raw_context owns one WorkerContext and the entrypoint takes ownership on success.
+    // SAFETY: raw_context owns one context and the entrypoint takes ownership on success.
     let handle = unsafe {
         create(
             steam_thread_entry,
@@ -113,136 +153,360 @@ pub(super) fn spawn_user_stats_worker(shared: Arc<WorkerShared>) -> bool {
     true
 }
 
+pub(super) fn spawn_user_stats_worker(shared: Arc<WorkerShared>) -> bool {
+    spawn_steam_thread(THREAD_NAME, move || super::user_stats::run_worker(&shared))
+}
+
 unsafe extern "C" fn steam_thread_entry(context: *mut c_void) -> u32 {
     if context.is_null() {
         return 1;
     }
-    // SAFETY: spawn_user_stats_worker transferred one Box<WorkerContext> here.
-    let context = unsafe { Box::from_raw(context.cast::<WorkerContext>()) };
+    // SAFETY: spawn_steam_thread transferred one Box<SteamThreadContext> here.
+    let context = unsafe { Box::from_raw(context.cast::<SteamThreadContext>()) };
     if let Some(set_debug_name) = context.set_debug_name {
-        // SAFETY: THREAD_NAME is a process-lifetime NUL-terminated string.
-        unsafe { set_debug_name(THREAD_NAME.as_ptr().cast()) };
+        // SAFETY: the name is a process-lifetime NUL-terminated string.
+        unsafe { set_debug_name(context.name.as_ptr().cast()) };
     }
-    super::user_stats::run_worker(&context.shared);
+    (context.entry)();
     0
 }
 
+/// A generation-bound view of Steam's owner-managed global-user wrappers.
 pub(super) struct SteamUserStatsSession {
-    _module: LoadedModule,
-    engine: *mut c_void,
-    engine_vtable: *const ClientEngine005VTable,
+    captured: CapturedInterfaces,
     client_user: *mut c_void,
     stats: *mut c_void,
     stats_vtable: *const ClientUserStatsVTable,
-    pipe: i32,
-    user: i32,
 }
 
 impl SteamUserStatsSession {
     pub(super) fn connect() -> Result<Self, &'static str> {
-        let module = LoadedModule::open(STEAMCLIENT_SONAME)
-            .ok_or("steamclient base-namespace handle is unavailable")?;
-        // SAFETY: CreateInterface is exported by the loaded steamclient module.
-        let create = unsafe { create_interface_fn(module.symbol(CREATE_INTERFACE)) }
-            .ok_or("CreateInterface export is unavailable")?;
-
-        let mut return_code = -1;
-        // SAFETY: ENGINE_VERSION and return_code satisfy CreateInterface's contract.
-        let engine = unsafe { create(ENGINE_VERSION.as_ptr().cast(), &mut return_code) };
-        if return_code != 0 || engine.is_null() {
-            return Err("CLIENTENGINE_INTERFACE_VERSION005 is unavailable");
+        if !callback_notify::hooks_ready() {
+            return Err("callback hooks are unavailable");
         }
-        // SAFETY: the requested interface version fixes this vtable layout.
-        let engine_vtable = unsafe { object_vtable::<ClientEngine005VTable>(engine) }
-            .ok_or("IClientEngine vtable is unavailable")?;
-
-        // SAFETY: engine and its typed vtable came from CreateInterface above.
-        let pipe = unsafe { ((*engine_vtable).create_steam_pipe)(engine) };
-        if pipe == 0 {
-            return Err("CreateSteamPipe failed");
+        let captured =
+            super::steam_context::capture().ok_or("Steam interface context unavailable")?;
+        if captured.stats.is_null() {
+            return Err("IClientUserStats context unavailable");
         }
-        // SAFETY: pipe belongs to this engine.
-        let user = unsafe { ((*engine_vtable).connect_to_global_user)(engine, pipe) };
-        if user == 0 {
-            // SAFETY: pipe was created above and remains live.
-            let _ = unsafe { ((*engine_vtable).release_steam_pipe)(engine, pipe) };
-            return Err("ConnectToGlobalUser failed");
-        }
-        // SAFETY: user and pipe are paired live handles from this engine.
-        let client_user = unsafe { ((*engine_vtable).get_client_user)(engine, user, pipe) };
-        if client_user.is_null() {
-            // SAFETY: handles are live and owned by this function.
-            unsafe { release_session(engine, engine_vtable, pipe, user) };
-            return Err("GetIClientUser failed");
-        }
-        // SAFETY: the null version requests the engine's IClientUserStats map wrapper.
-        let stats = unsafe {
-            ((*engine_vtable).get_client_user_stats)(engine, user, pipe, std::ptr::null())
-        };
-        if stats.is_null() {
-            // SAFETY: handles are live and owned by this function.
-            unsafe { release_session(engine, engine_vtable, pipe, user) };
-            return Err("GetIClientUserStats failed");
-        }
-        // SAFETY: GetIClientUserStats returned the version paired with Engine005.
-        let stats_vtable = match unsafe { object_vtable::<ClientUserStatsVTable>(stats) } {
-            Some(vtable) => vtable,
-            None => {
-                // SAFETY: handles are live and owned by this function.
-                unsafe { release_session(engine, engine_vtable, pipe, user) };
-                return Err("IClientUserStats vtable is unavailable");
-            }
-        };
-
-        super::user::install_get_steam_id_hook(client_user);
+        let stats_vtable = super::steam_context::checked_call(captured, || {
+            // SAFETY: owner discovery captured this live IClientUserStats wrapper.
+            unsafe { object_vtable::<ClientUserStatsVTable>(captured.stats) }
+        })?
+        .ok_or("IClientUserStats vtable is unavailable")?;
         let session = Self {
-            _module: module,
-            engine,
-            engine_vtable,
-            client_user,
-            stats,
+            captured,
+            client_user: captured.user,
+            stats: captured.stats,
             stats_vtable,
-            pipe,
-            user,
         };
-        session.refresh_identity()?;
+        callback_notify::activate_session(captured.revision);
         Ok(session)
     }
 
     fn refresh_identity(&self) -> Result<u64, &'static str> {
-        super::user::refresh_real_steam_id(self.client_user)
+        self.ensure_current()?;
+        Ok(self.captured.steam_id64)
     }
 
-    pub(super) fn snapshot(&self, app_id: u32) -> Result<AchievementSnapshot, &'static str> {
-        let game_id = u64::from(app_id);
-        // SAFETY: session construction validated the typed stats vtable.
-        if !unsafe { ((*self.stats_vtable).request_current_stats)(self.stats, &game_id) } {
-            return Err("RequestCurrentStats was rejected");
+    pub(super) fn user(&self) -> i32 {
+        self.captured.steam_user
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        super::steam_context::is_current(self.captured)
+    }
+
+    fn ensure_current(&self) -> Result<(), &'static str> {
+        self.is_current()
+            .then_some(())
+            .ok_or("Steam interface context changed")
+    }
+
+    fn checked_call<T>(&self, call: impl FnOnce() -> T) -> Result<T, &'static str> {
+        super::steam_context::checked_call(self.captured, call)
+    }
+
+    pub(super) fn playtime_snapshot(&self, app_id: u32) -> Result<PlaytimeSnapshot, &'static str> {
+        if app_id == 0 {
+            return Err("AppID is invalid");
         }
-        debug!(app_id, "user-stats snapshot requested");
-        let count = self.wait_for_schema(app_id, &game_id)?;
-        if count > MAX_ACHIEVEMENTS {
+        // The notification arrives after Steam updates its playtime data.
+        let steam_id64 = self.refresh_identity()?;
+        let get_minutes = self
+            .bget_app_minutes_played()?
+            .ok_or("IClientUser::BGetAppMinutesPlayed is unavailable")?;
+        let mut total = 0i32;
+        let mut two_weeks = 0i32;
+        // SAFETY: the function pointer was read from the live IClientUser vtable
+        // slot named by Steam RTTI, and both out-pointers are live locals.
+        let got_minutes = self.checked_call(|| {
+            // SAFETY: the function pointer belongs to this captured wrapper and
+            // both output pointers reference live locals.
+            unsafe { get_minutes(self.client_user, app_id, &mut total, &mut two_weeks) }
+        })?;
+        if !got_minutes {
+            return Err("BGetAppMinutesPlayed returned false");
+        }
+        let playtime_minutes =
+            u32::try_from(total).map_err(|_| "BGetAppMinutesPlayed returned negative total")?;
+        let playtime_2weeks_minutes = u32::try_from(two_weeks)
+            .map_err(|_| "BGetAppMinutesPlayed returned negative two-week total")?;
+        let last_played_at = match self.get_app_last_played_time()? {
+            Some(get_last_played) => Some(self.checked_call(|| {
+                // SAFETY: the function pointer belongs to this captured
+                // wrapper and takes only value arguments.
+                unsafe { get_last_played(self.client_user, app_id) }
+            })?),
+            None => None,
+        }
+        .filter(|value| *value != 0)
+        .map(i64::from);
+        debug!(
+            app_id,
+            playtime_minutes,
+            playtime_2weeks_minutes,
+            "user-stats native playtime snapshot complete"
+        );
+        Ok(PlaytimeSnapshot {
+            steam_id64,
+            games: vec![PlaytimeGame {
+                app_id,
+                playtime_minutes,
+                playtime_2weeks_minutes,
+                last_played_at,
+            }],
+        })
+    }
+
+    /// Issue one stats request and return its completion handle.
+    ///
+    /// A matching `SetAPICallResult` event carries the copied result payload.
+    ///
+    /// Passing our own SteamID asks for our own stats: the argument names a user, it
+    /// does not restrict this to other users.
+    pub(super) fn request_stats(&self, app_id: u32, steam_id64: u64) -> Result<u64, &'static str> {
+        if app_id == 0 {
+            return Err("AppID is invalid");
+        }
+        if steam_id64 == 0 {
+            return Err("SteamID is unavailable");
+        }
+        if !callback_notify::begin_api_call(self.captured.revision, USER_STATS_RECEIVED) {
+            return Err("RequestUserStats issue window could not be registered");
+        }
+        let game_id = u64::from(app_id);
+        let call = match self.checked_call(|| {
+            // SAFETY: session construction validated the typed stats vtable.
+            unsafe { ((*self.stats_vtable).request_user_stats)(self.stats, steam_id64, &game_id) }
+        }) {
+            Ok(call) => call,
+            Err(error) => {
+                callback_notify::cancel_api_call(self.captured.revision, USER_STATS_RECEIVED);
+                return Err(error);
+            }
+        };
+        if call == 0 {
+            callback_notify::cancel_api_call(self.captured.revision, USER_STATS_RECEIVED);
+            return Err("RequestUserStats returned no call handle");
+        }
+        if !callback_notify::finish_api_call(self.captured.revision, call, USER_STATS_RECEIVED) {
+            return Err("RequestUserStats handle could not be registered");
+        }
+        debug!(app_id, call, "user-stats request issued");
+        Ok(call)
+    }
+
+    /// How many stats and achievements Steam currently holds for an app.
+    ///
+    /// A single immediate read. Zero counts are not a completion signal.
+    pub(super) fn stats_counts(&self, app_id: u32) -> Result<(u32, u32), &'static str> {
+        let game_id = u64::from(app_id);
+        let stat_count = self.checked_call(|| {
+            // SAFETY: session construction validated the typed stats vtable.
+            unsafe { ((*self.stats_vtable).get_num_stats)(self.stats, &game_id) }
+        })?;
+        let achievement_count = self.checked_call(|| {
+            // SAFETY: session construction validated the typed stats vtable.
+            unsafe { ((*self.stats_vtable).get_num_achievements)(self.stats, &game_id) }
+        })?;
+        if stat_count > MAX_STATS || achievement_count > MAX_ACHIEVEMENTS {
+            return Err("stats map count is invalid");
+        }
+        Ok((stat_count, achievement_count))
+    }
+
+    /// Read Steam's stats map for one app, exactly as it stands.
+    ///
+    /// Reads and nothing else: the caller establishes that the map is ready from a
+    /// Steam event or a completed refresh request. Pulling from the backend before
+    /// this point would overwrite an unsent local change with older backend state.
+    pub(super) fn read_snapshot(
+        &self,
+        app_id: u32,
+        layout: Option<&SnapshotLayout>,
+    ) -> Result<AchievementSnapshot, &'static str> {
+        if app_id == 0 {
+            return Err("AppID is invalid");
+        }
+        match layout {
+            Some(layout) => self.read_snapshot_from_layout(app_id, layout),
+            None => self.read_snapshot_by_enumeration(app_id),
+        }
+    }
+
+    /// Read values with names and types already decoded from the packet schema.
+    ///
+    /// The interface context guard spans the complete snapshot, and each item needs
+    /// only its value getter. A stat with no recognized schema type falls back to
+    /// `GetStatType` for that item.
+    fn read_snapshot_from_layout(
+        &self,
+        app_id: u32,
+        layout: &SnapshotLayout,
+    ) -> Result<AchievementSnapshot, &'static str> {
+        if layout.achievements.len() > MAX_ACHIEVEMENTS as usize {
+            return Err("achievement count is invalid");
+        }
+        let game_id = u64::from(app_id);
+        let snapshot = self.checked_call(|| {
+            let mut achievements = Vec::with_capacity(layout.achievements.len());
+            for achievement in &layout.achievements {
+                let mut unlocked = false;
+                let mut unlock_time = 0;
+                // SAFETY: the layout owns a NUL-terminated key for the duration
+                // of this call and both output pointers reference live locals.
+                let got_achievement = unsafe {
+                    ((*self.stats_vtable).get_achievement)(
+                        self.stats,
+                        &game_id,
+                        achievement.c_key.as_ptr(),
+                        &mut unlocked,
+                        &mut unlock_time,
+                    )
+                };
+                if !got_achievement {
+                    return Err("GetAchievement failed");
+                }
+                achievements.push(AchievementState {
+                    key: achievement.key.clone(),
+                    unlocked,
+                    unlock_time,
+                });
+            }
+
+            let mut stats = Vec::with_capacity(layout.stats.len());
+            for stat in &layout.stats {
+                let key_ptr = stat.key.c_key.as_ptr();
+                let kind = match stat.kind {
+                    SnapshotStatKind::Dynamic => {
+                        // SAFETY: the layout-owned key and game id remain live.
+                        match unsafe {
+                            ((*self.stats_vtable).get_stat_type)(self.stats, &game_id, key_ptr)
+                        } {
+                            1 => SnapshotStatKind::Int,
+                            2 => SnapshotStatKind::Float,
+                            3 => SnapshotStatKind::AverageRate,
+                            _ => continue,
+                        }
+                    }
+                    kind => kind,
+                };
+                let (value_type, value) = match kind {
+                    SnapshotStatKind::Int => {
+                        let mut value = 0i32;
+                        // SAFETY: output points to a live i32 and the layout owns
+                        // the key for the complete guarded snapshot.
+                        let got_stat = unsafe {
+                            ((*self.stats_vtable).get_stat_int)(
+                                self.stats, &game_id, key_ptr, &mut value,
+                            )
+                        };
+                        if !got_stat {
+                            return Err("GetStat(int32) failed");
+                        }
+                        ("int", value.to_string())
+                    }
+                    SnapshotStatKind::Float | SnapshotStatKind::AverageRate => {
+                        let mut value = 0f32;
+                        // SAFETY: output points to a live f32 and the layout owns
+                        // the key for the complete guarded snapshot.
+                        let got_stat = unsafe {
+                            ((*self.stats_vtable).get_stat_float)(
+                                self.stats, &game_id, key_ptr, &mut value,
+                            )
+                        };
+                        if !got_stat {
+                            return Err("GetStat(float) failed");
+                        }
+                        let value_type = if kind == SnapshotStatKind::AverageRate {
+                            "average_rate"
+                        } else {
+                            "float"
+                        };
+                        (value_type, value.to_string())
+                    }
+                    SnapshotStatKind::Dynamic => unreachable!("dynamic stat type was resolved"),
+                };
+                stats.push(StatState {
+                    key: stat.key.key.clone(),
+                    value_type: value_type.to_owned(),
+                    value,
+                });
+            }
+            Ok(AchievementSnapshot {
+                app_id,
+                achievements,
+                stats,
+            })
+        })??;
+        debug!(
+            app_id,
+            achievement_count = snapshot.achievements.len(),
+            stat_count = snapshot.stats.len(),
+            "user-stats schema-guided snapshot complete"
+        );
+        Ok(snapshot)
+    }
+
+    /// Enumerate Steam's public interface when this process has not observed the
+    /// packet schema, such as a launch that reuses Steam's existing cache.
+    fn read_snapshot_by_enumeration(
+        &self,
+        app_id: u32,
+    ) -> Result<AchievementSnapshot, &'static str> {
+        let game_id = u64::from(app_id);
+        let (stat_count, achievement_count) = self.stats_counts(app_id)?;
+        if achievement_count > MAX_ACHIEVEMENTS {
             return Err("achievement count is invalid");
         }
 
-        let mut achievements = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            // SAFETY: index is below the count reported by this stats map.
-            let key_ptr =
-                unsafe { ((*self.stats_vtable).get_achievement_name)(self.stats, &game_id, index) };
-            let key = bounded_key(key_ptr).ok_or("achievement name is invalid")?;
+        let mut achievements = Vec::with_capacity(achievement_count as usize);
+        for index in 0..achievement_count {
+            let (key_ptr, key) = self
+                .checked_call(|| {
+                    // SAFETY: index is below the count reported by this stats map.
+                    let key_ptr = unsafe {
+                        ((*self.stats_vtable).get_achievement_name)(self.stats, &game_id, index)
+                    };
+                    bounded_key(key_ptr).map(|key| (key_ptr, key))
+                })?
+                .ok_or("achievement name is invalid")?;
             let mut unlocked = false;
             let mut unlock_time = 0;
-            // SAFETY: all pointers reference live local values for this call.
-            if !unsafe {
-                ((*self.stats_vtable).get_achievement)(
-                    self.stats,
-                    &game_id,
-                    key_ptr,
-                    &mut unlocked,
-                    &mut unlock_time,
-                )
-            } {
+            let got_achievement = self.checked_call(|| {
+                // SAFETY: all pointers reference live local values for this call.
+                unsafe {
+                    ((*self.stats_vtable).get_achievement)(
+                        self.stats,
+                        &game_id,
+                        key_ptr,
+                        &mut unlocked,
+                        &mut unlock_time,
+                    )
+                }
+            })?;
+            if !got_achievement {
                 return Err("GetAchievement failed");
             }
             achievements.push(AchievementState {
@@ -251,147 +515,299 @@ impl SteamUserStatsSession {
                 unlock_time,
             });
         }
-        debug!(app_id, count, "user-stats snapshot complete");
+        let mut stats = Vec::with_capacity(stat_count as usize);
+        for index in 0..stat_count {
+            let (key_ptr, key) = self
+                .checked_call(|| {
+                    // SAFETY: index is below Steam's reported stat count.
+                    let key_ptr = unsafe {
+                        ((*self.stats_vtable).get_stat_name)(self.stats, &game_id, index)
+                    };
+                    bounded_key(key_ptr).map(|key| (key_ptr, key))
+                })?
+                .ok_or("stat name is invalid")?;
+            let stat_type = self.checked_call(|| {
+                // SAFETY: key is owned by Steam and valid for this call.
+                unsafe { ((*self.stats_vtable).get_stat_type)(self.stats, &game_id, key_ptr) }
+            })?;
+            let (value_type, value) = match stat_type {
+                1 => {
+                    let mut value = 0i32;
+                    let got_stat = self.checked_call(|| {
+                        // SAFETY: output points to a live i32 and the key/game are valid.
+                        unsafe {
+                            ((*self.stats_vtable).get_stat_int)(
+                                self.stats, &game_id, key_ptr, &mut value,
+                            )
+                        }
+                    })?;
+                    if !got_stat {
+                        return Err("GetStat(int32) failed");
+                    }
+                    ("int".to_owned(), value.to_string())
+                }
+                2 | 3 => {
+                    let mut value = 0f32;
+                    let got_stat = self.checked_call(|| {
+                        // SAFETY: output points to a live f32 and the key/game are valid.
+                        unsafe {
+                            ((*self.stats_vtable).get_stat_float)(
+                                self.stats, &game_id, key_ptr, &mut value,
+                            )
+                        }
+                    })?;
+                    if !got_stat {
+                        return Err("GetStat(float) failed");
+                    }
+                    let value_type = if stat_type == 3 {
+                        "average_rate"
+                    } else {
+                        "float"
+                    };
+                    (value_type.to_owned(), value.to_string())
+                }
+                _ => continue,
+            };
+            stats.push(StatState {
+                key,
+                value_type,
+                value,
+            });
+        }
+        debug!(
+            app_id,
+            achievement_count, stat_count, "user-stats snapshot complete"
+        );
         Ok(AchievementSnapshot {
             app_id,
             achievements,
+            stats,
         })
     }
 
-    pub(super) fn apply_achievements(
+    /// Build debug output after the dispatcher consumes the completion event.
+    #[cfg(any(debug_assertions, test))]
+    pub(super) fn read_stats_probe(
         &self,
         app_id: u32,
-        states: &[AchievementSyncState],
-        should_apply: &dyn Fn() -> bool,
-    ) -> Result<(), &'static str> {
-        if states.is_empty() || !should_apply() {
-            return Ok(());
-        }
-        let targets = super::achievement_adapters::remote_apply_targets();
-        if targets[..3].contains(&0) || !self.vtable_contains_all(&targets[..3]) {
-            return Err("CUserStats apply targets are unavailable on this interface");
-        }
+        call: u64,
+        result: i32,
+    ) -> Result<UserStatsProbe, &'static str> {
         let game_id = u64::from(app_id);
-        // SAFETY: session construction validated the typed stats vtable.
-        if !unsafe { ((*self.stats_vtable).request_current_stats)(self.stats, &game_id) } {
-            return Err("RequestCurrentStats was rejected before remote apply");
+        let (stat_count, achievement_count) = self.stats_counts(app_id)?;
+        let mut samples = vec![format!(
+            "api_call result {result} via SetAPICallResult event"
+        )];
+        if achievement_count > 0 || stat_count > 0 {
+            samples.extend(self.sample_achievements(&game_id, achievement_count)?);
+            samples.extend(self.sample_stats(&game_id, stat_count)?);
         }
-        self.wait_for_schema(app_id, &game_id)?;
-        if !should_apply() {
-            return Ok(());
-        }
+        Ok(UserStatsProbe {
+            api_call: call,
+            stat_count,
+            achievement_count,
+            samples,
+        })
+    }
 
-        let mut changed = false;
-        for state in states.iter().filter(|state| state.app_id == app_id) {
-            if !should_apply() {
-                return Ok(());
-            }
-            let key = CString::new(state.achievement_key.as_bytes())
-                .map_err(|_| "remote achievement key contains NUL")?;
-            let mut current_unlocked = false;
-            let mut current_unlock_time = 0u32;
-            // SAFETY: key and output pointers remain valid for this call.
-            if !unsafe {
-                ((*self.stats_vtable).get_achievement)(
-                    self.stats,
-                    &game_id,
-                    key.as_ptr(),
-                    &mut current_unlocked,
-                    &mut current_unlock_time,
-                )
-            } {
-                continue;
-            }
-            let should_set = state.unlocked && !current_unlocked;
-            let should_clear = !state.unlocked
-                && current_unlocked
-                && state.observed_at >= i64::from(current_unlock_time);
-            if should_set || should_clear {
-                if !should_apply() {
-                    return Ok(());
-                }
-                // SAFETY: target membership above proves this object exposes the
-                // validated CUserStats methods, and CString/game_id are live.
-                let accepted = unsafe {
-                    super::achievement_adapters::apply_remote_set(
-                        self.stats,
-                        &game_id,
-                        key.as_ptr(),
-                        should_set,
-                    )
+    /// Achievement state read straight out of Steam's map.
+    ///
+    /// The unlocked flag and the time are what the client itself holds, so this is
+    /// also the instrument for observing whether an injected response changed the
+    /// map or left it alone.
+    ///
+    #[cfg(any(debug_assertions, test))]
+    fn sample_achievements(&self, game_id: &u64, count: u32) -> Result<Vec<String>, &'static str> {
+        const MAX: usize = 8;
+        let mut out = Vec::new();
+        let mut unlocked_total = 0;
+        for index in 0..count {
+            let key_and_ptr = self.checked_call(|| {
+                // SAFETY: index is below the count this map reported.
+                let key_ptr = unsafe {
+                    ((*self.stats_vtable).get_achievement_name)(self.stats, game_id, index)
                 };
-                changed |= accepted != 0;
-            }
-            if let (Some(current), Some(maximum)) = (state.progress_current, state.progress_max) {
-                if targets[3] != 0 && self.vtable_contains_all(&targets[3..]) {
-                    if !should_apply() {
-                        return Ok(());
-                    }
-                    // SAFETY: same validated object and arguments as above.
-                    let accepted = unsafe {
-                        super::achievement_adapters::apply_remote_progress(
-                            self.stats,
-                            &game_id,
-                            key.as_ptr(),
-                            current,
-                            maximum,
-                        )
-                    };
-                    changed |= accepted != 0;
+                bounded_key(key_ptr).map(|key| (key_ptr, key))
+            })?;
+            let Some((key_ptr, key)) = key_and_ptr else {
+                continue;
+            };
+            let mut unlocked = false;
+            let mut unlock_time = 0u32;
+            let ok = self.checked_call(|| {
+                // SAFETY: both outputs point to live locals and the key is valid.
+                unsafe {
+                    ((*self.stats_vtable).get_achievement)(
+                        self.stats,
+                        game_id,
+                        key_ptr,
+                        &mut unlocked,
+                        &mut unlock_time,
+                    )
                 }
+            })?;
+            if unlocked {
+                unlocked_total += 1;
+            }
+            if out.len() < MAX || unlocked {
+                out.push(format!(
+                    "ach[{index}] {key} ok={ok} unlocked={unlocked} at={unlock_time}"
+                ));
             }
         }
-        if changed && should_apply() {
-            // SAFETY: target membership and object lifetime were validated above.
-            if unsafe { super::achievement_adapters::apply_remote_store(self.stats, &game_id) } == 0
-            {
-                return Err("StoreStats rejected remote achievement state");
-            }
-        }
-        Ok(())
+        out.insert(0, format!("unlocked {unlocked_total}/{count}"));
+        Ok(out)
     }
 
-    fn vtable_contains_all(&self, targets: &[usize]) -> bool {
-        // SAFETY: GetIClientUserStats returned a live interface whose vtable has
-        // at least the known public method surface scanned here.
-        let slots = unsafe {
-            std::slice::from_raw_parts(
-                self.stats_vtable.cast::<usize>(),
-                USER_STATS_VTABLE_SCAN_SLOTS,
-            )
+    /// A few stats read back through both typed getters.
+    ///
+    /// The int and float getters occupy adjacent slots whose stubs are
+    /// indistinguishable in the binary, so which is which rests on ordering rather
+    /// than on decoded evidence. Reading a declared int and a declared float and
+    /// seeing whether the values are plausible is the only way to settle it.
+    ///
+    #[cfg(any(debug_assertions, test))]
+    fn sample_stats(&self, game_id: &u64, stat_count: u32) -> Result<Vec<String>, &'static str> {
+        const PER_BUCKET: usize = 3;
+        let mut by_type = std::collections::BTreeMap::<i32, u32>::new();
+        let mut nonzero_int = Vec::new();
+        let mut zero_int = Vec::new();
+        let mut floats = Vec::new();
+        for index in 0..stat_count {
+            let key_and_ptr = self.checked_call(|| {
+                // SAFETY: index is below the count this map reported.
+                let key_ptr =
+                    unsafe { ((*self.stats_vtable).get_stat_name)(self.stats, game_id, index) };
+                bounded_key(key_ptr).map(|key| (key_ptr, key))
+            })?;
+            let Some((key_ptr, key)) = key_and_ptr else {
+                continue;
+            };
+            let stat_type = self.checked_call(|| {
+                // SAFETY: key_ptr is owned by Steam and valid for this call.
+                unsafe { ((*self.stats_vtable).get_stat_type)(self.stats, game_id, key_ptr) }
+            })?;
+            *by_type.entry(stat_type).or_default() += 1;
+            match stat_type {
+                1 => {
+                    let mut value = 0i32;
+                    let ok = self.checked_call(|| {
+                        // SAFETY: output points to a live i32 and the key is valid.
+                        unsafe {
+                            ((*self.stats_vtable).get_stat_int)(
+                                self.stats, game_id, key_ptr, &mut value,
+                            )
+                        }
+                    })?;
+                    let line = format!("int[{index}] {key} ok={ok} value={value}");
+                    if value != 0 {
+                        if nonzero_int.len() < PER_BUCKET {
+                            nonzero_int.push(line);
+                        }
+                    } else if zero_int.len() < PER_BUCKET {
+                        zero_int.push(line);
+                    }
+                }
+                2 | 3 if floats.len() < PER_BUCKET * 2 => {
+                    let mut value = 0f32;
+                    let ok = self.checked_call(|| {
+                        // SAFETY: output points to a live f32 and the key is valid.
+                        unsafe {
+                            ((*self.stats_vtable).get_stat_float)(
+                                self.stats, game_id, key_ptr, &mut value,
+                            )
+                        }
+                    })?;
+                    floats.push(format!(
+                        "float{stat_type}[{index}] {key} ok={ok} value={value}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let mut samples = vec![format!(
+            "types {}",
+            by_type
+                .iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )];
+        samples.extend(nonzero_int);
+        samples.extend(zero_int);
+        samples.extend(floats);
+        Ok(samples)
+    }
+
+    /// Read Steam's live subscribed-app inventory through IClientUser. This
+    /// avoids inferring ownership from installed files or library-cache data.
+    pub(super) fn subscribed_app_ids(&self) -> Result<Vec<u32>, &'static str> {
+        let get_subscribed = self
+            .client_user_method::<GetSubscribedAppsFn>("GetSubscribedApps")?
+            .ok_or("IClientUser::GetSubscribedApps is unavailable")?;
+        // SAFETY: a null output buffer asks Steam for the capacity required by
+        // this live IClientUser instance.
+        let count = self.checked_call(|| {
+            // SAFETY: a null output buffer requests the required capacity.
+            unsafe { get_subscribed(self.client_user, std::ptr::null_mut(), 0, 0) }
+        })?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > MAX_SUBSCRIBED_APPS {
+            return Err("IClientUser::GetSubscribedApps returned an invalid count");
+        }
+
+        let mut app_ids = vec![0_u32; count as usize];
+        // SAFETY: app_ids supplies the exact number of writable u32 slots
+        // reported by Steam in the preceding capacity query.
+        let written = self.checked_call(|| {
+            // SAFETY: app_ids has exactly count writable elements.
+            unsafe { get_subscribed(self.client_user, app_ids.as_mut_ptr(), count, 0) }
+        })?;
+        if written > count {
+            return Err("IClientUser::GetSubscribedApps exceeded its output buffer");
+        }
+        app_ids.truncate(written as usize);
+        app_ids.sort_unstable();
+        app_ids.dedup();
+        Ok(app_ids)
+    }
+
+    fn client_user_method<T>(&self, name: &str) -> Result<Option<T>, &'static str> {
+        let Some(slot) = crate::vtable_scan::slot_of("IClientUser", name) else {
+            return Ok(None);
         };
-        targets.iter().all(|target| slots.contains(target))
+        let Some(address) = self.checked_call(|| {
+            // SAFETY: the slot comes from Steam's scanned interface RTTI and
+            // the context guard keeps the captured wrapper current.
+            unsafe { super::install::read_vtable_slot(self.client_user, slot) }
+        })?
+        else {
+            return Ok(None);
+        };
+        if address == 0 {
+            return Ok(None);
+        }
+        // SAFETY: the caller instantiates T with the Steam ABI for the named
+        // method just read from the live IClientUser vtable.
+        Ok(Some(unsafe {
+            std::mem::transmute_copy::<usize, T>(&address)
+        }))
     }
 
-    fn wait_for_schema(&self, app_id: u32, game_id: &u64) -> Result<u32, &'static str> {
-        for _ in 0..ENUMERATION_ATTEMPTS {
-            // SAFETY: session construction validated both typed vtables.
-            unsafe { ((*self.engine_vtable).run_frame)(self.engine) };
-            // IClientUserStats map requests do not deliver UserStatsReceived on
-            // this engine pipe. Steam's cache counts are the completion signal.
-            // SAFETY: session construction validated the typed stats vtable.
-            let stat_count = unsafe { ((*self.stats_vtable).get_num_stats)(self.stats, game_id) };
-            // SAFETY: session construction validated the typed stats vtable.
-            let achievement_count =
-                unsafe { ((*self.stats_vtable).get_num_achievements)(self.stats, game_id) };
-            if stat_count > 0 || achievement_count > 0 {
-                debug!(
-                    app_id,
-                    stat_count, achievement_count, "user-stats schema loaded"
-                );
-                return Ok(achievement_count);
-            }
-            std::thread::sleep(ENUMERATION_INTERVAL);
-        }
-        warn!(app_id, "user-stats schema did not become observable");
-        Err("IClientUserStats schema load timed out")
+    fn bget_app_minutes_played(&self) -> Result<Option<BGetAppMinutesPlayedFn>, &'static str> {
+        self.client_user_method::<BGetAppMinutesPlayedFn>("BGetAppMinutesPlayed")
+    }
+
+    fn get_app_last_played_time(&self) -> Result<Option<GetAppLastPlayedTimeFn>, &'static str> {
+        self.client_user_method::<GetAppLastPlayedTimeFn>("GetAppLastPlayedTime")
     }
 }
 
 impl Drop for SteamUserStatsSession {
     fn drop(&mut self) {
-        // SAFETY: this session owns the live handles until Drop.
-        unsafe { release_session(self.engine, self.engine_vtable, self.pipe, self.user) };
+        callback_notify::clear_session(self.captured.revision);
     }
 }
 
@@ -433,19 +849,6 @@ unsafe fn object_vtable<T>(object: *mut c_void) -> Option<*const T> {
     (!vtable.is_null()).then_some(vtable)
 }
 
-unsafe fn release_session(
-    engine: *mut c_void,
-    vtable: *const ClientEngine005VTable,
-    pipe: i32,
-    user: i32,
-) {
-    // SAFETY: caller owns these paired handles and the typed vtable.
-    unsafe {
-        ((*vtable).release_user)(engine, pipe, user);
-        let _ = ((*vtable).release_steam_pipe)(engine, pipe);
-    }
-}
-
 fn bounded_key(key: *const c_char) -> Option<String> {
     if key.is_null() {
         return None;
@@ -460,13 +863,6 @@ fn bounded_key(key: *const c_char) -> Option<String> {
         bytes.push(byte);
     }
     None
-}
-
-unsafe fn create_interface_fn(address: *mut c_void) -> Option<CreateInterfaceFn> {
-    (!address.is_null()).then(|| {
-        // SAFETY: caller resolved the CreateInterface export.
-        unsafe { std::mem::transmute::<*mut c_void, CreateInterfaceFn>(address) }
-    })
 }
 
 unsafe fn create_simple_thread_fn(address: *mut c_void) -> Option<CreateSimpleThreadFn> {
@@ -488,4 +884,76 @@ unsafe fn thread_set_debug_name_fn(address: *mut c_void) -> Option<ThreadSetDebu
         // SAFETY: caller resolved ThreadSetDebugName.
         unsafe { std::mem::transmute::<*mut c_void, ThreadSetDebugNameFn>(address) }
     })
+}
+
+#[cfg(test)]
+mod client_user_stats_vtable_layout {
+    use super::ClientUserStatsVTable;
+
+    // Slot numbers were read off the live IClientUserStats vtable. A field added
+    // or removed above one of these shifts every later accessor onto a different
+    // Steam method, and the failure is silent: the wrong method commonly returns
+    // success while leaving the output buffer untouched.
+    #[test]
+    fn matches_the_live_interface_slots() {
+        let slot = |offset: usize| offset / std::mem::size_of::<usize>();
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_num_stats)),
+            0
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_stat_name)),
+            1
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_stat_type)),
+            2
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(
+                ClientUserStatsVTable,
+                get_num_achievements
+            )),
+            3
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(
+                ClientUserStatsVTable,
+                get_achievement_name
+            )),
+            4
+        );
+        // Slot 5 is RequestCurrentStats and slot 6 is
+        // DeprecatedPublic_RequestCurrentStats. Neither is callable from here, but
+        // both still have to occupy their slot or every accessor below shifts.
+        assert_eq!(
+            slot(std::mem::offset_of!(
+                ClientUserStatsVTable,
+                _request_current_stats
+            )),
+            5
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_stat_int)),
+            7
+        );
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_stat_float)),
+            8
+        );
+        // Slots 9 to 11 are SetStat(int32), SetStat(float), UpdateAvgRateStat.
+        assert_eq!(
+            slot(std::mem::offset_of!(ClientUserStatsVTable, get_achievement)),
+            12
+        );
+        // Slots 13 to 21 are the achievement setters, StoreStats, the icon and
+        // display accessors, and SetMaxStatsLoaded.
+        assert_eq!(
+            slot(std::mem::offset_of!(
+                ClientUserStatsVTable,
+                request_user_stats
+            )),
+            22
+        );
+    }
 }

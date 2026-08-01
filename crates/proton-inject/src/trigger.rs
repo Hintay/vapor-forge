@@ -2,18 +2,10 @@
 // Pure safe code operating on slices.
 
 use crate::maps::MapEntry;
-
-const TRIGGER_DLLS: &[&str] = &["steam_api64.dll", "steamclient.dll"];
-
-/// Check if a UTF-16LE DLL name (from Wine's UNICODE_STRING) is a trigger.
-pub fn is_trigger_name(name: &[u16]) -> bool {
-    for trigger in TRIGGER_DLLS {
-        if u16_ends_with_ascii_ci(name, trigger) {
-            return true;
-        }
-    }
-    false
-}
+/// Trigger-name matching lives in `vapor-forge-pe` next to the DLL list; this
+/// module keeps the process-local half of the check.
+pub use crate::pe::is_trigger_name;
+use crate::pe::TRIGGER_DLLS;
 
 /// Check if any trigger DLL is already loaded (scan /proc/self/maps).
 pub fn trigger_already_loaded(maps: &[MapEntry]) -> bool {
@@ -42,21 +34,6 @@ pub fn linux_path_to_wine_nt(path: &str) -> Vec<u16> {
     out
 }
 
-fn u16_ends_with_ascii_ci(haystack: &[u16], needle: &str) -> bool {
-    let n = needle.len();
-    if haystack.len() < n {
-        return false;
-    }
-    let start = haystack.len() - n;
-    for (i, expected) in needle.bytes().enumerate() {
-        let actual = haystack[start + i];
-        if !ascii_char_eq_ci(actual, expected) {
-            return false;
-        }
-    }
-    true
-}
-
 fn ascii_eq_ci(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -66,30 +43,9 @@ fn ascii_eq_ci(a: &str, b: &str) -> bool {
         .all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
-fn ascii_char_eq_ci(wide: u16, ascii: u8) -> bool {
-    if wide > 127 {
-        return false;
-    }
-    (wide as u8).eq_ignore_ascii_case(&ascii)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_trigger_name() {
-        let name: Vec<u16> = "steam_api64.dll".encode_utf16().collect();
-        assert!(is_trigger_name(&name));
-
-        let name: Vec<u16> = "C:\\windows\\system32\\Steam_API64.DLL"
-            .encode_utf16()
-            .collect();
-        assert!(is_trigger_name(&name));
-
-        let name: Vec<u16> = "kernel32.dll".encode_utf16().collect();
-        assert!(!is_trigger_name(&name));
-    }
 
     #[test]
     fn linux_to_wine_path() {

@@ -167,6 +167,28 @@ fn outbound_loop(receiver: mpsc::Receiver<Message>) {
 fn parse_app_id_from_env() -> u32 {
     std::env::var("SteamGameId")
         .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+        .and_then(|value| app_id_from_steam_game_id(&value))
         .unwrap_or(0)
+}
+
+fn app_id_from_steam_game_id(value: &str) -> Option<u32> {
+    let game_id = value.parse::<u64>().ok()?;
+    let app_id = game_id as u32 & 0x00ff_ffff;
+    (app_id != 0).then_some(app_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_id_from_steam_game_id;
+
+    #[test]
+    fn extracts_app_id_from_steam_game_id() {
+        assert_eq!(app_id_from_steam_game_id("736260"), Some(736_260));
+        assert_eq!(
+            app_id_from_steam_game_id(&((2_u64 << 24) | 736_260).to_string()),
+            Some(736_260)
+        );
+        assert_eq!(app_id_from_steam_game_id("0"), None);
+        assert_eq!(app_id_from_steam_game_id("invalid"), None);
+    }
 }

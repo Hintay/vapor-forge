@@ -79,6 +79,7 @@ struct Pending {
     done: Arc<AtomicBool>,
     /// Serialized request header bytes used to fabricate the response header.
     req_hdr_bytes: Vec<u8>,
+    response_generation: u64,
 }
 
 /// A completed manifest code fetch, ready for injection.
@@ -87,6 +88,7 @@ pub struct CompletedFetch {
     pub gid: u64,
     pub code: u64,
     pub req_hdr_bytes: Vec<u8>,
+    pub response_generation: u64,
 }
 
 /// Thread-safe queue of in-flight manifest code fetches.
@@ -108,6 +110,7 @@ impl PendingQueue {
         request: ManifestCodeFetch,
         config: &RuntimeConfig,
         lua_callback: Option<ManifestCodeCallback>,
+        response_generation: u64,
     ) -> bool {
         let ManifestCodeFetch {
             job_id,
@@ -125,6 +128,7 @@ impl PendingQueue {
             result: Arc::clone(&result),
             done: Arc::clone(&done),
             req_hdr_bytes,
+            response_generation,
         };
 
         {
@@ -201,6 +205,7 @@ impl PendingQueue {
                     gid: entry.gid,
                     code,
                     req_hdr_bytes: entry.req_hdr_bytes,
+                    response_generation: entry.response_generation,
                 });
                 // Don't increment i because swap_remove moved the last element to position i.
             } else {
@@ -243,7 +248,7 @@ pub fn should_intercept_with_ownership(
 
 /// Build a complete fabricated `ServiceMethodResponse` packet from parts.
 ///
-/// Uses protobuf types from `steam-abi` and `assemble_raw` to produce the
+/// Uses protobuf types from `steam-protocol` and `assemble_raw` to produce the
 /// final byte vector using safe code, with no raw pointers involved.
 pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code: u64) -> Vec<u8> {
     // Parse the original request header to copy fields
@@ -263,6 +268,7 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
         eresult,
         transport_error,
         seq_num,
+        ..Default::default()
     };
 
     let resp_body = GetManifestRequestCodeResponse {
@@ -387,11 +393,8 @@ mod tests {
         CMsgProtoBufHeader {
             steamid: Some(0x0110_0001_DEAD_BEEF),
             jobid_source: Some(job_id),
-            jobid_target: None,
             target_job_name: Some(method.to_owned()),
-            eresult: None,
-            transport_error: None,
-            seq_num: None,
+            ..Default::default()
         }
         .encode_to_vec()
     }
@@ -433,6 +436,7 @@ mod tests {
             app_id: Some(480),
             depot_id: Some(481),
             manifest_id: Some(1234),
+            ..Default::default()
         }
         .encode_to_vec();
         let fetch = plan_fetch(&header, &header_bytes, &body).unwrap();
@@ -506,6 +510,7 @@ mod tests {
             },
             &RuntimeConfig::default(),
             Some(callback),
+            7,
         ));
 
         let completed = (0..100)
@@ -547,6 +552,7 @@ mod tests {
                 },
                 &RuntimeConfig::default(),
                 Some(Arc::clone(&callback)),
+                7,
             ));
         }
         assert!(!queue.queue_fetch(
@@ -559,6 +565,7 @@ mod tests {
             },
             &RuntimeConfig::default(),
             Some(callback),
+            7,
         ));
         barrier.wait();
     }

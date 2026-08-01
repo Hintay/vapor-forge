@@ -6,7 +6,7 @@ use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_hook_engine::original::{detour_or_return, vmt_or_return};
 use vapor_forge_hook_engine::vmt;
 
-use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
+use super::install::{config, plan_vmt_hook, read_vtable_slot};
 
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -107,13 +107,13 @@ fn install_app_manager_vmt(this: *mut c_void) {
             // SAFETY: this is the live IClientAppManager object passed by Steam.
             if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
                 let repl = hk_is_app_dlc_installed as *const () as usize;
-                if validate_vmt_hook_eligibility("IsAppDlcInstalled", addr, repl) {
+                if let Some(plan) = plan_vmt_hook("IsAppDlcInstalled", addr, repl) {
                     // SAFETY: original is stored before replacing the validated slot.
                     unsafe {
                         std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED).write(Some(
                             std::mem::transmute::<usize, IsAppDlcInstalledFn>(addr),
                         ));
-                        if vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, repl).is_some() {
+                        if vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, plan).is_some() {
                             attempt.commit();
                         }
                     }
@@ -132,12 +132,12 @@ fn install_app_manager_vmt(this: *mut c_void) {
             // SAFETY: this is the live IClientAppManager object passed by Steam.
             if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
                 let repl = hk_b_is_dlc_enabled as *const () as usize;
-                if validate_vmt_hook_eligibility("BIsDlcEnabled", addr, repl) {
+                if let Some(plan) = plan_vmt_hook("BIsDlcEnabled", addr, repl) {
                     // SAFETY: original is stored before replacing the validated slot.
                     unsafe {
                         std::ptr::addr_of_mut!(ORIG_B_IS_DLC_ENABLED)
                             .write(Some(std::mem::transmute::<usize, BIsDlcEnabledFn>(addr)));
-                        if vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, repl).is_some() {
+                        if vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, plan).is_some() {
                             attempt.commit();
                         }
                     }
@@ -157,7 +157,7 @@ fn install_app_manager_vmt(this: *mut c_void) {
             // SAFETY: this is the live IClientAppManager object passed by Steam.
             if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
                 let repl = hk_launch_app as *const () as usize;
-                if validate_vmt_hook_eligibility("LaunchApp", addr, repl) {
+                if let Some(plan) = plan_vmt_hook("LaunchApp", addr, repl) {
                     // SAFETY: original is stored before replacing the validated slot.
                     unsafe {
                         std::ptr::addr_of_mut!(ORIG_LAUNCH_APP).write(Some(std::mem::transmute::<
@@ -166,7 +166,7 @@ fn install_app_manager_vmt(this: *mut c_void) {
                         >(
                             addr
                         )));
-                        if vmt::swap_vtable_slot("LaunchApp", this, slot, repl).is_some() {
+                        if vmt::swap_vtable_slot("LaunchApp", this, slot, plan).is_some() {
                             attempt.commit();
                         }
                     }

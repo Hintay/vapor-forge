@@ -6,7 +6,7 @@ use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_hook_engine::original::{detour_or_return, vmt_or_return};
 use vapor_forge_hook_engine::vmt;
 
-use super::install::{config, read_vtable_slot, validate_vmt_hook_eligibility};
+use super::install::{config, plan_vmt_hook, read_vtable_slot, validate_steamclient_code_address};
 
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -106,10 +106,10 @@ fn install_cloud_vmt(this: *mut c_void) {
     let Some(addr) = orig_addr else { return };
     let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
 
-    if !validate_vmt_hook_eligibility("IsCloudEnabledForApp", addr, replacement) {
+    let Some(plan) = plan_vmt_hook("IsCloudEnabledForApp", addr, replacement) else {
         attempt.disable();
         return;
-    }
+    };
 
     // SAFETY: transmuting a valid function address to a typed fn pointer.
     let orig_fn: IsCloudEnabledForAppFn = unsafe { std::mem::transmute(addr) };
@@ -117,7 +117,7 @@ fn install_cloud_vmt(this: *mut c_void) {
     unsafe { std::ptr::addr_of_mut!(ORIGINAL_IS_CLOUD_ENABLED).write(Some(orig_fn)) };
 
     // SAFETY: swap the vtable slot (original already stored).
-    if unsafe { vmt::swap_vtable_slot("IsCloudEnabledForApp", this, slot, replacement) }.is_some() {
+    if unsafe { vmt::swap_vtable_slot("IsCloudEnabledForApp", this, slot, plan) }.is_some() {
         attempt.commit();
     }
 }
@@ -140,8 +140,7 @@ fn capture_set_cloud_from_vtable(this: *mut c_void) {
     let Some(addr) = (unsafe { read_vtable_slot(this, slot) }) else {
         return;
     };
-    let replacement = hk_is_cloud_enabled_for_app as *const () as usize;
-    if !validate_vmt_hook_eligibility("SetCloudEnabledForApp", addr, replacement) {
+    if !validate_steamclient_code_address("SetCloudEnabledForApp", addr) {
         attempt.disable();
         return;
     }

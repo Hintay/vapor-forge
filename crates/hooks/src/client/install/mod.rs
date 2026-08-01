@@ -6,10 +6,12 @@ use tracing::{debug, error, info, warn};
 use vapor_forge_memory::{find_proc_self_maps_targets, ProcMapsEntry};
 use vapor_forge_patterns::registry::PatternRegistry;
 
-use vapor_forge_hook_boundary::{validate_raw_hook_plan, RawAddressRange, RawHookEligibilityInput};
-
 use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
-use vapor_forge_hook_engine::detour::{self, CodeRegion, PendingDetour};
+use crate::pattern_resolver::{resolve_pattern_entry, CodeRegion};
+use vapor_forge_hook_engine::detour::{self, PendingDetour};
+use vapor_forge_hook_engine::plan::{
+    validate_hook_target, AddressRange, HookPlanError, HookTargetInput, ValidatedHookTarget,
+};
 
 mod package_info;
 mod runtime;
@@ -146,7 +148,7 @@ pub(crate) fn resolve_address_from_registry(
         None
     })?;
 
-    detour::resolve_pattern_entry(code, name, &entry)
+    resolve_pattern_entry(code, name, &entry)
 }
 
 fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
@@ -158,61 +160,45 @@ fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
     // SAFETY: F is a function pointer type; its bit pattern is the address.
     let replacement_addr: usize = unsafe { std::mem::transmute_copy(&replacement) };
 
-    if let Err(e) = validate_hook_eligibility(name, addr, replacement_addr, code) {
-        error!(hook = name, error = %e, "hook boundary validation failed");
-        return None;
-    }
+    let plan = match validate_hook_eligibility(name, addr, replacement_addr, code) {
+        Ok(plan) => plan,
+        Err(error) => {
+            error!(hook = name, %error, "hook boundary validation failed");
+            return None;
+        }
+    };
 
-    // SAFETY: addr is a validated code address in steamclient.so.
-    let target: F = unsafe { std::mem::transmute_copy(&addr) };
-    // SAFETY: target is a valid function pointer.
-    unsafe { detour::create_detour(name, target, addr, replacement) }
+    // SAFETY: the typed replacement and resolved target share signature F.
+    unsafe { detour::create_detour(name, plan) }
 }
 
-fn resolve_cuser_stats_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
+fn resolve_interface_method<F: vapor_forge_hook_engine::detour::HookFn>(
     code: &CodeRegion,
     name: &str,
-    public_method: &str,
-    overload: usize,
-    expected_overloads: usize,
+    interface: &str,
+    method: &str,
     replacement: F,
 ) -> Option<PendingDetour<F>> {
-    let slots = crate::vtable_scan::slots_of("IClientUserStats", public_method);
-    if slots.len() != expected_overloads {
+    let slots = crate::vtable_scan::slots_of(interface, method);
+    if slots.len() != 1 {
         error!(
             hook = name,
-            public_method,
+            interface,
+            method,
             found = slots.len(),
-            expected = expected_overloads,
-            "CUserStats adapter slot lookup failed"
+            "interface method lookup did not produce one slot"
         );
         return None;
     }
-    let slot = slots[overload];
-    let Some(addr) = crate::vtable_scan::method_address("CUserStats", slot) else {
+    let slot = slots[0];
+    let Some(address) = crate::vtable_scan::method_address(interface, slot) else {
         error!(
             hook = name,
-            slot, "CUserStats adapter address was not found"
+            interface, method, slot, "interface method address unavailable"
         );
         return None;
     };
-    if !super::achievement_adapters::validate_adapter_target(code, name, addr) {
-        error!(
-            hook = name,
-            slot,
-            target = format_args!("0x{addr:x}"),
-            "CUserStats adapter ABI validation failed"
-        );
-        return None;
-    }
-    debug!(
-        hook = name,
-        public_method,
-        slot,
-        target = format_args!("0x{addr:x}"),
-        "CUserStats adapter resolved from vtable"
-    );
-    resolve_from_address(code, name, addr, replacement)
+    resolve_from_address(code, name, address, replacement)
 }
 
 fn resolve_cuser_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
@@ -311,19 +297,14 @@ fn validate_hook_eligibility(
     target_addr: usize,
     replacement_addr: usize,
     code: &CodeRegion,
-) -> vapor_forge_hook_boundary::Result<()> {
-    validate_raw_hook_plan(RawHookEligibilityInput {
-        module_name: "steamclient.so",
-        expected_module_name: "steamclient.so",
-        actual_architecture: current_hook_architecture(),
-        expected_architecture: current_hook_architecture(),
+) -> Result<ValidatedHookTarget, HookPlanError> {
+    let target = validate_hook_target(HookTargetInput {
         target_address: target_addr,
         replacement_address: replacement_addr,
-        executable_range: RawAddressRange {
+        executable_range: AddressRange {
             start: code.base,
             end: code.base + code.bytes.len(),
         },
-        write_requested: false,
     })?;
     debug!(
         hook = name,
@@ -331,39 +312,47 @@ fn validate_hook_eligibility(
         replacement = format_args!("0x{:x}", replacement_addr),
         "hook boundary: eligible"
     );
-    Ok(())
+    Ok(target)
 }
 
-pub(crate) fn validate_vmt_hook_eligibility(
+pub(crate) fn plan_vmt_hook(
     name: &str,
     original_addr: usize,
     replacement_addr: usize,
-) -> bool {
+) -> Option<ValidatedHookTarget> {
     let Some(&(base, end)) = CODE_RANGE.get() else {
-        warn!(hook = name, "VMT validation skipped: code range not set");
-        return false;
+        warn!(hook = name, "VMT validation failed: code range not set");
+        return None;
     };
-    let result = validate_raw_hook_plan(RawHookEligibilityInput {
-        module_name: "steamclient.so",
-        expected_module_name: "steamclient.so",
-        actual_architecture: current_hook_architecture(),
-        expected_architecture: current_hook_architecture(),
+    let result = validate_hook_target(HookTargetInput {
         target_address: original_addr,
         replacement_address: replacement_addr,
-        executable_range: RawAddressRange { start: base, end },
-        write_requested: false,
+        executable_range: AddressRange { start: base, end },
     });
-    if let Err(e) = result {
-        warn!(hook = name, error = %e, "VMT hook boundary validation failed");
-        return false;
-    }
+    let target = result
+        .inspect_err(|error| warn!(hook = name, %error, "VMT hook boundary validation failed"))
+        .ok()?;
     debug!(
         hook = name,
         original = format_args!("0x{:x}", original_addr),
         replacement = format_args!("0x{:x}", replacement_addr),
         "VMT hook boundary: eligible"
     );
-    true
+    Some(target)
+}
+
+pub(crate) fn validate_steamclient_code_address(name: &str, address: usize) -> bool {
+    let valid = CODE_RANGE
+        .get()
+        .is_some_and(|&(base, end)| base <= address && address < end);
+    if !valid {
+        warn!(
+            hook = name,
+            address = format_args!("0x{address:x}"),
+            "captured function is outside steamclient executable code"
+        );
+    }
+    valid
 }
 
 // ---------------------------------------------------------------------------
@@ -409,16 +398,41 @@ fn do_install() {
     }
 
     super::client_id::resolve(&registry, &code);
-    super::eticket::resolve_set_api_call_result(&code, &registry);
 
-    // Phase 1: create all detours (the engine allocates trampolines on a shared pool page).
-    // Do NOT mprotect or PIC-repair yet. Modifying page permissions between allocations
-    // would lock the pool page to RX before the engine can write the next trampoline.
-    let d_steam_engine_init = resolve_from_registry(
+    // Create every detour before finalizing their shared trampoline storage.
+    let d_set_api_call_result = resolve_from_registry(
         &registry,
         &code,
-        "CSteamEngine::Init",
-        super::eticket::hk_steam_engine_init as super::eticket::SteamEngineInitFn,
+        "CSteamEngine::SetAPICallResult",
+        super::callback_notify::hk_set_api_call_result
+            as super::callback_notify::SetApiCallResultFn,
+    );
+    let d_register_internal_callback = resolve_from_registry(
+        &registry,
+        &code,
+        "CSteamEngine::RegisterInternalCallback",
+        super::internal_callbacks::hk_register_internal_callback
+            as super::internal_callbacks::RegisterInternalCallbackFn,
+    );
+    let d_get_steam_id = resolve_interface_method(
+        &code,
+        super::user::GET_STEAM_ID_NAME,
+        "IClientUser",
+        "GetSteamID",
+        super::user::hk_get_steam_id as super::user::GetSteamIdFn,
+    );
+    let d_user_interface_init = resolve_from_registry(
+        &registry,
+        &code,
+        super::steam_context::USER_INTERFACE_INIT_NAME,
+        super::steam_context::hk_user_interface_init as super::steam_context::UserInterfaceInitFn,
+    );
+    let d_user_interface_destructor = resolve_from_registry(
+        &registry,
+        &code,
+        super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
+        super::steam_context::hk_user_interface_destructor
+            as super::steam_context::UserInterfaceDestructorFn,
     );
     let d_ownership = resolve_from_registry(
         &registry,
@@ -462,78 +476,7 @@ fn do_install() {
     } else {
         None
     };
-    let d_set_stat_int = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::SET_STAT_INT_NAME,
-        "SetStat",
-        0,
-        2,
-        super::achievement_adapters::hook_set_stat_int as super::achievement_adapters::SetStatIntFn,
-    );
-    let d_set_stat_float = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::SET_STAT_FLOAT_NAME,
-        "SetStat",
-        1,
-        2,
-        super::achievement_adapters::hook_set_stat_float
-            as super::achievement_adapters::SetStatFloatFn,
-    );
-    let d_set_achievement = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::SET_ACHIEVEMENT_NAME,
-        "SetAchievement",
-        0,
-        1,
-        super::achievement_adapters::hook_set_achievement
-            as super::achievement_adapters::SetAchievementFn,
-    );
-    let d_clear_achievement = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
-        "ClearAchievement",
-        0,
-        1,
-        super::achievement_adapters::hook_clear_achievement
-            as super::achievement_adapters::SetAchievementFn,
-    );
-    let d_store_stats = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::STORE_STATS_NAME,
-        "StoreStats",
-        0,
-        1,
-        super::achievement_adapters::hook_store_stats as super::achievement_adapters::StoreStatsFn,
-    );
-    let d_achievement_progress = resolve_cuser_stats_adapter(
-        &code,
-        super::achievement_adapters::PROGRESS_NAME,
-        "IndicateAchievementProgress",
-        0,
-        1,
-        super::achievement_adapters::hook_progress
-            as super::achievement_adapters::IndicateAchievementProgressFn,
-    );
-    super::achievement_adapters::register_remote_apply_targets(
-        d_set_achievement
-            .as_ref()
-            .map_or(0, |detour| detour.callee_addr),
-        d_clear_achievement
-            .as_ref()
-            .map_or(0, |detour| detour.callee_addr),
-        d_store_stats
-            .as_ref()
-            .map_or(0, |detour| detour.callee_addr),
-        d_achievement_progress
-            .as_ref()
-            .map_or(0, |detour| detour.callee_addr),
-    );
-    super::current_app::resolve(
-        &code,
-        d_achievement_progress
-            .as_ref()
-            .map(|detour| detour.callee_addr),
-    );
+    super::current_app::resolve(&code);
     let d_get_pkg_info = if package_injection_supported() {
         package_info::create_detour()
     } else {
@@ -560,14 +503,6 @@ fn do_install() {
         "IsUserSubscribedAppInTicket",
         check_ownership,
         super::ticket::hk_is_subscribed_in_ticket as super::ticket::IsSubscribedInTicketFn,
-    );
-    let d_request_enc = resolve_cuser_adapter(
-        &code,
-        super::eticket::REQUEST_ENCRYPTED_NAME,
-        "RequestEncryptedAppTicket",
-        check_ownership,
-        super::eticket::hk_request_encrypted_app_ticket
-            as super::eticket::RequestEncryptedAppTicketFn,
     );
     let d_get_enc = resolve_cuser_adapter(
         &code,
@@ -600,13 +535,10 @@ fn do_install() {
         "CCMConnection::RecvPkt",
         super::network::hk_recv_pkt as super::network::RecvPktFn,
     );
-    let d_post_work_item = resolve_from_registry(
-        &registry,
-        &code,
-        "CWorkThreadPool::PostWorkItem",
-        super::network::hk_post_work_item as super::network::WebSocketWorkerPostItemFn,
-    );
     super::network::resolve_native_packet_functions(&registry, &code);
+    vapor_forge_features::inject_wake::set_injection_generation_provider(Box::new(|| {
+        super::network::injection_generation()
+    }));
     // Route each response source's completion straight to its own injection
     // dispatch, so a fabricated response is delivered the moment it is ready
     // instead of waiting for the next inbound packet.
@@ -665,34 +597,26 @@ fn do_install() {
         };
     }
     #[cfg_attr(not(target_pointer_width = "32"), allow(unused_mut))]
-    let hook_results = vec![
-        hr!("CSteamEngine::Init", d_steam_engine_init),
+    let mut hook_results = vec![
+        hr!("CSteamEngine::SetAPICallResult", d_set_api_call_result),
+        hr!(
+            "CSteamEngine::RegisterInternalCallback",
+            d_register_internal_callback
+        ),
+        hr!(super::user::GET_STEAM_ID_NAME, d_get_steam_id),
+        hr!(
+            super::steam_context::USER_INTERFACE_INIT_NAME,
+            d_user_interface_init
+        ),
+        hr!(
+            super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
+            d_user_interface_destructor
+        ),
         hr!("CUser::CheckAppOwnership", d_ownership),
         hr!("CUser::GetSubscribedApps", d_subscribed),
         hr!("IClientRemoteStorage::RunIPCFrame", d_remote_storage_ipc),
         hr!("IClientAppManager::RunIPCFrame", d_app_mgr_ipc),
         hr!("IClientApps::RunIPCFrame", d_client_apps_ipc),
-        hr!(
-            super::achievement_adapters::SET_STAT_INT_NAME,
-            d_set_stat_int
-        ),
-        hr!(
-            super::achievement_adapters::SET_STAT_FLOAT_NAME,
-            d_set_stat_float
-        ),
-        hr!(
-            super::achievement_adapters::SET_ACHIEVEMENT_NAME,
-            d_set_achievement
-        ),
-        hr!(
-            super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
-            d_clear_achievement
-        ),
-        hr!(super::achievement_adapters::STORE_STATS_NAME, d_store_stats),
-        hr!(
-            super::achievement_adapters::PROGRESS_NAME,
-            d_achievement_progress
-        ),
         HookResult {
             name: package_info::hook_name(),
             installed: d_get_pkg_info.is_some(),
@@ -704,7 +628,6 @@ fn do_install() {
         ),
         hr!("IClientUser::BUpdateAppOwnershipTicket", d_update_ticket),
         hr!("IClientUser::IsUserSubscribedAppInTicket", d_is_sub_ticket),
-        hr!("IClientUser::RequestEncryptedAppTicket", d_request_enc),
         hr!("IClientUser::GetEncryptedAppTicket", d_get_enc),
         hr!("BuildDepotDependency", d_build_depot),
         hr!("LoadDepotDecryptionKey", d_depot_key),
@@ -713,20 +636,51 @@ fn do_install() {
             d_send_frame
         ),
         hr!("CCMConnection::RecvPkt", d_recv_pkt),
-        hr!("CWorkThreadPool::PostWorkItem", d_post_work_item),
         hr!(super::cloud_http::HTTP_JOB_START_NAME, d_http_job_start),
         hr!("CConfigStore::WriteVdfFile", d_write_vdf),
         hr!("CUser::BuildSpawnEnvBlock", d_build_spawn_env),
         hr!("CUser::SpawnProcess", d_spawn_process),
     ];
 
-    // Phase 2: PIC-repair all trampolines, then enable.
-    // SAFETY: each static is written exactly once during init.
+    // Finalize and enable the resolved detours.
+    // SAFETY: each static is written once during initialization.
     unsafe {
-        detour::store_and_finalize(
-            "CSteamEngine::Init",
-            std::ptr::addr_of_mut!(super::eticket::STEAM_ENGINE_INIT_DETOUR),
-            d_steam_engine_init,
+        let api_call_result_ready = detour::store_and_finalize(
+            "CSteamEngine::SetAPICallResult",
+            std::ptr::addr_of_mut!(super::callback_notify::SET_API_CALL_RESULT_DETOUR),
+            d_set_api_call_result,
+        );
+        let internal_callback_ready = detour::store_and_finalize(
+            "CSteamEngine::RegisterInternalCallback",
+            std::ptr::addr_of_mut!(super::internal_callbacks::REGISTER_INTERNAL_CALLBACK_DETOUR),
+            d_register_internal_callback,
+        );
+        let get_steam_id_ready = detour::store_and_finalize(
+            super::user::GET_STEAM_ID_NAME,
+            std::ptr::addr_of_mut!(super::user::GET_STEAM_ID_DETOUR),
+            d_get_steam_id,
+        );
+        let user_interface_init_ready = detour::store_and_finalize(
+            super::steam_context::USER_INTERFACE_INIT_NAME,
+            std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_INIT_DETOUR),
+            d_user_interface_init,
+        );
+        let user_interface_destructor_ready = detour::store_and_finalize(
+            super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
+            std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_DESTRUCTOR_DETOUR),
+            d_user_interface_destructor,
+        );
+        hook_results[0].installed = api_call_result_ready;
+        hook_results[1].installed = internal_callback_ready;
+        hook_results[2].installed = get_steam_id_ready;
+        hook_results[3].installed = user_interface_init_ready;
+        hook_results[4].installed = user_interface_destructor_ready;
+        super::callback_notify::set_hooks_ready(
+            api_call_result_ready
+                && internal_callback_ready
+                && get_steam_id_ready
+                && user_interface_init_ready
+                && user_interface_destructor_ready,
         );
         detour::store_and_finalize(
             "CUser::CheckAppOwnership",
@@ -754,36 +708,6 @@ fn do_install() {
             d_client_apps_ipc,
         );
         detour::store_and_finalize(
-            super::achievement_adapters::SET_STAT_INT_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::SET_STAT_INT_DETOUR),
-            d_set_stat_int,
-        );
-        detour::store_and_finalize(
-            super::achievement_adapters::SET_STAT_FLOAT_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::SET_STAT_FLOAT_DETOUR),
-            d_set_stat_float,
-        );
-        detour::store_and_finalize(
-            super::achievement_adapters::SET_ACHIEVEMENT_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::SET_ACHIEVEMENT_DETOUR),
-            d_set_achievement,
-        );
-        detour::store_and_finalize(
-            super::achievement_adapters::CLEAR_ACHIEVEMENT_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::CLEAR_ACHIEVEMENT_DETOUR),
-            d_clear_achievement,
-        );
-        detour::store_and_finalize(
-            super::achievement_adapters::STORE_STATS_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::STORE_STATS_DETOUR),
-            d_store_stats,
-        );
-        detour::store_and_finalize(
-            super::achievement_adapters::PROGRESS_NAME,
-            std::ptr::addr_of_mut!(super::achievement_adapters::PROGRESS_DETOUR),
-            d_achievement_progress,
-        );
-        detour::store_and_finalize(
             package_info::hook_name(),
             std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
             d_get_pkg_info,
@@ -802,11 +726,6 @@ fn do_install() {
             "IClientUser::IsUserSubscribedAppInTicket",
             std::ptr::addr_of_mut!(super::ticket::IS_SUBSCRIBED_IN_TICKET_DETOUR),
             d_is_sub_ticket,
-        );
-        detour::store_and_finalize(
-            "IClientUser::RequestEncryptedAppTicket",
-            std::ptr::addr_of_mut!(super::eticket::REQUEST_ENCRYPTED_DETOUR),
-            d_request_enc,
         );
         detour::store_and_finalize(
             "IClientUser::GetEncryptedAppTicket",
@@ -832,11 +751,6 @@ fn do_install() {
             "CCMConnection::RecvPkt",
             std::ptr::addr_of_mut!(super::network::RECV_PKT_DETOUR),
             d_recv_pkt,
-        );
-        detour::store_and_finalize(
-            "CWorkThreadPool::PostWorkItem",
-            std::ptr::addr_of_mut!(super::network::POST_WORK_ITEM_DETOUR),
-            d_post_work_item,
         );
         detour::store_and_finalize(
             super::cloud_http::HTTP_JOB_START_NAME,

@@ -321,6 +321,7 @@ fn read_cstr(data: &[u8], pos: &mut usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn parse_kv1_flat_pairs() {
@@ -369,6 +370,52 @@ mod tests {
         );
 
         *RP_KVS.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn persona_rewrite_preserves_non_game_fields() {
+        *RP_KVS.lock().unwrap() = None;
+        let message = vapor_forge_steam_protocol::ClientPersonaState {
+            status_flags: Some(7),
+            friends: vec![vapor_forge_steam_protocol::PersonaStateFriend {
+                friendid: Some(76561198000000000),
+                player_name: Some("player".into()),
+                avatar_hash: Some(vec![1, 2, 3]),
+                clan_data: Some(vapor_forge_steam_protocol::PersonaStateClanData {
+                    ogg_app_id: Some(570),
+                    chat_group_id: Some(9),
+                }),
+                other_game_data: vec![vapor_forge_steam_protocol::PersonaStateOtherGameData {
+                    gameid: Some(730),
+                    rich_presence: vec![vapor_forge_steam_protocol::PersonaStateKV {
+                        key: Some("status".into()),
+                        value: Some("other".into()),
+                    }],
+                }],
+                watching_broadcast_title: Some("broadcast".into()),
+                gaming_device_type: Some(2),
+                ..Default::default()
+            }],
+        };
+
+        let mut decoded = vapor_forge_steam_protocol::ClientPersonaState::decode(
+            message.encode_to_vec().as_slice(),
+        )
+        .unwrap();
+        apply_game_fields(&mut decoded.friends[0], AppId(480));
+        let rewritten = vapor_forge_steam_protocol::ClientPersonaState::decode(
+            decoded.encode_to_vec().as_slice(),
+        )
+        .unwrap();
+        let entry = &rewritten.friends[0];
+
+        assert_eq!(entry.game_played_app_id, Some(480));
+        assert_eq!(entry.player_name.as_deref(), Some("player"));
+        assert_eq!(entry.avatar_hash.as_deref(), Some([1, 2, 3].as_slice()));
+        assert_eq!(entry.clan_data.as_ref().unwrap().chat_group_id, Some(9));
+        assert_eq!(entry.other_game_data[0].gameid, Some(730));
+        assert_eq!(entry.watching_broadcast_title.as_deref(), Some("broadcast"));
+        assert_eq!(entry.gaming_device_type, Some(2));
     }
 
     #[test]

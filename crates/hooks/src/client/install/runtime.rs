@@ -138,17 +138,20 @@ pub(crate) fn script_state() -> Arc<ScriptState> {
 }
 
 pub(crate) fn ensure_runtime_services_for_config(config: &RuntimeConfig) {
+    crate::cloud_backend::refresh(config);
     if config.local_cloud_configured() || config.cumulus_configured() {
         crate::achievement_worker::ensure_started();
         crate::playtime_worker::ensure_started();
-        crate::downsync_worker::ensure_started();
+    }
+    if config.cumulus_configured() {
+        crate::playtime_downlink_worker::ensure_started();
+        crate::stats_wakeup_worker::ensure_started();
     }
     ensure_ipc_server_for_config(config);
 }
 
 fn ensure_ipc_server_for_config(config: &RuntimeConfig) {
-    if (!config.ticket.auto_delegate && !config.cumulus_configured()) || IPC_SERVER.get().is_some()
-    {
+    if !game_bridge_required(config) || IPC_SERVER.get().is_some() {
         return;
     }
     if crate::client::env::resolve_helper_path(&config.library_inject.helper_path).is_none() {
@@ -158,6 +161,10 @@ fn ensure_ipc_server_for_config(config: &RuntimeConfig) {
     if let Some(server) = crate::ipc_server::IpcServer::start() {
         let _ = IPC_SERVER.set(server);
     }
+}
+
+fn game_bridge_required(config: &RuntimeConfig) -> bool {
+    config.ticket.auto_delegate
 }
 
 pub(crate) fn package_state() -> &'static vapor_forge_features::package::PackageState {
@@ -433,5 +440,19 @@ mod tests {
 
         assert_eq!(snapshot.avatar_map.get(&AppId(480)), Some(&AppId(20)));
         assert_eq!(snapshot.avatar_map.get(&AppId(481)), Some(&AppId(11)));
+    }
+
+    #[test]
+    fn game_bridge_is_only_required_for_auto_delegate() {
+        let mut config = RuntimeConfig::default();
+        assert!(!game_bridge_required(&config));
+
+        config.cloud.server_url = "https://cumulus.example".into();
+        config.cloud.token = "token".into();
+        assert!(config.cumulus_configured());
+        assert!(!game_bridge_required(&config));
+
+        config.ticket.auto_delegate = true;
+        assert!(game_bridge_required(&config));
     }
 }

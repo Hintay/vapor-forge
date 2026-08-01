@@ -5,39 +5,47 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# The debug API and packet-capture adapter also compile under `cfg(test)` on
+# other hosts; everything else is Linux-only and lives in the target table.
 [dependencies]
-iced-x86.workspace = true
-libc.workspace = true
 serde_json.workspace = true
-vapor-forge-hook-boundary = { path = "../hook-boundary" }
-vapor-forge-packet-capture = { path = "../packet-capture" }
+sha2.workspace = true
+vapor-forge-packet-capture = { path = "../packet-capture", features = ["json"] }
 
 [dev-dependencies]
+iced-x86.workspace = true
+prost.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+vapor-forge-cloud-core = { path = "../cloud-core" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
+vapor-forge-steam-protocol = { path = "../steam-protocol" }
 
 [target.'cfg(target_family = "unix")'.dev-dependencies]
 vapor-forge-features = { path = "../features" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arc-swap.workspace = true
+iced-x86.workspace = true
 inotify.workspace = true
+libc.workspace = true
 once_cell.workspace = true
 tracing.workspace = true
+vapor-forge-core = { path = "../runtime-core" }
 vapor-forge-hook-engine = { path = "../hook-engine" }
 vapor-forge-steam-native-abi = { path = "../steam-native-abi" }
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-cloud-core = { path = "../cloud-core" }
 vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
 vapor-forge-cloud-local = { path = "../cloud-local" }
+vapor-forge-cloud-rpc = { path = "../cloud-rpc" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-features = { path = "../features" }
 vapor-forge-memory = { path = "../memory" }
 vapor-forge-patterns = { path = "../patterns" }
-vapor-forge-sync-state = { path = "../sync-state" }
+vapor-forge-sync-journal = { path = "../sync-journal" }
 prost.workspace = true
 vapor-forge-scripting = { path = "../scripting" }
 vapor-forge-game-bridge = { path = "../game-bridge" }

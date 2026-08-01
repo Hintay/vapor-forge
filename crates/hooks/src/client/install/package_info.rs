@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error};
 use vapor_forge_hook_engine::detour::Detour;
 
-use vapor_forge_hook_engine::detour::{self, CodeRegion, PendingDetour};
+use crate::pattern_resolver::CodeRegion;
+use vapor_forge_hook_engine::detour::{self, PendingDetour};
 
 pub(super) type GetPackageInfoHookFn = vapor_forge_steam_native_abi::GetPackageInfoArchFn;
 
@@ -108,23 +109,26 @@ pub(super) fn create_detour() -> Option<PendingDetour<GetPackageInfoHookFn>> {
 
     let replacement_addr = replacement as *const () as usize;
     let hook_name = hook_name();
-    if let Some((base, end)) = super::steamclient_code_range() {
-        // SAFETY: steamclient_code_range is populated from the executable
-        // steamclient.so mapping and kept for validation only.
-        let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, end - base) };
-        if let Err(e) = super::validate_hook_eligibility(
-            hook_name,
-            addr,
-            replacement_addr,
-            &CodeRegion { base, bytes },
-        ) {
-            error!(hook = hook_name, error = %e, "hook boundary validation failed");
-            return None;
-        }
-    }
+    let (base, end) = super::steamclient_code_range().or_else(|| {
+        error!(
+            hook = hook_name,
+            "hook boundary validation failed: code range unavailable"
+        );
+        None
+    })?;
+    // SAFETY: this range was captured from steamclient's executable mapping.
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, end - base) };
+    let plan = super::validate_hook_eligibility(
+        hook_name,
+        addr,
+        replacement_addr,
+        &CodeRegion { base, bytes },
+    )
+    .inspect_err(|error| {
+        error!(hook = hook_name, %error, "hook boundary validation failed");
+    })
+    .ok()?;
 
-    // SAFETY: addr is a validated code address.
-    let target: GetPackageInfoHookFn = unsafe { std::mem::transmute(addr) };
-    // SAFETY: target is valid.
-    unsafe { detour::create_detour(hook_name, target, addr, replacement) }
+    // SAFETY: the validated target and typed replacement share the package-info ABI.
+    unsafe { detour::create_detour(hook_name, plan) }
 }
