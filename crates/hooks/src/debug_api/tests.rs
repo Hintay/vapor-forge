@@ -224,10 +224,6 @@ fn command_parser_normalizes_known_commands() {
     );
     assert_eq!(parse_command("inject-self"), DebugCommand::NativeInjectSelf);
     assert_eq!(
-        parse_command("game-action-probe status"),
-        DebugCommand::GameActionProbe("status")
-    );
-    assert_eq!(
         parse_command("toast hello"),
         DebugCommand::Toast(ToastArgs::Fields("hello"))
     );

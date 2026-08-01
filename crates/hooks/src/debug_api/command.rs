@@ -25,8 +25,6 @@ pub(crate) enum DebugCommand<'a> {
     Log(&'a str),
     NativeInject,
     NativeInjectSelf,
-    #[cfg(debug_assertions)]
-    GameActionProbe(&'a str),
     Toast(ToastArgs<'a>),
     Unknown(&'a str),
 }
@@ -83,8 +81,6 @@ fn dispatch_local(target: DebugTarget, command: &str, json: bool) -> String {
         DebugCommand::Log(level) => log_response(level, json),
         DebugCommand::NativeInject => native_inject_response(json),
         DebugCommand::NativeInjectSelf => native_inject_self_response(json),
-        #[cfg(debug_assertions)]
-        DebugCommand::GameActionProbe(args) => game_action_probe_response(target, args),
         DebugCommand::Toast(args) => queue_toast_command(target, args),
         DebugCommand::Unknown(command) => format!("err unknown command: {command}"),
     }
@@ -153,14 +149,6 @@ pub(crate) fn parse_command(command: &str) -> DebugCommand<'_> {
     }
     if trimmed == "native-inject" || trimmed == "inject" {
         return DebugCommand::NativeInject;
-    }
-    #[cfg(debug_assertions)]
-    if trimmed == "game-action-probe" {
-        return DebugCommand::GameActionProbe("");
-    }
-    #[cfg(debug_assertions)]
-    if let Some(args) = trimmed.strip_prefix("game-action-probe ") {
-        return DebugCommand::GameActionProbe(args.trim());
     }
     if trimmed == "toast" {
         return DebugCommand::Toast(ToastArgs::Default);
@@ -235,36 +223,6 @@ fn queue_toast_fields(args: &str) -> Result<String, String> {
     ))
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
-fn game_action_probe_response(target: DebugTarget, args: &str) -> String {
-    if target != DebugTarget::SteamUi {
-        return "err game-action-probe is a steamui command".to_owned();
-    }
-    if args == "status" {
-        let status = crate::ui::game_action_probe::status();
-        return format!(
-            "ok hit={} native_next={:#x} active_count={} active_min={:#x} active_max={:#x}",
-            status.hit,
-            status.native_next_handle,
-            status.active_handle_count,
-            status.active_handle_min,
-            status.active_handle_max
-        );
-    }
-    if !args.is_empty() && args != "run" {
-        return "err usage: game-action-probe [run|status]".to_owned();
-    }
-
-    let handle = crate::ui::game_action_probe::arm();
-    crate::ui::toast_bridge::request_game_action_probe(handle);
-    format!("ok queued handle={handle:#x}")
-}
-
-#[cfg(all(debug_assertions, not(target_os = "linux")))]
-fn game_action_probe_response(_target: DebugTarget, _args: &str) -> String {
-    "err game-action-probe requires Linux".to_owned()
-}
-
 #[cfg(target_os = "linux")]
 fn request_target_pump(target: DebugTarget) {
     if target == DebugTarget::SteamUi {
@@ -294,8 +252,6 @@ fn help_response() -> String {
     out.push_str("  log [level]           query or set log level\n");
     out.push_str("  native-inject         arm a native dispatch self-test\n");
     out.push_str("  native-inject-self    dispatch a captured packet from our own thread\n");
-    #[cfg(debug_assertions)]
-    out.push_str("  game-action-probe     verify SteamUI-to-native game action dispatch\n");
     out.push_str("  dump/status           toast subsystem status\n");
     out.push_str("  toast [args]          queue a toast notification\n");
     out.push('\n');

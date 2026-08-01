@@ -367,16 +367,6 @@ const STEAMUI32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         label: "google::protobuf::RepeatedField<uint32>::Add body",
         validate: validate_repeated_field_add32,
     },
-    SemanticCheck {
-        name: "CGameActionController::ContinueGameAction",
-        label: "CGameActionController::ContinueGameAction body",
-        validate: validate_continue_game_action32,
-    },
-    SemanticCheck {
-        name: "CGameActionController::RegisterGameAction",
-        label: "CGameActionController::RegisterGameAction body",
-        validate: validate_register_game_action32,
-    },
 ];
 
 const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
@@ -2457,9 +2447,6 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86_64, "CSteamEngine::RegisterInternalCallback") => {
             register_internal_callback64_evidence(code, offset)
-        }
-        (SemanticArch::X86, "CGameActionController::RegisterGameAction") => {
-            register_game_action32_evidence(code, offset)
         }
         (SemanticArch::X86, "CUserInterface::Init") => user_interface_init32_evidence(code, offset),
         (SemanticArch::X86_64, "CUserInterface::Init") => {
@@ -5168,64 +5155,6 @@ fn repeated_field_add32_evidence(code: &[u8], offset: usize) -> Option<Evidence>
             has_asm32(bytes, |a| a.lea(edi, dword_ptr(esi + 0x01)))
                 || has_asm32(bytes, |a| a.mov(dword_ptr(eax + esi * 4), edx)),
         ),
-    ]))
-}
-
-fn validate_continue_game_action32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        continue_game_action32_evidence(code, offset),
-        "game action handle dispatch",
-    )
-}
-
-fn continue_game_action32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x90)?;
-    Some(Evidence::required([
-        (
-            "controller and action arguments",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esp + 0x10)))
-                && has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x18))),
-        ),
-        (
-            "active action vector",
-            has_asm32(bytes, |a| a.mov(ebx, dword_ptr(eax + 0x38)))
-                && has_asm32(bytes, |a| a.mov(esi, dword_ptr(eax + 0x2C))),
-        ),
-        (
-            "handle and active flag match",
-            has_asm32(bytes, |a| a.cmp(ecx, dword_ptr(edx + 0x08)))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(edx + 0x0C), 0)),
-        ),
-        (
-            "action virtual dispatch",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x10)))
-                && has_asm32(bytes, |a| a.jmp(eax)),
-        ),
-    ]))
-}
-
-fn validate_register_game_action32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        register_game_action32_evidence(code, offset),
-        "game action handle allocation",
-    )
-}
-
-fn register_game_action32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    Some(Evidence::required([
-        (
-            "active action iteration",
-            has_seq(bytes, &[0x8b, 0x5d, 0x38]) && has_seq(bytes, &[0x8b, 0x45, 0x2c]),
-        ),
-        (
-            "next handle increment",
-            has_seq(bytes, &[0x8b, 0x45, 0x28])
-                && has_seq(bytes, &[0x8d, 0x50, 0x01])
-                && has_seq(bytes, &[0x89, 0x55, 0x28]),
-        ),
-        ("handle assignment", has_seq(bytes, &[0x89, 0x43, 0x08])),
-        ("action append", has_seq(bytes, &[0x89, 0x14, 0x18])),
     ]))
 }
 

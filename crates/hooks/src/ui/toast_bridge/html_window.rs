@@ -62,6 +62,49 @@ pub(super) fn execute_javascript(script: &str) -> bool {
     true
 }
 
+pub(crate) fn html_windows() -> Vec<usize> {
+    let Some(maps) = read_maps() else {
+        return Vec::new();
+    };
+    find_html_windows(&maps).unwrap_or_default()
+}
+
+pub(crate) fn execute_javascript_on(window: usize, script: &str) -> bool {
+    let Some(maps) = read_maps() else {
+        return false;
+    };
+    let Some(vtable) = resolve_html_window_vtable(&maps) else {
+        return false;
+    };
+    if !is_html_window_candidate(window, vtable, &maps) {
+        return false;
+    }
+    let exec_addr = EXEC_JS_ADDR.load(Ordering::Acquire);
+    if !is_executable_addr(exec_addr, &maps) {
+        return false;
+    }
+    let Ok(script) = std::ffi::CString::new(script) else {
+        return false;
+    };
+    // SAFETY: the window and slot are validated against the current mappings.
+    let execute: ExecuteJavaScriptFn = unsafe { std::mem::transmute(exec_addr) };
+    // SAFETY: the string remains live for the synchronous Steam call.
+    unsafe { execute(window as *mut c_void, script.as_ptr()) };
+    true
+}
+
+#[cfg(target_pointer_width = "32")]
+pub(crate) fn register_js_method_address() -> Option<usize> {
+    const REGISTER_JS_METHOD_SLOT: usize = 6;
+    let maps = read_maps()?;
+    let vtable = resolve_html_window_vtable(&maps)?;
+    let address = read_usize(
+        vtable + REGISTER_JS_METHOD_SLOT * std::mem::size_of::<usize>(),
+        &maps,
+    )?;
+    is_executable_addr(address, &maps).then_some(address)
+}
+
 fn find_html_windows(maps: &[MapsEntry]) -> Option<Vec<usize>> {
     let vtable = resolve_html_window_vtable(maps)?;
 

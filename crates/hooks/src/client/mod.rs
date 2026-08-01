@@ -23,6 +23,9 @@ pub(crate) mod user;
 pub(crate) mod user_stats;
 
 pub(crate) fn reset_account_state() {
+    if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
+        queue.cancel_pending_conflicts();
+    }
     network::invalidate_injection_context();
     steam_context::invalidate_identity();
     package::reset_account_state();

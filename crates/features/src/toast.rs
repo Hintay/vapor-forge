@@ -285,12 +285,33 @@ mod tests {
     #[test]
     fn bridge_uses_general_notification_type_by_default() {
         let script = bridge_script();
-        assert!(script.contains("version === 1"));
-        assert!(script.contains("version: 1"));
+        assert!(script.contains("version === 11"));
+        assert!(script.contains("version: 11"));
         assert!(script.contains("eType: toast.eType || 31"));
         assert!(script.contains("function allocateNotificationId(toast)"));
         assert!(script.contains("notificationID: id"));
         assert!(script.contains("nNotificationID: id"));
+    }
+
+    #[test]
+    fn cloud_conflict_bridge_resumes_the_public_game_action() {
+        let script = bridge_script();
+        assert!(script.contains("SteamClient.Apps.GetGameActionForApp"));
+        assert!(script.contains("SteamClient.Apps.VaporForgeResolveCloudConflict"));
+        assert!(script.contains("'aria-disabled': 'true'"));
+        assert!(script.contains("IgnorePendingCloudSessions"));
+        assert!(script.contains("SteamClient.Apps.CancelGameAction"));
+        assert!(script.contains("new Observer"));
+        assert!(script.contains("ActiveWindowInstance.BrowserWindow"));
+        assert!(script.contains("targetDocument.querySelectorAll"));
+        assert!(script.contains("customOverlay.classList.contains('inactive')"));
+        assert!(script.contains("activeDialog.close()"));
+        assert!(script.contains("activeDialog.remove()"));
+        assert!(script.contains("restoreNativeCloudDialog(appId)"));
+        assert!(script.contains("customDialog.showModal()"));
+        assert!(script.contains("bridge.cloudObserver.disconnect()"));
+        assert!(script.contains("bridge.cloudEpoch[key] !== epoch"));
+        assert!(!script.contains("synthetic"));
     }
 
     #[test]

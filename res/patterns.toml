@@ -269,13 +269,3 @@ optional = true
 
 [[steamui."CUpdateManager::MarkAppChange".variants]]
 pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C 8B 75 0C 8B 5D 10 89 45 D4 8B 80 E0 09 00 00 85 F6 0F 94 C1 85 DB 8B 00 0F 94 C2 09 D1 89 CF 85 C0 0F 85 ? ? ? ? C7 45 DC 00 00 00 00 84 C9"
-
-[steamui."CGameActionController::ContinueGameAction"]
-follow = "none"
-pattern = "57 56 53 8B 4C 24 14 E8 ? ? ? ? 81 C3 ? ? ? ? 8B 44 24 10 8B 7C 24 18 85 C9 74 ? 8B 58 38 85 DB 7E ? 8B 70 2C 31 C0 EB 0B ? ? ? ? 83 C0 01 39 D8 74 ? 8B 14 86 3B 4A 08 75 F1 80 7A 0C 00 74 EB 8B 02 89 7C 24 14 89 54 24 10 5B 5E 5F 8B 40 10 FF E0"
-optional = true
-
-[steamui."CGameActionController::RegisterGameAction"]
-follow = "none"
-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 57 56 53 83 EC 2C 8B 6C 24 40 89 44 24 0C 8B 44 24 44 89 44 24 04 85 C0 0F 84 ? ? ? ? 8B 44 24 48 85 C0 0F 84 ? ? ? ? 8B 5D 38 31 F6 85 DB 7F ?"
-optional = true
