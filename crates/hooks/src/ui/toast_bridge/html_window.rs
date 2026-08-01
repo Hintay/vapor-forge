@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 use tracing::{info, warn};
 
+use super::monotonic_ns;
+
 type ExecuteJavaScriptFn = unsafe extern "C" fn(*mut c_void, *const c_char);
 
 const CHTML_WINDOW_RTTI_NAME: &[u8] = b"11CHTMLWindow\0";
@@ -477,20 +479,6 @@ fn parse_maps_line(line: &str) -> Option<MapsEntry> {
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
-}
-
-fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: clock_gettime writes to the provided timespec pointer.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(ts.tv_nsec as u64)
 }
 
 #[cfg(test)]

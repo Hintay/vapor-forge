@@ -19,7 +19,9 @@ use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_steam_native_abi::steamui::CSteamApp;
 
 use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
+use crate::pattern_resolver::{resolve_pattern_entry, CodeRegion};
 use vapor_forge_hook_engine::original::detour_or_return;
+use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTargetInput};
 
 pub use super::library::queue_removal;
 use super::state::{
@@ -151,7 +153,7 @@ unsafe extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags:
 
 /// Install the steamui.so hooks after the loader reaches a consistent state.
 pub fn install(
-    steamui_code: &vapor_forge_hook_engine::detour::CodeRegion,
+    steamui_code: &CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> bool {
     use vapor_forge_hook_engine::detour;
@@ -176,7 +178,7 @@ pub fn install(
             }
         };
         let short = name.rsplit("::").next().unwrap_or(name);
-        match detour::resolve_pattern_entry(steamui_code, short, &entry) {
+        match resolve_pattern_entry(steamui_code, short, &entry) {
             Some(a) => addrs[i] = a,
             None => {
                 warn!(name, "steamui: pattern not found in steamui.so");
@@ -189,10 +191,23 @@ pub fn install(
         ($name:expr, $addr:expr, $fn:expr, $ty:ty, $slot:ident) => {{
             let mut installed = false;
             if $addr != 0 {
-                // SAFETY: $addr was resolved from steamui.so code for this function signature.
-                let target: $ty = unsafe { std::mem::transmute($addr) };
-                // SAFETY: target and replacement use the same function pointer type.
-                let pending = unsafe { detour::create_detour::<$ty>($name, target, $addr, $fn) };
+                let replacement_address = $fn as *const () as usize;
+                let plan = validate_hook_target(HookTargetInput {
+                    target_address: $addr,
+                    replacement_address,
+                    executable_range: AddressRange {
+                        start: steamui_code.base,
+                        end: steamui_code.base + steamui_code.bytes.len(),
+                    },
+                })
+                .inspect_err(|error| {
+                    warn!(hook = $name, %error, "steamui hook validation failed");
+                })
+                .ok();
+                // SAFETY: the pattern-resolved target and typed replacement share $ty.
+                let pending = plan.and_then(|plan| unsafe {
+                    detour::create_detour::<$ty>($name, plan)
+                });
                 // SAFETY: single-threaded init writes each detour slot once.
                 installed = unsafe {
                     detour::store_and_finalize($name, std::ptr::addr_of_mut!($slot), pending)
@@ -289,6 +304,9 @@ pub fn install(
         hook_results[5].installed = true;
     }
 
+    #[cfg(debug_assertions)]
+    hook_results.push(super::game_action_probe::install(steamui_code, registry));
+
     INSTALLED.store(true, Ordering::Release);
 
     if !all_found {
@@ -332,11 +350,11 @@ fn maybe_show_init_toast() {
 
 /// Resolve RepeatedField<uint32>::Add from steamui.so.
 fn resolve_repeated_field_add(
-    steamui_code: &vapor_forge_hook_engine::detour::CodeRegion,
+    steamui_code: &CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let entry = registry.get("google::protobuf::RepeatedField<uint32>::Add")?;
-    let addr = vapor_forge_hook_engine::detour::resolve_pattern_entry(
+    let addr = resolve_pattern_entry(
         steamui_code,
         "google::protobuf::RepeatedField<uint32>::Add",
         &entry,
@@ -363,10 +381,7 @@ fn resolve_repeated_field_add(
 }
 
 #[cfg(target_pointer_width = "64")]
-fn is_repeated_field_u32_add_abi(
-    code: &vapor_forge_hook_engine::detour::CodeRegion,
-    addr: usize,
-) -> bool {
+fn is_repeated_field_u32_add_abi(code: &CodeRegion, addr: usize) -> bool {
     let Some(offset) = addr.checked_sub(code.base) else {
         return false;
     };
@@ -379,7 +394,7 @@ fn is_repeated_field_u32_add_abi(
 }
 
 /// Resolve steamui.so code region from /proc/self/maps.
-pub fn get_steamui_code() -> Option<vapor_forge_hook_engine::detour::CodeRegion> {
+pub fn get_steamui_code() -> Option<CodeRegion> {
     use vapor_forge_memory::find_proc_self_maps_targets;
 
     let entries = find_proc_self_maps_targets(64).ok()?;
@@ -391,5 +406,5 @@ pub fn get_steamui_code() -> Option<vapor_forge_hook_engine::detour::CodeRegion>
     let size = exec_entry.range.size;
     // SAFETY: reading the executable mapping of steamui.so.
     let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    Some(vapor_forge_hook_engine::detour::CodeRegion { base, bytes })
+    Some(CodeRegion { base, bytes })
 }

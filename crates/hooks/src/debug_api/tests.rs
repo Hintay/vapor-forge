@@ -201,6 +201,11 @@ fn command_parser_normalizes_known_commands() {
     assert_eq!(parse_command("config"), DebugCommand::Config);
     assert_eq!(parse_command("hooks"), DebugCommand::Hooks);
     assert_eq!(parse_command("apps"), DebugCommand::Apps);
+    assert_eq!(parse_command("stats"), DebugCommand::Stats(""));
+    assert_eq!(
+        parse_command("stats refresh 620"),
+        DebugCommand::Stats("refresh 620")
+    );
     assert_eq!(parse_command("pkg0"), DebugCommand::Pkg0);
     assert_eq!(parse_command("packet"), DebugCommand::Packet(""));
     assert_eq!(
@@ -218,6 +223,10 @@ fn command_parser_normalizes_known_commands() {
         DebugCommand::NativeInjectSelf
     );
     assert_eq!(parse_command("inject-self"), DebugCommand::NativeInjectSelf);
+    assert_eq!(
+        parse_command("game-action-probe status"),
+        DebugCommand::GameActionProbe("status")
+    );
     assert_eq!(
         parse_command("toast hello"),
         DebugCommand::Toast(ToastArgs::Fields("hello"))
