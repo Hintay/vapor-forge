@@ -19,8 +19,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("detour.rs", include_str!("../src/detour.rs")),
     ("original.rs", include_str!("../src/original.rs")),
+    ("pic_thunk.rs", include_str!("../src/pic_thunk.rs")),
+    ("plan.rs", include_str!("../src/plan.rs")),
     ("vmt.rs", include_str!("../src/vmt.rs")),
 ];
+
+const MANIFEST: &str = include_str!("../Cargo.toml");
 
 /// Strip `//` comments; comments may legitimately name a target module when
 /// explaining a SAFETY invariant.
@@ -49,5 +53,17 @@ fn engine_code_carries_no_steam_specifics() {
     assert!(
         found.is_empty(),
         "Steam specifics leaked into engine: {found:?}"
+    );
+}
+
+#[test]
+fn engine_manifest_carries_no_workspace_dependencies() {
+    let dependencies = MANIFEST
+        .split_once("[dependencies]")
+        .map(|(_, dependencies)| dependencies)
+        .unwrap_or_default();
+    assert!(
+        !dependencies.contains("vapor-forge-"),
+        "hook-engine acquired a target-specific workspace dependency"
     );
 }

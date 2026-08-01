@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use tracing::{debug, error, info};
 
+use crate::plan::ValidatedHookTarget;
+
 const INSTALL_IDLE: u8 = 0;
 const INSTALLING: u8 = 1;
 const INSTALLED: u8 = 2;
@@ -73,13 +75,13 @@ impl Drop for InstallAttempt<'_> {
 ///
 /// # Safety
 /// `this` must point to a valid C++ object with a vtable pointer as its first field.
-/// `slot` must be within the vtable bounds. The replacement function must match the
-/// slot's calling convention and signature.
+/// `slot` must be within the vtable bounds. The validated replacement function
+/// must match the slot's calling convention and signature.
 pub unsafe fn swap_vtable_slot(
     name: &str,
     this: *mut std::ffi::c_void,
     slot: usize,
-    replacement: usize,
+    target: ValidatedHookTarget,
 ) -> Option<usize> {
     if this.is_null() {
         error!(hook = name, "VMT swap failed: this is null");
@@ -97,6 +99,16 @@ pub unsafe fn swap_vtable_slot(
     let slot_ptr = unsafe { vtable.add(slot) };
     // SAFETY: slot_ptr was derived from the validated vtable and slot index.
     let original = unsafe { *slot_ptr };
+    if original != target.target_address {
+        error!(
+            hook = name,
+            planned = format_args!("0x{:x}", target.target_address),
+            actual = format_args!("0x{original:x}"),
+            "VMT swap failed: slot changed after validation"
+        );
+        return None;
+    }
+    let replacement = target.replacement_address;
 
     debug!(
         hook = name,
@@ -143,6 +155,7 @@ pub unsafe fn swap_vtable_slot(
 #[cfg(test)]
 mod tests {
     use super::InstallGate;
+    use crate::plan::{validate_hook_target, AddressRange, HookTargetInput};
 
     #[test]
     fn install_gate_retries_failure_and_commits_success() {
@@ -166,5 +179,28 @@ mod tests {
         assert!(gate.is_settled());
         assert!(!gate.is_installed());
         assert!(gate.begin().is_none());
+    }
+
+    #[test]
+    fn swap_rejects_a_slot_that_changed_after_validation() {
+        let vtable = [0x1200usize];
+        let object_vtable = vtable.as_ptr();
+        let this = std::ptr::addr_of!(object_vtable) as *mut std::ffi::c_void;
+        let target = validate_hook_target(HookTargetInput {
+            target_address: 0x1100,
+            replacement_address: 0x2000,
+            executable_range: AddressRange {
+                start: 0x1000,
+                end: 0x1800,
+            },
+        })
+        .unwrap();
+
+        // SAFETY: `this` points to a test-owned object with one readable slot;
+        // the mismatch returns before any memory protection or write occurs.
+        let result = unsafe { super::swap_vtable_slot("test", this, 0, target) };
+
+        assert_eq!(result, None);
+        assert_eq!(vtable[0], 0x1200);
     }
 }

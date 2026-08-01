@@ -40,6 +40,16 @@ pub struct ProcMapsModuleInventory {
     pub permissions: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessRangeQuery {
+    pub address: usize,
+    pub len: usize,
+    pub read: Option<bool>,
+    pub write: Option<bool>,
+    pub execute: Option<bool>,
+    pub file_backed: bool,
+}
+
 #[derive(Debug)]
 struct ProcMapsModuleInventoryBuilder {
     name: String,
@@ -64,6 +74,61 @@ pub fn current_process_context() -> ProcessContext {
 pub fn find_proc_self_maps_targets(max_entries: usize) -> Result<Vec<ProcMapsEntry>> {
     let maps = std::fs::read_to_string("/proc/self/maps")?;
     Ok(find_proc_maps_targets_in_text(&maps, max_entries))
+}
+
+/// Whether one current-process range is wholly contained in a mapping with the
+/// requested read/write/execute permissions.
+pub fn current_process_range_has_permissions(
+    address: usize,
+    len: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> Result<bool> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    Ok(maps.lines().filter_map(parse_proc_maps_entry).any(|entry| {
+        range_is_contained_in_entry(&entry, address, len)
+            && (!read || entry.permissions.as_bytes().first() == Some(&b'r'))
+            && (!write || entry.permissions.as_bytes().get(1) == Some(&b'w'))
+            && (!execute || entry.permissions.as_bytes().get(2) == Some(&b'x'))
+    }))
+}
+
+/// Whether one current-process range is file-backed, readable module data and
+/// cannot be modified or executed.
+pub fn current_process_range_is_readonly_data(address: usize, len: usize) -> Result<bool> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    Ok(maps.lines().filter_map(parse_proc_maps_entry).any(|entry| {
+        range_is_contained_in_entry(&entry, address, len)
+            && entry.permissions.as_bytes().first() == Some(&b'r')
+            && entry.permissions.as_bytes().get(1) != Some(&b'w')
+            && entry.permissions.as_bytes().get(2) != Some(&b'x')
+            && entry.path.starts_with('/')
+    }))
+}
+
+/// Validate several mappings against one `/proc/self/maps` snapshot.
+pub fn current_process_ranges_match(queries: &[ProcessRangeQuery]) -> Result<bool> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let entries = maps
+        .lines()
+        .filter_map(parse_proc_maps_entry)
+        .collect::<Vec<_>>();
+    Ok(queries.iter().all(|query| {
+        entries.iter().any(|entry| {
+            range_is_contained_in_entry(entry, query.address, query.len)
+                && query.read.map_or(true, |expected| {
+                    (entry.permissions.as_bytes().first() == Some(&b'r')) == expected
+                })
+                && query.write.map_or(true, |expected| {
+                    (entry.permissions.as_bytes().get(1) == Some(&b'w')) == expected
+                })
+                && query.execute.map_or(true, |expected| {
+                    (entry.permissions.as_bytes().get(2) == Some(&b'x')) == expected
+                })
+                && (!query.file_backed || entry.path.starts_with('/'))
+        })
+    }))
 }
 
 pub fn summarize_proc_self_maps_targets(
@@ -115,6 +180,54 @@ pub(crate) fn parse_parent_pid_from_stat(stat: &str) -> Option<u32> {
     after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Readable, non-executable address ranges of a loaded module, including the
+/// anonymous mapping that immediately follows its last named segment.
+///
+/// That trailing mapping is the module's `.bss`, which `/proc/self/maps` leaves
+/// unnamed. A range built only from named entries stops short of every
+/// zero-initialised global, which is where a shared library keeps its pointer
+/// slots.
+pub fn find_proc_self_module_data(name: &str, max_entries: usize) -> Result<Vec<ModuleRange>> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    Ok(module_data_ranges_in_text(&maps, name, max_entries))
+}
+
+pub(crate) fn module_data_ranges_in_text(
+    maps: &str,
+    name: &str,
+    max_entries: usize,
+) -> Vec<ModuleRange> {
+    let entries: Vec<ProcMapsEntry> = maps.lines().filter_map(parse_proc_maps_entry).collect();
+    let named = entries
+        .iter()
+        .filter(|entry| entry.path.rsplit('/').next() == Some(name))
+        .take(max_entries)
+        .collect::<Vec<_>>();
+    let Some(module_end) = named.iter().map(|entry| entry.range.end.0).max() else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<ModuleRange> = named
+        .into_iter()
+        .filter(|entry| is_readable_data(&entry.permissions))
+        .map(|entry| entry.range)
+        .collect();
+    // Private anonymous mappings butted against the module, in order, are its
+    // .bss. Stop at the first gap or named entry so a neighbouring module's
+    // memory is never accepted.
+    let mut end = module_end;
+    while let Some(entry) = entries.iter().find(|entry| {
+        entry.range.base.0 == end && entry.path.is_empty() && entry.permissions.starts_with("rw")
+    }) {
+        ranges.push(entry.range);
+        end = entry.range.end.0;
+    }
+    ranges
+}
+
+fn is_readable_data(permissions: &str) -> bool {
+    permissions.starts_with('r') && !permissions.contains('x')
+}
+
 pub(crate) fn find_proc_maps_targets_in_text(maps: &str, max_entries: usize) -> Vec<ProcMapsEntry> {
     maps.lines()
         .filter_map(parse_proc_maps_entry)
@@ -153,7 +266,9 @@ pub(crate) fn parse_proc_maps_entry(line: &str) -> Option<ProcMapsEntry> {
         parts.next()?;
     }
 
-    let path = parts.next()?;
+    // Anonymous mappings have no path column; keeping them as empty-path entries
+    // is what makes a module's .bss visible.
+    let path = parts.next().unwrap_or("");
     if path.len() > MAX_PROC_MAPS_PATH_LEN {
         return None;
     }

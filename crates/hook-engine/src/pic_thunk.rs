@@ -1,6 +1,17 @@
 #![allow(clippy::manual_range_contains)]
 
-use crate::HookBoundaryError;
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PicThunkError {
+    #[error("no PIC thunk call found in the scanned region")]
+    NoPicThunkFound,
+    #[error("PIC thunk uses an unsupported register (reg_field={0})")]
+    UnsupportedThunkRegister(u8),
+    #[cfg(test)]
+    #[error("PIC thunk repair range is outside the target buffer")]
+    PatchOutsideBuffer,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThunkRegister {
@@ -13,7 +24,7 @@ pub enum ThunkRegister {
 }
 
 impl ThunkRegister {
-    fn from_modrm_reg_field(field: u8) -> Result<Self, HookBoundaryError> {
+    fn from_modrm_reg_field(field: u8) -> Result<Self, PicThunkError> {
         match field {
             0 => Ok(Self::Eax),
             1 => Ok(Self::Ecx),
@@ -21,7 +32,7 @@ impl ThunkRegister {
             3 => Ok(Self::Ebx),
             6 => Ok(Self::Esi),
             7 => Ok(Self::Edi),
-            _ => Err(HookBoundaryError::UnsupportedThunkRegister(field)),
+            _ => Err(PicThunkError::UnsupportedThunkRegister(field)),
         }
     }
 
@@ -59,7 +70,7 @@ pub fn find_pic_thunk_call(
     buffer: &[u8],
     buffer_base_address: u32,
     read_target_bytes: &dyn Fn(u32) -> Option<[u8; 4]>,
-) -> Result<PicThunkCallSite, HookBoundaryError> {
+) -> Result<PicThunkCallSite, PicThunkError> {
     let mut decoder = iced_x86::Decoder::with_ip(
         32,
         buffer,
@@ -93,7 +104,7 @@ pub fn find_pic_thunk_call(
         }
     }
 
-    Err(HookBoundaryError::NoPicThunkFound)
+    Err(PicThunkError::NoPicThunkFound)
 }
 
 /// Build a repair plan: what bytes to write at the call site to replace
@@ -127,17 +138,18 @@ pub fn plan_pic_thunk_repair(
 /// a trampoline made writable by the caller).
 ///
 /// Returns `Ok(())` if the 5-byte patch was written at the call site offset.
-pub fn apply_repair_to_buffer(
+#[cfg(test)]
+fn apply_repair_to_buffer(
     buffer: &mut [u8],
     plan: &PicThunkRepairPlan,
-) -> Result<(), HookBoundaryError> {
+) -> Result<(), PicThunkError> {
     let offset = plan.call_site.offset_in_buffer;
     let end = offset
         .checked_add(plan.patch_bytes.len())
-        .ok_or(HookBoundaryError::PicThunkPatchOutsideBuffer)?;
+        .ok_or(PicThunkError::PatchOutsideBuffer)?;
     let target = buffer
         .get_mut(offset..end)
-        .ok_or(HookBoundaryError::PicThunkPatchOutsideBuffer)?;
+        .ok_or(PicThunkError::PatchOutsideBuffer)?;
     target.copy_from_slice(&plan.patch_bytes);
     Ok(())
 }
@@ -219,7 +231,7 @@ mod tests {
     fn reports_no_thunk_in_empty_buffer() {
         let buffer = [0x90u8; 8];
         let result = find_pic_thunk_call(&buffer, 0x1000, &|_| None);
-        assert_eq!(result, Err(HookBoundaryError::NoPicThunkFound));
+        assert_eq!(result, Err(PicThunkError::NoPicThunkFound));
     }
 
     #[test]
@@ -280,7 +292,7 @@ mod tests {
 
         assert_eq!(
             apply_repair_to_buffer(&mut buffer, &plan),
-            Err(HookBoundaryError::PicThunkPatchOutsideBuffer)
+            Err(PicThunkError::PatchOutsideBuffer)
         );
     }
 

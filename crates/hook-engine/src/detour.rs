@@ -1,12 +1,10 @@
 use retour::GenericDetour;
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use vapor_forge_patterns::registry::{FollowMode, PatternLookup, PatternVariantLookup};
-use vapor_forge_patterns::{
-    find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
-};
 
-use vapor_forge_hook_boundary::pic_thunk;
+use crate::plan::ValidatedHookTarget;
+
+use crate::pic_thunk;
 
 static TRAMPOLINE_PAGES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -22,246 +20,21 @@ pub use retour::Function as HookFn;
 /// point through [`crate::original::original_detour`].
 pub type Detour<F> = GenericDetour<F>;
 
-pub struct CodeRegion {
-    pub base: usize,
-    pub bytes: &'static [u8],
-}
-
 pub struct PendingDetour<F: HookFn> {
     pub detour: Detour<F>,
     pub callee_addr: usize,
 }
 
-pub fn resolve_pattern_entry(
-    code: &CodeRegion,
-    name: &str,
-    entry: &PatternLookup<'_>,
-) -> Option<usize> {
-    for (variant_index, variant) in entry.variants().enumerate() {
-        if let Some(addr) = resolve_pattern_variant(code, name, variant_index, variant) {
-            return Some(addr);
-        }
-    }
-    None
-}
-
-fn resolve_pattern_variant(
-    code: &CodeRegion,
-    name: &str,
-    variant_index: usize,
-    entry: PatternVariantLookup<'_>,
-) -> Option<usize> {
-    let addr = match entry.follow() {
-        FollowMode::None => resolve_callee(code, name, entry.pattern(), false)?,
-        FollowMode::Relative => resolve_callee(code, name, entry.pattern(), true)?,
-        FollowMode::Upward => {
-            let prologue = entry.prologue_bytes().or_else(|| {
-                error!(
-                    hook = name,
-                    variant = variant_index,
-                    "upward follow requires prologue bytes"
-                );
-                None
-            })?;
-            resolve_prologue_upwards(code, name, entry.pattern(), prologue)?
-        }
-        FollowMode::Call => resolve_follow_call(code, name, entry)?,
-    };
-
-    if entry.pic_entry() {
-        find_pic_entry(addr)
-    } else {
-        Some(addr)
-    }
-}
-
-fn resolve_callee(code: &CodeRegion, name: &str, pattern_str: &str, follow: bool) -> Option<usize> {
-    let pattern = match Pattern::parse(pattern_str) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(hook = name, error = %e, "pattern parse failed");
-            return None;
-        }
-    };
-
-    let offset = match pattern.find_unique(code.bytes) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(hook = name, error = %e, "pattern match failed");
-            return None;
-        }
-    };
-
-    if !follow {
-        let addr = code.base + offset;
-        debug!(
-            hook = name,
-            addr = format_args!("0x{:x}", addr),
-            "pattern matched (prologue)"
-        );
-        return Some(addr);
-    }
-
-    match follow_relative_call(code.bytes, offset) {
-        Ok(o) if o >= 0 && (o as usize) < code.bytes.len() => {
-            let addr = code.base + o as usize;
-            debug!(
-                hook = name,
-                addr = format_args!("0x{:x}", addr),
-                "callee resolved"
-            );
-            Some(addr)
-        }
-        Ok(o) => {
-            warn!(
-                hook = name,
-                offset = format_args!("0x{:x}", o),
-                "callee offset out of bounds"
-            );
-            None
-        }
-        Err(e) => {
-            error!(hook = name, error = %e, "follow relative call failed");
-            None
-        }
-    }
-}
-
-fn resolve_prologue_upwards(
-    code: &CodeRegion,
-    name: &str,
-    body_pattern_str: &str,
-    prologue_bytes: &[u8],
-) -> Option<usize> {
-    let body_pattern = match Pattern::parse(body_pattern_str) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(hook = name, error = %e, "body pattern parse failed");
-            return None;
-        }
-    };
-
-    let body_offset = match body_pattern.find_unique(code.bytes) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(hook = name, error = %e, "body pattern match failed");
-            return None;
-        }
-    };
-
-    match find_prologue_upwards(code.bytes, body_offset, prologue_bytes, 0x10000) {
-        Ok(entry_offset) => {
-            let addr = code.base + entry_offset;
-            debug!(
-                hook = name,
-                body = format_args!("0x{:x}", code.base + body_offset),
-                entry = format_args!("0x{:x}", addr),
-                "prologue resolved"
-            );
-            Some(addr)
-        }
-        Err(e) => {
-            warn!(hook = name, error = %e, "prologue scan failed");
-            None
-        }
-    }
-}
-
-fn resolve_follow_call(
-    code: &CodeRegion,
-    name: &str,
-    entry: PatternVariantLookup<'_>,
-) -> Option<usize> {
-    let pattern = match Pattern::parse(entry.pattern()) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(hook = name, error = %e, "callsite pattern parse failed");
-            return None;
-        }
-    };
-    let callee_pattern = match entry.callee_pattern() {
-        Some(pattern) => match Pattern::parse(pattern) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                error!(hook = name, error = %e, "callee pattern parse failed");
-                return None;
-            }
-        },
-        None => None,
-    };
-
-    let matches = pattern.find_all(code.bytes);
-    if matches.is_empty() {
-        warn!(hook = name, "callsite pattern match failed: no match");
-        return None;
-    }
-
-    for offset in matches.iter().copied() {
-        let Ok(callee_offset) = follow_last_call_before_ret(code.bytes, offset, 256) else {
-            continue;
-        };
-        let addr = code.base + callee_offset;
-        if let Some(callee_pattern) = callee_pattern.as_ref() {
-            if !callee_pattern.matches_at(code.bytes, callee_offset) {
-                continue;
-            }
-        }
-        debug!(
-            hook = name,
-            match_addr = format_args!("0x{:x}", code.base + offset),
-            match_count = matches.len(),
-            addr = format_args!("0x{:x}", addr),
-            "call target resolved"
-        );
-        return Some(addr);
-    }
-
-    warn!(
-        hook = name,
-        match_count = matches.len(),
-        has_callee_pattern = callee_pattern.is_some(),
-        "no matching call target found"
-    );
-    None
-}
-
-/// Scan backward from a prologue address to find the PIC preamble entry point.
-/// PIC functions on i686 start with `E8 rel32` (CALL thunk) + `ADD reg, imm32`
-/// before the prologue. The ADD is 5 bytes (EAX, opcode 05) or 6 bytes (other
-/// registers, opcode 81 Cx), giving a total preamble of 10 or 11 bytes.
-fn find_pic_entry(prologue_addr: usize) -> Option<usize> {
-    if !cfg!(target_pointer_width = "32") {
-        return Some(prologue_addr);
-    }
-
-    for offset in [10usize, 11] {
-        if prologue_addr < offset {
-            continue;
-        }
-        let candidate = prologue_addr - offset;
-        // SAFETY: candidate is within the steamclient.so code segment.
-        let byte = unsafe { *(candidate as *const u8) };
-        if byte == 0xE8 {
-            return Some(candidate);
-        }
-    }
-    warn!(
-        addr = format_args!("0x{:x}", prologue_addr),
-        "find_pic_entry: no E8 CALL found before prologue"
-    );
-    None
-}
-
 /// Create a detour without enabling it.
 ///
 /// # Safety
-/// `target` must be a valid function pointer matching the signature `F`.
+/// The validated target and replacement addresses must both point to functions
+/// matching the signature `F`.
 pub unsafe fn create_detour<F: HookFn>(
     name: &str,
-    target: F,
-    callee_addr: usize,
-    replacement: F,
+    target: ValidatedHookTarget,
 ) -> Option<PendingDetour<F>> {
+    let callee_addr = target.target_address;
     // Sanity check: reject obviously invalid target addresses.
     // During la_objopen, steamclient.so may not be fully relocated yet,
     // which can produce garbage addresses from pattern resolution.
@@ -276,11 +49,16 @@ pub unsafe fn create_detour<F: HookFn>(
 
     ensure_trampoline_pages_writable();
 
-    // SAFETY: caller guarantees target is valid.
+    // SAFETY: caller guarantees the validated addresses use signature F.
+    let target_fn = unsafe { F::from_ptr(target.target_address as *const ()) };
+    // SAFETY: caller guarantees the validated addresses use signature F.
+    let replacement_fn = unsafe { F::from_ptr(target.replacement_address as *const ()) };
+
+    // SAFETY: caller guarantees both function pointers are valid.
     // Note: GenericDetour::new() does NOT overwrite the original function.
     // that only happens on enable(). So the original prologue is still
     // readable at callee_addr until finalize_detour calls enable().
-    match unsafe { GenericDetour::new(target, replacement) } {
+    match unsafe { GenericDetour::new(target_fn, replacement_fn) } {
         Ok(detour) => {
             debug!(hook = name, "detour created");
             Some(PendingDetour {
@@ -327,9 +105,8 @@ pub unsafe fn store_and_finalize<F: HookFn>(
             error!(hook = name, "stored detour missing after initialization");
             return false;
         };
-        finalize_detour(name, detour, callee_addr);
+        finalize_detour(name, detour, callee_addr)
     }
-    true
 }
 
 fn ensure_trampoline_pages_writable() {
@@ -377,7 +154,7 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     name: &str,
     detour: &mut Detour<F>,
     callee_addr: usize,
-) {
+) -> bool {
     let tramp_addr = detour.trampoline() as *const _ as usize;
     remember_trampoline_page(trampoline_page_start(tramp_addr));
 
@@ -394,9 +171,10 @@ pub(crate) unsafe fn finalize_detour<F: HookFn>(
     // SAFETY: enabling the detour.
     if let Err(e) = unsafe { detour.enable() } {
         error!(hook = name, error = %e, "detour enable failed");
-        return;
+        return false;
     }
     info!(hook = name, "detour INSTALLED");
+    true
 }
 
 /// PIC thunk repair using the saved original prologue.

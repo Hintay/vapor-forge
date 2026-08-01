@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+iced-x86.workspace = true
 libc.workspace = true
 retour.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
-vapor-forge-hook-boundary = { path = "../hook-boundary" }
-vapor-forge-patterns = { path = "../patterns" }
