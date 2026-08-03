@@ -112,7 +112,7 @@ fn pump_cloud_conflicts(revision: u64) {
                 token: callback.as_str().to_owned(),
                 app_id: 0,
                 accepted: false,
-                message: "The cloud conflict choice is no longer valid".into(),
+                error: "stale_choice".into(),
                 resume_launch: false,
                 cancel_launch: false,
             };

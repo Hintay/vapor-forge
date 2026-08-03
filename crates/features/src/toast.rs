@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use tracing::warn;
 use vapor_forge_config::RuntimeConfig;
@@ -10,6 +10,10 @@ static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TITLE: &str = "Vapor Forge";
 const INIT_BODY: &str = "Loaded successfully";
 const DEFAULT_DURATION_MS: u32 = 5000;
+const STEAMUI_BRIDGE_JS: &str = include_str!("ui/steamui_bridge.js");
+const TOAST_JS: &str = include_str!("ui/toast.js");
+const CLOUD_CONFLICT_JS: &str = include_str!("ui/cloud_conflict.js");
+const CLOUD_CONFLICT_I18N: &str = include_str!("ui/cloud_conflict_i18n.json");
 
 #[derive(Clone, Debug)]
 pub struct ToastRequest {
@@ -213,12 +217,33 @@ fn js_escape(input: &str) -> String {
 }
 
 pub fn bridge_script() -> &'static str {
-    include_str!("toast_bridge.js")
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let capacity = STEAMUI_BRIDGE_JS.len()
+            + TOAST_JS.len()
+            + CLOUD_CONFLICT_JS.len()
+            + CLOUD_CONFLICT_I18N.len()
+            + 256;
+        let mut script = String::with_capacity(capacity);
+        script.push_str(STEAMUI_BRIDGE_JS);
+        script.push_str("\n(function(){try{var bridge=window.VaporForgeUIBridge;");
+        script.push_str("if(bridge){bridge.resources.cloudConflictLocales=");
+        script.push_str(CLOUD_CONFLICT_I18N);
+        script.push_str(
+            ";}}catch(error){try{console.log('[VaporForgeUI] locale install error: '+error);}",
+        );
+        script.push_str("catch(_){}}})();\n");
+        script.push_str(TOAST_JS);
+        script.push('\n');
+        script.push_str(CLOUD_CONFLICT_JS);
+        script
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -285,8 +310,9 @@ mod tests {
     #[test]
     fn bridge_uses_general_notification_type_by_default() {
         let script = bridge_script();
-        assert!(script.contains("version === 11"));
-        assert!(script.contains("version: 11"));
+        assert!(script.contains("version === BRIDGE_VERSION"));
+        assert!(script.contains("version: BRIDGE_VERSION"));
+        assert!(script.contains("const BRIDGE_VERSION = 12"));
         assert!(script.contains("eType: toast.eType || 31"));
         assert!(script.contains("function allocateNotificationId(toast)"));
         assert!(script.contains("notificationID: id"));
@@ -309,9 +335,38 @@ mod tests {
         assert!(script.contains("activeDialog.remove()"));
         assert!(script.contains("restoreNativeCloudDialog(appId)"));
         assert!(script.contains("customDialog.showModal()"));
-        assert!(script.contains("bridge.cloudObserver.disconnect()"));
-        assert!(script.contains("bridge.cloudEpoch[key] !== epoch"));
+        assert!(script.contains("state.observer.disconnect()"));
+        assert!(script.contains("state.epoch[key] !== epoch"));
+        assert!(script.contains("popupHeight: 560"));
+        assert!(script.contains("popupWidth: 740"));
+        assert!(script.contains("settings.GetCurrentLanguage()"));
+        assert!(script.contains("if (state.languageReady || state.languagePromise) return"));
+        assert!(script.contains("if (!Object.keys(state.dialogs).length) return true"));
+        assert!(script.contains("cloudConflictLocales"));
+        assert!(!script.contains("setInterval"));
+        assert!(!script.contains("setTimeout"));
         assert!(!script.contains("synthetic"));
+    }
+
+    #[test]
+    fn cloud_conflict_locales_match_english_keys() {
+        let locales: serde_json::Value = serde_json::from_str(CLOUD_CONFLICT_I18N).unwrap();
+        let locales = locales.as_object().unwrap();
+        assert_eq!(
+            locales.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["english", "japanese", "schinese", "tchinese"])
+        );
+        let english = locales["english"].as_object().unwrap();
+        for locale in locales.values() {
+            let messages = locale.as_object().unwrap();
+            assert_eq!(messages.len(), english.len());
+            for key in english.keys() {
+                assert!(messages
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some());
+            }
+        }
     }
 
     #[test]

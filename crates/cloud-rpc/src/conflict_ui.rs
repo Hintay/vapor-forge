@@ -41,7 +41,7 @@ pub struct ConflictUiAck {
     pub token: String,
     pub app_id: u32,
     pub accepted: bool,
-    pub message: String,
+    pub error: String,
     pub resume_launch: bool,
     pub cancel_launch: bool,
 }
@@ -302,7 +302,7 @@ impl LocalConflictCoordinator {
                         token: token.to_owned(),
                         app_id: binding.key.1,
                         accepted: true,
-                        message: String::new(),
+                        error: String::new(),
                         resume_launch: false,
                         cancel_launch: true,
                     },
@@ -413,13 +413,19 @@ impl LocalConflictCoordinator {
                             token: choice.token,
                             app_id: choice.key.1,
                             accepted: true,
-                            message: String::new(),
+                            error: String::new(),
                             resume_launch: true,
                             cancel_launch: false,
                         },
                     ));
                 }
                 Err(message) => {
+                    tracing::warn!(
+                        steam_id64 = choice.key.0,
+                        app_id = choice.key.1,
+                        error = %message,
+                        "cloud conflict resolution failed"
+                    );
                     if let Some(pending) = state.pending.get_mut(&choice.key) {
                         pending.resolving = false;
                     }
@@ -430,7 +436,7 @@ impl LocalConflictCoordinator {
                             token: choice.token,
                             app_id: choice.key.1,
                             accepted: false,
-                            message,
+                            error: "save_failed".into(),
                             resume_launch: false,
                             cancel_launch: false,
                         },
@@ -907,7 +913,7 @@ mod tests {
         );
         let ack = wait_for_ack(&coordinator, context);
         assert!(!ack.accepted);
-        assert!(ack.message.contains("changed"));
+        assert_eq!(ack.error, "save_failed");
         assert_eq!(coordinator.dialogs(context).len(), 1);
     }
 
