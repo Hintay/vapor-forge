@@ -236,7 +236,6 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // comes from the post-item hook).
     capture_dispatch_context(this, packet);
     maybe_warmup_flush();
-    post_injection();
     capture_last_inbound_body(packet);
     maybe_fire_armed_selftest(packet);
 
@@ -265,7 +264,6 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // context above. This same real packet is authoritative for the new context.
     capture_dispatch_context(this, packet);
     maybe_warmup_flush();
-    post_injection();
 }
 
 // Work-item vtable. `#[repr(C)]` of 9 function pointers auto-scales to the
@@ -459,7 +457,7 @@ fn enqueue(injection: QueuedInjection) {
         }
         queue.push_back(injection);
     }
-    post_injection();
+    schedule_injection_drain();
 }
 
 /// Once dispatch context is fully captured, flush anything a source queued
@@ -470,14 +468,14 @@ fn maybe_warmup_flush() {
         return;
     }
     if !WARMUP_FLUSH_DONE.swap(true, Ordering::AcqRel) {
-        post_injection();
+        schedule_injection_drain();
     }
 }
 
 /// Hand one work item to the CNet pool. Steam's own post at the decoded site
 /// calls `AddWorkItem` and returns, with no separate wake: the enqueue starts the
 /// pool's threads and signals them itself.
-fn post_injection() {
+fn schedule_injection_drain() {
     if !dispatch_ready() {
         return;
     }
@@ -611,7 +609,7 @@ unsafe extern "C" fn native_inject_slot_14(_item: *mut c_void, _arg: *mut c_void
 }
 
 unsafe extern "C" fn native_inject_deleting_destroy(item: *mut c_void) {
-    WORK_ITEM_POSTED.store(false, Ordering::Release);
+    // Completion owns the post state; destruction can follow a newer post.
     // SAFETY: this slot is the ownership terminal for our allocation.
     unsafe { NativeWorkItem::free(item) };
 }
@@ -622,7 +620,6 @@ unsafe extern "C" fn native_inject_deleting_destroy(item: *mut c_void) {
 /// Steam delivers inbound packets. Returning true suppresses Steam's "job no
 /// longer existed to notify" warning.
 unsafe extern "C" fn native_inject_execute(item: *mut c_void, _arg: *mut c_void) -> bool {
-    WORK_ITEM_POSTED.store(false, Ordering::Release);
     let pthread = current_pthread();
     // Drop the caller-owned reference now that Steam's queue reference drives
     // destruction after this returns.
@@ -645,6 +642,10 @@ unsafe extern "C" fn native_inject_execute(item: *mut c_void, _arg: *mut c_void)
         "native-inject: completion on the RecvPkt thread"
     );
     drain_injections();
+    // Producers that raced the drain observed the armed state and left their
+    // response queued. Disarm first, then publish one successor if needed.
+    WORK_ITEM_POSTED.store(false, Ordering::Release);
+    schedule_injection_drain();
     true
 }
 
@@ -694,9 +695,9 @@ fn drain_injections() {
         // not free it.
         let packet = unsafe { packet_alloc() };
         if packet.is_null() {
-            injection_queue().lock().unwrap().push_front(queued);
-            warn!("native-inject: packet allocation failed; response retained");
-            break;
+            warn!("native-inject: packet allocation failed");
+            terminate_dispatch_generation("CNetPacket allocation failed");
+            return;
         }
         // SAFETY: packet is live; conn_id is a real connection id; body outlives
         // the synchronous dispatch below.
