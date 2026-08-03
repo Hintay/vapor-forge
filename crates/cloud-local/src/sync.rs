@@ -1,27 +1,23 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use vapor_forge_cloud_core::{
     AccountSyncState, AchievementSchema, AchievementSyncState, AppStatsQuery, AppStatsResult,
     AppStatsUploadResult, AppStatsUploadStatus, BackendError, CloudBackend, DeviceDescriptor,
-    OfficialAchievementState, OfficialStatState, PlaytimeEntry, PlaytimeSession,
-    SchemaUploadOutcome, StatSyncState, SteamAppSnapshot, SteamStateUploadResult, UploadIdentity,
+    PlaytimeEntry, PlaytimeSession, SchemaUploadOutcome, StatSyncState, SteamAppSnapshot,
+    SteamStateUploadResult, UploadIdentity,
 };
 
-use crate::store::{atomic_publish, atomic_replace};
+use crate::store::atomic_replace;
 
 const RECORD_VERSION: u32 = 1;
 
-const APP_SNAPSHOT_DIR: &str = "steam-app-snapshots";
-const APP_PACK_DIR: &str = "steam-app-packs";
-
-/// Loose records this device may leave unpacked for one app before folding them.
-///
-/// Records are immutable and content addressed, so the directory would otherwise
-/// grow by one file per observation forever and every read would parse all of
-/// them. Packing trades that for one rewritten file per (device, app).
-const APP_PACK_THRESHOLD: usize = 16;
+const STATS_DIR: &str = "stats";
+const PLAYTIME_DIR: &str = "playtime";
+const MAX_STATS_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STATS_ENTRIES: usize = 100_000;
+const MAX_PLAYTIME_RECORD_BYTES: u64 = 64 * 1024;
 
 pub struct LocalBackend {
     root: PathBuf,
@@ -29,6 +25,7 @@ pub struct LocalBackend {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PlaytimeRecord {
     version: u32,
     steam_id64: String,
@@ -37,36 +34,32 @@ struct PlaytimeRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct PlaytimeSessionRecord {
+#[serde(deny_unknown_fields)]
+struct SteamAppStateRecord {
     version: u32,
     steam_id64: String,
     client_id: u64,
-    session: PlaytimeSession,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct SteamAppSnapshotRecord {
-    version: u32,
-    steam_id64: String,
-    client_id: u64,
-    snapshot: SteamAppSnapshot,
-    /// Commit ids this record folded. Present only on a pack.
-    ///
-    /// Reclaimed one cycle late: a pack lists what it absorbed, and the run after
-    /// that deletes those files. A new pack file and a batch of deletions are not
-    /// guaranteed to reach a peer in that order, so the delay gives every peer a
-    /// full scan interval to receive the pack that supersedes them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    covered: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct SchemaRecord {
-    version: u32,
     app_id: u32,
-    language: String,
-    schema_version: Option<String>,
-    blob_sha256: String,
+    commit_id: String,
+    observed_at: i64,
+    achievements: Vec<StoredAchievementState>,
+    stats: Vec<StoredStatState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAchievementState {
+    key: String,
+    unlocked: bool,
+    unlocked_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredStatState {
+    key: String,
+    value_type: String,
+    value: String,
 }
 
 impl LocalBackend {
@@ -79,83 +72,105 @@ impl LocalBackend {
 
     fn account_root(&self, steam_id64: &str) -> Result<PathBuf, BackendError> {
         validate_steam_id(steam_id64)?;
-        Ok(self.root.join("records/accounts").join(steam_id64))
+        Ok(self.root.join(steam_id64))
     }
 
-    fn publish_record<T: Serialize>(
-        &self,
-        directory: &Path,
-        identity: &[u8],
-        value: &T,
-    ) -> Result<(), BackendError> {
-        let bytes = serde_json::to_vec(value).map_err(json_error)?;
-        let id = digest(identity);
-        atomic_publish(&directory.join(&id[..2]).join(format!("{id}.json")), &bytes)
+    fn app_root(&self, steam_id64: &str, app_id: u32) -> Result<PathBuf, BackendError> {
+        if app_id == 0 {
+            return Err(permanent("invalid local AppID"));
+        }
+        Ok(self.account_root(steam_id64)?.join(app_id.to_string()))
     }
 
-    fn read_records_with_paths<T: for<'de> Deserialize<'de>>(
+    fn account_app_roots(&self, steam_id64: &str) -> Result<Vec<(u32, PathBuf)>, BackendError> {
+        let account_root = self.account_root(steam_id64)?;
+        if !account_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut apps = Vec::new();
+        for entry in std::fs::read_dir(account_root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_dir() {
+                continue;
+            }
+            let Some(app_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value != 0)
+            else {
+                continue;
+            };
+            apps.push((app_id, entry.path()));
+        }
+        apps.sort_by_key(|(app_id, _)| *app_id);
+        Ok(apps)
+    }
+
+    fn read_playtime_records_with_paths(
         &self,
         directory: &Path,
-    ) -> Result<Vec<(PathBuf, T)>, BackendError> {
+    ) -> Result<Vec<(PathBuf, PlaytimeRecord)>, BackendError> {
         if !directory.exists() {
             return Ok(Vec::new());
         }
         let mut records = Vec::new();
-        for shard in std::fs::read_dir(directory).map_err(io_error)? {
-            let shard = shard.map_err(io_error)?.path();
-            if !shard.is_dir() {
+        for entry in std::fs::read_dir(directory).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            for entry in std::fs::read_dir(shard).map_err(io_error)? {
-                let path = entry.map_err(io_error)?.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                    continue;
-                }
-                let value = serde_json::from_slice(&std::fs::read(&path).map_err(io_error)?)
-                    .map_err(json_error)?;
-                records.push((path, value));
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                return Err(permanent("invalid local playtime state file"));
             }
+            let metadata = entry.metadata().map_err(io_error)?;
+            if metadata.len() > MAX_PLAYTIME_RECORD_BYTES {
+                return Err(permanent("invalid local playtime state file"));
+            }
+            let bytes = std::fs::read(&path).map_err(io_error)?;
+            if bytes.len() as u64 > MAX_PLAYTIME_RECORD_BYTES {
+                return Err(permanent("invalid local playtime state file"));
+            }
+            let value = serde_json::from_slice(&bytes).map_err(json_error)?;
+            records.push((path, value));
         }
         Ok(records)
     }
 
-    fn read_records<T: for<'de> Deserialize<'de>>(
-        &self,
-        directory: &Path,
-    ) -> Result<Vec<T>, BackendError> {
-        Ok(self
-            .read_records_with_paths(directory)?
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect())
-    }
-
-    /// Every app-state record for one account: the loose immutable observations
-    /// plus each device's pack. A pack is the same record type, so it needs no
-    /// separate parse or reduce path, and the merge is idempotent, so a pack
-    /// coexisting with records it already folded changes nothing.
+    /// Read the current state published by each device for the requested Apps.
     fn read_app_records(
         &self,
         steam_id64: &str,
-    ) -> Result<Vec<SteamAppSnapshotRecord>, BackendError> {
-        let account_root = self.account_root(steam_id64)?;
-        let mut records: Vec<SteamAppSnapshotRecord> =
-            self.read_records(&account_root.join(APP_PACK_DIR))?;
-        records.extend(
-            self.read_records::<SteamAppSnapshotRecord>(&account_root.join(APP_SNAPSHOT_DIR))?,
-        );
-        for record in &records {
-            if record.version != RECORD_VERSION || record.steam_id64 != steam_id64 {
-                return Err(permanent("invalid local app state record"));
+        only_app_id: Option<u32>,
+    ) -> Result<Vec<SteamAppStateRecord>, BackendError> {
+        let app_roots = match only_app_id {
+            Some(app_id) => vec![(app_id, self.app_root(steam_id64, app_id)?)],
+            None => self.account_app_roots(steam_id64)?,
+        };
+        let mut all_records = Vec::new();
+        for (app_id, app_root) in app_roots {
+            let directory = app_root.join(STATS_DIR);
+            if !directory.exists() {
+                continue;
             }
-            if record.snapshot.commit_id.is_empty()
-                || record.snapshot.app_id == 0
-                || record.snapshot.observed_at <= 0
-            {
-                return Err(permanent("invalid local Steam app snapshot"));
+            for entry in std::fs::read_dir(directory).map_err(io_error)? {
+                let entry = entry.map_err(io_error)?;
+                if !entry.file_type().map_err(io_error)?.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let bytes = read_stats_record_bytes(&path)?;
+                let record =
+                    serde_json::from_slice::<SteamAppStateRecord>(&bytes).map_err(json_error)?;
+                validate_stats_record(&record, steam_id64, app_id, Some(&path))?;
+                all_records.push(record);
             }
         }
-        Ok(records)
+        Ok(all_records)
     }
 
     /// Converge achievement and stat state from records already read.
@@ -168,30 +183,22 @@ impl LocalBackend {
     /// needs: it has no arbiter, so nothing computed here may be treated as a
     /// decision that a later arrival cannot revise.
     fn reduce_app_state(
-        records: &[SteamAppSnapshotRecord],
+        records: &[SteamAppStateRecord],
         only_app_id: Option<u32>,
     ) -> Result<(Vec<AchievementSyncState>, Vec<StatSyncState>), BackendError> {
         let mut achievements = BTreeMap::<(u32, String), AchievementSyncState>::new();
         let mut stats = BTreeMap::<(u32, String), (StatSyncState, MergeOrder)>::new();
         for record in records {
-            let app_id = record.snapshot.app_id;
+            let app_id = record.app_id;
             if only_app_id.is_some_and(|wanted| wanted != app_id) {
                 continue;
             }
             let order = (
-                record.snapshot.observed_at,
+                record.observed_at,
                 record.client_id,
-                record.snapshot.commit_id.clone(),
+                record.commit_id.clone(),
             );
-            for achievement in &record.snapshot.achievements {
-                let key = achievement.key.trim();
-                if key.is_empty()
-                    || key.len() > 255
-                    || key.contains('\0')
-                    || achievement.unlocked_at.is_some_and(|value| value <= 0)
-                {
-                    return Err(permanent("invalid local Steam achievement snapshot"));
-                }
+            for achievement in &record.achievements {
                 merge_achievement(
                     &mut achievements,
                     (app_id, achievement.key.clone()),
@@ -201,29 +208,18 @@ impl LocalBackend {
                         unlocked: achievement.unlocked,
                         progress_current: None,
                         progress_max: None,
-                        observed_at: record.snapshot.observed_at,
+                        observed_at: record.observed_at,
                         unlocked_at: achievement.unlocked_at,
                     },
                 );
             }
-            for stat in &record.snapshot.stats {
-                let key = stat.key.trim();
-                if key.is_empty()
-                    || key.len() > 255
-                    || key.contains('\0')
-                    || stat.value_type.trim().is_empty()
-                    || stat.value_type.contains('\0')
-                    || stat.value.len() > 255
-                    || stat.value.contains('\0')
-                {
-                    return Err(permanent("invalid local Steam stat snapshot"));
-                }
+            for stat in &record.stats {
                 let state = StatSyncState {
                     app_id,
                     stat_key: stat.key.clone(),
                     value_type: stat.value_type.clone(),
                     value: stat.value.clone(),
-                    observed_at: record.snapshot.observed_at,
+                    observed_at: record.observed_at,
                 };
                 insert_latest(&mut stats, (app_id, state.stat_key.clone()), state, &order);
             }
@@ -234,121 +230,28 @@ impl LocalBackend {
         ))
     }
 
-    /// Fold this device's loose records for one app into a single pack, and reclaim
-    /// the batch the previous pack already folded.
-    ///
-    /// Only this device's own records are ever folded or deleted. A folder gives no
-    /// reader a complete view, because a peer may still hold records this process
-    /// has never seen, so collapsing another device's state here would be a
-    /// decision taken on partial input. Within one device's own namespace there is
-    /// no such gap: it wrote every one of those files itself.
-    ///
-    /// Runs on the write path, where the file count actually grows and the caller
-    /// is already doing IO, so reads stay free of side effects.
-    fn pack_own_records(&self, steam_id64: &str, client_id: u64) -> Result<(), BackendError> {
-        let account_root = self.account_root(steam_id64)?;
-        let pack_root = account_root.join(APP_PACK_DIR);
-        let packs: Vec<(PathBuf, SteamAppSnapshotRecord)> =
-            self.read_records_with_paths(&pack_root)?;
-        let loose: Vec<(PathBuf, SteamAppSnapshotRecord)> =
-            self.read_records_with_paths(&account_root.join(APP_SNAPSHOT_DIR))?;
-
-        let covered = packs
-            .iter()
-            .filter(|(_, pack)| pack.client_id == client_id)
-            .flat_map(|(_, pack)| pack.covered.iter().cloned())
-            .collect::<std::collections::HashSet<_>>();
-
-        let mut mine = BTreeMap::<u32, Vec<&SteamAppSnapshotRecord>>::new();
-        for (path, record) in &loose {
-            if record.client_id != client_id {
-                continue;
-            }
-            if covered.contains(&record.snapshot.commit_id) {
-                // Superseded by the pack on disk, which has had a full cycle to
-                // reach every peer.
-                let _ = std::fs::remove_file(path);
-                continue;
-            }
-            mine.entry(record.snapshot.app_id).or_default().push(record);
-        }
-
-        for (app_id, records) in mine {
-            if records.len() < APP_PACK_THRESHOLD {
-                continue;
-            }
-            let existing = packs
-                .iter()
-                .map(|(_, pack)| pack)
-                .find(|pack| pack.client_id == client_id && pack.snapshot.app_id == app_id);
-            let folded = records
-                .iter()
-                .map(|record| record.snapshot.commit_id.clone())
-                .collect::<Vec<_>>();
-            let record = SteamAppSnapshotRecord {
-                version: RECORD_VERSION,
-                steam_id64: steam_id64.to_owned(),
-                client_id,
-                snapshot: fold_own_snapshots(
-                    steam_id64,
-                    client_id,
-                    app_id,
-                    existing.into_iter().chain(records.iter().copied()),
-                ),
-                covered: folded,
-            };
-            let bytes = serde_json::to_vec(&record).map_err(json_error)?;
-            atomic_replace(
-                &pack_root
-                    .join(client_id.to_string())
-                    .join(format!("{app_id}.json")),
-                &bytes,
-            )?;
-        }
-        Ok(())
-    }
-
     fn reduce_playtime(&self, steam_id64: &str) -> Result<Vec<PlaytimeEntry>, BackendError> {
-        let account_root = self.account_root(steam_id64)?;
-        let records: Vec<PlaytimeRecord> = self.read_records(&account_root.join("playtime"))?;
-        let sessions: Vec<PlaytimeSessionRecord> =
-            self.read_records(&account_root.join("playtime-sessions"))?;
-        let mut observations = Vec::with_capacity(records.len() + sessions.len());
-        for record in records {
-            if record.version != RECORD_VERSION || record.steam_id64 != steam_id64 {
-                return Err(permanent("invalid local playtime record"));
-            }
-            if record.entry.app_id == 0
-                || record.entry.observed_at <= 0
-                || record.entry.last_played_at.is_some_and(|value| value < 0)
-                || (!record.entry.owner_steam_id64.is_empty()
-                    && record.entry.owner_steam_id64 != steam_id64)
-            {
-                return Err(permanent("invalid local playtime observation"));
-            }
-            let tie = serde_json::to_vec(&record).map_err(json_error)?;
-            observations.push((
-                (record.entry.observed_at, record.client_id, digest(&tie)),
-                record.entry,
-            ));
-        }
-        // Validated but not converged: `seconds` duplicates the snapshot
-        // total, and `started_at + seconds` is not the session end.
-        // See docs/developer/steam-playtime-source-analysis.md.
-        for record in sessions {
-            if record.version != RECORD_VERSION || record.steam_id64 != steam_id64 {
-                return Err(permanent("invalid local playtime session record"));
-            }
-            if record.session.session_id.is_empty()
-                || record.session.session_id.contains('\0')
-                || record.session.app_id == 0
-                || record.session.started_at == 0
-                || record.session.seconds == 0
-                || record.session.observed_at <= 0
-                || (!record.session.owner_steam_id64.is_empty()
-                    && record.session.owner_steam_id64 != steam_id64)
-            {
-                return Err(permanent("invalid local playtime session"));
+        let mut observations = Vec::new();
+        for (app_id, app_root) in self.account_app_roots(steam_id64)? {
+            let records = self.read_playtime_records_with_paths(&app_root.join(PLAYTIME_DIR))?;
+            for (path, record) in records {
+                if record.version != RECORD_VERSION || record.steam_id64 != steam_id64 {
+                    return Err(permanent("invalid local playtime record"));
+                }
+                if record_client_id(&path)? != record.client_id
+                    || record.entry.app_id != app_id
+                    || record.entry.observed_at <= 0
+                    || record.entry.last_played_at.is_some_and(|value| value < 0)
+                    || (!record.entry.owner_steam_id64.is_empty()
+                        && record.entry.owner_steam_id64 != steam_id64)
+                {
+                    return Err(permanent("invalid local playtime observation"));
+                }
+                let tie = serde_json::to_vec(&record).map_err(json_error)?;
+                observations.push((
+                    (record.entry.observed_at, record.client_id, digest(&tie)),
+                    record.entry,
+                ));
             }
         }
         observations.sort_by(|left, right| left.0.cmp(&right.0));
@@ -399,40 +302,15 @@ impl CloudBackend for LocalBackend {
         }
     }
 
+    fn accepts_achievement_schemas(&self) -> bool {
+        false
+    }
+
     fn upload_achievement_schema(
         &self,
-        schema: &AchievementSchema,
+        _schema: &AchievementSchema,
     ) -> Result<SchemaUploadOutcome, BackendError> {
-        if schema.app_id == 0 || schema.content.is_empty() {
-            return Ok(SchemaUploadOutcome::Declined);
-        }
-        let blob_sha256 = digest(&schema.content);
-        atomic_publish(
-            &self
-                .root
-                .join("blobs/sha256")
-                .join(&blob_sha256[..2])
-                .join(&blob_sha256),
-            &schema.content,
-        )?;
-        let record = SchemaRecord {
-            version: RECORD_VERSION,
-            app_id: schema.app_id,
-            language: schema.language.clone(),
-            schema_version: schema.schema_version.clone(),
-            blob_sha256,
-        };
-        let bytes = serde_json::to_vec(&record).map_err(json_error)?;
-        let id = digest(&bytes);
-        atomic_publish(
-            &self
-                .root
-                .join("records/schemas")
-                .join(schema.app_id.to_string())
-                .join(format!("{id}.json")),
-            &bytes,
-        )?;
-        Ok(SchemaUploadOutcome::Accepted)
+        Ok(SchemaUploadOutcome::Declined)
     }
 
     fn upload_playtime(
@@ -441,7 +319,12 @@ impl CloudBackend for LocalBackend {
         steam_id64: &str,
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError> {
-        let directory = self.account_root(steam_id64)?.join("playtime");
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if client_id == 0 {
+            return Err(permanent("local playtime ClientID is unavailable"));
+        }
         for entry in entries {
             if entry.app_id == 0
                 || entry.observed_at <= 0
@@ -450,55 +333,35 @@ impl CloudBackend for LocalBackend {
             {
                 return Err(permanent("invalid local playtime observation"));
             }
+        }
+        for entry in entries {
             let record = PlaytimeRecord {
                 version: RECORD_VERSION,
                 steam_id64: steam_id64.to_owned(),
                 client_id,
                 entry: entry.clone(),
             };
-            // One object per account, device and app, rewritten in place.
-            // A record is a running total, so keeping the history buys nothing:
-            // `reduce_playtime` takes the max of the monotonic fields and the
-            // newest observation for the rest, and a device's latest record
-            // already carries both. Addressing the object by the observation
-            // instead made every sample a new immutable file, because
-            // `observed_at` moves each time even when the playtime does not.
-            // The device id is in the path, so each file has a single writer and
-            // rewriting it cannot collide with another device.
-            let id = digest(format!("{steam_id64}/{client_id}/{}", entry.app_id).as_bytes());
-            let path = directory.join(&id[..2]).join(format!("{id}.json"));
+            // Each device owns one cumulative playtime record per App.
+            let path = self
+                .app_root(steam_id64, entry.app_id)?
+                .join(PLAYTIME_DIR)
+                .join(format!("{client_id}.json"));
             let bytes = serde_json::to_vec(&record).map_err(json_error)?;
             atomic_replace(&path, &bytes)?;
         }
         Ok(())
     }
 
+    fn accepts_playtime_sessions(&self) -> bool {
+        false
+    }
+
     fn upload_playtime_sessions(
         &self,
-        client_id: u64,
-        steam_id64: &str,
-        sessions: &[PlaytimeSession],
+        _client_id: u64,
+        _steam_id64: &str,
+        _sessions: &[PlaytimeSession],
     ) -> Result<(), BackendError> {
-        let directory = self.account_root(steam_id64)?.join("playtime-sessions");
-        for session in sessions {
-            if session.session_id.is_empty()
-                || session.session_id.contains('\0')
-                || session.app_id == 0
-                || session.started_at == 0
-                || session.seconds == 0
-                || session.observed_at <= 0
-                || (!session.owner_steam_id64.is_empty() && session.owner_steam_id64 != steam_id64)
-            {
-                return Err(permanent("invalid local playtime session"));
-            }
-            let record = PlaytimeSessionRecord {
-                version: RECORD_VERSION,
-                steam_id64: steam_id64.to_owned(),
-                client_id,
-                session: session.clone(),
-            };
-            self.publish_record(&directory, session.session_id.as_bytes(), &record)?;
-        }
         Ok(())
     }
 
@@ -509,25 +372,66 @@ impl CloudBackend for LocalBackend {
     ) -> Result<SteamStateUploadResult, BackendError> {
         if snapshot.commit_id.is_empty()
             || snapshot.app_id == 0
+            || identity.client_id == 0
             || snapshot.owner_steam_id64 != identity.steam_id64
         {
             return Err(permanent("invalid local Steam app snapshot"));
         }
-        let record = SteamAppSnapshotRecord {
+        let path = self
+            .app_root(&identity.steam_id64, snapshot.app_id)?
+            .join(STATS_DIR)
+            .join(format!("{}.json", identity.client_id));
+        let incoming = SteamAppStateRecord {
             version: RECORD_VERSION,
             steam_id64: identity.steam_id64.clone(),
             client_id: identity.client_id,
-            snapshot: snapshot.clone(),
-            covered: Vec::new(),
+            app_id: snapshot.app_id,
+            commit_id: snapshot.commit_id.clone(),
+            observed_at: snapshot.observed_at,
+            achievements: snapshot
+                .achievements
+                .iter()
+                .map(|achievement| StoredAchievementState {
+                    key: achievement.key.clone(),
+                    unlocked: achievement.unlocked,
+                    unlocked_at: achievement.unlocked_at,
+                })
+                .collect(),
+            stats: snapshot
+                .stats
+                .iter()
+                .map(|stat| StoredStatState {
+                    key: stat.key.clone(),
+                    value_type: stat.value_type.clone(),
+                    value: stat.value.clone(),
+                })
+                .collect(),
         };
-        self.publish_record(
-            &self
-                .account_root(&identity.steam_id64)?
-                .join(APP_SNAPSHOT_DIR),
-            snapshot.commit_id.as_bytes(),
-            &record,
+        validate_stats_record(
+            &incoming,
+            &identity.steam_id64,
+            snapshot.app_id,
+            Some(&path),
         )?;
-        self.pack_own_records(&identity.steam_id64, identity.client_id)?;
+        let record = if path.exists() {
+            let existing =
+                serde_json::from_slice::<SteamAppStateRecord>(&read_stats_record_bytes(&path)?)
+                    .map_err(json_error)?;
+            validate_stats_record(
+                &existing,
+                &identity.steam_id64,
+                snapshot.app_id,
+                Some(&path),
+            )?;
+            fold_device_records(existing, incoming)
+        } else {
+            incoming
+        };
+        let bytes = serde_json::to_vec(&record).map_err(json_error)?;
+        if bytes.len() as u64 > MAX_STATS_RECORD_BYTES {
+            return Err(permanent("local Steam app state file is too large"));
+        }
+        atomic_replace(&path, &bytes)?;
         Ok(SteamStateUploadResult {
             stats_apps: vec![AppStatsUploadResult {
                 app_id: snapshot.app_id,
@@ -545,7 +449,7 @@ impl CloudBackend for LocalBackend {
         // One read, one pass. Reducing achievements and stats separately parsed the
         // whole corpus twice for a single call.
         let (achievements, stats) =
-            Self::reduce_app_state(&self.read_app_records(steam_id64)?, None)?;
+            Self::reduce_app_state(&self.read_app_records(steam_id64, None)?, None)?;
         Ok(AccountSyncState {
             stats_crcs: Vec::new(),
             // Local state is read on Steam's native pull boundary, not published
@@ -563,13 +467,8 @@ impl CloudBackend for LocalBackend {
         steam_id64: &str,
         query: &AppStatsQuery,
     ) -> Result<AppStatsResult, BackendError> {
-        // One read, filtered during the reduce. This used to parse the whole corpus
-        // three times and only then retain a single app.
-        let records = self.read_app_records(steam_id64)?;
-        if !records
-            .iter()
-            .any(|record| record.snapshot.app_id == query.app_id)
-        {
+        let records = self.read_app_records(steam_id64, Some(query.app_id))?;
+        if records.is_empty() {
             return Ok(AppStatsResult::Uninitialized);
         }
         let (mut achievements, mut stats) = Self::reduce_app_state(&records, Some(query.app_id))?;
@@ -644,27 +543,18 @@ fn insert_latest<K: Ord, V>(
     }
 }
 
-/// Merge several of one device's snapshots for one app into a single snapshot,
-/// applying the same per-key order the read path uses. `client_id` is constant
-/// across the inputs, so it drops out of the comparison.
-fn fold_own_snapshots<'a>(
-    steam_id64: &str,
-    client_id: u64,
-    app_id: u32,
-    records: impl Iterator<Item = &'a SteamAppSnapshotRecord>,
-) -> SteamAppSnapshot {
-    let mut achievements = BTreeMap::<String, (OfficialAchievementState, (i64, String))>::new();
-    let mut stats = BTreeMap::<String, (OfficialStatState, (i64, String))>::new();
-    let mut observed_at = 0_i64;
-    for record in records {
-        let order = (
-            record.snapshot.observed_at,
-            record.snapshot.commit_id.clone(),
-        );
-        observed_at = observed_at.max(record.snapshot.observed_at);
-        for achievement in &record.snapshot.achievements {
+/// Fold a new complete observation into the state owned by one device.
+fn fold_device_records(
+    existing: SteamAppStateRecord,
+    incoming: SteamAppStateRecord,
+) -> SteamAppStateRecord {
+    let mut achievements = BTreeMap::<String, StoredAchievementState>::new();
+    let mut stats = BTreeMap::<String, (StoredStatState, (i64, String))>::new();
+    for record in [&existing, &incoming] {
+        let order = (record.observed_at, record.commit_id.clone());
+        for achievement in &record.achievements {
             match achievements.get_mut(&achievement.key) {
-                Some((current, current_order)) => {
+                Some(current) => {
                     current.unlocked |= achievement.unlocked;
                     current.unlocked_at = match (current.unlocked_at, achievement.unlocked_at) {
                         (Some(a), Some(b)) => Some(a.min(b)),
@@ -673,17 +563,13 @@ fn fold_own_snapshots<'a>(
                     if !current.unlocked {
                         current.unlocked_at = None;
                     }
-                    *current_order = current_order.clone().max(order.clone());
                 }
                 None => {
-                    achievements.insert(
-                        achievement.key.clone(),
-                        (achievement.clone(), order.clone()),
-                    );
+                    achievements.insert(achievement.key.clone(), achievement.clone());
                 }
             }
         }
-        for stat in &record.snapshot.stats {
+        for stat in &record.stats {
             if stats
                 .get(&stat.key)
                 .map_or(true, |current| order > current.1)
@@ -692,21 +578,93 @@ fn fold_own_snapshots<'a>(
             }
         }
     }
-    SteamAppSnapshot {
-        owner_scope: String::new(),
-        owner_steam_id64: steam_id64.to_owned(),
-        // Stable across rewrites for one (account, device, app), so the pack keeps
-        // one identity as it is replaced.
-        commit_id: digest(format!("pack/{steam_id64}/{client_id}/{app_id}").as_bytes()),
-        app_id,
-        // A pack is converged state, not a commit against a baseline. Neither field
-        // is read back anywhere in this crate.
-        base_crc_stats: None,
-        dirty_stat_ids: Vec::new(),
-        achievements: achievements.into_values().map(|(state, _)| state).collect(),
-        stats: stats.into_values().map(|(state, _)| state).collect(),
+    let latest = if (incoming.observed_at, &incoming.commit_id)
+        >= (existing.observed_at, &existing.commit_id)
+    {
+        &incoming
+    } else {
+        &existing
+    };
+    let commit_id = latest.commit_id.clone();
+    let observed_at = latest.observed_at;
+    SteamAppStateRecord {
+        version: RECORD_VERSION,
+        steam_id64: incoming.steam_id64,
+        client_id: incoming.client_id,
+        app_id: incoming.app_id,
+        commit_id,
         observed_at,
+        achievements: achievements.into_values().collect(),
+        stats: stats.into_values().map(|(state, _)| state).collect(),
     }
+}
+
+fn read_stats_record_bytes(path: &Path) -> Result<Vec<u8>, BackendError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_STATS_RECORD_BYTES {
+        return Err(permanent("invalid local Steam app state file"));
+    }
+    std::fs::read(path).map_err(io_error)
+}
+
+fn validate_stats_record(
+    record: &SteamAppStateRecord,
+    steam_id64: &str,
+    app_id: u32,
+    path: Option<&Path>,
+) -> Result<(), BackendError> {
+    if record.version != RECORD_VERSION
+        || record.steam_id64 != steam_id64
+        || record.client_id == 0
+        || record.app_id != app_id
+        || record.commit_id.is_empty()
+        || record.commit_id.len() > 255
+        || record.commit_id.contains('\0')
+        || record.observed_at <= 0
+        || match record.achievements.len().checked_add(record.stats.len()) {
+            Some(count) => count > MAX_STATS_ENTRIES,
+            None => true,
+        }
+        || path.is_some_and(|path| record_client_id(path).ok() != Some(record.client_id))
+    {
+        return Err(permanent("invalid local Steam app state record"));
+    }
+
+    let mut achievement_keys = HashSet::with_capacity(record.achievements.len());
+    for achievement in &record.achievements {
+        let key = achievement.key.trim();
+        if key.is_empty()
+            || key.len() > 255
+            || key.contains('\0')
+            || !achievement_keys.insert(achievement.key.as_str())
+            || achievement.unlocked_at.is_some_and(|value| {
+                value <= 0 || value > i64::from(u32::MAX) || !achievement.unlocked
+            })
+        {
+            return Err(permanent("invalid local Steam achievement state"));
+        }
+    }
+
+    let mut stat_keys = HashSet::with_capacity(record.stats.len());
+    for stat in &record.stats {
+        let key = stat.key.trim();
+        let valid_value = match stat.value_type.as_str() {
+            "int" => stat.value.parse::<i32>().is_ok(),
+            "float" | "average_rate" => stat.value.parse::<f32>().is_ok(),
+            _ => false,
+        };
+        if key.is_empty()
+            || key.len() > 255
+            || key.contains('\0')
+            || !stat_keys.insert(stat.key.as_str())
+            || stat.value.len() > 255
+            || stat.value.contains('\0')
+            || !valid_value
+        {
+            return Err(permanent("invalid local Steam stat state"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_steam_id(value: &str) -> Result<(), BackendError> {
@@ -715,6 +673,14 @@ fn validate_steam_id(value: &str) -> Result<(), BackendError> {
     } else {
         Err(permanent("invalid Steam account ID"))
     }
+}
+
+fn record_client_id(path: &Path) -> Result<u64, BackendError> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| permanent("invalid local ClientID record name"))
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -771,27 +737,116 @@ mod tests {
         }
     }
 
-    fn record_files(root: &std::path::Path, steam_id64: &str, directory: &str) -> usize {
-        let directory = root
-            .join("records/accounts")
-            .join(steam_id64)
-            .join(directory);
-        let Ok(shards) = std::fs::read_dir(&directory) else {
+    fn json_files(directory: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(directory) else {
             return 0;
         };
         let mut count = 0;
-        for shard in shards {
-            for entry in std::fs::read_dir(shard.unwrap().path()).unwrap() {
-                if entry.unwrap().path().extension().and_then(|e| e.to_str()) == Some("json") {
-                    count += 1;
-                }
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                count += json_files(&path);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                count += 1;
             }
         }
         count
     }
 
     fn playtime_files(root: &std::path::Path, steam_id64: &str) -> usize {
-        record_files(root, steam_id64, "playtime")
+        let account = root.join(steam_id64);
+        let Ok(apps) = std::fs::read_dir(account) else {
+            return 0;
+        };
+        apps.map(|app| json_files(&app.unwrap().path().join(PLAYTIME_DIR)))
+            .sum()
+    }
+
+    #[test]
+    fn schemas_are_not_persisted_by_the_local_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::open(temporary.path()).unwrap();
+        let schema = AchievementSchema {
+            owner_scope: String::new(),
+            app_id: 480,
+            language: "english".into(),
+            schema_version: Some("sha".into()),
+            content: b"schema".to_vec(),
+        };
+
+        assert_eq!(
+            backend.upload_achievement_schema(&schema).unwrap(),
+            SchemaUploadOutcome::Declined
+        );
+        assert!(!backend.accepts_achievement_schemas());
+        assert!(!temporary.path().join("records").exists());
+        assert!(!temporary.path().join("records/schemas").exists());
+        assert!(!temporary.path().join("blobs/sha256").exists());
+    }
+
+    #[test]
+    fn account_data_uses_the_account_app_layout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::open(temporary.path()).unwrap();
+        let identity = identity();
+        let app_id = 480;
+        backend
+            .upload_steam_app_snapshot(
+                &identity,
+                &SteamAppSnapshot {
+                    owner_scope: String::new(),
+                    owner_steam_id64: identity.steam_id64.clone(),
+                    commit_id: "commit".into(),
+                    app_id,
+                    base_crc_stats: None,
+                    dirty_stat_ids: Vec::new(),
+                    achievements: Vec::new(),
+                    stats: Vec::new(),
+                    observed_at: 1_800_000_001,
+                },
+            )
+            .unwrap();
+        backend
+            .upload_playtime(
+                identity.client_id,
+                &identity.steam_id64,
+                &[playtime_entry(&identity.steam_id64, app_id, 120)],
+            )
+            .unwrap();
+        backend
+            .upload_playtime_sessions(
+                identity.client_id,
+                &identity.steam_id64,
+                &[PlaytimeSession {
+                    owner_scope: String::new(),
+                    owner_steam_id64: identity.steam_id64.clone(),
+                    session_id: "session".into(),
+                    app_id,
+                    started_at: 1_800_000_000,
+                    seconds: 60,
+                    offline: true,
+                    owner_account_id: 39_734_273,
+                    observed_at: 1_800_000_060,
+                }],
+            )
+            .unwrap();
+
+        let app_root = temporary
+            .path()
+            .join(&identity.steam_id64)
+            .join(app_id.to_string());
+        assert!(app_root
+            .join(STATS_DIR)
+            .join(format!("{}.json", identity.client_id))
+            .is_file());
+        assert!(app_root
+            .join(PLAYTIME_DIR)
+            .join(format!("{}.json", identity.client_id))
+            .is_file());
+        assert_eq!(json_files(&app_root.join(PLAYTIME_DIR)), 1);
+        assert!(!app_root.join("playtime/totals").exists());
+        assert!(!app_root.join("playtime/sessions").exists());
+        assert!(!temporary.path().join("records").exists());
     }
 
     #[test]
@@ -820,6 +875,35 @@ mod tests {
             .upload_playtime(8, steam_id64, &[playtime_entry(steam_id64, 480, 90)])
             .unwrap();
         assert_eq!(playtime_files(temporary.path(), steam_id64), 3);
+    }
+
+    #[test]
+    fn playtime_rejects_zero_client_without_writing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::open(temporary.path()).unwrap();
+        let steam_id64 = "76561198000000001";
+
+        assert!(backend
+            .upload_playtime(0, steam_id64, &[playtime_entry(steam_id64, 480, 120)])
+            .is_err());
+        assert!(!temporary.path().join(steam_id64).exists());
+    }
+
+    #[test]
+    fn playtime_rejects_oversized_device_records() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::open(temporary.path()).unwrap();
+        let steam_id64 = "76561198000000001";
+        let directory = temporary
+            .path()
+            .join(steam_id64)
+            .join("480")
+            .join(PLAYTIME_DIR);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = std::fs::File::create(directory.join("7.json")).unwrap();
+        file.set_len(MAX_PLAYTIME_RECORD_BYTES + 1).unwrap();
+
+        assert!(backend.pull_playtime(steam_id64).is_err());
     }
 
     #[test]
@@ -865,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn account_state_converges_immutable_records() {
+    fn account_state_converges_device_records() {
         let temporary = tempfile::tempdir().unwrap();
         let backend = LocalBackend::open(temporary.path()).unwrap();
         let identity = identity();
@@ -933,23 +1017,6 @@ mod tests {
             )
             .unwrap();
         backend
-            .upload_playtime_sessions(
-                7,
-                &identity.steam_id64,
-                &[PlaytimeSession {
-                    owner_scope: String::new(),
-                    owner_steam_id64: identity.steam_id64.clone(),
-                    session_id: "covered-by-later-snapshot".into(),
-                    app_id: 480,
-                    started_at: 101,
-                    seconds: 120,
-                    offline: true,
-                    owner_account_id: 39734273,
-                    observed_at: 12,
-                }],
-            )
-            .unwrap();
-        backend
             .upload_playtime(
                 8,
                 &identity.steam_id64,
@@ -964,24 +1031,6 @@ mod tests {
                 }],
             )
             .unwrap();
-        backend
-            .upload_playtime_sessions(
-                8,
-                &identity.steam_id64,
-                &[PlaytimeSession {
-                    owner_scope: String::new(),
-                    owner_steam_id64: identity.steam_id64.clone(),
-                    session_id: "after-latest-snapshot".into(),
-                    app_id: 480,
-                    started_at: 200,
-                    seconds: 180,
-                    offline: false,
-                    owner_account_id: 39734273,
-                    observed_at: 21,
-                }],
-            )
-            .unwrap();
-
         let state = backend.pull_account_state(7, &identity.steam_id64).unwrap();
         // Unlocking is one-way, so the later record reporting it as locked does not
         // win. It asserted the opposite before: a snapshot names every achievement,
@@ -993,18 +1042,17 @@ mod tests {
         // Ordinary stats are genuinely not monotonic, so they still take the latest.
         assert_eq!(state.stats[0].stat_key, "STAT_SCORE");
         assert_eq!(state.stats[0].value, "3");
-        // Sessions do not contribute.
         assert_eq!(state.playtime[0].playtime_minutes, 40);
         assert_eq!(state.playtime[0].playtime_2weeks_minutes, 4);
-        // Not 380 (`started_at + seconds`).
         assert_eq!(state.playtime[0].last_played_at, Some(100));
     }
 
     #[test]
-    fn a_session_alone_never_synthesizes_playtime() {
+    fn local_backend_does_not_persist_playtime_sessions() {
         let temporary = tempfile::tempdir().unwrap();
         let backend = LocalBackend::open(temporary.path()).unwrap();
         let steam_id64 = "76561198000000001";
+        assert!(!backend.accepts_playtime_sessions());
         backend
             .upload_playtime_sessions(
                 7,
@@ -1023,9 +1071,9 @@ mod tests {
             )
             .unwrap();
 
-        // A 0-minute entry would overwrite Steam's own value.
         let state = backend.pull_account_state(7, steam_id64).unwrap();
         assert!(state.playtime.is_empty());
+        assert!(!temporary.path().join(steam_id64).exists());
     }
 
     #[test]
@@ -1223,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn own_records_are_packed_and_reclaimed_one_cycle_later() {
+    fn device_stats_reuse_one_rolling_state_file() {
         let temporary = tempfile::tempdir().unwrap();
         let backend = LocalBackend::open(temporary.path()).unwrap();
         let identity = identity();
@@ -1263,63 +1311,83 @@ mod tests {
             assert_eq!(state.stats.len(), 1);
             state.stats[0].value.clone()
         };
-        let loose = || record_files(temporary.path(), &steam_id64, APP_SNAPSHOT_DIR);
-        let packs = || record_files(temporary.path(), &steam_id64, APP_PACK_DIR);
+        let stats_root = temporary
+            .path()
+            .join(&steam_id64)
+            .join("480")
+            .join(STATS_DIR);
 
-        // Below the threshold nothing is folded.
-        for nth in 0..(APP_PACK_THRESHOLD as i64 - 1) {
+        for nth in 0..32 {
             publish(7, nth, nth);
         }
-        assert_eq!(packs(), 0);
-        assert_eq!(loose(), APP_PACK_THRESHOLD - 1);
+        assert_eq!(json_files(&stats_root), 1);
+        assert_eq!(latest_score(), "31");
 
-        // Reaching it writes one pack and leaves the batch in place: deletion waits
-        // a cycle so a peer cannot see the inputs vanish before the pack arrives.
-        let threshold = APP_PACK_THRESHOLD as i64 - 1;
-        publish(7, threshold, threshold);
-        assert_eq!(packs(), 1);
-        assert_eq!(loose(), APP_PACK_THRESHOLD);
-        assert_eq!(latest_score(), threshold.to_string());
+        // A delayed observation from the same device cannot replace newer Stats,
+        // while its earlier achievement unlock remains part of the rolling state.
+        publish(7, 5, 9_999);
+        assert_eq!(json_files(&stats_root), 1);
+        assert_eq!(latest_score(), "31");
 
-        // The next write reclaims what that pack folded. The pack carries the state
-        // forward, so the answer does not change.
-        publish(7, threshold + 1, threshold + 1);
-        assert_eq!(packs(), 1);
-        assert_eq!(loose(), 1);
-        assert_eq!(latest_score(), (threshold + 1).to_string());
+        // Every device owns one path. Reads merge those current states without
+        // either device rewriting the other's file.
+        publish(8, 40, 4_000);
+        assert_eq!(json_files(&stats_root), 2);
+        assert_eq!(latest_score(), "4000");
 
-        // Another device's records are never folded or deleted, because this process
-        // cannot know what that device still holds unsent.
-        publish(8, 0, 4_000);
-        assert_eq!(loose(), 2);
-        assert_eq!(packs(), 1);
-        // 4000 was observed at 1_800_000_000, older than device 7's latest, so the
-        // per-key merge keeps device 7's value and the pack did not swallow a vote.
-        assert_eq!(latest_score(), (threshold + 1).to_string());
+        let bytes = std::fs::read(stats_root.join("7.json")).unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert!(value.get("snapshot").is_none());
+        assert!(value.get("base_crc_stats").is_none());
+        assert!(!stats_root.join("snapshots").exists());
+        assert!(!stats_root.join("packs").exists());
     }
 
     #[test]
-    fn an_invalid_session_still_fails_the_read() {
+    fn stats_record_identity_and_shape_are_validated() {
         let temporary = tempfile::tempdir().unwrap();
         let backend = LocalBackend::open(temporary.path()).unwrap();
-        let steam_id64 = "76561198000000001";
+        let identity = identity();
+        backend
+            .upload_steam_app_snapshot(
+                &identity,
+                &SteamAppSnapshot {
+                    owner_scope: String::new(),
+                    owner_steam_id64: identity.steam_id64.clone(),
+                    commit_id: "commit".into(),
+                    app_id: 480,
+                    base_crc_stats: None,
+                    dirty_stat_ids: Vec::new(),
+                    achievements: Vec::new(),
+                    stats: Vec::new(),
+                    observed_at: 1_800_000_001,
+                },
+            )
+            .unwrap();
+        let path = temporary
+            .path()
+            .join(&identity.steam_id64)
+            .join("480/stats/7.json");
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        value["unexpected"] = serde_json::Value::Bool(true);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
         assert!(backend
-            .upload_playtime_sessions(
-                7,
-                steam_id64,
-                &[PlaytimeSession {
-                    owner_scope: String::new(),
-                    owner_steam_id64: steam_id64.to_owned(),
-                    session_id: String::new(),
+            .pull_app_stats(
+                identity.client_id,
+                &identity.steam_id64,
+                &AppStatsQuery {
                     app_id: 480,
-                    started_at: 1_800_000_000,
-                    seconds: 3600,
-                    offline: false,
-                    owner_account_id: 39734273,
-                    observed_at: 1_800_003_600,
-                }],
+                    client_crc_stats: None,
+                    schema_version: "sha".into(),
+                },
             )
             .is_err());
+
+        value.as_object_mut().unwrap().remove("unexpected");
+        value["client_id"] = serde_json::Value::from(8);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(backend.pull_account_state(7, &identity.steam_id64).is_err());
     }
 }

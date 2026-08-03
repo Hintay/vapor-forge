@@ -147,6 +147,14 @@ pub(super) fn build_response_packet(
             (Vec::new(), ERESULT_FAIL)
         }
     };
+    assemble_response_packet(request, body, eresult)
+}
+
+pub(super) fn build_failure_response_packet(request: &CMsgProtoBufHeader) -> Vec<u8> {
+    assemble_response_packet(request, Vec::new(), ERESULT_FAIL)
+}
+
+fn assemble_response_packet(request: &CMsgProtoBufHeader, body: Vec<u8>, eresult: i32) -> Vec<u8> {
     let response = CMsgProtoBufHeader {
         steamid: request.steamid,
         jobid_source: None,

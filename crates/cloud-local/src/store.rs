@@ -1,12 +1,11 @@
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use vapor_forge_cloud_core::{
     BackendError, ByteStore, ChangeList, CloudFileStore, FileEntry, FileMetadata, Quota, Transfer,
@@ -19,6 +18,11 @@ const FORMAT_FILE: &str = "format.json";
 pub struct FolderStore {
     root: PathBuf,
     account: Option<String>,
+    coordination: Arc<RepositoryCoordination>,
+}
+
+struct RepositoryCoordination {
+    lock: Mutex<()>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,14 +67,6 @@ pub struct CommitIdentity {
     pub machine_name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeepLocalResolution {
-    pub heads: Vec<String>,
-    pub selected_head: String,
-    pub client_id: u64,
-    pub machine_name: String,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcRoots {
     pub manifest_ids: BTreeSet<String>,
@@ -79,6 +75,8 @@ pub struct GcRoots {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcReport {
+    pub app_id: u32,
+    pub manifest_scope: String,
     pub retained_manifests: Vec<String>,
     pub candidate_manifests: Vec<String>,
     pub retained_blobs: Vec<String>,
@@ -90,6 +88,15 @@ pub struct GcReport {
 pub(crate) struct GcSweep {
     pub deleted_manifests: usize,
     pub deleted_blobs: usize,
+}
+
+pub(crate) struct GcSweepPlan<'a> {
+    _lock: MutexGuard<'a, ()>,
+    root: PathBuf,
+    app_id: u32,
+    inspected_roots: GcRoots,
+    candidate_manifests: BTreeSet<String>,
+    candidate_blobs: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,7 +154,6 @@ impl ResolvedApp {
 enum SessionStatus {
     Active,
     Suspended,
-    Exited,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -170,19 +176,6 @@ struct SessionOverride {
     app_id: u32,
     client_id: u64,
     superseded_claims: Vec<String>,
-    updated_at: u32,
-    nonce: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct StoredKeepLocalResolution {
-    version: u32,
-    app_id: u32,
-    heads: Vec<String>,
-    selected_head: String,
-    client_id: u64,
-    machine_name: String,
-    nonce: String,
 }
 
 impl FolderStore {
@@ -204,7 +197,12 @@ impl FolderStore {
         }
         std::fs::create_dir_all(root).map_err(io_error)?;
         let root = root.canonicalize().map_err(io_error)?;
-        let store = Self { root, account };
+        let coordination = repository_coordination(&root);
+        let store = Self {
+            root,
+            account,
+            coordination,
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -215,6 +213,11 @@ impl FolderStore {
 
     pub fn view(&self, app_id: u32) -> Result<StoreView, BackendError> {
         validate_app_id(app_id)?;
+        let _lock = self.lock_app(app_id)?;
+        self.view_unlocked(app_id)
+    }
+
+    fn view_unlocked(&self, app_id: u32) -> Result<StoreView, BackendError> {
         let resolved = self.resolve_app(app_id)?;
         let current_change_number = match resolved.heads.as_slice() {
             [] => Some(0),
@@ -256,6 +259,7 @@ impl FolderStore {
         since: u64,
     ) -> Result<ChangeList, BackendError> {
         validate_app_id(app_id)?;
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         if !resolved.heads.iter().any(|candidate| candidate == head) {
             return Err(conflict(
@@ -271,14 +275,16 @@ impl FolderStore {
 
     pub fn stage_file(
         &self,
+        app_id: u32,
         path: &str,
         contents: &[u8],
         metadata: &FileMetadata,
     ) -> Result<StagedFile, BackendError> {
+        validate_app_id(app_id)?;
         validate_cloud_path(path)?;
         validate_metadata(contents, metadata)?;
         let blob_sha1 = metadata.sha1.to_ascii_lowercase();
-        self.publish_blob(&blob_sha1, contents)?;
+        self.publish_blob(app_id, &blob_sha1, contents)?;
         Ok(StagedFile {
             path: path.to_owned(),
             blob_sha1,
@@ -297,11 +303,10 @@ impl FolderStore {
     ) -> Result<u64, BackendError> {
         validate_app_id(app_id)?;
         validate_identity(identity)?;
-        let _lock = self.lock_repository()?;
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         let base_heads = normalized_head_ids(base_heads)?;
         let resolution_heads = resolution_heads.map(normalized_head_ids).transpose()?;
-        let clears_keep_local = resolution_heads.is_some();
         let (parents, original_files, force_publish) = match resolution_heads {
             Some(expected) => {
                 if expected.len() < 2 || resolved.heads != expected {
@@ -352,18 +357,13 @@ impl FolderStore {
                 },
             );
         }
-        self.verify_files(&files)?;
+        self.verify_files(app_id, &files)?;
         if files == original_files && !force_publish {
             return Ok(resolved
                 .current()?
                 .map_or(0, |(_, manifest)| manifest.revision));
         }
-        let revision =
-            self.publish_manifest(app_id, parents, files, identity, resolved.max_revision)?;
-        if clears_keep_local && self.account.is_some() {
-            remove_if_exists(&self.keep_local_resolution_path(app_id, identity.client_id)?)?;
-        }
-        Ok(revision)
+        self.publish_manifest(app_id, parents, files, identity, resolved.max_revision)
     }
 
     pub fn resolve_to_manifest(
@@ -376,7 +376,7 @@ impl FolderStore {
     ) -> Result<u64, BackendError> {
         validate_app_id(app_id)?;
         validate_identity(identity)?;
-        let _lock = self.lock_repository()?;
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         let expected_heads = normalized_head_ids(expected_heads)?;
         if expected_heads.len() < 2 || resolved.heads != expected_heads {
@@ -389,7 +389,7 @@ impl FolderStore {
             .get(selected_head)
             .filter(|_| expected_heads.iter().any(|head| head == selected_head))
             .ok_or_else(|| permanent("selected cloud conflict manifest is not an active head"))?;
-        self.verify_files(&selected.files)?;
+        self.verify_files(app_id, &selected.files)?;
         self.publish_manifest(
             app_id,
             expected_heads,
@@ -406,7 +406,7 @@ impl FolderStore {
     ) -> Result<Option<u64>, BackendError> {
         validate_app_id(app_id)?;
         validate_identity(identity)?;
-        let _lock = self.lock_repository()?;
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         if resolved.heads.len() < 2 {
             return Ok(None);
@@ -422,7 +422,7 @@ impl FolderStore {
         {
             return Ok(None);
         }
-        self.verify_files(&selected.files)?;
+        self.verify_files(app_id, &selected.files)?;
         self.publish_manifest(
             app_id,
             resolved.heads,
@@ -433,167 +433,59 @@ impl FolderStore {
         .map(Some)
     }
 
-    pub fn record_keep_local_resolution(
-        &self,
-        app_id: u32,
-        expected_heads: &[String],
-        selected_head: &str,
-        identity: &CommitIdentity,
-    ) -> Result<(), BackendError> {
+    pub fn inspect_gc(&self, app_id: u32, active: &GcRoots) -> Result<GcReport, BackendError> {
         validate_app_id(app_id)?;
-        validate_identity(identity)?;
-        let _lock = self.lock_repository()?;
-        let resolved = self.resolve_app(app_id)?;
-        let heads = normalized_head_ids(expected_heads)?;
-        if heads.len() < 2 || resolved.heads != heads {
-            return Err(conflict(
-                "local cloud conflict heads changed before resolution",
-            ));
-        }
-        if !heads.iter().any(|head| head == selected_head) {
-            return Err(permanent(
-                "selected local conflict manifest is not an active head",
-            ));
-        }
-        let stored = StoredKeepLocalResolution {
-            version: FORMAT_VERSION,
-            app_id,
-            heads,
-            selected_head: selected_head.to_owned(),
-            client_id: identity.client_id,
-            machine_name: identity.machine_name.clone(),
-            nonce: next_nonce(),
-        };
-        let bytes = serde_json::to_vec(&stored).map_err(json_error)?;
-        atomic_replace(
-            &self.keep_local_resolution_path(app_id, identity.client_id)?,
-            &bytes,
-        )
-    }
-
-    pub fn keep_local_resolution(
-        &self,
-        app_id: u32,
-        client_id: u64,
-    ) -> Result<Option<KeepLocalResolution>, BackendError> {
-        validate_app_id(app_id)?;
-        if client_id == 0 {
-            return Err(permanent("local cloud client identity is unavailable"));
-        }
-        let path = self.keep_local_resolution_path(app_id, client_id)?;
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io_error(error)),
-        };
-        let stored = serde_json::from_slice::<StoredKeepLocalResolution>(&bytes)
-            .map_err(|_| incomplete("local cloud keep-local decision is incomplete"))?;
-        validate_keep_local_resolution(app_id, client_id, &stored)?;
-        let resolved = self.resolve_app(app_id)?;
-        if resolved.heads != stored.heads {
-            if resolved.heads.len() <= 1 {
-                remove_if_exists(&path)?;
-                return Ok(None);
-            }
-            return Err(conflict(
-                "local cloud conflict heads changed after the keep-local decision",
-            ));
-        }
-        Ok(Some(KeepLocalResolution {
-            heads: stored.heads,
-            selected_head: stored.selected_head,
-            client_id: stored.client_id,
-            machine_name: stored.machine_name,
-        }))
-    }
-
-    pub fn clear_keep_local_resolution(
-        &self,
-        app_id: u32,
-        client_id: u64,
-    ) -> Result<(), BackendError> {
-        remove_if_exists(&self.keep_local_resolution_path(app_id, client_id)?)
-    }
-
-    pub fn inspect_gc(&self, active: &GcRoots) -> Result<GcReport, BackendError> {
-        let manifest_root = self.root.join("commits/saves");
-        let mut manifests = BTreeMap::<String, SaveManifest>::new();
-        collect_manifest_objects(&manifest_root, &manifest_root, &mut manifests)?;
-
-        let mut retained = BTreeSet::new();
-        let mut manifests_by_scope = BTreeMap::<String, BTreeSet<String>>::new();
-        for path in manifests.keys() {
-            let scope = manifest_scope(path)?;
-            manifests_by_scope
-                .entry(scope)
-                .or_default()
-                .insert(manifest_id(path)?.to_string());
-        }
-        for ids in manifests_by_scope.values() {
-            let referenced = ids
-                .iter()
-                .filter_map(|id| {
-                    manifests
-                        .iter()
-                        .find(|(path, _)| manifest_id(path).ok() == Some(id.as_str()))
-                        .map(|(_, manifest)| manifest)
-                })
-                .flat_map(|manifest| manifest.parents.iter())
-                .collect::<BTreeSet<_>>();
-            let heads = ids
-                .iter()
-                .filter(|id| !referenced.contains(id))
-                .cloned()
-                .collect::<Vec<_>>();
-            for head in heads {
-                retained.insert(head.clone());
-                let manifest = manifests
+        let target_scope = self.gc_manifest_scope(app_id);
+        let manifests = collect_manifest_objects(&self.commit_dir(app_id), app_id)?;
+        let referenced = manifests
+            .values()
+            .flat_map(|manifest| manifest.parents.iter())
+            .collect::<BTreeSet<_>>();
+        let mut retained_manifest_ids = BTreeSet::new();
+        for (id, manifest) in manifests.iter().filter(|(id, _)| !referenced.contains(id)) {
+            retained_manifest_ids.insert(id.clone());
+            retained_manifest_ids.extend(
+                manifest
+                    .parents
                     .iter()
-                    .find(|(path, _)| manifest_id(path).ok() == Some(head.as_str()))
-                    .map(|(_, manifest)| manifest)
-                    .ok_or_else(|| incomplete("local cloud GC lost a manifest head"))?;
-                retained.extend(
-                    manifest
-                        .parents
-                        .iter()
-                        .filter(|parent| ids.contains(*parent))
-                        .cloned(),
-                );
-            }
+                    .filter(|parent| manifests.contains_key(*parent))
+                    .cloned(),
+            );
         }
-        retained.extend(active.manifest_ids.iter().cloned());
-        if !active.manifest_ids.iter().all(|id| {
-            manifests
-                .keys()
-                .any(|path| manifest_id(path).ok() == Some(id))
-        }) {
+        retained_manifest_ids.extend(active.manifest_ids.iter().cloned());
+        if !active
+            .manifest_ids
+            .iter()
+            .all(|id| manifests.contains_key(id))
+        {
             return Err(incomplete("local cloud GC active manifest is unavailable"));
         }
 
-        let mut retained_manifest_paths = BTreeSet::new();
         let mut retained_blobs = active.blob_sha1s.clone();
-        for (path, manifest) in &manifests {
-            if retained.contains(manifest_id(path)?) {
-                retained_manifest_paths.insert(path.clone());
-                for file in manifest.files.values() {
-                    self.read_blob(file)?;
-                    retained_blobs.insert(file.sha1.clone());
-                }
+        for id in &retained_manifest_ids {
+            let manifest = manifests
+                .get(id)
+                .ok_or_else(|| incomplete("local cloud GC retained manifest is unavailable"))?;
+            for file in manifest.files.values() {
+                self.read_blob(app_id, file)?;
+                retained_blobs.insert(file.sha1.clone());
             }
         }
 
-        let all_blobs = collect_blob_objects(&self.root.join("blobs/sha1"))?;
+        let all_blobs = collect_blob_objects(&self.blob_dir(app_id))?;
         if !retained_blobs.iter().all(|sha1| all_blobs.contains(sha1)) {
             return Err(incomplete("local cloud GC active blob is unavailable"));
         }
         let candidate_manifests = manifests
             .keys()
-            .filter(|path| !retained_manifest_paths.contains(*path))
+            .filter(|id| !retained_manifest_ids.contains(*id))
             .cloned()
             .collect();
         let candidate_blobs = all_blobs.difference(&retained_blobs).cloned().collect();
         Ok(GcReport {
-            retained_manifests: retained_manifest_paths.into_iter().collect(),
+            app_id,
+            manifest_scope: target_scope,
+            retained_manifests: retained_manifest_ids.into_iter().collect(),
             candidate_manifests,
             retained_blobs: retained_blobs.into_iter().collect(),
             candidate_blobs,
@@ -601,13 +493,12 @@ impl FolderStore {
         })
     }
 
-    pub(crate) fn sweep_gc(
+    pub(crate) fn prepare_gc_sweep(
         &self,
         report: &GcReport,
-        active: &GcRoots,
-    ) -> Result<Option<GcSweep>, BackendError> {
-        if report.inspected_roots != *active {
-            return Ok(None);
+    ) -> Result<Option<GcSweepPlan<'_>>, BackendError> {
+        if report.manifest_scope != self.gc_manifest_scope(report.app_id) {
+            return Err(permanent("invalid local cloud GC scope"));
         }
         let retained_manifests = unique_items(&report.retained_manifests)?;
         let candidate_manifests = unique_items(&report.candidate_manifests)?;
@@ -619,14 +510,13 @@ impl FolderStore {
             return Err(permanent("invalid local cloud GC report"));
         }
 
-        let _lock = self.lock_repository()?;
-        let manifest_root = self.root.join("commits/saves");
-        let current_manifests = collect_manifest_paths(&manifest_root, &manifest_root)?;
+        let _lock = self.lock_app(report.app_id)?;
+        let current_manifests = collect_manifest_paths(&self.commit_dir(report.app_id))?;
         let expected_manifests = retained_manifests
             .union(&candidate_manifests)
             .cloned()
             .collect::<BTreeSet<_>>();
-        let current_blobs = collect_blob_objects(&self.root.join("blobs/sha1"))?;
+        let current_blobs = collect_blob_objects(&self.blob_dir(report.app_id))?;
         let expected_blobs = retained_blobs
             .union(&candidate_blobs)
             .cloned()
@@ -634,24 +524,43 @@ impl FolderStore {
         if current_manifests != expected_manifests || current_blobs != expected_blobs {
             return Ok(None);
         }
-        if active.manifest_ids.iter().any(|id| {
-            candidate_manifests
-                .iter()
-                .any(|path| manifest_id(path).ok() == Some(id.as_str()))
-        }) || !active.blob_sha1s.is_disjoint(&candidate_blobs)
+
+        Ok(Some(GcSweepPlan {
+            _lock,
+            root: self.app_dir(report.app_id),
+            app_id: report.app_id,
+            inspected_roots: report.inspected_roots.clone(),
+            candidate_manifests,
+            candidate_blobs,
+        }))
+    }
+
+    pub(crate) fn apply_gc_sweep(
+        &self,
+        plan: GcSweepPlan<'_>,
+        active: &GcRoots,
+    ) -> Result<Option<GcSweep>, BackendError> {
+        if plan.root != self.app_dir(plan.app_id) || plan.inspected_roots != *active {
+            return Ok(None);
+        }
+        if active
+            .manifest_ids
+            .iter()
+            .any(|id| plan.candidate_manifests.contains(id))
+            || !active.blob_sha1s.is_disjoint(&plan.candidate_blobs)
         {
             return Ok(None);
         }
 
-        for path in &candidate_manifests {
-            remove_if_exists(&manifest_root.join(path))?;
+        for id in &plan.candidate_manifests {
+            remove_if_exists(&self.commit_dir(plan.app_id).join(format!("{id}.json")))?;
         }
-        for sha1 in &candidate_blobs {
-            remove_if_exists(&self.blob_path(sha1)?)?;
+        for sha1 in &plan.candidate_blobs {
+            remove_if_exists(&self.blob_path(plan.app_id, sha1)?)?;
         }
         Ok(Some(GcSweep {
-            deleted_manifests: candidate_manifests.len(),
-            deleted_blobs: candidate_blobs.len(),
+            deleted_manifests: plan.candidate_manifests.len(),
+            deleted_blobs: plan.candidate_blobs.len(),
         }))
     }
 
@@ -689,7 +598,6 @@ impl FolderStore {
                 "another local manifest was published concurrently",
             ));
         }
-        self.materialize_checkout(app_id, &current_manifest.files)?;
         Ok(revision)
     }
 
@@ -703,15 +611,14 @@ impl FolderStore {
     ) -> Result<Vec<SessionPeer>, BackendError> {
         validate_app_id(app_id)?;
         validate_identity(identity)?;
+        let _lock = self.lock_app(app_id)?;
         let claims = self.read_session_claims(app_id)?;
-        let superseded = self.read_session_overrides(app_id)?;
+        let mut overrides = self.read_session_overrides(app_id)?;
+        let initial_live_claims = live_claim_ids(&claims);
+        let superseded = superseded_live_claims(&overrides, &initial_live_claims);
         let pending = claims
             .iter()
-            .filter(|(id, claim)| {
-                claim.client_id != identity.client_id
-                    && claim.status != SessionStatus::Exited
-                    && !superseded.contains(id)
-            })
+            .filter(|(id, claim)| claim.client_id != identity.client_id && !superseded.contains(id))
             .map(|(_, claim)| SessionPeer {
                 client_id: claim.client_id,
                 machine_name: claim.machine_name.clone(),
@@ -721,6 +628,7 @@ impl FolderStore {
             })
             .collect::<Vec<_>>();
         if !pending.is_empty() && !ignore_pending {
+            self.reconcile_loaded_session_overrides(overrides, &initial_live_claims)?;
             return Ok(pending);
         }
         if !pending.is_empty() {
@@ -728,10 +636,7 @@ impl FolderStore {
             superseded_claims.extend(
                 claims
                     .iter()
-                    .filter(|(_, claim)| {
-                        claim.client_id != identity.client_id
-                            && claim.status != SessionStatus::Exited
-                    })
+                    .filter(|(_, claim)| claim.client_id != identity.client_id)
                     .map(|(id, _)| id.clone()),
             );
             let mut superseded_claims = superseded_claims.into_iter().collect::<Vec<_>>();
@@ -741,12 +646,13 @@ impl FolderStore {
                 app_id,
                 client_id: identity.client_id,
                 superseded_claims,
-                updated_at: unix_seconds(),
-                nonce: next_nonce(),
             };
+            let path = self.session_override_path(app_id, identity.client_id)?;
             self.write_session_override(&override_record)?;
+            overrides.retain(|(existing, _)| existing != &path);
+            overrides.push((path, override_record));
         }
-        self.write_session_claim(SessionClaim {
+        let claim_id = self.write_session_claim(SessionClaim {
             version: FORMAT_VERSION,
             app_id,
             client_id: identity.client_id,
@@ -754,10 +660,17 @@ impl FolderStore {
             os_type,
             device_type,
             status: SessionStatus::Active,
-            observed_heads: self.view(app_id)?.head_ids(),
+            observed_heads: self.view_unlocked(app_id)?.head_ids(),
             updated_at: unix_seconds(),
             nonce: next_nonce(),
         })?;
+        let mut final_live_claims = claims
+            .iter()
+            .filter(|(_, claim)| claim.client_id != identity.client_id)
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        final_live_claims.insert(claim_id);
+        self.reconcile_loaded_session_overrides(overrides, &final_live_claims)?;
         Ok(Vec::new())
     }
 
@@ -778,7 +691,19 @@ impl FolderStore {
     }
 
     pub fn exit_session(&self, app_id: u32, identity: &CommitIdentity) -> Result<(), BackendError> {
-        self.update_session(app_id, identity, SessionStatus::Exited)
+        validate_app_id(app_id)?;
+        validate_identity(identity)?;
+        let _lock = self.lock_app(app_id)?;
+        if self
+            .read_session_claim(app_id, identity.client_id)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        remove_if_exists(&self.session_claim_path(app_id, identity.client_id)?)?;
+        let claims = self.read_session_claims(app_id)?;
+        self.reconcile_session_overrides(app_id, &live_claim_ids(&claims))?;
+        Ok(())
     }
 
     fn update_session(
@@ -789,22 +714,25 @@ impl FolderStore {
     ) -> Result<(), BackendError> {
         validate_app_id(app_id)?;
         validate_identity(identity)?;
-        let mut claims = self
-            .read_session_claims(app_id)?
-            .into_iter()
-            .filter(|(_, claim)| claim.client_id == identity.client_id)
-            .map(|(_, claim)| claim)
-            .collect::<Vec<_>>();
-        claims.sort_by_key(|claim| claim.updated_at);
-        let mut claim = claims
-            .pop()
+        let _lock = self.lock_app(app_id)?;
+        let mut claim = self
+            .read_session_claim(app_id, identity.client_id)?
             .ok_or_else(|| conflict("local cloud session does not belong to this client"))?;
-        claim.machine_name = identity.machine_name.clone();
-        claim.status = status;
-        claim.observed_heads = self.view(app_id)?.head_ids();
-        claim.updated_at = unix_seconds();
-        claim.nonce = next_nonce();
-        self.write_session_claim(claim)
+        let observed_heads = self.view_unlocked(app_id)?.head_ids();
+        if claim.machine_name != identity.machine_name
+            || claim.status != status
+            || claim.observed_heads != observed_heads
+        {
+            claim.machine_name = identity.machine_name.clone();
+            claim.status = status;
+            claim.observed_heads = observed_heads;
+            claim.updated_at = unix_seconds();
+            claim.nonce = next_nonce();
+            self.write_session_claim(claim)?;
+        }
+        let claims = self.read_session_claims(app_id)?;
+        self.reconcile_session_overrides(app_id, &live_claim_ids(&claims))?;
+        Ok(())
     }
 
     fn read_session_claims(
@@ -821,58 +749,115 @@ impl FolderStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = std::fs::read(path).map_err(io_error)?;
+            let bytes = std::fs::read(&path).map_err(io_error)?;
             let claim = serde_json::from_slice::<SessionClaim>(&bytes)
                 .map_err(|_| incomplete("local cloud session claim is incomplete"))?;
             validate_session_claim(app_id, &claim)?;
+            if session_record_client_id(&path)? != claim.client_id {
+                return Err(permanent("local cloud session claim ClientID is invalid"));
+            }
             claims.push((hex_digest::<Sha256>(&bytes), claim));
         }
         Ok(claims)
     }
 
-    fn read_session_overrides(&self, app_id: u32) -> Result<HashSet<String>, BackendError> {
+    fn read_session_claim(
+        &self,
+        app_id: u32,
+        client_id: u64,
+    ) -> Result<Option<SessionClaim>, BackendError> {
+        let path = self.session_claim_path(app_id, client_id)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(error)),
+        };
+        let claim = serde_json::from_slice::<SessionClaim>(&bytes)
+            .map_err(|_| incomplete("local cloud session claim is incomplete"))?;
+        validate_session_claim(app_id, &claim)?;
+        if claim.client_id != client_id {
+            return Err(permanent("local cloud session claim ClientID is invalid"));
+        }
+        Ok(Some(claim))
+    }
+
+    fn reconcile_session_overrides(
+        &self,
+        app_id: u32,
+        live_claims: &HashSet<String>,
+    ) -> Result<HashSet<String>, BackendError> {
+        let overrides = self.read_session_overrides(app_id)?;
+        self.reconcile_loaded_session_overrides(overrides, live_claims)
+    }
+
+    fn read_session_overrides(
+        &self,
+        app_id: u32,
+    ) -> Result<Vec<(PathBuf, SessionOverride)>, BackendError> {
         let directory = self.session_dir(app_id)?.join("overrides");
         if !directory.exists() {
-            return Ok(HashSet::new());
+            return Ok(Vec::new());
         }
-        let mut superseded = HashSet::new();
+        let mut overrides = Vec::new();
         for entry in std::fs::read_dir(directory).map_err(io_error)? {
             let path = entry.map_err(io_error)?.path();
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
             let record =
-                serde_json::from_slice::<SessionOverride>(&std::fs::read(path).map_err(io_error)?)
+                serde_json::from_slice::<SessionOverride>(&std::fs::read(&path).map_err(io_error)?)
                     .map_err(|_| incomplete("local cloud session override is incomplete"))?;
             validate_session_override(app_id, &record)?;
+            if session_record_client_id(&path)? != record.client_id {
+                return Err(permanent(
+                    "local cloud session override ClientID is invalid",
+                ));
+            }
+            overrides.push((path, record));
+        }
+        Ok(overrides)
+    }
+
+    fn reconcile_loaded_session_overrides(
+        &self,
+        overrides: Vec<(PathBuf, SessionOverride)>,
+        live_claims: &HashSet<String>,
+    ) -> Result<HashSet<String>, BackendError> {
+        let mut superseded = HashSet::new();
+        for (path, mut record) in overrides {
+            let retained = record
+                .superseded_claims
+                .iter()
+                .filter(|id| live_claims.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if retained.is_empty() {
+                remove_if_exists(&path)?;
+                continue;
+            }
+            if retained != record.superseded_claims {
+                record.superseded_claims = retained;
+                self.write_session_override(&record)?;
+            }
             superseded.extend(record.superseded_claims);
         }
         Ok(superseded)
     }
 
-    fn write_session_claim(&self, claim: SessionClaim) -> Result<(), BackendError> {
-        let path = self
-            .session_dir(claim.app_id)?
-            .join("claims")
-            .join(format!("{}.json", claim.client_id));
+    fn write_session_claim(&self, claim: SessionClaim) -> Result<String, BackendError> {
+        let path = self.session_claim_path(claim.app_id, claim.client_id)?;
         let bytes = serde_json::to_vec(&claim).map_err(json_error)?;
-        atomic_replace(&path, &bytes)
+        atomic_replace(&path, &bytes)?;
+        Ok(hex_digest::<Sha256>(&bytes))
     }
 
     fn write_session_override(&self, record: &SessionOverride) -> Result<(), BackendError> {
-        let path = self
-            .session_dir(record.app_id)?
-            .join("overrides")
-            .join(format!("{}.json", record.client_id));
+        let path = self.session_override_path(record.app_id, record.client_id)?;
         let bytes = serde_json::to_vec(record).map_err(json_error)?;
         atomic_replace(&path, &bytes)
     }
 
     fn initialize(&self) -> Result<(), BackendError> {
-        std::fs::create_dir_all(self.root.join("blobs/sha1")).map_err(io_error)?;
-        std::fs::create_dir_all(self.root.join("commits/saves")).map_err(io_error)?;
-        std::fs::create_dir_all(self.root.join("sessions")).map_err(io_error)?;
-        std::fs::create_dir_all(self.root.join("records")).map_err(io_error)?;
         let format_path = self.root.join(FORMAT_FILE);
         if format_path.exists() {
             let format: Format =
@@ -891,59 +876,75 @@ impl FolderStore {
         Ok(())
     }
 
-    fn commit_dir(&self, app_id: u32) -> PathBuf {
-        let mut directory = self.root.join("commits/saves");
+    fn app_dir(&self, app_id: u32) -> PathBuf {
+        let mut directory = self.root.clone();
         if let Some(account) = &self.account {
             directory.push(account);
         }
         directory.join(app_id.to_string())
     }
 
-    fn session_dir(&self, app_id: u32) -> Result<PathBuf, BackendError> {
-        let account = self
-            .account
-            .as_deref()
-            .ok_or_else(|| permanent("local cloud session requires an account"))?;
-        Ok(self
-            .root
-            .join("sessions")
-            .join(account)
-            .join(app_id.to_string()))
+    fn commit_dir(&self, app_id: u32) -> PathBuf {
+        self.app_dir(app_id).join("manifests")
     }
 
-    fn keep_local_resolution_path(
-        &self,
-        app_id: u32,
-        client_id: u64,
-    ) -> Result<PathBuf, BackendError> {
+    pub(crate) fn gc_manifest_scope(&self, app_id: u32) -> String {
+        match &self.account {
+            Some(account) => format!("{account}/{app_id}"),
+            None => app_id.to_string(),
+        }
+    }
+
+    fn session_dir(&self, app_id: u32) -> Result<PathBuf, BackendError> {
+        if self.account.is_none() {
+            return Err(permanent("local cloud session requires an account"));
+        }
+        Ok(self.app_dir(app_id).join("sessions"))
+    }
+
+    fn session_claim_path(&self, app_id: u32, client_id: u64) -> Result<PathBuf, BackendError> {
+        if client_id == 0 {
+            return Err(permanent("local cloud session ClientID is unavailable"));
+        }
         Ok(self
             .session_dir(app_id)?
-            .join("resolutions")
+            .join("claims")
             .join(format!("{client_id}.json")))
     }
 
-    fn lock_repository(&self) -> Result<File, BackendError> {
-        let path = self.root.join(".vapor-forge.commit.lock");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(io_error)?;
-        FileExt::lock_exclusive(&file).map_err(io_error)?;
-        Ok(file)
+    fn session_override_path(&self, app_id: u32, client_id: u64) -> Result<PathBuf, BackendError> {
+        if client_id == 0 {
+            return Err(permanent("local cloud session ClientID is unavailable"));
+        }
+        Ok(self
+            .session_dir(app_id)?
+            .join("overrides")
+            .join(format!("{client_id}.json")))
     }
 
-    fn blob_path(&self, hash: &str) -> Result<PathBuf, BackendError> {
+    fn lock_app(&self, app_id: u32) -> Result<MutexGuard<'_, ()>, BackendError> {
+        validate_app_id(app_id)?;
+        Ok(self
+            .coordination
+            .lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()))
+    }
+
+    fn blob_dir(&self, app_id: u32) -> PathBuf {
+        self.app_dir(app_id).join("blobs")
+    }
+
+    fn blob_path(&self, app_id: u32, hash: &str) -> Result<PathBuf, BackendError> {
+        validate_app_id(app_id)?;
         if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(permanent("invalid local cloud blob hash"));
         }
-        Ok(self.root.join("blobs/sha1").join(&hash[..2]).join(hash))
+        Ok(self.blob_dir(app_id).join(&hash[..2]).join(hash))
     }
 
-    fn publish_blob(&self, hash: &str, contents: &[u8]) -> Result<(), BackendError> {
-        atomic_publish(&self.blob_path(hash)?, contents)
+    fn publish_blob(&self, app_id: u32, hash: &str, contents: &[u8]) -> Result<(), BackendError> {
+        atomic_publish(&self.blob_path(app_id, hash)?, contents)
     }
 
     fn resolve_app(&self, app_id: u32) -> Result<ResolvedApp, BackendError> {
@@ -974,7 +975,7 @@ impl FolderStore {
             let manifest = serde_json::from_slice::<SaveManifest>(&bytes)
                 .map_err(|_| incomplete("local cloud manifest is incomplete"))?;
             validate_manifest(id, app_id, &manifest)?;
-            self.verify_files(&manifest.files)?;
+            self.verify_files(app_id, &manifest.files)?;
             manifests.insert(id.to_owned(), manifest);
         }
 
@@ -1000,35 +1001,20 @@ impl FolderStore {
         })
     }
 
-    fn verify_files(&self, files: &BTreeMap<String, StoredFile>) -> Result<(), BackendError> {
-        for (path, file) in files {
-            validate_cloud_path(path)?;
-            self.read_blob(file)?;
-        }
-        Ok(())
-    }
-
-    fn materialize_checkout(
+    fn verify_files(
         &self,
         app_id: u32,
         files: &BTreeMap<String, StoredFile>,
     ) -> Result<(), BackendError> {
-        let mut root = self.root.join("checkouts").join(device_id());
-        if let Some(account) = &self.account {
-            root.push(account);
-        }
-        root.push(app_id.to_string());
-        std::fs::create_dir_all(&root).map_err(io_error)?;
         for (path, file) in files {
-            let destination = joined_cloud_path(&root, path)?;
-            let bytes = self.read_blob(file)?;
-            atomic_replace(&destination, &bytes)?;
+            validate_cloud_path(path)?;
+            self.read_blob(app_id, file)?;
         }
-        remove_unlisted_files(&root, &root, &files.keys().cloned().collect())
+        Ok(())
     }
 
-    fn read_blob(&self, file: &StoredFile) -> Result<Vec<u8>, BackendError> {
-        let bytes = std::fs::read(self.blob_path(&file.sha1)?).map_err(io_error)?;
+    fn read_blob(&self, app_id: u32, file: &StoredFile) -> Result<Vec<u8>, BackendError> {
+        let bytes = std::fs::read(self.blob_path(app_id, &file.sha1)?).map_err(io_error)?;
         if bytes.len() as u64 != file.raw_size || hex_digest::<Sha1>(&bytes) != file.sha1 {
             return Err(permanent("local cloud blob failed integrity verification"));
         }
@@ -1036,9 +1022,28 @@ impl FolderStore {
     }
 }
 
+fn repository_coordination(root: &Path) -> Arc<RepositoryCoordination> {
+    static COORDINATORS: OnceLock<Mutex<HashMap<PathBuf, Weak<RepositoryCoordination>>>> =
+        OnceLock::new();
+    let coordinators = COORDINATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut coordinators = coordinators
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(coordination) = coordinators.get(root).and_then(Weak::upgrade) {
+        return coordination;
+    }
+    coordinators.retain(|_, coordination| coordination.strong_count() != 0);
+    let coordination = Arc::new(RepositoryCoordination {
+        lock: Mutex::new(()),
+    });
+    coordinators.insert(root.to_owned(), Arc::downgrade(&coordination));
+    coordination
+}
+
 impl ByteStore for FolderStore {
     fn read(&self, app_id: u32, path: &str) -> Result<Vec<u8>, BackendError> {
         validate_cloud_path(path)?;
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         let (_, current) = resolved
             .current()?
@@ -1047,7 +1052,7 @@ impl ByteStore for FolderStore {
             .files
             .get(path)
             .ok_or_else(|| permanent(format!("local cloud file not found: {path}")))?;
-        self.read_blob(file)
+        self.read_blob(app_id, file)
     }
 
     fn write(
@@ -1059,7 +1064,7 @@ impl ByteStore for FolderStore {
     ) -> Result<u64, BackendError> {
         let view = self.view(app_id)?;
         let identity = current_identity()?;
-        let staged = self.stage_file(path, contents, metadata)?;
+        let staged = self.stage_file(app_id, path, contents, metadata)?;
         self.commit_batch(
             app_id,
             &view.head_ids(),
@@ -1073,6 +1078,7 @@ impl ByteStore for FolderStore {
 
 impl CloudFileStore for FolderStore {
     fn changes_since(&self, app_id: u32, since: u64) -> Result<ChangeList, BackendError> {
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         let current = resolved.current()?;
         change_list_from_manifest(current.map(|(_, manifest)| manifest), since, false)
@@ -1093,6 +1099,7 @@ impl CloudFileStore for FolderStore {
     }
 
     fn quota(&self, app_id: u32) -> Result<Quota, BackendError> {
+        let _lock = self.lock_app(app_id)?;
         let resolved = self.resolve_app(app_id)?;
         let files = resolved.current()?.map(|(_, manifest)| &manifest.files);
         let used_bytes = files
@@ -1222,8 +1229,6 @@ fn validate_session_override(app_id: u32, record: &SessionOverride) -> Result<()
     if record.version != FORMAT_VERSION
         || record.app_id != app_id
         || record.client_id == 0
-        || record.updated_at == 0
-        || record.nonce.is_empty()
         || normalized_head_ids(&record.superseded_claims)? != record.superseded_claims
     {
         return Err(permanent("invalid local cloud session override"));
@@ -1231,27 +1236,30 @@ fn validate_session_override(app_id: u32, record: &SessionOverride) -> Result<()
     Ok(())
 }
 
-fn validate_keep_local_resolution(
-    app_id: u32,
-    client_id: u64,
-    record: &StoredKeepLocalResolution,
-) -> Result<(), BackendError> {
-    if record.version != FORMAT_VERSION
-        || record.app_id != app_id
-        || record.client_id != client_id
-        || record.nonce.is_empty()
-        || !record
-            .heads
-            .iter()
-            .any(|head| head == &record.selected_head)
-        || normalized_head_ids(&record.heads)? != record.heads
-    {
-        return Err(permanent("invalid local cloud keep-local decision"));
-    }
-    validate_identity(&CommitIdentity {
-        client_id: record.client_id,
-        machine_name: record.machine_name.clone(),
-    })
+fn live_claim_ids(claims: &[(String, SessionClaim)]) -> HashSet<String> {
+    claims.iter().map(|(id, _)| id.clone()).collect()
+}
+
+fn superseded_live_claims(
+    overrides: &[(PathBuf, SessionOverride)],
+    live_claims: &HashSet<String>,
+) -> HashSet<String> {
+    overrides
+        .iter()
+        .flat_map(|(_, record)| record.superseded_claims.iter())
+        .filter(|id| live_claims.contains(*id))
+        .cloned()
+        .collect()
+}
+
+fn session_record_client_id(path: &Path) -> Result<u64, BackendError> {
+    let client_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| permanent("invalid local cloud session record name"))?;
+    Ok(client_id)
 }
 
 fn normalized_head_ids(ids: &[String]) -> Result<Vec<String>, BackendError> {
@@ -1291,15 +1299,6 @@ fn validate_cloud_path(path: &str) -> Result<(), BackendError> {
         return Err(permanent("invalid local cloud path component"));
     }
     Ok(())
-}
-
-fn joined_cloud_path(root: &Path, path: &str) -> Result<PathBuf, BackendError> {
-    validate_cloud_path(path)?;
-    let mut result = root.to_owned();
-    for component in path.split('/') {
-        result.push(component);
-    }
-    Ok(result)
 }
 
 fn validate_metadata(contents: &[u8], metadata: &FileMetadata) -> Result<(), BackendError> {
@@ -1357,9 +1356,15 @@ pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
 }
 
 pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
     let parent = path
         .parent()
-        .ok_or_else(|| permanent("local cloud checkout has no parent directory"))?;
+        .ok_or_else(|| permanent("local cloud object has no parent directory"))?;
     std::fs::create_dir_all(parent).map_err(io_error)?;
     let temporary = parent.join(format!(".syncthing.{}.tmp", next_nonce()));
     let mut file = std::fs::OpenOptions::new()
@@ -1367,10 +1372,17 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
         .write(true)
         .open(&temporary)
         .map_err(io_error)?;
-    file.write_all(bytes).map_err(io_error)?;
-    file.sync_all().map_err(io_error)?;
+    let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
-    std::fs::rename(&temporary, path).map_err(io_error)
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(io_error(error));
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(io_error(error));
+    }
+    Ok(())
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), BackendError> {
@@ -1381,49 +1393,18 @@ fn remove_if_exists(path: &Path) -> Result<(), BackendError> {
     }
 }
 
-fn remove_unlisted_files(
-    root: &Path,
-    directory: &Path,
-    listed: &BTreeSet<String>,
-) -> Result<(), BackendError> {
-    for entry in std::fs::read_dir(directory).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        if path.is_dir() {
-            remove_unlisted_files(root, &path, listed)?;
-            if std::fs::read_dir(&path).map_err(io_error)?.next().is_none() {
-                std::fs::remove_dir(&path).map_err(io_error)?;
-            }
-        } else if path.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| permanent("local checkout escaped its root"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !listed.contains(&relative) {
-                std::fs::remove_file(path).map_err(io_error)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn collect_manifest_objects(
-    root: &Path,
     directory: &Path,
-    manifests: &mut BTreeMap<String, SaveManifest>,
-) -> Result<(), BackendError> {
+    app_id: u32,
+) -> Result<BTreeMap<String, SaveManifest>, BackendError> {
     if !directory.exists() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
+    let mut manifests = BTreeMap::new();
     for entry in std::fs::read_dir(directory).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let file_type = entry.file_type().map_err(io_error)?;
         let path = entry.path();
-        if file_type.is_dir() {
-            collect_manifest_objects(root, &path, manifests)?;
-            continue;
-        }
         if !file_type.is_file() {
             return Err(incomplete("local cloud manifest namespace is incomplete"));
         }
@@ -1436,27 +1417,6 @@ fn collect_manifest_objects(
         }
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             return Err(incomplete("local cloud manifest namespace is incomplete"));
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| permanent("local cloud manifest escaped its namespace"))?;
-        let components = relative
-            .components()
-            .map(|component| component.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| incomplete("local cloud manifest path is not UTF-8"))?;
-        let app_component = match components.as_slice() {
-            [app_id, _] => *app_id,
-            [account, app_id, _] if account.parse::<u64>().is_ok_and(|account| account != 0) => {
-                *app_id
-            }
-            _ => return Err(permanent("invalid local cloud manifest path")),
-        };
-        let app_id = app_component
-            .parse::<u32>()
-            .map_err(|_| permanent("invalid local cloud manifest AppID"))?;
-        if app_id == 0 {
-            continue;
         }
         let bytes = std::fs::read(&path).map_err(io_error)?;
         let id = path
@@ -1469,36 +1429,22 @@ fn collect_manifest_objects(
         let manifest = serde_json::from_slice::<SaveManifest>(&bytes)
             .map_err(|_| incomplete("local cloud manifest is incomplete"))?;
         validate_manifest(id, app_id, &manifest)?;
-        let key = components.join("/");
-        if manifests.insert(key, manifest).is_some() {
-            return Err(permanent("duplicate local cloud manifest path"));
+        if manifests.insert(id.to_owned(), manifest).is_some() {
+            return Err(permanent("duplicate local cloud manifest identity"));
         }
     }
-    Ok(())
+    Ok(manifests)
 }
 
-fn collect_manifest_paths(root: &Path, directory: &Path) -> Result<BTreeSet<String>, BackendError> {
+fn collect_manifest_paths(directory: &Path) -> Result<BTreeSet<String>, BackendError> {
     if !directory.exists() {
         return Ok(BTreeSet::new());
     }
     let mut paths = BTreeSet::new();
-    collect_manifest_paths_inner(root, directory, &mut paths)?;
-    Ok(paths)
-}
-
-fn collect_manifest_paths_inner(
-    root: &Path,
-    directory: &Path,
-    paths: &mut BTreeSet<String>,
-) -> Result<(), BackendError> {
     for entry in std::fs::read_dir(directory).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let file_type = entry.file_type().map_err(io_error)?;
         let path = entry.path();
-        if file_type.is_dir() {
-            collect_manifest_paths_inner(root, &path, paths)?;
-            continue;
-        }
         if !file_type.is_file() {
             return Err(incomplete("local cloud manifest namespace is incomplete"));
         }
@@ -1512,27 +1458,6 @@ fn collect_manifest_paths_inner(
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             return Err(incomplete("local cloud manifest namespace is incomplete"));
         }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| permanent("local cloud manifest escaped its namespace"))?;
-        let components = relative
-            .components()
-            .map(|component| component.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| incomplete("local cloud manifest path is not UTF-8"))?;
-        let app_component = match components.as_slice() {
-            [app_id, _] => *app_id,
-            [account, app_id, _] if account.parse::<u64>().is_ok_and(|account| account != 0) => {
-                *app_id
-            }
-            _ => return Err(permanent("invalid local cloud manifest path")),
-        };
-        let app_id = app_component
-            .parse::<u32>()
-            .map_err(|_| permanent("invalid local cloud manifest AppID"))?;
-        if app_id == 0 {
-            continue;
-        }
         let id = path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -1540,12 +1465,11 @@ fn collect_manifest_paths_inner(
         if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(incomplete("local cloud manifest identity is invalid"));
         }
-        let key = components.join("/");
-        if !paths.insert(key) {
-            return Err(permanent("duplicate local cloud manifest path"));
+        if !paths.insert(id.to_owned()) {
+            return Err(permanent("duplicate local cloud manifest identity"));
         }
     }
-    Ok(())
+    Ok(paths)
 }
 
 fn unique_items(items: &[String]) -> Result<BTreeSet<String>, BackendError> {
@@ -1556,24 +1480,9 @@ fn unique_items(items: &[String]) -> Result<BTreeSet<String>, BackendError> {
     Ok(unique)
 }
 
-fn manifest_scope(path: &str) -> Result<String, BackendError> {
-    Path::new(path)
-        .parent()
-        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
-        .filter(|scope| !scope.is_empty())
-        .ok_or_else(|| permanent("invalid local cloud manifest scope"))
-}
-
-fn manifest_id(path: &str) -> Result<&str, BackendError> {
-    Path::new(path)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| permanent("invalid local cloud manifest id"))
-}
-
 fn collect_blob_objects(root: &Path) -> Result<BTreeSet<String>, BackendError> {
     if !root.exists() {
-        return Err(incomplete("local cloud blob namespace is unavailable"));
+        return Ok(BTreeSet::new());
     }
     let mut blobs = BTreeSet::new();
     for prefix_entry in std::fs::read_dir(root).map_err(io_error)? {
@@ -1623,12 +1532,6 @@ fn hex_digest<D: sha1::Digest + Default>(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn device_id() -> String {
-    vapor_forge_cloud_core::device_descriptor()
-        .map(|descriptor| format!("{:016x}", descriptor.client_id))
-        .unwrap_or_else(|| "local".to_string())
 }
 
 fn unix_millis() -> u64 {
@@ -1743,7 +1646,7 @@ mod tests {
     ) -> u64 {
         let view = store.view(app_id).unwrap();
         let staged = store
-            .stage_file(path, contents, &metadata(contents, mtime))
+            .stage_file(app_id, path, contents, &metadata(contents, mtime))
             .unwrap();
         store
             .commit_batch(
@@ -1755,6 +1658,20 @@ mod tests {
                 None,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn replacing_identical_bytes_keeps_the_existing_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.json");
+        let link = temporary.path().join("state-link.json");
+        atomic_replace(&path, b"same").unwrap();
+        std::fs::hard_link(&path, &link).unwrap();
+
+        atomic_replace(&path, b"same").unwrap();
+        std::fs::write(&link, b"changed through link").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed through link");
     }
 
     fn divergent_heads(store: &FolderStore) -> (String, String) {
@@ -1770,7 +1687,7 @@ mod tests {
             "save.dat".into(),
             stored_file(
                 store
-                    .stage_file("save.dat", b"left", &metadata(b"left", 2))
+                    .stage_file(480, "save.dat", b"left", &metadata(b"left", 2))
                     .unwrap(),
             ),
         );
@@ -1790,7 +1707,7 @@ mod tests {
             "save.dat".into(),
             stored_file(
                 store
-                    .stage_file("save.dat", b"right", &metadata(b"right", 3))
+                    .stage_file(480, "save.dat", b"right", &metadata(b"right", 3))
                     .unwrap(),
             ),
         );
@@ -1854,7 +1771,7 @@ mod tests {
         commit_file(&store, 480, "old.dat", b"old", 1, &identity);
         let view = store.view(480).unwrap();
         let staged = store
-            .stage_file("new.dat", b"new", &metadata(b"new", 2))
+            .stage_file(480, "new.dat", b"new", &metadata(b"new", 2))
             .unwrap();
         assert_eq!(
             store
@@ -1882,7 +1799,9 @@ mod tests {
         let base = store.view(480).unwrap();
         let identity = identity(7, "deck");
         commit_file(&store, 480, "a", b"a", 1, &identity);
-        let staged = store.stage_file("b", b"b", &metadata(b"b", 2)).unwrap();
+        let staged = store
+            .stage_file(480, "b", b"b", &metadata(b"b", 2))
+            .unwrap();
         assert!(store
             .commit_batch(
                 480,
@@ -1902,18 +1821,22 @@ mod tests {
         let contents = b"save data";
         let metadata = metadata(contents, 10);
 
-        let staged = store.stage_file("save.dat", contents, &metadata).unwrap();
+        let staged = store
+            .stage_file(480, "save.dat", contents, &metadata)
+            .unwrap();
 
         assert_eq!(staged.blob_sha1, metadata.sha1);
         assert!(directory
             .path()
-            .join("blobs/sha1")
+            .join("480/blobs")
             .join(&metadata.sha1[..2])
             .join(&metadata.sha1)
             .is_file());
         // Re-staging identical contents must not fail, and must not need a
         // second digest pass to prove it.
-        assert!(store.stage_file("save.dat", contents, &metadata).is_ok());
+        assert!(store
+            .stage_file(480, "save.dat", contents, &metadata)
+            .is_ok());
     }
 
     #[test]
@@ -1921,18 +1844,18 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let store = FolderStore::open(temporary.path()).unwrap();
         let identity = identity(7, "deck");
-        let staged = store.stage_file("../escape", b"save", &metadata(b"save", 10));
+        let staged = store.stage_file(480, "../escape", b"save", &metadata(b"save", 10));
         assert!(staged.is_err());
         assert!(store
             .commit_batch(0, &[], &[], &BTreeSet::new(), &identity, None)
             .is_err());
         let mut wrong = metadata(b"save", 10);
         wrong.sha1 = "0".repeat(40);
-        assert!(store.stage_file("save.dat", b"save", &wrong).is_err());
+        assert!(store.stage_file(480, "save.dat", b"save", &wrong).is_err());
     }
 
     #[test]
-    fn account_scopes_do_not_share_save_manifests_or_checkouts() {
+    fn account_scopes_do_not_share_save_manifests() {
         let temporary = tempfile::tempdir().unwrap();
         let first = FolderStore::open_account(temporary.path(), 76_561_198_000_000_001).unwrap();
         let second = FolderStore::open_account(temporary.path(), 76_561_198_000_000_002).unwrap();
@@ -1945,11 +1868,11 @@ mod tests {
         assert_eq!(second.read(480, "save.dat").unwrap(), b"second");
         assert!(temporary
             .path()
-            .join("commits/saves/76561198000000001/480")
+            .join("76561198000000001/480/manifests")
             .is_dir());
         assert!(temporary
             .path()
-            .join("commits/saves/76561198000000002/480")
+            .join("76561198000000002/480/manifests")
             .is_dir());
     }
 
@@ -2051,7 +1974,7 @@ mod tests {
         let (left, right) = divergent_heads(&store);
         let heads = normalized_head_ids(&[left.clone(), right]).unwrap();
         let staged = store
-            .stage_file("save.dat", b"chosen", &metadata(b"chosen", 4))
+            .stage_file(480, "save.dat", b"chosen", &metadata(b"chosen", 4))
             .unwrap();
         let resolver = identity(7, "deck");
 
@@ -2071,47 +1994,6 @@ mod tests {
         assert_eq!(store.read(480, "save.dat").unwrap(), b"chosen");
         let resolved = store.resolve_app(480).unwrap();
         assert_eq!(resolved.manifests[&resolved.heads[0]].parents, heads);
-    }
-
-    #[test]
-    fn keep_local_decision_survives_reopen_and_clears_after_commit() {
-        let temporary = tempfile::tempdir().unwrap();
-        let account = 76_561_198_000_000_001;
-        let store = FolderStore::open_account(temporary.path(), account).unwrap();
-        let (left, right) = divergent_heads(&store);
-        let heads = normalized_head_ids(&[left.clone(), right]).unwrap();
-        let resolver = identity(7, "deck");
-        store
-            .record_keep_local_resolution(480, &heads, &left, &resolver)
-            .unwrap();
-        drop(store);
-
-        let reopened = FolderStore::open_account(temporary.path(), account).unwrap();
-        let decision = reopened
-            .keep_local_resolution(480, resolver.client_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(decision.heads, heads);
-        assert_eq!(decision.selected_head, left);
-        assert_eq!(decision.machine_name, resolver.machine_name);
-
-        let staged = reopened
-            .stage_file("save.dat", b"chosen", &metadata(b"chosen", 4))
-            .unwrap();
-        reopened
-            .commit_batch(
-                480,
-                &[decision.selected_head],
-                &[staged],
-                &BTreeSet::new(),
-                &resolver,
-                Some(&decision.heads),
-            )
-            .unwrap();
-        assert!(reopened
-            .keep_local_resolution(480, resolver.client_id)
-            .unwrap()
-            .is_none());
     }
 
     #[test]
@@ -2160,7 +2042,7 @@ mod tests {
         commit_file(&store, 480, "save.dat", b"save", 1, &owner);
         let resolved = store.resolve_app(480).unwrap();
         let file = &resolved.manifests[&resolved.heads[0]].files["save.dat"];
-        std::fs::remove_file(store.blob_path(&file.sha1).unwrap()).unwrap();
+        std::fs::remove_file(store.blob_path(480, &file.sha1).unwrap()).unwrap();
         assert!(store.view(480).is_err());
 
         let malformed = store
@@ -2192,17 +2074,20 @@ mod tests {
         let oldest = resolved.manifests[&previous].parents[0].clone();
         let oldest_blob = resolved.manifests[&oldest].files["save.dat"].sha1.clone();
 
-        let report = store.inspect_gc(&GcRoots::default()).unwrap();
+        let report = store.inspect_gc(480, &GcRoots::default()).unwrap();
         assert_eq!(report.retained_manifests.len(), 2);
         assert_eq!(report.candidate_manifests.len(), 1);
         assert!(report.candidate_manifests[0].contains(&oldest));
         assert_eq!(report.candidate_blobs, vec![oldest_blob.clone()]);
 
         let report = store
-            .inspect_gc(&GcRoots {
-                manifest_ids: BTreeSet::from([oldest]),
-                blob_sha1s: BTreeSet::from([oldest_blob]),
-            })
+            .inspect_gc(
+                480,
+                &GcRoots {
+                    manifest_ids: BTreeSet::from([oldest]),
+                    blob_sha1s: BTreeSet::from([oldest_blob]),
+                },
+            )
             .unwrap();
         assert!(report.candidate_manifests.is_empty());
         assert!(report.candidate_blobs.is_empty());
@@ -2223,16 +2108,17 @@ mod tests {
         let oldest_blob = resolved.manifests[&oldest].files["save.dat"].sha1.clone();
         let current_blob = resolved.manifests[&current].files["save.dat"].sha1.clone();
         let roots = GcRoots::default();
-        let report = store.inspect_gc(&roots).unwrap();
+        let report = store.inspect_gc(480, &roots).unwrap();
 
-        let sweep = store.sweep_gc(&report, &roots).unwrap().unwrap();
+        let plan = store.prepare_gc_sweep(&report).unwrap().unwrap();
+        let sweep = store.apply_gc_sweep(plan, &roots).unwrap().unwrap();
         assert_eq!(sweep.deleted_manifests, 1);
         assert_eq!(sweep.deleted_blobs, 1);
         assert!(!store
             .commit_dir(480)
             .join(format!("{oldest}.json"))
             .exists());
-        assert!(!store.blob_path(&oldest_blob).unwrap().exists());
+        assert!(!store.blob_path(480, &oldest_blob).unwrap().exists());
         assert!(store
             .commit_dir(480)
             .join(format!("{current}.json"))
@@ -2241,7 +2127,7 @@ mod tests {
             .commit_dir(480)
             .join(format!("{previous}.json"))
             .exists());
-        assert!(store.blob_path(&current_blob).unwrap().exists());
+        assert!(store.blob_path(480, &current_blob).unwrap().exists());
         assert_eq!(store.read(480, "save.dat").unwrap(), b"three");
     }
 
@@ -2254,29 +2140,32 @@ mod tests {
             commit_file(&store, 480, "save.dat", contents, mtime, &owner);
         }
         let roots = GcRoots::default();
-        let report = store.inspect_gc(&roots).unwrap();
+        let report = store.inspect_gc(480, &roots).unwrap();
         let candidate_path = store
-            .root()
-            .join("commits/saves")
-            .join(&report.candidate_manifests[0]);
-        let candidate_blob = store.blob_path(&report.candidate_blobs[0]).unwrap();
+            .commit_dir(480)
+            .join(format!("{}.json", report.candidate_manifests[0]));
+        let candidate_blob = store.blob_path(480, &report.candidate_blobs[0]).unwrap();
 
         let changed_roots = GcRoots {
             manifest_ids: BTreeSet::new(),
             blob_sha1s: BTreeSet::from([report.candidate_blobs[0].clone()]),
         };
-        assert!(store.sweep_gc(&report, &changed_roots).unwrap().is_none());
+        let plan = store.prepare_gc_sweep(&report).unwrap().unwrap();
+        assert!(store
+            .apply_gc_sweep(plan, &changed_roots)
+            .unwrap()
+            .is_none());
         assert!(candidate_path.exists());
         assert!(candidate_blob.exists());
 
         commit_file(&store, 480, "save.dat", b"four", 4, &owner);
-        assert!(store.sweep_gc(&report, &roots).unwrap().is_none());
+        assert!(store.prepare_gc_sweep(&report).unwrap().is_none());
         assert!(candidate_path.exists());
         assert!(candidate_blob.exists());
     }
 
     #[test]
-    fn gc_sweep_retains_blobs_shared_by_another_app() {
+    fn gc_sweep_isolates_identical_blobs_by_app() {
         let temporary = tempfile::tempdir().unwrap();
         let store = FolderStore::open(temporary.path()).unwrap();
         let owner = identity(7, "deck");
@@ -2286,14 +2175,57 @@ mod tests {
         commit_file(&store, 481, "save.dat", b"shared", 1, &owner);
         let shared_blob = hex_digest::<Sha1>(b"shared");
         let roots = GcRoots::default();
-        let report = store.inspect_gc(&roots).unwrap();
+        let report = store.inspect_gc(480, &roots).unwrap();
 
-        assert!(!report.candidate_blobs.contains(&shared_blob));
-        let sweep = store.sweep_gc(&report, &roots).unwrap().unwrap();
+        assert!(report.candidate_blobs.contains(&shared_blob));
+        let plan = store.prepare_gc_sweep(&report).unwrap().unwrap();
+        let sweep = store.apply_gc_sweep(plan, &roots).unwrap().unwrap();
         assert_eq!(sweep.deleted_manifests, 1);
-        assert_eq!(sweep.deleted_blobs, 0);
-        assert!(store.blob_path(&shared_blob).unwrap().exists());
+        assert_eq!(sweep.deleted_blobs, 1);
+        assert!(!store.blob_path(480, &shared_blob).unwrap().exists());
+        assert!(store.blob_path(481, &shared_blob).unwrap().exists());
         assert_eq!(store.read(481, "save.dat").unwrap(), b"shared");
+    }
+
+    #[test]
+    fn gc_sweep_reclaims_only_the_requested_app_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open(temporary.path()).unwrap();
+        let owner = identity(7, "deck");
+        for app_id in [480, 481] {
+            for revision in 1..=3 {
+                let contents = format!("{app_id}-{revision}");
+                commit_file(
+                    &store,
+                    app_id,
+                    "save.dat",
+                    contents.as_bytes(),
+                    revision,
+                    &owner,
+                );
+            }
+        }
+        let other = store.resolve_app(481).unwrap();
+        let other_current = other.heads[0].clone();
+        let other_previous = other.manifests[&other_current].parents[0].clone();
+        let other_oldest = other.manifests[&other_previous].parents[0].clone();
+        let other_oldest_blob = other.manifests[&other_oldest].files["save.dat"]
+            .sha1
+            .clone();
+        let roots = GcRoots::default();
+        let report = store.inspect_gc(480, &roots).unwrap();
+
+        assert_eq!(report.candidate_manifests.len(), 1);
+        assert!(!report.candidate_blobs.contains(&other_oldest_blob));
+        let plan = store.prepare_gc_sweep(&report).unwrap().unwrap();
+        let sweep = store.apply_gc_sweep(plan, &roots).unwrap().unwrap();
+        assert_eq!(sweep.deleted_manifests, 1);
+        assert!(store
+            .commit_dir(481)
+            .join(format!("{other_oldest}.json"))
+            .exists());
+        assert!(store.blob_path(481, &other_oldest_blob).unwrap().exists());
+        assert_eq!(store.resolve_app(481).unwrap().manifests.len(), 3);
     }
 
     #[test]
@@ -2317,13 +2249,24 @@ mod tests {
             .unwrap()
             .is_empty());
         store.suspend_session(480, &second).unwrap();
+        let claim_path = store.session_claim_path(480, second.client_id).unwrap();
+        let suspended = std::fs::read(&claim_path).unwrap();
+        store.suspend_session(480, &second).unwrap();
+        assert_eq!(std::fs::read(&claim_path).unwrap(), suspended);
         store.resume_session(480, &second).unwrap();
+        let active = std::fs::read(&claim_path).unwrap();
+        store.resume_session(480, &second).unwrap();
+        assert_eq!(std::fs::read(&claim_path).unwrap(), active);
         store.exit_session(480, &second).unwrap();
-        assert!(store.exit_session(480, &identity(9, "other")).is_err());
+        assert!(!store
+            .session_claim_path(480, second.client_id)
+            .unwrap()
+            .exists());
+        store.exit_session(480, &identity(9, "other")).unwrap();
     }
 
     #[test]
-    fn repeated_session_override_retains_older_claim_ids() {
+    fn repeated_session_override_discards_obsolete_claim_ids() {
         let temporary = tempfile::tempdir().unwrap();
         let store = FolderStore::open_account(temporary.path(), 76_561_198_000_000_001).unwrap();
         let first = identity(7, "deck");
@@ -2345,12 +2288,67 @@ mod tests {
             .unwrap()
             .join("overrides")
             .join("8.json");
-        let record =
-            serde_json::from_slice::<SessionOverride>(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(record.superseded_claims.len(), 2);
+        let bytes = std::fs::read(path).unwrap();
+        let record = serde_json::from_slice::<SessionOverride>(&bytes).unwrap();
+        assert_eq!(record.superseded_claims.len(), 1);
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap()
+            .get("nonce")
+            .is_none());
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap()
+            .get("updated_at")
+            .is_none());
         assert!(store
             .launch_session(480, &second, Some(3), Some(4), false)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn concurrent_session_launches_allow_only_one_client() {
+        let temporary = tempfile::tempdir().unwrap();
+        let account = 76_561_198_000_000_001;
+        let first_store = FolderStore::open_account(temporary.path(), account).unwrap();
+        let second_store = FolderStore::open_account(temporary.path(), account).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.launch_session(480, &identity(7, "deck"), Some(1), Some(2), false)
+        });
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            second_store.launch_session(480, &identity(8, "desktop"), Some(3), Some(4), false)
+        });
+
+        let mut pending_counts = vec![
+            first.join().unwrap().unwrap().len(),
+            second.join().unwrap().unwrap().len(),
+        ];
+        pending_counts.sort_unstable();
+        assert_eq!(pending_counts, vec![0, 1]);
+        assert!(!temporary
+            .path()
+            .join(format!("{account}/480/.lock"))
+            .exists());
+    }
+
+    #[test]
+    fn session_record_name_must_match_its_client_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open_account(temporary.path(), 76_561_198_000_000_001).unwrap();
+        store
+            .launch_session(480, &identity(7, "deck"), Some(1), Some(2), false)
+            .unwrap();
+        std::fs::rename(
+            store.session_claim_path(480, 7).unwrap(),
+            store.session_claim_path(480, 8).unwrap(),
+        )
+        .unwrap();
+
+        assert!(store
+            .launch_session(480, &identity(9, "desktop"), Some(3), Some(4), false)
+            .is_err());
     }
 }

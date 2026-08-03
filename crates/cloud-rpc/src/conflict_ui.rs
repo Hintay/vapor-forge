@@ -470,7 +470,7 @@ fn apply_choice(choice: &Choice, gc: &LocalGcCoordinator) -> Result<(), String> 
             choice.pending.minimum_revision,
         )
         .map_err(|error| error.to_string())?;
-    gc.queue_inspection(store);
+    gc.queue_inspection(store, choice.key.1);
     Ok(())
 }
 
@@ -526,6 +526,7 @@ mod tests {
             server_url: String::new(),
             token: String::new(),
             steam_client_id: Some(7),
+            steam_machine_name: Some("deck".into()),
             steam_id64: Some(76_561_198_000_000_001),
             bind_device: false,
             timeout_connect_ms: 1,
@@ -563,6 +564,7 @@ mod tests {
         };
         let staged = store
             .stage_file(
+                480,
                 "save.dat",
                 b"root",
                 &FileMetadata {
@@ -578,9 +580,7 @@ mod tests {
             .unwrap();
 
         let root = store.view(480).unwrap().head_ids().remove(0);
-        let directory = temporary
-            .path()
-            .join(format!("commits/saves/{ACCOUNT}/480"));
+        let directory = temporary.path().join(format!("{ACCOUNT}/480/manifests"));
         let root_bytes = std::fs::read(directory.join(format!("{root}.json"))).unwrap();
         let root_manifest = serde_json::from_slice::<serde_json::Value>(&root_bytes).unwrap();
         for (client_id, machine_name) in [(7, "deck"), (8, "desktop"), (9, "laptop")] {
