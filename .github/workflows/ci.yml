@@ -20,6 +20,9 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_ZIGBUILD_VERSION: 0.23.0
+  STEAM_GLIBC_BASELINE: "2.17"
+  ZIG_VERSION: 0.16.0
 
 jobs:
   check:
@@ -31,7 +34,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: file
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+          targets: i686-unknown-linux-gnu, x86_64-unknown-linux-gnu
 
       - name: Cache cargo registry + build
         uses: actions/cache@v4
@@ -65,40 +70,65 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+
+      - name: Check workspace
+        run: cargo check --workspace --all-features --locked
+
   build:
     name: Build
     needs: check
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
     steps:
       - name: Install system packages
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -eux
-          dpkg --add-architecture i386
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             curl ca-certificates git \
             gcc g++ gcc-multilib g++-multilib \
-            libc6-dev-i386 make pkg-config
+            libc6-dev-i386 make pkg-config \
+            binutils python3
 
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: file
+          toolchain: 1.96.0
+          components: clippy
+          targets: i686-unknown-linux-gnu, x86_64-unknown-linux-gnu
 
-      - name: Cache cargo registry + build
+      - name: Cache cargo registry + release tools + build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/cargo-zigbuild
             target
-          key: build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: build-${{ runner.os }}-
+          key: build-glibc-${{ env.STEAM_GLIBC_BASELINE }}-zig-${{ env.ZIG_VERSION }}-cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: build-glibc-${{ env.STEAM_GLIBC_BASELINE }}-zig-${{ env.ZIG_VERSION }}-cargo-zigbuild-${{ env.CARGO_ZIGBUILD_VERSION }}-${{ runner.os }}-
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
 
       - name: Compute version metadata
         id: version
@@ -130,20 +160,38 @@ jobs:
         run: |
           set -eux
           cargo clippy -p vapor-forge-audit-loader --target i686-unknown-linux-gnu --locked -- -D warnings
+          cargo clippy -p vapor-forge-audit-loader --target x86_64-unknown-linux-gnu --locked -- -D warnings
           cargo clippy -p vapor-forge-proton-inject --target x86_64-unknown-linux-gnu --locked -- -D warnings
 
       - name: Build release
+        env:
+          CFLAGS_i686_unknown_linux_gnu: -DLUAJIT_NO_UNWIND
+          CFLAGS_x86_64_unknown_linux_gnu: -DLUAJIT_NO_UNWIND
         run: |
           set -eux
-          cargo build-main-release --locked
-          cargo build-inject-release --locked
+          cargo zigbuild --release -p vapor-forge-audit-loader --target "i686-unknown-linux-gnu.${STEAM_GLIBC_BASELINE}" --locked
+          cargo zigbuild --release -p vapor-forge-audit-loader --target "x86_64-unknown-linux-gnu.${STEAM_GLIBC_BASELINE}" --locked
+          cargo zigbuild --release -p vapor-forge-proton-inject --target "x86_64-unknown-linux-gnu.${STEAM_GLIBC_BASELINE}" --locked
+
+      - name: Verify glibc baseline
+        run: |
+          set -eux
+          scripts/check-glibc-baseline.py "${STEAM_GLIBC_BASELINE}" \
+            target/i686-unknown-linux-gnu/release/libvapor_forge.so \
+            target/x86_64-unknown-linux-gnu/release/libvapor_forge.so \
+            target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so
+
+      - name: Generate third-party notices
+        run: scripts/generate-third-party-licenses.py dist/THIRD_PARTY_LICENSES.md
 
       - name: Stage artifacts
         run: |
           set -eux
-          mkdir -p dist
-          cp target/i686-unknown-linux-gnu/release/libvapor_forge.so dist/
-          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so dist/
+          mkdir -p dist/i686-unknown-linux-gnu dist/x86_64-unknown-linux-gnu
+          cp target/i686-unknown-linux-gnu/release/libvapor_forge.so dist/i686-unknown-linux-gnu/
+          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge.so dist/x86_64-unknown-linux-gnu/
+          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so dist/x86_64-unknown-linux-gnu/
+          cp LICENSE README.md dist/
 
       - name: Compute artifact name
         id: meta
@@ -175,9 +223,7 @@ jobs:
           set -eux
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p bundle
-          cp artifacts/libvapor_forge.so bundle/
-          cp artifacts/libvapor_forge_proton_inject.so bundle/
-          cp README.md bundle/
+          cp -R artifacts/. bundle/
           tar -C bundle -czf "vapor-forge-${VERSION}-linux.tar.gz" .
 
       - name: Publish release

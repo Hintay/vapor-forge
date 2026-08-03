@@ -14,10 +14,11 @@ Yet another mod for the Linux Steam client, built with Rust.
 
 ## Prerequisites
 
-- **Rust** 1.80+ (MSRV), toolchain **1.96.0** pinned in `rust-toolchain.toml`
+- **Rust** 1.85+ (MSRV), toolchain **1.96.0** pinned in `rust-toolchain.toml`
 - **Targets:** `i686-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`
 - **i686 linker:** `gcc` with 32-bit libc headers (`-m32`)
 - **x86_64 Linux linker:** `x86_64-linux-gnu-gcc` when cross-building from a non-Linux host
+- **Binary runtime:** glibc 2.17 or newer
 
 `rustup` will install the pinned toolchain and targets automatically on first build.
 
@@ -32,6 +33,9 @@ cargo build-main-release    # release variants
 cargo build-main64-release
 cargo build-inject-release
 ```
+
+Published artifacts are cross-linked with Zig against glibc 2.17. Local builds
+using the commands above inherit the host system's glibc baseline.
 
 ## Install
 
@@ -71,13 +75,14 @@ See `res/config.default.toml` for the full generated template and commented exam
 
 ### Cumulus cloud saves
 
-Set the Cumulus origin and a device bearer token under `[cloud]`. A complete
-Cumulus configuration enables cloud sync for controlled, unowned apps even when
-the legacy `enabled` flag is left false. Owned apps remain on Steam's normal
-cloud path.
+Select the Cumulus backend and configure its origin and device bearer token.
+Owned apps remain on Steam's normal cloud path.
 
 ```toml
 [cloud]
+backend = "cumulus"
+
+[cloud.cumulus]
 server_url = "https://cloud.example.com"
 token = "device-bearer-token"
 timeout_connect_ms = 5000
