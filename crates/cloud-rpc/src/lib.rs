@@ -1,7 +1,5 @@
 //! Translation between Steam client's `Cloud.*#1` service RPCs and Cumulus.
 
-use prost::Message;
-
 mod adapter;
 mod conflict_ui;
 mod http;
@@ -53,26 +51,6 @@ const HTTP_METHOD_PUT: i32 = 4;
 const RPC_WORKER_SHARDS: usize = 4;
 const RPC_QUEUE_CAPACITY: usize = 64;
 const RPC_CHANNEL_CAPACITY: usize = RPC_QUEUE_CAPACITY * 2;
-
-/// Capture the device identity carried by Steam's launch-intent request.
-/// Returns true only when the effective descriptor changed.
-pub fn capture_launch_device_descriptor(method: &str, body: &[u8]) -> bool {
-    if method != LAUNCH_INTENT {
-        return false;
-    }
-    let Ok(request) = vapor_forge_steam_protocol::CloudAppLaunchIntentRequest::decode(body) else {
-        return false;
-    };
-    let Some(client_id) = request.client_id.filter(|client_id| *client_id != 0) else {
-        return false;
-    };
-    vapor_forge_cloud_core::record_device_descriptor(vapor_forge_cloud_core::DeviceDescriptor {
-        client_id,
-        machine_name: request.machine_name.unwrap_or_default(),
-        os_type: request.os_type.map(i64::from),
-        device_type: request.device_type.map(i64::from),
-    })
-}
 
 #[cfg(test)]
 mod tests;
