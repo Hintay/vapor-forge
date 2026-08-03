@@ -20,7 +20,6 @@ const THREAD_NAME: &[u8] = b"vapor-user-stats\0";
 const MAX_ACHIEVEMENTS: u32 = 10_000;
 const MAX_STATS: u32 = 10_000;
 const MAX_ACHIEVEMENT_KEY_LEN: usize = 255;
-const MAX_SUBSCRIBED_APPS: u32 = 100_000;
 /// `k_EResultOK`.
 pub(super) const ERESULT_OK: i32 = 1;
 /// Bounds one callback batch without dropping the remaining events.
@@ -32,7 +31,6 @@ type CreateSimpleThreadFn =
 type ReleaseThreadHandleFn = unsafe extern "C" fn(usize) -> bool;
 type ThreadSetDebugNameFn = unsafe extern "C" fn(*const c_char);
 
-type GetSubscribedAppsFn = unsafe extern "C" fn(*mut c_void, *mut u32, u32, u8) -> u32;
 // Read-only playtime accessors, never detoured: playtime is corrected at the
 // ingest side. See docs/developer/steam-playtime-source-analysis.md.
 type BGetAppMinutesPlayedFn = unsafe extern "C" fn(*mut c_void, u32, *mut i32, *mut i32) -> bool;
@@ -737,41 +735,6 @@ impl SteamUserStatsSession {
         samples.extend(zero_int);
         samples.extend(floats);
         Ok(samples)
-    }
-
-    /// Read Steam's live subscribed-app inventory through IClientUser. This
-    /// avoids inferring ownership from installed files or library-cache data.
-    pub(super) fn subscribed_app_ids(&self) -> Result<Vec<u32>, &'static str> {
-        let get_subscribed = self
-            .client_user_method::<GetSubscribedAppsFn>("GetSubscribedApps")?
-            .ok_or("IClientUser::GetSubscribedApps is unavailable")?;
-        // SAFETY: a null output buffer asks Steam for the capacity required by
-        // this live IClientUser instance.
-        let count = self.checked_call(|| {
-            // SAFETY: a null output buffer requests the required capacity.
-            unsafe { get_subscribed(self.client_user, std::ptr::null_mut(), 0, 0) }
-        })?;
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        if count > MAX_SUBSCRIBED_APPS {
-            return Err("IClientUser::GetSubscribedApps returned an invalid count");
-        }
-
-        let mut app_ids = vec![0_u32; count as usize];
-        // SAFETY: app_ids supplies the exact number of writable u32 slots
-        // reported by Steam in the preceding capacity query.
-        let written = self.checked_call(|| {
-            // SAFETY: app_ids has exactly count writable elements.
-            unsafe { get_subscribed(self.client_user, app_ids.as_mut_ptr(), count, 0) }
-        })?;
-        if written > count {
-            return Err("IClientUser::GetSubscribedApps exceeded its output buffer");
-        }
-        app_ids.truncate(written as usize);
-        app_ids.sort_unstable();
-        app_ids.dedup();
-        Ok(app_ids)
     }
 
     fn client_user_method<T>(&self, name: &str) -> Result<Option<T>, &'static str> {

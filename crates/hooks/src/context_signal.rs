@@ -9,6 +9,7 @@
 //! stream was running is never missed.
 
 use std::sync::{Condvar, Mutex};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -52,6 +53,7 @@ impl ContextChangeSignal {
     }
 
     /// Wait for a context change, or until a transport retry delay expires.
+    #[cfg(target_os = "linux")]
     pub(crate) fn wait_timeout_after(&self, previous: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut revision = self

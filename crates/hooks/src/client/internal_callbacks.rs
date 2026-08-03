@@ -250,6 +250,7 @@ impl<const N: usize> CoalescedEvents<N> {
         }
     }
 
+    #[cfg(any(debug_assertions, test))]
     fn pending(&self) -> usize {
         self.slots
             .iter()
@@ -257,6 +258,7 @@ impl<const N: usize> CoalescedEvents<N> {
             .count()
     }
 
+    #[cfg(any(debug_assertions, test))]
     fn used(&self) -> usize {
         self.slots
             .iter()
