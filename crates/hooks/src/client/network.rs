@@ -12,7 +12,6 @@ use crate::netpacket::SendFrameDecision;
 use crate::pattern_resolver::CodeRegion;
 use crate::work_item_site::WorkItemSite;
 use vapor_forge_hook_engine::original::detour_or_return;
-
 // ---------------------------------------------------------------------------
 // Function type aliases
 // ---------------------------------------------------------------------------
@@ -198,8 +197,6 @@ pub(crate) unsafe extern "C" fn hk_send_frame(
     data: *mut u8,
     size: u32,
 ) -> bool {
-    super::client_id::refresh_device_descriptor();
-
     const WEBSOCKET_BINARY: i32 = 2;
     if opcode == WEBSOCKET_BINARY && !data.is_null() && size > 0 {
         // SAFETY: data is a valid buffer of `size` bytes, provided by Steam.

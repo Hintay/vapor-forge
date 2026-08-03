@@ -753,23 +753,35 @@ impl SyncJournal {
         &self,
         descriptor: &DeviceDescriptor,
         now: i64,
-    ) -> Result<(), SyncJournalError> {
-        self.write(|tx| {
-            let record = DeviceRecord {
-                client_id: descriptor.client_id,
-                machine_name: descriptor.machine_name.clone(),
-                os_type: descriptor.os_type,
-                device_type: descriptor.device_type,
-                observed_at: now,
-            };
-            match tx.scan::<DeviceRecord>()?.next() {
-                Some((id, _)) => tx.update(&id, &record)?,
-                None => {
-                    tx.insert(&record)?;
-                }
+    ) -> Result<bool, SyncJournalError> {
+        let _writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let existing = self.database.scan::<DeviceRecord>()?.next();
+        if existing
+            .as_ref()
+            .is_some_and(|(_, record)| record.value() == *descriptor)
+        {
+            return Ok(false);
+        }
+
+        let record = DeviceRecord {
+            client_id: descriptor.client_id,
+            machine_name: descriptor.machine_name.clone(),
+            os_type: descriptor.os_type,
+            device_type: descriptor.device_type,
+            observed_at: now,
+        };
+        let mut transaction = self.database.begin()?;
+        match existing {
+            Some((id, _)) => transaction.update(&id, &record)?,
+            None => {
+                transaction.insert(&record)?;
             }
-            Ok(())
-        })
+        }
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn load_backend_principal_scope(

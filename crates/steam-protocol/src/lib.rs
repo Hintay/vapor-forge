@@ -115,6 +115,30 @@ struct ClientLogOnResponseWireView {
     eresult: Option<i32>,
     #[prost(fixed64, optional, tag = "20")]
     client_supplied_steam_id: Option<u64>,
+    #[prost(uint64, optional, tag = "27")]
+    client_instance_id: Option<u64>,
+}
+
+#[derive(Clone, prost::Message)]
+struct ClientLogOnWireView {
+    #[prost(uint32, optional, tag = "7")]
+    client_os_type: Option<u32>,
+    #[prost(string, optional, tag = "96")]
+    machine_name: Option<String>,
+    #[prost(string, optional, tag = "97")]
+    machine_name_userchosen: Option<String>,
+    #[prost(uint64, optional, tag = "100")]
+    client_instance_id: Option<u64>,
+    #[prost(uint32, optional, tag = "111")]
+    gaming_device_type: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientLogOnDevice {
+    pub client_instance_id: Option<u64>,
+    pub machine_name: String,
+    pub os_type: Option<i64>,
+    pub device_type: Option<i64>,
 }
 
 /// Decode an AppID from a known Steam service-method request.
@@ -258,7 +282,8 @@ pub const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 /// EMsg for server-initiated service notifications.
 pub const EMSG_SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
 
-/// Successful CM login response and server-initiated logout.
+/// CM login request, successful response, and server-initiated logout.
+pub const EMSG_CLIENT_LOG_ON: u32 = 5514;
 pub const EMSG_CLIENT_LOG_ON_RESPONSE: u32 = 751;
 pub const EMSG_CLIENT_LOGGED_OFF: u32 = 757;
 
@@ -390,8 +415,8 @@ pub struct CMsgProtoBufHeader {
     pub ip_addr: Option<MsgProtoBufHeaderIpAddress>,
 }
 
-/// Return the local account carried by a successful CM login response.
-pub fn successful_logon_steam_id(header: &[u8], body: &[u8]) -> Option<u64> {
+/// Return the local account and ClientID carried by a successful CM login response.
+pub fn successful_logon_identity(header: &[u8], body: &[u8]) -> Option<(u64, Option<u64>)> {
     use prost::Message;
 
     let response = ClientLogOnResponseWireView::decode(body).ok()?;
@@ -402,7 +427,25 @@ pub fn successful_logon_steam_id(header: &[u8], body: &[u8]) -> Option<u64> {
         .ok()
         .and_then(|header| header.steamid)
         .or(response.client_supplied_steam_id)?;
-    (steam_id != 0).then_some(steam_id)
+    (steam_id != 0).then_some((steam_id, response.client_instance_id.filter(|id| *id != 0)))
+}
+
+/// Return the device identity submitted with a CM login request.
+pub fn client_logon_device(body: &[u8]) -> Option<ClientLogOnDevice> {
+    use prost::Message;
+
+    let request = ClientLogOnWireView::decode(body).ok()?;
+    let machine_name = request
+        .machine_name_userchosen
+        .filter(|name| !name.trim().is_empty())
+        .or(request.machine_name)
+        .unwrap_or_default();
+    Some(ClientLogOnDevice {
+        client_instance_id: request.client_instance_id.filter(|id| *id != 0),
+        machine_name,
+        os_type: request.client_os_type.map(|value| i64::from(value as i32)),
+        device_type: request.gaming_device_type.map(i64::from),
+    })
 }
 
 #[derive(Clone, prost::Message)]
@@ -1804,12 +1847,101 @@ mod tests {
         let body = ClientLogOnResponseWireView {
             eresult: Some(ERESULT_OK),
             client_supplied_steam_id: Some(76_561_198_000_000_001),
+            client_instance_id: Some(11_047_413_376_560_171_870),
         }
         .encode_to_vec();
 
         assert_eq!(
-            successful_logon_steam_id(&header, &body),
-            Some(header_steam_id)
+            successful_logon_identity(&header, &body),
+            Some((header_steam_id, Some(11_047_413_376_560_171_870)))
+        );
+    }
+
+    #[test]
+    fn client_logon_exposes_the_submitted_device_identity() {
+        let body = ClientLogOnWireView {
+            client_os_type: Some((-203_i32) as u32),
+            machine_name: Some("generated-name".into()),
+            machine_name_userchosen: Some("living-room".into()),
+            client_instance_id: Some(11_047_413_376_560_171_870),
+            gaming_device_type: Some(8),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            client_logon_device(&body),
+            Some(ClientLogOnDevice {
+                client_instance_id: Some(11_047_413_376_560_171_870),
+                machine_name: "living-room".into(),
+                os_type: Some(-203),
+                device_type: Some(8),
+            })
+        );
+    }
+
+    #[test]
+    fn client_logon_falls_back_to_the_generated_machine_name() {
+        let body = ClientLogOnWireView {
+            client_os_type: None,
+            machine_name: Some("generated-name".into()),
+            machine_name_userchosen: Some("  ".into()),
+            client_instance_id: Some(42),
+            gaming_device_type: None,
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            client_logon_device(&body),
+            Some(ClientLogOnDevice {
+                client_instance_id: Some(42),
+                machine_name: "generated-name".into(),
+                os_type: None,
+                device_type: None,
+            })
+        );
+    }
+
+    #[test]
+    fn client_logon_treats_a_zero_client_instance_id_as_absent() {
+        let body = ClientLogOnWireView {
+            client_os_type: Some(1),
+            machine_name: Some("machine".into()),
+            machine_name_userchosen: None,
+            client_instance_id: Some(0),
+            gaming_device_type: Some(2),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            client_logon_device(&body),
+            Some(ClientLogOnDevice {
+                client_instance_id: None,
+                machine_name: "machine".into(),
+                os_type: Some(1),
+                device_type: Some(2),
+            })
+        );
+    }
+
+    #[test]
+    fn client_logon_exposes_device_metadata_without_a_client_instance_id() {
+        let body = ClientLogOnWireView {
+            client_os_type: Some(1),
+            machine_name: Some("machine".into()),
+            machine_name_userchosen: None,
+            client_instance_id: None,
+            gaming_device_type: Some(2),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            client_logon_device(&body),
+            Some(ClientLogOnDevice {
+                client_instance_id: None,
+                machine_name: "machine".into(),
+                os_type: Some(1),
+                device_type: Some(2),
+            })
         );
     }
 
@@ -1818,10 +1950,32 @@ mod tests {
         let body = ClientLogOnResponseWireView {
             eresult: Some(2),
             client_supplied_steam_id: Some(76_561_198_106_179_127),
+            client_instance_id: Some(11_047_413_376_560_171_870),
         }
         .encode_to_vec();
 
-        assert_eq!(successful_logon_steam_id(&[], &body), None);
+        assert_eq!(successful_logon_identity(&[], &body), None);
+    }
+
+    #[test]
+    fn successful_logon_ignores_a_zero_client_instance_id() {
+        let header_steam_id = 76_561_198_106_179_127;
+        let header = CMsgProtoBufHeader {
+            steamid: Some(header_steam_id),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let body = ClientLogOnResponseWireView {
+            eresult: Some(ERESULT_OK),
+            client_supplied_steam_id: None,
+            client_instance_id: Some(0),
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            successful_logon_identity(&header, &body),
+            Some((header_steam_id, None))
+        );
     }
 
     #[test]

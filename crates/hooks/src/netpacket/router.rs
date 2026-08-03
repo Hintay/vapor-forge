@@ -22,14 +22,15 @@ use vapor_forge_steam_protocol::{
     EncryptedAppTicketResponse, GetAppOwnershipTicketRequest, GetAppOwnershipTicketResponse,
     PlayerGetUserStatsRequest, PlayerGetUserStatsResponse, PlayerPlayHistory,
     PlayerRecordDisconnectedPlaytimeRequest, PlayerRecordDisconnectedPlaytimeResponse,
-    EMSG_CLIENT_LOGGED_OFF, EMSG_CLIENT_LOG_ON_RESPONSE, EMSG_CLIENT_PERSONA_STATE,
-    EMSG_CLIENT_RICH_PRESENCE_UPLOAD, EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING,
-    EMSG_ENCRYPTED_APPTICKET_REQUEST, EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED,
-    EMSG_GAMESPLAYED_WITH_DATABLOB, EMSG_GET_APP_OWNERSHIP_TICKET,
-    EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE, EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS,
-    EMSG_REQUEST_USERSTATS_RESPONSE, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
-    EMSG_SERVICE_METHOD_RESPONSE, EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS,
-    EMSG_STORE_USERSTATS2, ERESULT_OK, FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB, K_MSG_HDR_PROTO_FLAG,
+    EMSG_CLIENT_LOGGED_OFF, EMSG_CLIENT_LOG_ON, EMSG_CLIENT_LOG_ON_RESPONSE,
+    EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
+    EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING, EMSG_ENCRYPTED_APPTICKET_REQUEST,
+    EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB,
+    EMSG_GET_APP_OWNERSHIP_TICKET, EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE,
+    EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS, EMSG_REQUEST_USERSTATS_RESPONSE,
+    EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_SERVICE_METHOD_RESPONSE,
+    EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, ERESULT_OK,
+    FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB, K_MSG_HDR_PROTO_FLAG,
     PLAYER_RECORD_DISCONNECTED_PLAYTIME_JOB_NAME,
 };
 
@@ -55,6 +56,9 @@ pub(super) static LOCAL_RESPONSES: once_cell::sync::Lazy<Mutex<VecDeque<LocalRes
     once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
 static STATS_REQUESTS: once_cell::sync::Lazy<Mutex<VecDeque<(u64, u32)>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(VecDeque::new()));
+static PENDING_LOGIN_DEVICE: once_cell::sync::Lazy<
+    Mutex<Option<vapor_forge_steam_protocol::ClientLogOnDevice>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 // A protected app without AppAvatar must not upload unscoped Rich Presence.
 static BLOCKED_RICH_PRESENCE_APP: AtomicU32 = AtomicU32::new(0);
@@ -67,6 +71,66 @@ pub enum SendFrameDecision {
     Pass,
     Drop,
     Rewrite(Vec<u8>),
+}
+
+fn record_login_device(body: &[u8]) {
+    let device = vapor_forge_steam_protocol::client_logon_device(body);
+    if let Ok(mut current) = PENDING_LOGIN_DEVICE.lock() {
+        *current = device;
+    }
+}
+
+struct LoginDeviceCompletion {
+    changed: bool,
+    metadata_matched: bool,
+    machine_name_present: bool,
+    os_type: Option<i64>,
+    device_type: Option<i64>,
+}
+
+fn complete_login_device(client_id: u64) -> LoginDeviceCompletion {
+    let pending = PENDING_LOGIN_DEVICE
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+        .filter(|device| {
+            device
+                .client_instance_id
+                .is_none_or(|request_client_id| request_client_id == client_id)
+        });
+    let Some(device) = pending else {
+        return LoginDeviceCompletion {
+            changed: vapor_forge_cloud_core::record_local_client_id(client_id),
+            metadata_matched: false,
+            machine_name_present: false,
+            os_type: None,
+            device_type: None,
+        };
+    };
+    let completion = LoginDeviceCompletion {
+        changed: false,
+        metadata_matched: true,
+        machine_name_present: !device.machine_name.trim().is_empty(),
+        os_type: device.os_type,
+        device_type: device.device_type,
+    };
+    LoginDeviceCompletion {
+        changed: vapor_forge_cloud_core::record_device_descriptor(
+            vapor_forge_cloud_core::DeviceDescriptor {
+                client_id,
+                machine_name: device.machine_name,
+                os_type: device.os_type,
+                device_type: device.device_type,
+            },
+        ),
+        ..completion
+    }
+}
+
+fn clear_pending_login_device() {
+    if let Ok(mut pending) = PENDING_LOGIN_DEVICE.lock() {
+        pending.take();
+    }
 }
 
 pub(super) enum RecvFrameDecision {
@@ -95,6 +159,9 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     if !is_proto {
         crate::packet_capture::capture(PacketDirection::Send, data, PacketChange::Unchanged, None);
         return SendFrameDecision::Pass;
+    }
+    if emsg == EMSG_CLIENT_LOG_ON {
+        record_login_device(body_bytes);
     }
     // ServiceMethod (EMsg 151): manifest request codes and achievement stats
     if emsg == EMSG_SERVICE_METHOD_CALL_FROM_CLIENT {
@@ -155,19 +222,6 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 &runtime.config,
             );
         }
-        if method == vapor_forge_cloud_rpc::LAUNCH_INTENT {
-            if (runtime.config.local_cloud_configured() || runtime.config.cumulus_configured())
-                && vapor_forge_cloud_rpc::capture_launch_device_descriptor(method, body_bytes)
-            {
-                crate::achievement_worker::notify_context_changed();
-                crate::playtime_worker::notify_context_changed();
-                crate::playtime_downlink_worker::notify_context_changed();
-                crate::stats_wakeup_worker::notify_context_changed();
-                crate::client::user_stats::notify_context_changed();
-                super::stats_proxy::notify_context_changed();
-            }
-        }
-
         if CLOUD_PENDING.intercept(
             method,
             &hdr,
@@ -382,6 +436,15 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     decision
 }
 
+fn notify_device_context_changed() {
+    crate::achievement_worker::notify_context_changed();
+    crate::playtime_worker::notify_context_changed();
+    crate::playtime_downlink_worker::notify_context_changed();
+    crate::stats_wakeup_worker::notify_context_changed();
+    crate::client::user_stats::notify_context_changed();
+    stats_proxy::notify_context_changed();
+}
+
 fn handle_record_disconnected_playtime(
     emsg_raw: u32,
     header_bytes: &[u8],
@@ -419,7 +482,6 @@ fn handle_record_disconnected_playtime(
         return SendFrameDecision::Pass;
     }
 
-    let steam_id64 = identity::steam_id();
     let Some(backend) = crate::cloud_backend::backend_context() else {
         warn!("playtime-sync: backend unavailable; controlled sessions were not recorded");
         return finish_disconnected_playtime(
@@ -430,6 +492,19 @@ fn handle_record_disconnected_playtime(
             0,
         );
     };
+    if !backend.accepts_playtime_sessions() {
+        for (app_id, _) in &protected_sessions {
+            crate::client::user_stats::signal_router_playtime(*app_id);
+        }
+        return finish_disconnected_playtime(
+            emsg_raw,
+            header_bytes,
+            original_packet,
+            valve_sessions,
+            protected_sessions.len(),
+        );
+    }
+    let steam_id64 = identity::steam_id();
     if steam_id64 == 0 {
         warn!("playtime-sync: account unavailable; controlled sessions were not recorded");
         return finish_disconnected_playtime(
@@ -492,7 +567,7 @@ fn handle_record_disconnected_playtime(
             observed_at,
         });
     }
-    if !crate::playtime_worker::persist_sessions(&protected) {
+    if !crate::playtime_worker::persist_sessions(backend.as_ref(), &protected) {
         warn!("playtime-sync: controlled sessions could not be persisted");
         return finish_disconnected_playtime(
             emsg_raw,
@@ -788,12 +863,31 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
     if emsg == EMSG_CLIENT_LOG_ON_RESPONSE {
-        if let Some(steam_id) =
-            vapor_forge_steam_protocol::successful_logon_steam_id(hdr_bytes, body_bytes)
+        if let Some((steam_id, client_id)) =
+            vapor_forge_steam_protocol::successful_logon_identity(hdr_bytes, body_bytes)
         {
             crate::client::set_authoritative_steam_id(steam_id);
+            if let Some(client_id) = client_id {
+                let completion = complete_login_device(client_id);
+                if completion.changed {
+                    notify_device_context_changed();
+                }
+                info!(
+                    client_id,
+                    metadata_matched = completion.metadata_matched,
+                    machine_name_present = completion.machine_name_present,
+                    os_type = ?completion.os_type,
+                    device_type = ?completion.device_type,
+                    "CM login: device identity captured"
+                );
+            } else {
+                clear_pending_login_device();
+            }
+        } else {
+            clear_pending_login_device();
         }
     } else if emsg == EMSG_CLIENT_LOGGED_OFF {
+        clear_pending_login_device();
         crate::client::set_authoritative_steam_id(0);
     }
     let mut change = PacketChange::Unchanged;

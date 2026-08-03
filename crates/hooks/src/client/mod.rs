@@ -4,7 +4,6 @@ pub mod package;
 pub(crate) mod achievement;
 pub(crate) mod callback_dispatch;
 pub(crate) mod callback_notify;
-pub(crate) mod client_id;
 pub(crate) mod cloud;
 pub(crate) mod cloud_http;
 pub(crate) mod current_app;

@@ -5,7 +5,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
-use vapor_forge_cloud_core::{PlaytimeEntry, PlaytimeSession};
+use vapor_forge_cloud_core::{CloudBackend, PlaytimeEntry, PlaytimeSession};
 use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_core::unix_now;
 use vapor_forge_features::playtime::{PlaytimeGame, PlaytimeSnapshot};
@@ -96,7 +96,10 @@ pub fn queue(snapshot: PlaytimeSnapshot) -> bool {
 }
 
 /// Persist disconnected-playtime reports before acknowledging their CM request.
-pub(crate) fn persist_sessions(sessions: &[PlaytimeSession]) -> bool {
+pub(crate) fn persist_sessions(backend: &dyn CloudBackend, sessions: &[PlaytimeSession]) -> bool {
+    if !backend.accepts_playtime_sessions() {
+        return true;
+    }
     let config = crate::client::install::config();
     let sessions = sessions
         .iter()

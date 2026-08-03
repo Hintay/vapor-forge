@@ -500,7 +500,7 @@ fn device_identity_and_conflict_are_durable() {
     let kept_cloud = conflict("conflict-1", "kept_cloud");
     {
         let journal = SyncJournal::open(&path).unwrap();
-        journal.store_device_descriptor(&descriptor, 10).unwrap();
+        assert!(journal.store_device_descriptor(&descriptor, 10).unwrap());
         journal.enqueue_conflict(&kept_cloud, 10).unwrap();
     }
 
@@ -522,9 +522,10 @@ fn storing_the_device_descriptor_twice_keeps_one_row() {
         os_type: Some(1),
         device_type: Some(2),
     };
-    journal.store_device_descriptor(&descriptor, 10).unwrap();
+    assert!(journal.store_device_descriptor(&descriptor, 10).unwrap());
+    assert!(!journal.store_device_descriptor(&descriptor, 11).unwrap());
     descriptor.client_id = 9;
-    journal.store_device_descriptor(&descriptor, 11).unwrap();
+    assert!(journal.store_device_descriptor(&descriptor, 12).unwrap());
     assert_eq!(journal.load_device_descriptor().unwrap(), Some(descriptor));
 }
 
