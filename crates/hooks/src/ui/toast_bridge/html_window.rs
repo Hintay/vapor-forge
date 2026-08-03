@@ -93,7 +93,6 @@ pub(crate) fn execute_javascript_on(window: usize, script: &str) -> bool {
     true
 }
 
-#[cfg(target_pointer_width = "32")]
 pub(crate) fn register_js_method_address() -> Option<usize> {
     const REGISTER_JS_METHOD_SLOT: usize = 6;
     let maps = read_maps()?;
@@ -139,17 +138,10 @@ fn resolve_html_window_vtable(maps: &[MapsEntry]) -> Option<usize> {
     }
 
     let name_addr = find_steamui_bytes(CHTML_WINDOW_RTTI_NAME, maps)?;
-    let typeinfo = find_typeinfo_for_name(name_addr, maps)?;
-    let vtable = find_primary_vtable(typeinfo, maps)?;
-    let exec = read_usize(vtable, maps)?;
-    if !is_executable_addr(exec, maps) {
-        warn!(
-            vtable = format_args!("{:#x}", vtable),
-            exec = format_args!("{:#x}", exec),
-            "toast: CHTMLWindow slot0 is not executable"
-        );
+    let Some((vtable, exec)) = find_primary_vtable_for_name(name_addr, maps) else {
+        warn!("toast: validated CHTMLWindow primary vtable not found");
         return None;
-    }
+    };
 
     HTML_WINDOW_VTABLE.store(vtable, Ordering::Release);
     EXEC_JS_ADDR.store(exec, Ordering::Release);
@@ -161,14 +153,23 @@ fn resolve_html_window_vtable(maps: &[MapsEntry]) -> Option<usize> {
     Some(vtable)
 }
 
-fn find_typeinfo_for_name(name_addr: usize, maps: &[MapsEntry]) -> Option<usize> {
+fn find_primary_vtable_for_name(name_addr: usize, maps: &[MapsEntry]) -> Option<(usize, usize)> {
+    let word = std::mem::size_of::<usize>();
     for hit in find_readable_ptrs(name_addr, maps) {
-        if hit < 4 {
+        let Some(typeinfo) = hit.checked_sub(word) else {
+            continue;
+        };
+        if !is_readable_range(typeinfo, word.saturating_mul(2), maps) {
             continue;
         }
-        let typeinfo = hit - 4;
-        if is_readable_range(typeinfo, 8, maps) {
-            return Some(typeinfo);
+        let Some(vtable) = find_primary_vtable(typeinfo, maps) else {
+            continue;
+        };
+        let Some(exec) = read_usize(vtable, maps) else {
+            continue;
+        };
+        if is_executable_addr(exec, maps) {
+            return Some((vtable, exec));
         }
     }
     None
@@ -181,8 +182,12 @@ fn find_primary_vtable(typeinfo: usize, maps: &[MapsEntry]) -> Option<usize> {
             continue;
         }
         let offset_to_top_addr = typeinfo_slot - word;
-        let offset_to_top = read_isize(offset_to_top_addr, maps)?;
-        let method0 = typeinfo_slot + word;
+        let Some(offset_to_top) = read_isize(offset_to_top_addr, maps) else {
+            continue;
+        };
+        let Some(method0) = typeinfo_slot.checked_add(word) else {
+            continue;
+        };
         if offset_to_top == 0
             && is_readable_range(method0, word, maps)
             && read_usize(method0, maps).is_some_and(|addr| is_executable_addr(addr, maps))
@@ -593,6 +598,44 @@ mod tests {
         assert_eq!(
             find_primary_vtable(typeinfo, &maps),
             Some(base + std::mem::size_of::<usize>() * 2)
+        );
+    }
+
+    #[test]
+    fn typeinfo_lookup_skips_unrelated_name_pointer_hits() {
+        let name_addr = 0x1234_5678usize;
+        let executable = typeinfo_lookup_skips_unrelated_name_pointer_hits as *const () as usize;
+        let mut words = Box::new([0usize; 12]);
+        let base = words.as_mut_ptr() as usize;
+        let word = std::mem::size_of::<usize>();
+        let typeinfo = base + word * 4;
+        let vtable = base + word * 10;
+
+        words[1] = name_addr;
+        words[4] = 1;
+        words[5] = name_addr;
+        words[8] = 0;
+        words[9] = typeinfo;
+        words[10] = executable;
+
+        let maps = vec![
+            MapsEntry {
+                start: base,
+                end: base + std::mem::size_of_val(&*words),
+                perms: "r--p".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
+            },
+            MapsEntry {
+                start: executable,
+                end: executable.saturating_add(1),
+                perms: "r-xp".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            find_primary_vtable_for_name(name_addr, &maps),
+            Some((vtable, executable))
         );
     }
 

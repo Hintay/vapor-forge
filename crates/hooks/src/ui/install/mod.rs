@@ -306,7 +306,6 @@ pub fn install(
         hook_results[5].installed = true;
     }
 
-    #[cfg(target_pointer_width = "32")]
     hook_results.push(super::reverse_bridge::install(steamui_code));
 
     INSTALLED.store(true, Ordering::Release);

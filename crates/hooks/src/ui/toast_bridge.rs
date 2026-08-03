@@ -171,7 +171,6 @@ fn execute_conflict_update(
     html_window::execute_javascript_on(window, &script)
 }
 
-#[cfg(any(target_pointer_width = "32", debug_assertions, test))]
 pub fn request_pump() {
     PUMP_REQUESTED.store(true, Ordering::Release);
 }
