@@ -31,6 +31,28 @@ pub(crate) use runtime::{
 
 pub(crate) static PKG0_INJECTED: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn reset_account_state() {
+    PKG0_INJECTED.store(false, Ordering::Release);
+    package_info::reset_account_state();
+    package_state().reset_account_state();
+}
+
+#[cfg(test)]
+pub(crate) fn seed_account_state_for_test() {
+    PKG0_INJECTED.store(true, Ordering::Release);
+    package_info::seed_account_state_for_test();
+    package_state().set_active();
+    package_state().record_injected(&[vapor_forge_config::AppId(5)]);
+}
+
+#[cfg(test)]
+pub(crate) fn account_state_is_clear_for_test() -> bool {
+    !PKG0_INJECTED.load(Ordering::Acquire)
+        && package_info::account_state_is_clear_for_test()
+        && !package_state().is_active()
+        && package_state().injected_count() == 0
+}
+
 static CODE_RANGE: OnceLock<(usize, usize)> = OnceLock::new();
 
 // ---------------------------------------------------------------------------

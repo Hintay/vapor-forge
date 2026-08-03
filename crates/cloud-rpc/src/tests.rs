@@ -384,6 +384,25 @@ fn response_reservation_is_held_until_the_response_is_drained() {
 }
 
 #[test]
+fn response_registered_before_immediate_disconnect_uses_fallback() {
+    let outstanding = Arc::new(AtomicUsize::new(1));
+    let reservation = ResponsePermit {
+        outstanding: Arc::clone(&outstanding),
+    };
+    let (sender, receiver) = mpsc::channel();
+    let queue = CloudRpcQueue::new();
+    queue.track_response(receiver, vec![9, 8, 7], 23, reservation);
+    drop(sender);
+
+    let completed = queue.drain_completed();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].packet, vec![9, 8, 7]);
+    assert_eq!(completed[0].response_generation, 23);
+    drop(completed);
+    assert_eq!(outstanding.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
     let config = RuntimeConfig {
         cloud: CloudSection {
@@ -1484,40 +1503,66 @@ fn create_local_manifest_heads(
         .unwrap();
 
     let root_id = store.view(app_id).unwrap().head_ids().remove(0);
-    let directory = path.join(format!("{ACCOUNT}/{app_id}/manifests"));
-    let root_bytes = std::fs::read(directory.join(format!("{root_id}.json"))).unwrap();
-    let root_manifest = serde_json::from_slice::<serde_json::Value>(&root_bytes).unwrap();
     for (client_id, machine_name, revision, contents, sha1) in heads {
-        let staged = store
-            .stage_file(
-                app_id,
-                "save.dat",
-                contents,
-                &vapor_forge_cloud_core::FileMetadata {
-                    sha1: (*sha1).into(),
-                    raw_size: contents.len() as u64,
-                    mtime: *revision as i64,
-                    platforms_to_sync: u32::MAX,
-                },
-            )
-            .unwrap();
-        let mut manifest = root_manifest.clone();
-        manifest["revision"] = serde_json::json!(revision);
-        manifest["parents"] = serde_json::json!([root_id.clone()]);
-        manifest["client_id"] = serde_json::json!(client_id);
-        manifest["machine_name"] = serde_json::json!(machine_name);
-        manifest["created_at_ms"] = serde_json::json!(revision * 1_000);
-        manifest["files"]["save.dat"] = serde_json::json!({
-            "sha1": staged.blob_sha1,
-            "raw_size": staged.metadata.raw_size,
-            "mtime": staged.metadata.mtime,
-            "platforms_to_sync": staged.metadata.platforms_to_sync,
-        });
-        let bytes = serde_json::to_vec(&manifest).unwrap();
-        let id = bytes_to_hex(&Sha256::digest(&bytes));
-        std::fs::write(directory.join(format!("{id}.json")), bytes).unwrap();
+        append_local_manifest_head(
+            &store,
+            path,
+            app_id,
+            &root_id,
+            *client_id,
+            machine_name,
+            *revision,
+            contents,
+            sha1,
+        );
     }
     store
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_local_manifest_head(
+    store: &vapor_forge_cloud_local::FolderStore,
+    path: &std::path::Path,
+    app_id: u32,
+    parent_id: &str,
+    client_id: u64,
+    machine_name: &str,
+    revision: u64,
+    contents: &[u8],
+    sha1: &str,
+) -> String {
+    const ACCOUNT: u64 = 76_561_198_000_000_001;
+    let staged = store
+        .stage_file(
+            app_id,
+            "save.dat",
+            contents,
+            &vapor_forge_cloud_core::FileMetadata {
+                sha1: sha1.into(),
+                raw_size: contents.len() as u64,
+                mtime: revision as i64,
+                platforms_to_sync: u32::MAX,
+            },
+        )
+        .unwrap();
+    let directory = path.join(format!("{ACCOUNT}/{app_id}/manifests"));
+    let parent_bytes = std::fs::read(directory.join(format!("{parent_id}.json"))).unwrap();
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(&parent_bytes).unwrap();
+    manifest["revision"] = serde_json::json!(revision);
+    manifest["parents"] = serde_json::json!([parent_id]);
+    manifest["client_id"] = serde_json::json!(client_id);
+    manifest["machine_name"] = serde_json::json!(machine_name);
+    manifest["created_at_ms"] = serde_json::json!(revision * 1_000);
+    manifest["files"]["save.dat"] = serde_json::json!({
+        "sha1": staged.blob_sha1,
+        "raw_size": staged.metadata.raw_size,
+        "mtime": staged.metadata.mtime,
+        "platforms_to_sync": staged.metadata.platforms_to_sync,
+    });
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let id = bytes_to_hex(&Sha256::digest(&bytes));
+    std::fs::write(directory.join(format!("{id}.json")), bytes).unwrap();
+    id
 }
 
 fn local_conflict_context(settings: &CloudSettings) -> ConflictUiContext {
@@ -1980,6 +2025,7 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
     ));
     assert!(!claim_path.exists());
     let mut state = AdapterState::default();
+    state.local_conflicts.set_ui_ready(true);
     let changelist = CloudGetAppFileChangelistRequest {
         app_id: Some(app_id),
         synced_change_number: Some(1),
@@ -2041,6 +2087,161 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
     };
     execute_rpc(&mut state, &settings, EXIT_SYNC_DONE, &exit.encode_to_vec()).unwrap();
     assert!(!claim_path.exists());
+}
+
+#[test]
+fn custom_conflict_requires_an_operational_ui_bridge() {
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    create_local_manifest_heads(
+        directory.path(),
+        app_id,
+        &[
+            (
+                7,
+                "deck",
+                2,
+                b"local",
+                "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+            ),
+            (
+                8,
+                "desktop",
+                2,
+                b"remote",
+                "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+            ),
+            (
+                9,
+                "laptop",
+                2,
+                b"third",
+                "34fb3300b9a77bebdc988ec3edd0d4a6a42a26f9",
+            ),
+        ],
+    );
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let launch = CloudAppLaunchIntentRequest {
+        app_id: Some(app_id),
+        client_id: Some(7),
+        machine_name: Some("deck".into()),
+        ignore_pending_operations: Some(false),
+        os_type: Some(1),
+        device_type: Some(2),
+    };
+
+    let error = match execute_rpc(
+        &mut state,
+        &settings,
+        LAUNCH_INTENT,
+        &launch.encode_to_vec(),
+    ) {
+        Ok(_) => panic!("custom conflict must require an operational UI bridge"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("conflict UI is unavailable"));
+}
+
+#[test]
+fn launch_binds_stock_conflict_to_heads_changed_after_changelist() {
+    const ACCOUNT: u64 = 76_561_198_000_000_001;
+    let directory = tempfile::tempdir().unwrap();
+    let app_id = 480;
+    let store =
+        vapor_forge_cloud_local::FolderStore::open_account(directory.path(), ACCOUNT).unwrap();
+    let root = store
+        .stage_file(
+            app_id,
+            "save.dat",
+            b"root",
+            &vapor_forge_cloud_core::FileMetadata {
+                sha1: "dc76e9f0c0006e8f919e0c515c66dbba3982f785".into(),
+                raw_size: 4,
+                mtime: 1,
+                platforms_to_sync: u32::MAX,
+            },
+        )
+        .unwrap();
+    store
+        .commit_batch(
+            app_id,
+            &[],
+            &[root],
+            &BTreeSet::new(),
+            &vapor_forge_cloud_local::CommitIdentity {
+                client_id: 1,
+                machine_name: "root".into(),
+            },
+            None,
+        )
+        .unwrap();
+    let root_id = store.view(app_id).unwrap().head_ids().remove(0);
+    let settings = local_settings(directory.path(), 7);
+    let mut state = AdapterState::default();
+    let changelist = CloudGetAppFileChangelistRequest {
+        app_id: Some(app_id),
+        synced_change_number: Some(1),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &changelist.encode_to_vec(),
+    )
+    .unwrap();
+
+    append_local_manifest_head(
+        &store,
+        directory.path(),
+        app_id,
+        &root_id,
+        7,
+        "deck",
+        2,
+        b"local",
+        "939bb46a04c3640c8c427e92b1b557e882e2d2a0",
+    );
+    append_local_manifest_head(
+        &store,
+        directory.path(),
+        app_id,
+        &root_id,
+        8,
+        "desktop",
+        2,
+        b"remote",
+        "41ffe5457d1a557c3317f2e5216ceaa355223d39",
+    );
+    let launch = CloudAppLaunchIntentRequest {
+        app_id: Some(app_id),
+        client_id: Some(7),
+        machine_name: Some("deck".into()),
+        ignore_pending_operations: Some(false),
+        os_type: Some(1),
+        device_type: Some(2),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        LAUNCH_INTENT,
+        &launch.encode_to_vec(),
+    )
+    .unwrap();
+    let choice = CloudClientConflictResolutionNotification {
+        app_id: Some(app_id),
+        chose_local_files: Some(false),
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        CONFLICT_RESOLUTION,
+        &choice.encode_to_vec(),
+    )
+    .unwrap();
+
+    assert_eq!(store.view(app_id).unwrap().heads.len(), 1);
+    assert_eq!(store.read(app_id, "save.dat").unwrap(), b"remote");
 }
 
 #[test]

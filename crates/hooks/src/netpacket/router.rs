@@ -70,6 +70,7 @@ static BLOCKED_RICH_PRESENCE_APP: AtomicU32 = AtomicU32::new(0);
 pub enum SendFrameDecision {
     Pass,
     Drop,
+    Retry,
     Rewrite(Vec<u8>),
 }
 
@@ -192,8 +193,10 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 
         vapor_forge_features::playtime::observe_request(method, &hdr, identity::steam_id());
 
+        let response_delivery_ready = crate::client::network::response_delivery_ready();
+
         if method == request_code::TARGET_JOB_NAME {
-            if handle_manifest_send(&hdr, header_bytes, body_bytes) {
+            if response_delivery_ready && handle_manifest_send(&hdr, header_bytes, body_bytes) {
                 decision = SendFrameDecision::Drop;
                 crate::packet_capture::capture(
                     PacketDirection::Send,
@@ -222,6 +225,14 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 &runtime.config,
             );
         }
+        if !response_delivery_ready
+            && vapor_forge_cloud_rpc::privacy_fallback(method, body_bytes, &runtime.config)
+                .is_some_and(|(_, expects_response)| expects_response)
+        {
+            warn!(method, "netpacket: native response delivery unavailable");
+            return SendFrameDecision::Retry;
+        }
+        CLOUD_PENDING.set_conflict_ui_ready(crate::ui::conflict_ui_ready());
         if CLOUD_PENDING.intercept(
             method,
             &hdr,
@@ -262,6 +273,13 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 return SendFrameDecision::Drop;
             }
             PrivacyAction::Respond { app_id, packet } => {
+                if !response_delivery_ready {
+                    warn!(
+                        app_id,
+                        method, "netpacket: native response delivery unavailable"
+                    );
+                    return SendFrameDecision::Retry;
+                }
                 info!(
                     app_id,
                     method, "netpacket: answered Valve service request locally"
@@ -314,16 +332,27 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 return SendFrameDecision::Drop;
             }
             PrivacyAction::Respond { app_id, packet } => {
-                let persisted =
-                    crate::achievement_worker::persist_store_commit(app_id, emsg, body_bytes);
+                if !crate::client::network::response_delivery_ready() {
+                    warn!(
+                        app_id,
+                        emsg, "netpacket: native response delivery unavailable"
+                    );
+                    return SendFrameDecision::Retry;
+                }
+                let requires_marker = runtime.config.cloud_enabled_for_controlled_apps();
+                let persisted = !requires_marker
+                    || crate::achievement_worker::persist_store_commit(app_id, emsg, body_bytes);
                 if persisted {
-                    crate::client::user_stats::queue_snapshot_read(app_id);
+                    if requires_marker {
+                        crate::client::user_stats::queue_snapshot_read(app_id);
+                    }
                     info!(app_id, emsg, "netpacket: acknowledged StoreStats locally");
                 } else {
                     warn!(
                         app_id,
-                        emsg, "netpacket: acknowledged StoreStats without a durable commit marker"
+                        emsg, "netpacket: StoreStats commit marker could not be persisted"
                     );
+                    return SendFrameDecision::Retry;
                 }
                 queue_local_response(packet);
                 capture_dropped(data);
@@ -334,6 +363,10 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 
     if emsg == EMSG_GET_APP_OWNERSHIP_TICKET {
         if let Some((app_id, packet)) = local_ownership_ticket_response(header_bytes, body_bytes) {
+            if !crate::client::network::response_delivery_ready() {
+                warn!(app_id, "netpacket: native response delivery unavailable");
+                return SendFrameDecision::Retry;
+            }
             info!(
                 app_id,
                 "netpacket: answered ownership ticket request locally"
@@ -346,6 +379,10 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 
     if emsg == EMSG_ENCRYPTED_APPTICKET_REQUEST {
         if let Some((app_id, packet)) = local_encrypted_ticket_response(header_bytes, body_bytes) {
+            if !crate::client::network::response_delivery_ready() {
+                warn!(app_id, "netpacket: native response delivery unavailable");
+                return SendFrameDecision::Retry;
+            }
             info!(
                 app_id,
                 "netpacket: answered encrypted ticket request locally"
@@ -483,7 +520,13 @@ fn handle_record_disconnected_playtime(
     }
 
     let Some(backend) = crate::cloud_backend::backend_context() else {
-        warn!("playtime-sync: backend unavailable; controlled sessions were not recorded");
+        if config.cloud_enabled_for_controlled_apps() {
+            warn!("playtime-sync: configured backend unavailable");
+            return SendFrameDecision::Retry;
+        }
+        for (app_id, _) in &protected_sessions {
+            crate::client::user_stats::signal_router_playtime(*app_id);
+        }
         return finish_disconnected_playtime(
             emsg_raw,
             header_bytes,
@@ -507,23 +550,11 @@ fn handle_record_disconnected_playtime(
     let steam_id64 = identity::steam_id();
     if steam_id64 == 0 {
         warn!("playtime-sync: account unavailable; controlled sessions were not recorded");
-        return finish_disconnected_playtime(
-            emsg_raw,
-            header_bytes,
-            original_packet,
-            valve_sessions,
-            0,
-        );
+        return SendFrameDecision::Retry;
     }
     let Some(scope) = crate::sync_journal::cached_principal_scope(backend.as_ref()) else {
         warn!("playtime-sync: principal unavailable; controlled sessions were not recorded");
-        return finish_disconnected_playtime(
-            emsg_raw,
-            header_bytes,
-            original_packet,
-            valve_sessions,
-            0,
-        );
+        return SendFrameDecision::Retry;
     };
     let observed_at = unix_now();
     let mut protected = Vec::new();
@@ -569,13 +600,7 @@ fn handle_record_disconnected_playtime(
     }
     if !crate::playtime_worker::persist_sessions(backend.as_ref(), &protected) {
         warn!("playtime-sync: controlled sessions could not be persisted");
-        return finish_disconnected_playtime(
-            emsg_raw,
-            header_bytes,
-            original_packet,
-            valve_sessions,
-            0,
-        );
+        return SendFrameDecision::Retry;
     }
     // Also sample the cumulative value for each disconnected-playtime report.
     // This supplements this recovery path only; ordinary exits rely on Steam's
@@ -600,6 +625,10 @@ fn finish_disconnected_playtime(
     persisted: usize,
 ) -> SendFrameDecision {
     if valve_sessions.is_empty() {
+        if !crate::client::network::response_delivery_ready() {
+            warn!("playtime-sync: native response delivery unavailable");
+            return SendFrameDecision::Retry;
+        }
         queue_local_response(valve_filter::service_response(
             header_bytes,
             PlayerRecordDisconnectedPlaytimeResponse {}.encode_to_vec(),

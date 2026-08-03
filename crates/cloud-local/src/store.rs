@@ -11,6 +11,9 @@ use vapor_forge_cloud_core::{
     BackendError, ByteStore, ChangeList, CloudFileStore, FileEntry, FileMetadata, Quota, Transfer,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 const FORMAT_VERSION: u32 = 1;
 const FORMAT_FILE: &str = "format.json";
 
@@ -197,7 +200,12 @@ impl FolderStore {
         if root.as_os_str().is_empty() {
             return Err(permanent("local cloud path is empty"));
         }
-        std::fs::create_dir_all(root).map_err(io_error)?;
+        let root = if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(io_error)?.join(root)
+        };
+        create_durable_dir_all(&root)?;
         let root = root.canonicalize().map_err(io_error)?;
         let coordination = repository_coordination(&root);
         let store = Self {
@@ -1332,13 +1340,13 @@ pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
     let parent = path
         .parent()
         .ok_or_else(|| permanent("local cloud object has no parent directory"))?;
-    std::fs::create_dir_all(parent).map_err(io_error)?;
+    create_durable_dir_all(parent)?;
     let temporary = parent.join(format!(".syncthing.{}.tmp", next_nonce()));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(io_error)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(io_error)?;
     if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
         let _ = std::fs::remove_file(&temporary);
         return Err(io_error(error));
@@ -1347,11 +1355,13 @@ pub(crate) fn atomic_publish(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
     match std::fs::hard_link(&temporary, path) {
         Ok(()) => {
             std::fs::remove_file(&temporary).map_err(io_error)?;
+            sync_directory(parent)?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = std::fs::remove_file(&temporary);
             if std::fs::read(path).map_err(io_error)? == bytes {
+                sync_directory(parent)?;
                 Ok(())
             } else {
                 Err(permanent("immutable local cloud object collision"))
@@ -1374,13 +1384,13 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
     let parent = path
         .parent()
         .ok_or_else(|| permanent("local cloud object has no parent directory"))?;
-    std::fs::create_dir_all(parent).map_err(io_error)?;
+    create_durable_dir_all(parent)?;
     let temporary = parent.join(format!(".syncthing.{}.tmp", next_nonce()));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(io_error)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(io_error)?;
     let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
     if let Err(error) = write_result {
@@ -1391,6 +1401,59 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), BackendErr
         let _ = std::fs::remove_file(&temporary);
         return Err(io_error(error));
     }
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn create_durable_dir_all(path: &Path) -> Result<(), BackendError> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current
+            .parent()
+            .ok_or_else(|| permanent("local cloud directory has no existing parent"))?;
+    }
+    if !current.is_dir() {
+        return Err(permanent("local cloud path parent is not a directory"));
+    }
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !directory.is_dir() {
+                    return Err(io_error(error));
+                }
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        set_private_directory_mode(&directory)?;
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory_mode(path: &Path) -> Result<(), BackendError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(io_error)
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_mode(_path: &Path) -> Result<(), BackendError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), BackendError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), BackendError> {
     Ok(())
 }
 
@@ -1681,6 +1744,33 @@ mod tests {
         std::fs::write(&link, b"changed through link").unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"changed through link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_objects_and_created_directories_use_private_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("cloud/account/app/manifests");
+        let path = parent.join("object.json");
+        atomic_publish(&path, b"private").unwrap();
+
+        for component in [
+            directory.path().join("cloud"),
+            directory.path().join("cloud/account"),
+            directory.path().join("cloud/account/app"),
+            parent,
+        ] {
+            assert_eq!(
+                std::fs::metadata(component).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn divergent_heads(store: &FolderStore) -> (String, String) {

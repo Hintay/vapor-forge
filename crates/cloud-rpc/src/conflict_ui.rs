@@ -94,6 +94,7 @@ struct State {
 pub(crate) struct LocalConflictCoordinator {
     state: Mutex<State>,
     revision: AtomicU64,
+    ui_ready: std::sync::atomic::AtomicBool,
     choices: mpsc::Sender<Choice>,
 }
 
@@ -115,9 +116,18 @@ impl LocalConflictCoordinator {
             Self {
                 state: Mutex::new(State::default()),
                 revision: AtomicU64::new(1),
+                ui_ready: std::sync::atomic::AtomicBool::new(false),
                 choices,
             }
         })
+    }
+
+    pub(crate) fn set_ui_ready(&self, ready: bool) {
+        self.ui_ready.store(ready, Ordering::Release);
+    }
+
+    pub(crate) fn ui_ready(&self) -> bool {
+        self.ui_ready.load(Ordering::Acquire)
     }
 
     pub(crate) fn register(

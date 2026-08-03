@@ -62,11 +62,14 @@ pub(super) fn execute_javascript(script: &str) -> bool {
     true
 }
 
-pub(crate) fn html_windows() -> Vec<usize> {
+pub(crate) fn is_html_window(window: usize) -> bool {
     let Some(maps) = read_maps() else {
-        return Vec::new();
+        return false;
     };
-    find_html_windows(&maps).unwrap_or_default()
+    let Some(vtable) = resolve_html_window_vtable(&maps) else {
+        return false;
+    };
+    is_html_window_candidate(window, vtable, &maps)
 }
 
 pub(crate) fn execute_javascript_on(window: usize, script: &str) -> bool {

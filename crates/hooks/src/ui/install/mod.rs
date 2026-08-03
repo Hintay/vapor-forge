@@ -27,8 +27,8 @@ use vapor_forge_patterns::Pattern;
 
 pub use super::library::queue_removal;
 use super::state::{
-    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, CONTROLLER,
-    GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
+    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, CONFLICT_UI_READY,
+    CONTROLLER, GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
 };
 
 type RunFrameFn = unsafe extern "C" fn(*mut c_void);
@@ -306,9 +306,14 @@ pub fn install(
         hook_results[5].installed = true;
     }
 
-    hook_results.push(super::reverse_bridge::install(steamui_code));
+    let reverse_bridge = super::reverse_bridge::install(steamui_code);
+    let conflict_ui_ready = hook_results[0].installed && reverse_bridge.installed;
+    hook_results.push(reverse_bridge);
 
-    INSTALLED.store(true, Ordering::Release);
+    let library_ready =
+        hook_results[0].installed && hook_results[3].installed && hook_results[4].installed;
+    INSTALLED.store(library_ready, Ordering::Release);
+    CONFLICT_UI_READY.store(conflict_ui_ready, Ordering::Release);
 
     if !all_found {
         warn!("steamui: some optional hooks missing, partial UI management");
@@ -328,9 +333,11 @@ pub fn install(
         get_app = format_args!("{:#x}", addrs[3]),
         mark = format_args!("{:#x}", addrs[4]),
         repeated_field_add = rfa,
+        library_ready,
+        conflict_ui_ready,
         "steamui: hooks installed"
     );
-    true
+    library_ready || conflict_ui_ready
 }
 
 fn maybe_show_init_toast() {

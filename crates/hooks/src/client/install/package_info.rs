@@ -12,6 +12,20 @@ pub(super) type GetPackageInfoHookFn = vapor_forge_steam_native_abi::GetPackageI
 pub(super) static mut GET_PKG_INFO_DETOUR: Option<Detour<GetPackageInfoHookFn>> = None;
 static CPKG_INFO_CAPTURED: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn reset_account_state() {
+    CPKG_INFO_CAPTURED.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(super) fn seed_account_state_for_test() {
+    CPKG_INFO_CAPTURED.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(super) fn account_state_is_clear_for_test() -> bool {
+    !CPKG_INFO_CAPTURED.load(Ordering::Acquire)
+}
+
 pub(super) fn hook_name() -> &'static str {
     "CPackageInfo::GetPackageInfo"
 }

@@ -315,13 +315,31 @@ fn stats_commit_marker_survives_reopen_and_completes_to_snapshot() {
         ),
         vec![snapshot]
     );
-    assert!(reopened
-        .stats_sync_pending(SCOPE, STEAM_ID, 620, 0, i64::MAX)
-        .unwrap());
+    assert!(reopened.stats_sync_pending(SCOPE, STEAM_ID, 620).unwrap());
     assert_eq!(
         reopened.pending_stats_commit(SCOPE, STEAM_ID, 620).unwrap(),
         None,
         "a completed record is no longer awaiting Steam"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_and_parent_directory_use_private_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("private");
+    let path = parent.join("sync-journal.stry");
+    drop(SyncJournal::open(&path).unwrap());
+
+    assert_eq!(
+        std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
     );
 }
 
@@ -355,9 +373,7 @@ fn successful_stats_delivery_is_removed_after_acknowledgement() {
             .pending_stats_snapshots(SCOPE, STEAM_ID, 101)
             .unwrap();
         journal.acknowledge(&pending[0]).unwrap();
-        assert!(!journal
-            .stats_sync_pending(SCOPE, STEAM_ID, 620, 0, i64::MAX)
-            .unwrap());
+        assert!(!journal.stats_sync_pending(SCOPE, STEAM_ID, 620).unwrap());
     }
 
     let reopened = SyncJournal::open(&path).unwrap();

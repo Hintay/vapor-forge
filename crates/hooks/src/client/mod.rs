@@ -28,6 +28,7 @@ pub(crate) fn reset_account_state() {
     network::invalidate_injection_context();
     steam_context::invalidate_identity();
     package::reset_account_state();
+    install::reset_account_state();
     vapor_forge_features::apps::reset_account_state();
     playtime_downlink::reset_account_state();
     vapor_forge_features::rich_presence::reset_account_state();
@@ -95,6 +96,8 @@ mod tests {
         let generation_a = vapor_forge_features::identity::generation();
         apps::record_actual_ownership(app_id, true);
         apps::mark_license_sync_complete();
+        super::package::seed_account_state_for_test();
+        super::install::seed_account_state_for_test();
         assert_eq!(apps::actual_ownership(app_id), OwnershipState::Owned);
         assert!(apps::license_sync_complete());
 
@@ -104,5 +107,7 @@ mod tests {
         assert!(vapor_forge_features::identity::generation() > generation_a);
         assert_eq!(apps::actual_ownership(app_id), OwnershipState::Unknown);
         assert!(!apps::license_sync_complete());
+        assert!(super::package::account_state_is_clear_for_test());
+        assert!(super::install::account_state_is_clear_for_test());
     }
 }

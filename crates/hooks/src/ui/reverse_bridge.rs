@@ -210,9 +210,8 @@ fn c_string_eq(value: *const c_char, expected: &[u8]) -> bool {
 }
 
 pub(super) fn registered_windows() -> Vec<(usize, u64)> {
-    let live = super::toast_bridge::html_window::html_windows();
     let mut windows = WINDOWS.lock().unwrap_or_else(|error| error.into_inner());
-    windows.retain(|window, _| live.contains(window));
+    windows.retain(|window, _| super::toast_bridge::html_window::is_html_window(*window));
     windows
         .iter()
         .filter_map(|(window, state)| state.registered.then_some((*window, state.generation)))

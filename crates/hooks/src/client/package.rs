@@ -353,6 +353,30 @@ pub(crate) unsafe fn capture_cuser(this: *mut c_void) {
 
 pub(crate) fn reset_account_state() {
     CUSER_PTR.store(0, Ordering::Release);
+    CPKG_INFO_PTR.store(0, Ordering::Release);
+    PKG0_PTR.store(0, Ordering::Release);
+    *PENDING_RELOAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn seed_account_state_for_test() {
+    CUSER_PTR.store(1, Ordering::Release);
+    CPKG_INFO_PTR.store(2, Ordering::Release);
+    PKG0_PTR.store(3, Ordering::Release);
+    queue_reload(vec![AppId(4)]);
+}
+
+#[cfg(test)]
+pub(crate) fn account_state_is_clear_for_test() -> bool {
+    CUSER_PTR.load(Ordering::Acquire) == 0
+        && CPKG_INFO_PTR.load(Ordering::Acquire) == 0
+        && PKG0_PTR.load(Ordering::Acquire) == 0
+        && PENDING_RELOAD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
 }
 
 // ---------------------------------------------------------------------------

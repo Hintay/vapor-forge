@@ -205,6 +205,7 @@ pub(crate) unsafe extern "C" fn hk_send_frame(
         match crate::netpacket::decide_send_frame(slice) {
             SendFrameDecision::Pass => {}
             SendFrameDecision::Drop => return true,
+            SendFrameDecision::Retry => return false,
             SendFrameDecision::Rewrite(rewritten) => {
                 // SAFETY: calling original with rewritten data.
                 let original =
@@ -317,7 +318,7 @@ fn take_next_dispatchable(
             && queued
                 .playtime_context
                 .as_ref()
-                .map_or(true, |context| Some(context) == current)
+                .is_none_or(|context| Some(context) == current)
         {
             return (Some(queued), discarded);
         }
@@ -379,6 +380,35 @@ fn dispatch_ready() -> bool {
         && PACKET_ALLOC_ADDR.load(Ordering::Acquire) != 0
         && PACKET_INIT_ADDR.load(Ordering::Acquire) != 0
         && PACKET_RELEASE_ADDR.load(Ordering::Acquire) != 0
+}
+
+pub(crate) fn response_delivery_ready() -> bool {
+    if !dispatch_ready() || RECV_PTHREAD.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let Some(site) = WORK_ITEM_SITE.get() else {
+        return false;
+    };
+    // SAFETY: installation validates the pointer-aligned pool slot against the
+    // live steamclient mapping before publishing WORK_ITEM_SITE.
+    !unsafe { (site.pool_slot as *const *mut c_void).read() }.is_null()
+}
+
+fn terminate_dispatch_generation(reason: &'static str) {
+    let discarded = {
+        let mut queue = injection_queue().lock().unwrap();
+        let discarded = queue.len();
+        queue.clear();
+        discarded
+    };
+    warn!(
+        discarded,
+        reason, "native-inject: terminated connection generation"
+    );
+    invalidate_injection_context();
+    if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
+        queue.cancel_pending_conflicts();
+    }
 }
 
 /// Queue a fabricated response and post a worker item to deliver it. If the
@@ -486,6 +516,7 @@ fn post_injection() {
         // SAFETY: Steam rejected the item, so ownership never left us.
         unsafe { NativeWorkItem::free(item) };
         WORK_ITEM_POSTED.store(false, Ordering::Release);
+        terminate_dispatch_generation("Steam rejected CNet work item");
     }
 }
 
@@ -605,6 +636,7 @@ unsafe extern "C" fn native_inject_execute(item: *mut c_void, _arg: *mut c_void)
             expected = format_args!("0x{expected:x}"),
             "native-inject: completion ran off the RecvPkt thread, skipping dispatch"
         );
+        terminate_dispatch_generation("CNet work item completed on the wrong thread");
         return true;
     }
     info!(

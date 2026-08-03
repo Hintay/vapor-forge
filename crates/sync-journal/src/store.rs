@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use structsy::{Fetch, Filter, Ref, Structsy, StructsyTx};
 use vapor_forge_cloud_core::{
     AchievementSchema, DeviceDescriptor, PlaytimeEntry, PlaytimeSession, StatsCommit,
@@ -145,8 +148,10 @@ impl SyncJournal {
     pub fn open(path: &Path) -> Result<Self, SyncJournalError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            set_private_directory_mode(parent)?;
         }
         let database = Structsy::open(path)?;
+        set_private_file_mode(path)?;
         database.define::<PlaytimeRecord>()?;
         database.define::<PlaytimeSessionRecord>()?;
         database.define::<SchemaRecord>()?;
@@ -485,27 +490,16 @@ impl SyncJournal {
             .map(|(_, record)| record.commit()))
     }
 
-    /// Whether this app has anything, marker or snapshot, still owed to the backend.
-    ///
-    /// A marker without content means a change was observed but has not been
-    /// captured yet, which is exactly when pulling backend state would clobber it.
-    /// But a marker whose snapshot never arrives would block that app's downlink for
-    /// the life of the install, so the marker only holds the gate for `grace`
-    /// seconds. A record that does carry content holds it until it is uploaded,
-    /// because that state is real and unsent.
+    /// Whether this app has a marker or snapshot still owed to the backend.
     pub fn stats_sync_pending(
         &self,
         owner_scope: &str,
         owner_steam_id64: &str,
         app_id: u32,
-        now: i64,
-        grace: i64,
     ) -> Result<bool, SyncJournalError> {
         Ok(self
             .stats_record(owner_scope, owner_steam_id64, app_id)
-            .is_some_and(|(_, record)| {
-                record.has_snapshot() || now.saturating_sub(record.observed_at) <= grace
-            }))
+            .is_some())
     }
 
     /// Upgrade a pending commit marker into the snapshot Steam produced for it.
@@ -883,4 +877,26 @@ impl SyncJournal {
             .fetch_tx(tx)
             .next()
     }
+}
+
+#[cfg(unix)]
+fn set_private_directory_mode(path: &Path) -> Result<(), SyncJournalError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_mode(_path: &Path) -> Result<(), SyncJournalError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_mode(path: &Path) -> Result<(), SyncJournalError> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_mode(_path: &Path) -> Result<(), SyncJournalError> {
+    Ok(())
 }

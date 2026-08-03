@@ -440,7 +440,7 @@ fn rebuild_manifest_override(state: &mut RuntimeState, depot_id: DepotId) {
     for (file, overrides) in &state.file_manifest_overrides {
         if let Some(entry) = overrides.get(&depot_id) {
             let seq = state.file_parse_sequence.get(file).copied().unwrap_or(0);
-            if winner.as_ref().map_or(true, |(best, _)| seq > *best) {
+            if winner.as_ref().is_none_or(|(best, _)| seq > *best) {
                 winner = Some((seq, entry.clone()));
             }
         }

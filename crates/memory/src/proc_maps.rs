@@ -117,13 +117,13 @@ pub fn current_process_ranges_match(queries: &[ProcessRangeQuery]) -> Result<boo
     Ok(queries.iter().all(|query| {
         entries.iter().any(|entry| {
             range_is_contained_in_entry(entry, query.address, query.len)
-                && query.read.map_or(true, |expected| {
+                && query.read.is_none_or(|expected| {
                     (entry.permissions.as_bytes().first() == Some(&b'r')) == expected
                 })
-                && query.write.map_or(true, |expected| {
+                && query.write.is_none_or(|expected| {
                     (entry.permissions.as_bytes().get(1) == Some(&b'w')) == expected
                 })
-                && query.execute.map_or(true, |expected| {
+                && query.execute.is_none_or(|expected| {
                     (entry.permissions.as_bytes().get(2) == Some(&b'x')) == expected
                 })
                 && (!query.file_backed || entry.path.starts_with('/'))

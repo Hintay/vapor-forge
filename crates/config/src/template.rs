@@ -1,5 +1,8 @@
 use std::{collections::BTreeSet, str::FromStr};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::RuntimeConfig;
@@ -46,21 +49,29 @@ impl RuntimeConfig {
     pub fn write_default_template(path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            set_private_directory_mode(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, CONFIG_TEMPLATE.as_bytes())
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        std::io::Write::write_all(&mut file, CONFIG_TEMPLATE.as_bytes())?;
+        set_private_file_mode(path)
     }
 
     pub fn sync_default_template(path: &std::path::Path) -> std::io::Result<bool> {
+        if let Some(parent) = path.parent() {
+            set_private_directory_mode(parent)?;
+        }
+        set_private_file_mode(path)?;
         let text = std::fs::read_to_string(path)?;
         let dry_run = Self::sync_default_template_dry_run(&text)?;
         if !dry_run.changed {
             return Ok(false);
         }
         std::fs::write(path, dry_run.synced)?;
+        set_private_file_mode(path)?;
         Ok(true)
     }
 
@@ -98,6 +109,26 @@ impl RuntimeConfig {
             pruned_commented_examples,
         })
     }
+}
+
+#[cfg(unix)]
+fn set_private_directory_mode(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_mode(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_mode(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_mode(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn parse_document(text: &str) -> std::io::Result<DocumentMut> {

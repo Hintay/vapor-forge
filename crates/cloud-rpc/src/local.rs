@@ -513,6 +513,11 @@ fn launch(
                 .as_ref()
                 .and_then(|conflict| conflict.remote_head.as_ref())
                 .is_none());
+    if custom_resolution && !state.local_conflicts.ui_ready() {
+        return Err(AdapterError::Protocol(
+            "local cloud conflict UI is unavailable".into(),
+        ));
+    }
     let minimum_revision = state
         .client_change_numbers
         .get(&app_id)
@@ -577,11 +582,11 @@ fn launch(
         pending_keep_local: None,
     });
     if app.verified_heads != verified_heads {
-        app.conflict = None;
         app.pending_keep_local = None;
     }
     app.identity = identity;
     app.verified_heads = verified_heads;
+    app.conflict = conflict;
     let eresult = if pending_remote_operations.is_empty() {
         super::ERESULT_OK
     } else {
