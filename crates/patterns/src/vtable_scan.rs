@@ -13,7 +13,6 @@ const EARLY_SCAN: usize = 0x400;
 pub const DEFAULT_INTERFACES: &[&str] = &[
     "IClientAppManager",
     "IClientApps",
-    "IClientConfigStore",
     "IClientRemoteStorage",
     "IClientUser",
     "IClientUserStats",
