@@ -1,6 +1,9 @@
+#[cfg(target_pointer_width = "32")]
 use core::ffi::{c_char, c_void};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_pointer_width = "32")]
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
@@ -18,13 +21,19 @@ use crate::hook_report::HookResult;
 #[cfg(target_pointer_width = "32")]
 use crate::pattern_resolver::CodeRegion;
 
+#[cfg(target_pointer_width = "32")]
 const RESOLVE_METHOD: &[u8] = b"Apps.VaporForgeResolveCloudConflict\0";
+#[cfg(target_pointer_width = "32")]
 const URL_METHOD: &[u8] = b"URL.ExecuteSteamURL";
+#[cfg(target_pointer_width = "32")]
 const CONTINUE_METHOD: &[u8] = b"Apps.ContinueGameAction";
 const TOKEN_LENGTH: usize = 64;
+#[cfg(target_pointer_width = "32")]
 const CALLBACK_CAPACITY: usize = 32;
 
+#[cfg(target_pointer_width = "32")]
 static NEXT_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_pointer_width = "32")]
 static STRING_HANDLER_VPTR: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_CONTEXT_CHANGED: AtomicBool = AtomicBool::new(false);
 static WINDOWS: Lazy<Mutex<HashMap<usize, WindowRegistration>>> =
@@ -137,7 +146,7 @@ fn register_window(original: RegisterJsMethodFn, window: usize) {
         state.registered = true;
         state.generation
     };
-    // Steam's handler deleting destructor uses the process allocator.
+    // SAFETY: Steam's handler deleting destructor uses the process allocator.
     let binding =
         unsafe { libc::malloc(std::mem::size_of::<StringBinding>()) }.cast::<StringBinding>();
     if binding.is_null() {

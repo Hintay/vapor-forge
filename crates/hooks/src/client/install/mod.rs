@@ -172,6 +172,41 @@ fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
     unsafe { detour::create_detour(name, plan) }
 }
 
+fn resolve_set_api_call_result(
+    registry: &PatternRegistry,
+    code: &CodeRegion,
+) -> Option<PendingDetour<super::callback_notify::SetApiCallResultFn>> {
+    const NAME: &str = "CSteamEngine::SetAPICallResult";
+    let addr = resolve_address_from_registry(registry, code, NAME)?;
+    let offset = addr.checked_sub(code.base)?;
+    let evidence = vapor_forge_patterns::semantic::set_api_call_result_evidence(
+        code.bytes,
+        offset,
+        std::mem::size_of::<usize>(),
+    )?;
+    if !evidence.is_complete() {
+        error!(
+            hook = NAME,
+            addr = format_args!("0x{addr:x}"),
+            ?evidence,
+            "hook semantic validation failed"
+        );
+        return None;
+    }
+    debug!(
+        hook = NAME,
+        addr = format_args!("0x{addr:x}"),
+        "hook semantic validation passed"
+    );
+    resolve_from_address(
+        code,
+        NAME,
+        addr,
+        super::callback_notify::hk_set_api_call_result
+            as super::callback_notify::SetApiCallResultFn,
+    )
+}
+
 fn resolve_interface_method<F: vapor_forge_hook_engine::detour::HookFn>(
     code: &CodeRegion,
     name: &str,
@@ -397,16 +432,8 @@ fn do_install() {
         );
     }
 
-    super::client_id::resolve(&registry, &code);
-
     // Create every detour before finalizing their shared trampoline storage.
-    let d_set_api_call_result = resolve_from_registry(
-        &registry,
-        &code,
-        "CSteamEngine::SetAPICallResult",
-        super::callback_notify::hk_set_api_call_result
-            as super::callback_notify::SetApiCallResultFn,
-    );
+    let d_set_api_call_result = resolve_set_api_call_result(&registry, &code);
     let d_register_internal_callback = resolve_from_registry(
         &registry,
         &code,

@@ -22,6 +22,8 @@ use crate::hook_report::{log_drift_summary, log_hook_details, store_results, Hoo
 use crate::pattern_resolver::{resolve_pattern_entry, CodeRegion};
 use vapor_forge_hook_engine::original::detour_or_return;
 use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTargetInput};
+#[cfg(target_pointer_width = "64")]
+use vapor_forge_patterns::Pattern;
 
 pub use super::library::queue_removal;
 use super::state::{
@@ -354,20 +356,48 @@ fn resolve_repeated_field_add(
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let entry = registry.get("google::protobuf::RepeatedField<uint32>::Add")?;
+    #[cfg(target_pointer_width = "64")]
+    let addr = {
+        let mut match_count = 0usize;
+        let mut resolved = None;
+        for variant in entry.variants() {
+            let pattern = match Pattern::parse(variant.pattern()) {
+                Ok(pattern) => pattern,
+                Err(error) => {
+                    error!(%error, "steamui: invalid RepeatedField<uint32>::Add pattern");
+                    return None;
+                }
+            };
+            let matches = pattern.find_all(steamui_code.bytes);
+            match_count += matches.len();
+            if let Some(offset) = matches.into_iter().find(|&offset| {
+                is_repeated_field_u32_add_abi(steamui_code, steamui_code.base + offset)
+            }) {
+                resolved = Some(steamui_code.base + offset);
+                break;
+            }
+        }
+        let addr = resolved.or_else(|| {
+            error!(
+                match_count,
+                "steamui: no ABI-compatible RepeatedField<uint32>::Add candidate"
+            );
+            None
+        })?;
+        info!(
+            match_count,
+            addr = format_args!("{:#x}", addr),
+            "steamui: selected ABI-compatible RepeatedField<uint32>::Add"
+        );
+        addr
+    };
+
+    #[cfg(target_pointer_width = "32")]
     let addr = resolve_pattern_entry(
         steamui_code,
         "google::protobuf::RepeatedField<uint32>::Add",
         &entry,
     )?;
-
-    #[cfg(target_pointer_width = "64")]
-    if !is_repeated_field_u32_add_abi(steamui_code, addr) {
-        error!(
-            addr = format_args!("{:#x}", addr),
-            "steamui: rejected RepeatedField<uint32>::Add candidate"
-        );
-        return None;
-    }
 
     // SAFETY: addr is a validated function address in steamui.so .text.
     let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };

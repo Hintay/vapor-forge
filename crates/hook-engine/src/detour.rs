@@ -210,6 +210,18 @@ fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[
     let offset = site.offset_in_buffer;
     let register = site.register;
 
+    let Some(relocated_len) = trampoline_relocated_prefix_len32(
+        tramp_bytes,
+        tramp_addr as u32,
+        callee_addr as u32,
+        original_prologue.len(),
+    ) else {
+        return;
+    };
+    if !range_within_relocated_prefix(offset, 5, relocated_len) {
+        return;
+    }
+
     // Verify: the trampoline must have a call (E8) at this offset.
     if offset >= tramp_bytes.len() || tramp_bytes[offset] != 0xE8 {
         return;
@@ -243,6 +255,48 @@ fn repair_pic_thunk(tramp_addr: usize, callee_addr: usize, original_prologue: &[
     );
 }
 
+fn trampoline_relocated_prefix_len32(
+    trampoline: &[u8],
+    trampoline_address: u32,
+    callee_address: u32,
+    original_window_len: usize,
+) -> Option<usize> {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+
+    let original_end = callee_address.checked_add(original_window_len as u32)?;
+    let mut decoder = Decoder::with_ip(
+        32,
+        trampoline,
+        u64::from(trampoline_address),
+        DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            return None;
+        }
+        if instruction.mnemonic() != Mnemonic::Jmp
+            || !matches!(
+                instruction.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32
+            )
+        {
+            continue;
+        }
+        let target = instruction.near_branch_target() as u32;
+        if target > callee_address && target <= original_end {
+            return Some(target.wrapping_sub(callee_address) as usize);
+        }
+    }
+    None
+}
+
+fn range_within_relocated_prefix(offset: usize, len: usize, relocated_len: usize) -> bool {
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= relocated_len)
+}
+
 fn remember_trampoline_page(page_start: usize) {
     let Ok(mut pages) = TRAMPOLINE_PAGES.lock() else {
         return;
@@ -260,4 +314,44 @@ fn trampoline_page_start(addr: usize) -> usize {
 fn page_size() -> usize {
     // SAFETY: sysconf is thread-safe and does not retain pointers.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{range_within_relocated_prefix, trampoline_relocated_prefix_len32};
+
+    fn append_return_jump(bytes: &mut Vec<u8>, trampoline_address: u32, target: u32) {
+        let jump_address = trampoline_address + bytes.len() as u32;
+        bytes.push(0xe9);
+        bytes.extend_from_slice(&target.wrapping_sub(jump_address + 5).to_le_bytes());
+    }
+
+    #[test]
+    fn measures_only_the_prefix_relocated_by_retour() {
+        let trampoline_address = 0xf670_0054;
+        let callee_address = 0xd22e_36b0;
+        let mut bytes = vec![0x55, 0x89, 0xe5, 0x57, 0x56];
+        append_return_jump(&mut bytes, trampoline_address, callee_address + 5);
+        bytes.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+
+        let relocated_len =
+            trampoline_relocated_prefix_len32(&bytes, trampoline_address, callee_address, 16)
+                .unwrap();
+        assert_eq!(relocated_len, 5);
+        assert!(!range_within_relocated_prefix(8, 5, relocated_len));
+    }
+
+    #[test]
+    fn includes_a_pic_call_relocated_before_the_return_jump() {
+        let trampoline_address = 0xf670_0054;
+        let callee_address = 0xd22e_36b0;
+        let mut bytes = vec![0x55, 0x57, 0x56, 0x53, 0xe8, 0, 0, 0, 0];
+        append_return_jump(&mut bytes, trampoline_address, callee_address + 9);
+
+        let relocated_len =
+            trampoline_relocated_prefix_len32(&bytes, trampoline_address, callee_address, 16)
+                .unwrap();
+        assert_eq!(relocated_len, 9);
+        assert!(range_within_relocated_prefix(4, 5, relocated_len));
+    }
 }

@@ -6,8 +6,11 @@ use vapor_forge_patterns::elf::{ElfImage, ExecutableSegment};
 use vapor_forge_patterns::registry::{
     parse_toml_patterns, FollowMode, PatternDef, RuntimePatternEntry, EMBEDDED_PATTERNS,
 };
-use vapor_forge_patterns::scan::{group_variants, resolve_entry_group, PatternRef};
+use vapor_forge_patterns::scan::{
+    group_variants, resolve_entry_group, PatternRef, ResolveError, ResolveResult,
+};
 use vapor_forge_patterns::vtable_scan::{self, ElfClass};
+use vapor_forge_patterns::Pattern;
 
 fn main() {
     if let Err(error) = run() {
@@ -266,7 +269,13 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         .collect::<Vec<_>>();
     for group in group_variants(&variants) {
         let entry = group[0];
-        match resolve_entry_group(segment.bytes, &group) {
+        let resolution = if is_elf64 && entry.name == "google::protobuf::RepeatedField<uint32>::Add"
+        {
+            resolve_equivalent_repeated_field_add64(segment.bytes, &group)
+        } else {
+            resolve_entry_group(segment.bytes, &group)
+        };
+        match resolution {
             Ok(result) => {
                 if group.len() == 1 {
                     println!(
@@ -337,7 +346,6 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
             },
             &resolved,
         );
-        failed |= scan_client_id_config_behavior(path, &data, segment, &resolved);
     } else if module == "steamui" {
         failed |= if is_elf64 {
             scan_steamui64_layouts(segment.bytes, segment.vaddr, &resolved)
@@ -357,6 +365,34 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     println!();
 
     Ok(failed)
+}
+
+fn resolve_equivalent_repeated_field_add64(
+    code: &[u8],
+    entries: &[PatternRef<'_>],
+) -> Result<ResolveResult, ResolveError> {
+    let mut match_count = 0usize;
+    for (variant_index, entry) in entries.iter().enumerate() {
+        let pattern = Pattern::parse(entry.pattern)
+            .map_err(|error| ResolveError::PatternParse(error.to_string()))?;
+        let matches = pattern.find_all(code);
+        match_count += matches.len();
+        if let Some(target_offset) = matches.into_iter().find(|&offset| {
+            repeated_field_add64_evidence(code, offset)
+                .is_some_and(|evidence| evidence.is_complete())
+        }) {
+            return Ok(ResolveResult {
+                target_offset,
+                match_count,
+                variant_index,
+            });
+        }
+    }
+    if match_count == 0 {
+        Err(ResolveError::NoMatch)
+    } else {
+        Err(ResolveError::CalleePatternMismatch(match_count))
+    }
 }
 
 fn scan_public_wrapper_collisions(
