@@ -199,7 +199,7 @@ pub(crate) fn snapshot_is_valid(
     snapshot.playtime.iter().all(|entry| {
         entry.app_id != 0
             && entry.observed_at > 0
-            && entry.last_played_at.map_or(true, |value| value >= 0)
+            && entry.last_played_at.is_none_or(|value| value >= 0)
             && apps.insert(entry.app_id)
     })
 }

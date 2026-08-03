@@ -187,6 +187,10 @@ impl CloudRpcQueue {
         self.local_conflicts.revision()
     }
 
+    pub fn set_conflict_ui_ready(&self, ready: bool) {
+        self.local_conflicts.set_ui_ready(ready);
+    }
+
     pub fn conflict_dialogs(&self, context: ConflictUiContext) -> Vec<ConflictDialog> {
         self.local_conflicts.dialogs(context)
     }
@@ -287,7 +291,7 @@ impl CloudRpcQueue {
         }
 
         let expects_response = method_expects_response(method);
-        if expects_response && request_header.jobid_source.map_or(true, |job| job == 0) {
+        if expects_response && request_header.jobid_source.is_none_or(|job| job == 0) {
             warn!(app_id, method, "cloud-rpc: request has no response job id");
             return false;
         }
@@ -300,6 +304,8 @@ impl CloudRpcQueue {
                 return false;
             };
             let (sender, receiver) = mpsc::channel();
+            let fallback = build_failure_response_packet(request_header);
+            self.track_response(receiver, fallback, response_generation, reservation);
             let request = QueuedRequest {
                 app_id,
                 method: method.to_string(),
@@ -319,8 +325,6 @@ impl CloudRpcQueue {
                     vapor_forge_features::inject_wake::InjectionSource::Cloud,
                 );
             }
-            let fallback = build_failure_response_packet(request_header);
-            self.track_response(receiver, fallback, response_generation, reservation);
         } else {
             let request = QueuedRequest {
                 app_id,

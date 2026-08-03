@@ -42,6 +42,11 @@ impl PackageState {
         self.active.store(true, Ordering::Release);
     }
 
+    pub fn reset_account_state(&self) {
+        self.active.store(false, Ordering::Release);
+        self.injected_apps.lock().unwrap().clear();
+    }
+
     /// Compute what app IDs to inject into pkg0 on first capture.
     ///
     /// `controlled_ids` = union of config inject IDs + script addappid IDs.
@@ -172,6 +177,18 @@ mod tests {
         state.record_injected(&[AppId(100)]);
         assert!(state.is_injected_into_pkg0(AppId(100)));
         assert!(!state.is_injected_into_pkg0(AppId(200)));
+    }
+
+    #[test]
+    fn account_reset_clears_runtime_package_state() {
+        let state = PackageState::new();
+        state.set_active();
+        state.record_injected(&[AppId(100), AppId(200)]);
+
+        state.reset_account_state();
+
+        assert!(!state.is_active());
+        assert_eq!(state.injected_count(), 0);
     }
 
     #[test]

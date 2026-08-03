@@ -173,24 +173,11 @@ pub(crate) fn queue_official_snapshot(
     persisted
 }
 
-/// How long an uncaptured marker may hold the downlink gate for its app.
-///
-/// A snapshot normally lands within a second of the marker. Beyond this the read
-/// has plainly failed, and continuing to block would cost that app every future
-/// pull rather than protecting one uncaptured change.
-const MARKER_GRACE_SECONDS: i64 = 60;
-
 pub(crate) fn has_pending_stats(owner_scope: &str, steam_id64: &str, app_id: u32) -> bool {
     worker().is_some_and(|worker| {
         worker
             .journal
-            .stats_sync_pending(
-                owner_scope,
-                steam_id64,
-                app_id,
-                unix_now(),
-                MARKER_GRACE_SECONDS,
-            )
+            .stats_sync_pending(owner_scope, steam_id64, app_id)
             .unwrap_or(true)
     })
 }

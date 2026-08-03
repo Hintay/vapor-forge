@@ -178,7 +178,7 @@ pub struct LocalCloudSection {
     pub syncthing: SyncthingSection,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct CumulusCloudSection {
     #[serde(default)]
     pub server_url: String,
@@ -188,6 +188,18 @@ pub struct CumulusCloudSection {
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for CumulusCloudSection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CumulusCloudSection")
+            .field("server_url", &self.server_url)
+            .field("token", &"[REDACTED]")
+            .field("timeout_connect_ms", &self.timeout_connect_ms)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 impl Default for CumulusCloudSection {
@@ -202,7 +214,7 @@ impl Default for CumulusCloudSection {
 }
 
 /// Optional Syncthing guard for local cloud garbage collection.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SyncthingSection {
     #[serde(default)]
     pub enabled: bool,
@@ -214,6 +226,19 @@ pub struct SyncthingSection {
     pub folder_id: String,
     #[serde(default = "default_syncthing_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+impl std::fmt::Debug for SyncthingSection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncthingSection")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("api_key", &"[REDACTED]")
+            .field("folder_id", &self.folder_id)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 impl Default for SyncthingSection {

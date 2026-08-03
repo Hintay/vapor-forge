@@ -538,7 +538,7 @@ fn insert_latest<K: Ord, V>(
     state: V,
     order: &MergeOrder,
 ) {
-    if states.get(&key).map_or(true, |current| *order > current.1) {
+    if states.get(&key).is_none_or(|current| *order > current.1) {
         states.insert(key, (state, order.clone()));
     }
 }
@@ -570,10 +570,7 @@ fn fold_device_records(
             }
         }
         for stat in &record.stats {
-            if stats
-                .get(&stat.key)
-                .map_or(true, |current| order > current.1)
-            {
+            if stats.get(&stat.key).is_none_or(|current| order > current.1) {
                 stats.insert(stat.key.clone(), (stat.clone(), order.clone()));
             }
         }

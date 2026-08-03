@@ -61,6 +61,9 @@ pub(super) fn handle_proxy_service_stats(
     ) {
         achievements::StatsSendPlan::Pass => None,
         achievements::StatsSendPlan::DropOffline { app_id, .. } => {
+            if !crate::client::network::response_delivery_ready() {
+                return Some(SendFrameDecision::Retry);
+            }
             queue_local_response(service_stats_failure(header_bytes));
             info!(app_id = app_id.0, "netpacket: answered stats offline");
             capture_dropped(original_packet);
@@ -73,6 +76,9 @@ pub(super) fn handle_proxy_service_stats(
             job_id: Some(job_id),
             was_probe,
         } => {
+            if !crate::client::network::response_delivery_ready() {
+                return Some(SendFrameDecision::Retry);
+            }
             let pending = PendingStatsRequest {
                 app_id: app_id.0,
                 queued_at: Instant::now(),
@@ -128,6 +134,9 @@ pub(super) fn handle_proxy_legacy_stats(
     ) {
         achievements::StatsSendPlan::Pass => None,
         achievements::StatsSendPlan::DropOffline { app_id, .. } => {
+            if !crate::client::network::response_delivery_ready() {
+                return Some(SendFrameDecision::Retry);
+            }
             queue_local_response(legacy_stats_failure(header_bytes, request.game_id));
             info!(
                 app_id = app_id.0,
@@ -143,6 +152,9 @@ pub(super) fn handle_proxy_legacy_stats(
             job_id: None,
             was_probe,
         } => {
+            if !crate::client::network::response_delivery_ready() {
+                return Some(SendFrameDecision::Retry);
+            }
             let game_id = request.game_id;
             let pending = PendingStatsRequest {
                 app_id: app_id.0,
@@ -767,6 +779,7 @@ pub(super) fn handle_proxy_service_stats_response(
     };
     if !backend_stats_context_still_current(&context) {
         debug!(app_id, "netpacket: discarded stale backend stats context");
+        inject_schema_only_stats_response(kind, donor, &full_schema, app_id, response_generation);
         return Some(RecvFrameDecision::Drop);
     }
     let backend_request = BackendStatsRequest {
@@ -857,6 +870,13 @@ pub(super) fn handle_proxy_legacy_stats_response(body: &[u8]) -> Option<RecvFram
     };
     if !backend_stats_context_still_current(&context) {
         debug!(app_id, "netpacket: discarded stale backend stats context");
+        inject_schema_only_stats_response(
+            kind,
+            DonorStatsResponse::Legacy(donor),
+            &full_schema,
+            app_id,
+            response_generation,
+        );
         return Some(RecvFrameDecision::Drop);
     }
     let schema_version = schema_version_for(app_id, &full_schema);

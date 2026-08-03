@@ -88,8 +88,51 @@ fn write_default_template_does_not_overwrite() {
     let written = std::fs::read_to_string(&path).expect("template should be readable");
     assert!(written.contains("Vapor Forge configuration"));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn debug_output_redacts_cloud_credentials() {
+    let config: RuntimeConfig = toml::from_str(
+        r#"
+[cloud]
+backend = "local"
+
+[cloud.local]
+path = "/tmp/cloud"
+
+[cloud.local.syncthing]
+enabled = true
+api_key = "syncthing-secret"
+folder_id = "saves"
+
+[cloud.cumulus]
+server_url = "https://example.invalid"
+token = "cumulus-secret"
+"#,
+    )
+    .unwrap();
+
+    let output = format!("{config:#?}");
+    assert!(!output.contains("syncthing-secret"));
+    assert!(!output.contains("cumulus-secret"));
+    assert_eq!(output.matches("[REDACTED]").count(), 2);
+    assert!(output.contains("https://example.invalid"));
+    assert!(output.contains("folder_id: \"saves\""));
 }
 
 #[test]

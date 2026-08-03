@@ -17,3 +17,4 @@ pub(crate) static mut MARK_APP_CHANGE_DETOUR: Option<Detour<MarkAppChangeFn>> = 
 pub(crate) static CONTROLLER: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static APP_CHANGE_SOURCE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static INSTALLED: AtomicBool = AtomicBool::new(false);
+pub(crate) static CONFLICT_UI_READY: AtomicBool = AtomicBool::new(false);
