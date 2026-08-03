@@ -22,8 +22,20 @@ enabled = true
 
 # Cloud sync control for apps controlled by Vapor Forge.
 [cloud]
-enabled = false             # false strips CloudEnabled for controlled apps
-local_path = ""             # local folder backend root; takes precedence over Cumulus
+backend = "disabled"        # disabled, local, or cumulus
+
+[cloud.local]
+path = ""
+
+# Optional Syncthing guard for local backend garbage collection.
+[cloud.local.syncthing]
+enabled = false
+url = "http://127.0.0.1:8384"
+api_key = ""
+folder_id = ""             # Syncthing folder containing cloud.local.path
+timeout_ms = 2000
+
+[cloud.cumulus]
 server_url = ""             # Cumulus origin, for example https://cloud.example.com
 token = ""                  # Cumulus device bearer token
 timeout_connect_ms = 5000

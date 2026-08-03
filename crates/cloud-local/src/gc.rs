@@ -1,6 +1,7 @@
-use crate::{FolderStore, GcRoots};
+use crate::{FolderStore, GcRoots, SyncthingGcConfig};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use tracing::{debug, warn};
 
@@ -21,6 +22,8 @@ struct InspectionRequest {
     store: FolderStore,
     app_id: u32,
     roots: GcRoots,
+    syncthing: Option<SyncthingGcConfig>,
+    epoch: u64,
 }
 
 impl InspectionRequest {
@@ -35,6 +38,7 @@ impl InspectionRequest {
 struct DeferredInspection {
     store: FolderStore,
     app_id: u32,
+    syncthing: Option<SyncthingGcConfig>,
 }
 
 #[derive(Default)]
@@ -46,6 +50,7 @@ struct CoordinatorState {
 pub struct LocalGcCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     sender: mpsc::Sender<InspectionRequest>,
+    epoch: Arc<AtomicU64>,
 }
 
 impl LocalGcCoordinator {
@@ -53,11 +58,17 @@ impl LocalGcCoordinator {
         let (sender, receiver) = mpsc::channel::<InspectionRequest>();
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
+        let epoch = Arc::new(AtomicU64::new(1));
+        let worker_epoch = Arc::clone(&epoch);
         std::thread::Builder::new()
             .name("vapor-local-cloud-gc".into())
-            .spawn(move || run_inspections(receiver, worker_state))
+            .spawn(move || run_inspections(receiver, worker_state, worker_epoch))
             .expect("local cloud GC worker must start");
-        Self { state, sender }
+        Self {
+            state,
+            sender,
+            epoch,
+        }
     }
 
     pub fn register_batch(
@@ -108,6 +119,8 @@ impl LocalGcCoordinator {
                     roots: roots_for(&state.active, &key.repository, &key.manifest_scope),
                     store: request.store,
                     app_id: request.app_id,
+                    syncthing: request.syncthing,
+                    epoch: self.epoch.load(Ordering::Acquire),
                 })
                 .collect::<Vec<_>>()
         };
@@ -116,7 +129,12 @@ impl LocalGcCoordinator {
         }
     }
 
-    pub fn queue_inspection(&self, store: FolderStore, app_id: u32) {
+    pub fn queue_inspection(
+        &self,
+        store: FolderStore,
+        app_id: u32,
+        syncthing: Option<SyncthingGcConfig>,
+    ) {
         let request = {
             let mut state = self.state.lock().unwrap();
             let key = InspectionKey {
@@ -128,9 +146,18 @@ impl LocalGcCoordinator {
                 roots: roots_for(&state.active, &key.repository, &key.manifest_scope),
                 store,
                 app_id,
+                syncthing,
+                epoch: self.epoch.load(Ordering::Acquire),
             }
         };
         self.send_request(request);
+    }
+
+    pub fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        state.active.clear();
+        state.deferred.clear();
     }
 
     fn send_request(&self, request: InspectionRequest) {
@@ -149,6 +176,7 @@ impl Default for LocalGcCoordinator {
 fn run_inspections(
     receiver: mpsc::Receiver<InspectionRequest>,
     state: Arc<Mutex<CoordinatorState>>,
+    epoch: Arc<AtomicU64>,
 ) {
     while let Ok(first) = receiver.recv() {
         let mut pending = BTreeMap::from([(first.key(), first)]);
@@ -156,6 +184,9 @@ fn run_inspections(
             pending.insert(request.key(), request);
         }
         for request in pending.into_values() {
+            if request.epoch != epoch.load(Ordering::Acquire) {
+                continue;
+            }
             let report = match request.store.inspect_gc(request.app_id, &request.roots) {
                 Ok(report) => report,
                 Err(error) => {
@@ -163,15 +194,39 @@ fn run_inspections(
                     continue;
                 }
             };
+            if let Some(syncthing) = &request.syncthing {
+                match syncthing.ready_for_gc(request.store.root()) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(
+                            app_id = request.app_id,
+                            "local cloud GC waits for Syncthing"
+                        );
+                        defer_request(&state, &epoch, request);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "local cloud GC Syncthing check failed closed");
+                        defer_request(&state, &epoch, request);
+                        continue;
+                    }
+                }
+            }
+            if request.epoch != epoch.load(Ordering::Acquire) {
+                continue;
+            }
             let plan = match request.store.prepare_gc_sweep(&report) {
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     defer_request(
                         &state,
+                        &epoch,
                         InspectionRequest {
                             store: request.store.clone(),
                             app_id: request.app_id,
                             roots: request.roots.clone(),
+                            syncthing: request.syncthing.clone(),
+                            epoch: request.epoch,
                         },
                     );
                     continue;
@@ -184,6 +239,9 @@ fn run_inspections(
 
             let key = request.key();
             let mut coordinator = state.lock().unwrap();
+            if request.epoch != epoch.load(Ordering::Acquire) {
+                continue;
+            }
             let current_roots =
                 roots_for(&coordinator.active, &key.repository, &key.manifest_scope);
             match request.store.apply_gc_sweep(plan, &current_roots) {
@@ -201,6 +259,7 @@ fn run_inspections(
                         DeferredInspection {
                             store: request.store,
                             app_id: request.app_id,
+                            syncthing: request.syncthing,
                         },
                     );
                 }
@@ -210,12 +269,17 @@ fn run_inspections(
     }
 }
 
-fn defer_request(state: &Mutex<CoordinatorState>, request: InspectionRequest) {
-    state.lock().unwrap().deferred.insert(
+fn defer_request(state: &Mutex<CoordinatorState>, epoch: &AtomicU64, request: InspectionRequest) {
+    let mut state = state.lock().unwrap();
+    if request.epoch != epoch.load(Ordering::Acquire) {
+        return;
+    }
+    state.deferred.insert(
         request.key(),
         DeferredInspection {
             store: request.store,
             app_id: request.app_id,
+            syncthing: request.syncthing,
         },
     );
 }

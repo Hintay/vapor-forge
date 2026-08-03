@@ -27,7 +27,7 @@ pub(super) fn execute_local_rpc(
         BEGIN_BATCH => begin_batch(state, settings, &store, body),
         BEGIN_FILE_UPLOAD => begin_file_upload(state, store, body),
         COMMIT_FILE_UPLOAD => commit_file_upload(state, body),
-        COMPLETE_BATCH | COMPLETE_BATCH_BLOCKING => complete_batch(state, &store, body),
+        COMPLETE_BATCH | COMPLETE_BATCH_BLOCKING => complete_batch(state, settings, &store, body),
         FILE_DOWNLOAD => file_download(store, body),
         DELETE_FILE => delete_file(state, &store, body),
         QUOTA_USAGE => quota(&store, body),
@@ -87,7 +87,9 @@ fn conflict_resolution(
         app.verified_heads = store.view(app_id)?.head_ids();
         app.conflict = None;
         app.pending_keep_local = None;
-        state.local_gc.queue_inspection(store.clone(), app_id);
+        state
+            .local_gc
+            .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
     }
     Ok(RpcReply::ok(Vec::new()))
 }
@@ -104,7 +106,9 @@ fn changelist(
     let identity = identity_for(settings, None, None)?;
     let mut view = store.view(app_id)?;
     if view.is_conflicted() && store.resolve_identical_heads(app_id, &identity)?.is_some() {
-        state.local_gc.queue_inspection(store.clone(), app_id);
+        state
+            .local_gc
+            .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
         view = store.view(app_id)?;
     }
     let conflict = conflict_from_view(&view, identity.client_id);
@@ -364,6 +368,7 @@ fn commit_file_upload(state: &mut AdapterState, body: &[u8]) -> Result<RpcReply,
 
 fn complete_batch(
     state: &mut AdapterState,
+    settings: &CloudSettings,
     store: &FolderStore,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
@@ -410,7 +415,9 @@ fn complete_batch(
     state.active_batches.remove(&app_id);
     state.batches.remove(&batch_id);
     state.local_gc.unregister_batch(batch_id);
-    state.local_gc.queue_inspection(store.clone(), app_id);
+    state
+        .local_gc
+        .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
     Ok(RpcReply::ok(
         CloudCompleteAppUploadBatchResponse {}.encode_to_vec(),
     ))

@@ -310,9 +310,7 @@ fn config_response(json_mode: bool) -> String {
                 "runtime": {"log_level": cfg.runtime.log_level, "diagnostics": cfg.runtime.diagnostics},
                 "apps": {"inject_count": cfg.apps.inject.len(), "inject_ids": inject_ids, "shared_enabled": cfg.apps.shared.enabled},
                 "cloud": {
-                    "enabled": cfg.cloud.enabled,
-                    "cumulus_configured": cfg.cumulus_configured(),
-                    "server_url": cfg.cloud.server_url,
+                    "backend": cloud_backend_name(cfg.cloud.backend),
                 },
                 "ticket": {"cache": ticket_cache, "auto_delegate": cfg.ticket.auto_delegate},
                 "toast": {"enabled": cfg.toast.enabled},
@@ -321,12 +319,6 @@ fn config_response(json_mode: bool) -> String {
             })
         );
     }
-
-    let cloud_str = match cfg.cloud.enabled {
-        Some(true) => "true",
-        Some(false) => "false",
-        None => "auto",
-    };
 
     let mut out = String::from("ok\n");
     let _ = writeln!(out, "  [runtime]");
@@ -341,15 +333,10 @@ fn config_response(json_mode: bool) -> String {
     );
     let _ = writeln!(out, "    shared:         {}", cfg.apps.shared.enabled);
     let _ = writeln!(out, "  [cloud]");
-    let _ = writeln!(out, "    enabled:        {cloud_str}");
     let _ = writeln!(
         out,
-        "    cumulus:        {}",
-        if cfg.cumulus_configured() {
-            cfg.cloud.server_url.as_str()
-        } else {
-            "disabled"
-        }
+        "    backend:        {}",
+        cloud_backend_name(cfg.cloud.backend)
     );
     let _ = writeln!(out, "  [ticket]");
     let _ = writeln!(out, "    cache:          {ticket_cache}");
@@ -361,6 +348,14 @@ fn config_response(json_mode: bool) -> String {
     let _ = writeln!(out, "  [debug]");
     let _ = write!(out, "    control_api:    {}", cfg.debug.control_api);
     out
+}
+
+fn cloud_backend_name(backend: vapor_forge_config::CloudBackendMode) -> &'static str {
+    match backend {
+        vapor_forge_config::CloudBackendMode::Disabled => "disabled",
+        vapor_forge_config::CloudBackendMode::Local => "local",
+        vapor_forge_config::CloudBackendMode::Cumulus => "cumulus",
+    }
 }
 
 // ---------------------------------------------------------------------------

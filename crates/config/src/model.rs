@@ -140,33 +140,90 @@ impl Default for SharedSection {
     }
 }
 
-/// Cloud control and optional Cumulus backend for controlled apps.
+/// Cloud backend selection and settings for controlled apps.
 #[derive(Clone, Debug, Deserialize)]
 pub struct CloudSection {
     #[serde(default)]
-    pub enabled: Option<bool>,
+    pub backend: CloudBackendMode,
+    #[serde(default)]
+    pub local: LocalCloudSection,
+    #[serde(default)]
+    pub cumulus: CumulusCloudSection,
+}
+
+impl Default for CloudSection {
+    fn default() -> Self {
+        Self {
+            backend: CloudBackendMode::Disabled,
+            local: LocalCloudSection::default(),
+            cumulus: CumulusCloudSection::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudBackendMode {
+    #[default]
+    Disabled,
+    Local,
+    Cumulus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LocalCloudSection {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub syncthing: SyncthingSection,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CumulusCloudSection {
     #[serde(default)]
     pub server_url: String,
     #[serde(default)]
     pub token: String,
-    /// Local folder backend root. Takes precedence over Cumulus when non-empty.
-    #[serde(default)]
-    pub local_path: String,
     #[serde(default = "default_timeout_connect_ms")]
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
 
-impl Default for CloudSection {
+impl Default for CumulusCloudSection {
     fn default() -> Self {
         Self {
-            enabled: None,
             server_url: String::new(),
             token: String::new(),
-            local_path: String::new(),
             timeout_connect_ms: default_timeout_connect_ms(),
             timeout_ms: default_timeout_ms(),
+        }
+    }
+}
+
+/// Optional Syncthing guard for local cloud garbage collection.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SyncthingSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_syncthing_url")]
+    pub url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub folder_id: String,
+    #[serde(default = "default_syncthing_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for SyncthingSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_syncthing_url(),
+            api_key: String::new(),
+            folder_id: String::new(),
+            timeout_ms: default_syncthing_timeout_ms(),
         }
     }
 }
@@ -354,6 +411,14 @@ fn default_timeout_ms() -> u64 {
     15000
 }
 
+fn default_syncthing_url() -> String {
+    "http://127.0.0.1:8384".into()
+}
+
+fn default_syncthing_timeout_ms() -> u64 {
+    2000
+}
+
 impl Default for RuntimeSection {
     fn default() -> Self {
         Self {
@@ -471,16 +536,14 @@ impl RuntimeConfig {
     }
 
     pub fn cloud_enabled_for_controlled_apps(&self) -> bool {
-        self.local_cloud_configured()
-            || self.cumulus_configured()
-            || self.cloud.enabled.unwrap_or(false)
+        self.cloud.backend != CloudBackendMode::Disabled
     }
 
     pub fn local_cloud_configured(&self) -> bool {
-        !self.cloud.local_path.trim().is_empty()
+        self.cloud.backend == CloudBackendMode::Local
     }
 
     pub fn cumulus_configured(&self) -> bool {
-        !self.cloud.server_url.trim().is_empty() && !self.cloud.token.trim().is_empty()
+        self.cloud.backend == CloudBackendMode::Cumulus
     }
 }

@@ -1274,6 +1274,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tracing",
+ "ureq",
  "vapor-forge-cloud-core",
  "zip",
 ]

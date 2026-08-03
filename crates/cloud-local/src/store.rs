@@ -95,6 +95,8 @@ pub(crate) struct GcSweepPlan<'a> {
     root: PathBuf,
     app_id: u32,
     inspected_roots: GcRoots,
+    expected_manifests: BTreeSet<String>,
+    expected_blobs: BTreeSet<String>,
     candidate_manifests: BTreeSet<String>,
     candidate_blobs: BTreeSet<String>,
 }
@@ -530,6 +532,8 @@ impl FolderStore {
             root: self.app_dir(report.app_id),
             app_id: report.app_id,
             inspected_roots: report.inspected_roots.clone(),
+            expected_manifests,
+            expected_blobs,
             candidate_manifests,
             candidate_blobs,
         }))
@@ -548,6 +552,11 @@ impl FolderStore {
             .iter()
             .any(|id| plan.candidate_manifests.contains(id))
             || !active.blob_sha1s.is_disjoint(&plan.candidate_blobs)
+        {
+            return Ok(None);
+        }
+        if collect_manifest_paths(&self.commit_dir(plan.app_id))? != plan.expected_manifests
+            || collect_blob_objects(&self.blob_dir(plan.app_id))? != plan.expected_blobs
         {
             return Ok(None);
         }

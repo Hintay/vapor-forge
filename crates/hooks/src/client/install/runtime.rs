@@ -447,8 +447,9 @@ mod tests {
         let mut config = RuntimeConfig::default();
         assert!(!game_bridge_required(&config));
 
-        config.cloud.server_url = "https://cumulus.example".into();
-        config.cloud.token = "token".into();
+        config.cloud.backend = vapor_forge_config::CloudBackendMode::Cumulus;
+        config.cloud.cumulus.server_url = "https://cumulus.example".into();
+        config.cloud.cumulus.token = "token".into();
         assert!(config.cumulus_configured());
         assert!(!game_bridge_required(&config));
 

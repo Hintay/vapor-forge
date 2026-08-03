@@ -17,24 +17,16 @@ pub(super) struct CloudStateScope {
 
 impl CloudStateScope {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
-        if config.local_cloud_configured() {
-            return Self::local(
-                &config.cloud.local_path,
-                Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
-            );
-        }
-        Self {
-            credential_fingerprint: vapor_forge_cloud_core::credential_fingerprint(
-                &config.cloud.server_url,
-                &config.cloud.token,
-            ),
-            steam_id64: Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
-        }
+        Self::from_settings(&CloudSettings::from_config(config))
     }
 
     pub(super) fn from_settings(settings: &CloudSettings) -> Self {
-        if !settings.local_path.is_empty() {
-            return Self::local(&settings.local_path, settings.steam_id64);
+        if settings.backend == vapor_forge_config::CloudBackendMode::Local {
+            return Self::local(
+                &settings.local_path,
+                settings.steam_id64,
+                settings.syncthing_fingerprint().as_deref(),
+            );
         }
         Self {
             credential_fingerprint: vapor_forge_cloud_core::credential_fingerprint(
@@ -49,12 +41,13 @@ impl CloudStateScope {
         &self.credential_fingerprint
     }
 
-    fn local(path: &str, steam_id64: Option<u64>) -> Self {
+    fn local(path: &str, steam_id64: Option<u64>, syncthing: Option<&str>) -> Self {
         Self {
             credential_fingerprint: vapor_forge_cloud_core::endpoint_scope(&format!(
-                "file://{}/accounts/{}",
+                "file://{}/accounts/{}?syncthing={}",
                 path.trim(),
-                steam_id64.unwrap_or(0)
+                steam_id64.unwrap_or(0),
+                syncthing.unwrap_or("disabled")
             )),
             steam_id64,
         }

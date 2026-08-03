@@ -5,7 +5,7 @@ use super::conflict_ui::{
 };
 use super::http::{AdapterError, CloudSettings};
 use super::protocol::{
-    build_failure_response_packet, build_response_packet, is_cumulus_transfer_report,
+    build_failure_response_packet, build_response_packet, is_backend_transfer_report,
     method_expects_response, request_app_id, RpcReply,
 };
 use super::transfer_targets::TransferTargetRegistry;
@@ -102,6 +102,7 @@ pub struct CloudRpcQueue {
     workers: Box<[RpcWorker]>,
     report_worker: mpsc::SyncSender<QueuedRequest>,
     pub(super) transfer_targets: Arc<TransferTargetRegistry>,
+    local_gc: Arc<vapor_forge_cloud_local::LocalGcCoordinator>,
     local_conflicts: Arc<LocalConflictCoordinator>,
     context_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -176,6 +177,7 @@ impl CloudRpcQueue {
             workers,
             report_worker,
             transfer_targets,
+            local_gc,
             local_conflicts,
             context_epoch,
         }
@@ -215,11 +217,16 @@ impl CloudRpcQueue {
 
     pub fn cancel_pending_conflicts(&self) {
         self.context_epoch.fetch_add(1, Ordering::AcqRel);
+        self.local_gc.invalidate();
         if self.local_conflicts.cancel_pending() {
             vapor_forge_features::inject_wake::wake(
                 vapor_forge_features::inject_wake::InjectionSource::Cloud,
             );
         }
+    }
+
+    pub fn invalidate_local_gc(&self) {
+        self.local_gc.invalidate();
     }
 
     pub(super) fn worker(&self, app_id: u32) -> &RpcWorker {
@@ -241,7 +248,7 @@ impl CloudRpcQueue {
         });
     }
 
-    /// Queue a supported Cumulus-backed RPC. Returns false when the packet
+    /// Queue a supported cloud RPC. Returns false when the packet
     /// must remain on Steam's normal path.
     pub fn intercept(
         &self,
@@ -252,7 +259,7 @@ impl CloudRpcQueue {
         config: &RuntimeConfig,
         response_generation: u64,
     ) -> bool {
-        if is_cumulus_transfer_report(method, body, config, &self.transfer_targets) {
+        if is_backend_transfer_report(method, body, config, &self.transfer_targets) {
             if self
                 .report_worker
                 .try_send(QueuedRequest {

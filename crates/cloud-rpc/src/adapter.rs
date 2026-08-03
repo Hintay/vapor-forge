@@ -105,7 +105,7 @@ impl AdapterState {
             return;
         }
         if self.scope.is_some() {
-            warn!("cloud-rpc: Cumulus scope changed; discarded transient adapter state");
+            warn!("cloud-rpc: backend scope changed; discarded transient adapter state");
         }
         self.unregister_local_batches();
         self.current_change_numbers.clear();
@@ -173,8 +173,14 @@ pub(super) fn execute_rpc(
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
     state.prepare(settings);
-    if !settings.local_path.is_empty() {
-        return super::local::execute_local_rpc(state, settings, method, body);
+    match settings.backend {
+        vapor_forge_config::CloudBackendMode::Local => {
+            return super::local::execute_local_rpc(state, settings, method, body);
+        }
+        vapor_forge_config::CloudBackendMode::Cumulus => {}
+        vapor_forge_config::CloudBackendMode::Disabled => {
+            return Err(AdapterError::Protocol("cloud backend is disabled".into()));
+        }
     }
     // Composition root for the RPC path: device binding and scoping go through
     // the backend port; the file transfers below still speak Cumulus HTTP.
