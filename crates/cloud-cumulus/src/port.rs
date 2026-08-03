@@ -57,6 +57,10 @@ impl CloudBackend for CumulusBackend {
         ensure_device_bound(&self.settings, descriptor).map_err(BackendError::from)
     }
 
+    fn accepts_achievement_schemas(&self) -> bool {
+        true
+    }
+
     fn upload_achievement_schema(
         &self,
         schema: &AchievementSchema,
@@ -76,6 +80,10 @@ impl CloudBackend for CumulusBackend {
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError> {
         playtime::upload(&self.settings, client_id, steam_id64, entries).map_err(BackendError::from)
+    }
+
+    fn accepts_playtime_sessions(&self) -> bool {
+        true
     }
 
     fn upload_playtime_sessions(

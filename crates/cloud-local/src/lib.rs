@@ -7,8 +7,8 @@ mod transfer;
 
 pub use gc::LocalGcCoordinator;
 pub use store::{
-    CommitIdentity, FolderStore, GcReport, GcRoots, KeepLocalResolution, ManifestCandidate,
-    SessionPeer, StagedFile, StoreView,
+    CommitIdentity, FolderStore, GcReport, GcRoots, ManifestCandidate, SessionPeer, StagedFile,
+    StoreView,
 };
 pub use sync::LocalBackend;
 pub use transfer::{

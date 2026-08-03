@@ -5,7 +5,7 @@ use super::*;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use vapor_forge_cloud_core::{device_descriptor, CloudFileStore, FileEntry, FileMetadata};
+use vapor_forge_cloud_core::{CloudFileStore, FileEntry, FileMetadata};
 use vapor_forge_cloud_local::{
     commit_upload, issue_download, issue_upload, CommitIdentity, FolderStore, StoreView,
 };
@@ -67,12 +67,6 @@ fn conflict_resolution(
         let selected_head = conflict.local_head.clone().ok_or_else(|| {
             AdapterError::Protocol("Steam local side does not identify one manifest".into())
         })?;
-        store.record_keep_local_resolution(
-            app_id,
-            &conflict.heads,
-            &selected_head,
-            &app.identity,
-        )?;
         app.pending_keep_local = Some(LocalKeepLocal {
             heads: conflict.heads.clone(),
             selected_head,
@@ -93,7 +87,7 @@ fn conflict_resolution(
         app.verified_heads = store.view(app_id)?.head_ids();
         app.conflict = None;
         app.pending_keep_local = None;
-        state.local_gc.queue_inspection(store.clone());
+        state.local_gc.queue_inspection(store.clone(), app_id);
     }
     Ok(RpcReply::ok(Vec::new()))
 }
@@ -110,7 +104,7 @@ fn changelist(
     let identity = identity_for(settings, None, None)?;
     let mut view = store.view(app_id)?;
     if view.is_conflicted() && store.resolve_identical_heads(app_id, &identity)?.is_some() {
-        state.local_gc.queue_inspection(store.clone());
+        state.local_gc.queue_inspection(store.clone(), app_id);
         view = store.view(app_id)?;
     }
     let conflict = conflict_from_view(&view, identity.client_id);
@@ -212,17 +206,8 @@ fn begin_batch(
         ));
     }
     let view = store.view(app_id)?;
-    let durable_keep_local = store
-        .keep_local_resolution(app_id, identity.client_id)?
-        .map(|resolution| LocalKeepLocal {
-            heads: resolution.heads,
-            selected_head: resolution.selected_head,
-        });
     let current_heads = view.head_ids();
-    let keep_local = app
-        .pending_keep_local
-        .as_ref()
-        .or(durable_keep_local.as_ref());
+    let keep_local = app.pending_keep_local.as_ref();
     let (base_heads, resolution_heads) = match keep_local {
         Some(resolution) => {
             if current_heads != resolution.heads {
@@ -272,7 +257,7 @@ fn begin_batch(
     );
     state
         .local_gc
-        .register_batch(batch_id, store, &gc_manifest_roots);
+        .register_batch(batch_id, store, app_id, &gc_manifest_roots);
     Ok(RpcReply::ok(
         CloudBeginAppUploadBatchResponse {
             batch_id: Some(batch_id),
@@ -425,9 +410,7 @@ fn complete_batch(
     state.active_batches.remove(&app_id);
     state.batches.remove(&batch_id);
     state.local_gc.unregister_batch(batch_id);
-    if committed {
-        state.local_gc.queue_inspection(store.clone());
-    }
+    state.local_gc.queue_inspection(store.clone(), app_id);
     Ok(RpcReply::ok(
         CloudCompleteAppUploadBatchResponse {}.encode_to_vec(),
     ))
@@ -656,9 +639,7 @@ fn exit(
 ) -> Result<RpcReply, AdapterError> {
     let request = CloudAppExitSyncDoneNotification::decode(body)?;
     let app_id = local_app_id(request.app_id)?;
-    if !state.local_sessions.remove(&app_id) {
-        return Ok(RpcReply::ok(Vec::new()));
-    }
+    state.local_sessions.remove(&app_id);
     let machine_name = state
         .local_apps
         .get(&app_id)
@@ -696,11 +677,14 @@ fn identity_for(
     let client_id = request_client_id.or(settings_client_id).ok_or_else(|| {
         AdapterError::Protocol("local cloud Steam ClientID is unavailable".into())
     })?;
-    let descriptor = device_descriptor().filter(|descriptor| descriptor.client_id == client_id);
     let machine_name = machine_name
         .filter(|name| !name.trim().is_empty())
-        .or_else(|| descriptor.map(|descriptor| descriptor.machine_name))
-        .unwrap_or_else(|| "Local machine".to_string());
+        .or_else(|| {
+            (settings.steam_client_id == Some(client_id))
+                .then(|| settings.steam_machine_name.clone())
+                .flatten()
+        })
+        .ok_or_else(|| AdapterError::Protocol("local cloud machine name is unavailable".into()))?;
     Ok(CommitIdentity {
         client_id,
         machine_name,

@@ -15,6 +15,7 @@ pub(super) struct CloudSettings {
     pub(super) server_url: String,
     pub(super) token: String,
     pub(super) steam_client_id: Option<u64>,
+    pub(super) steam_machine_name: Option<String>,
     pub(super) steam_id64: Option<u64>,
     pub(super) bind_device: bool,
     pub(super) timeout_connect_ms: u64,
@@ -23,11 +24,15 @@ pub(super) struct CloudSettings {
 
 impl CloudSettings {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
+        let descriptor = device_descriptor();
         Self {
             local_path: config.cloud.local_path.trim().to_string(),
             server_url: config.cloud.server_url.trim().to_string(),
             token: config.cloud.token.trim().to_string(),
-            steam_client_id: device_descriptor().map(|descriptor| descriptor.client_id),
+            steam_client_id: descriptor.as_ref().map(|descriptor| descriptor.client_id),
+            steam_machine_name: descriptor
+                .map(|descriptor| descriptor.machine_name)
+                .filter(|name| !name.trim().is_empty()),
             steam_id64: Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
             bind_device: true,
             timeout_connect_ms: config.cloud.timeout_connect_ms,
@@ -350,8 +355,6 @@ pub(super) struct CumulusPendingOperation {
 pub(super) enum AdapterError {
     #[error("invalid Steam cloud RPC: {0}")]
     Protocol(String),
-    #[error("Cumulus request queue is overloaded")]
-    Overloaded,
     #[error("Cumulus transport failed: {0}")]
     Http(#[from] ureq::Error),
     #[error("invalid Cumulus JSON: {0}")]

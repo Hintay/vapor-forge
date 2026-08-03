@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vapor_forge_cloud_core::{ByteStore, CloudFileStore};
 use vapor_forge_config::{AppId, AppsSection, CloudSection, InjectApp, RuntimeConfig};
 use vapor_forge_steam_protocol::*;
@@ -266,6 +266,7 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
                 server_url: "http://127.0.0.1".into(),
                 token: "token".into(),
                 steam_client_id: Some(7),
+                steam_machine_name: None,
                 steam_id64: Some(76_561_198_000_000_001),
                 bind_device: false,
                 timeout_connect_ms: 1,
@@ -287,6 +288,7 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
         server_url: "https://cloud-a.example".into(),
         token: "token-a".into(),
         steam_client_id: Some(7),
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
@@ -442,6 +444,7 @@ fn forwards_cumulus_transfer_reports_to_cumulus() {
         server_url,
         token: "report-token".into(),
         steam_client_id: None,
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -512,6 +515,7 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
         server_url,
         token: "batch-token".into(),
         steam_client_id: None,
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -587,6 +591,7 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         server_url,
         token: "conflict-token".into(),
         steam_client_id: None,
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -829,6 +834,7 @@ fn changelist_http_response_maps_to_steam_rpc() {
         server_url,
         token: "secret-token".into(),
         steam_client_id: Some(11_047_413_376_560_171_870),
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -886,6 +892,7 @@ fn download_uses_external_descriptor_without_cumulus_bearer() {
         server_url,
         token: "cumulus-secret".into(),
         steam_client_id: None,
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -962,6 +969,7 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
         server_url,
         token: "lifecycle-token".into(),
         steam_client_id: Some(7),
+        steam_machine_name: None,
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1000,
@@ -1096,6 +1104,7 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(7),
+        steam_machine_name: Some("deck".into()),
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
@@ -1288,6 +1297,85 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
     assert_eq!(delta.current_change_number, Some(2));
     assert!(delta.files.is_empty());
     assert_eq!(delta.is_only_delta, Some(false));
+
+    let failed_begin = CloudBeginAppUploadBatchRequest {
+        app_id: Some(app_id),
+        machine_name: Some("deck".into()),
+        files_to_upload: vec!["orphan.dat".into()],
+        files_to_delete: Vec::new(),
+        client_id: Some(7),
+        app_build_id: Some(1),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        BEGIN_BATCH,
+        &failed_begin.encode_to_vec(),
+    )
+    .unwrap();
+    let failed_batch = CloudBeginAppUploadBatchResponse::decode(reply.body.as_slice())
+        .unwrap()
+        .batch_id
+        .unwrap();
+    let orphan_contents = b"orphan";
+    let failed_upload = CloudClientBeginFileUploadRequest {
+        app_id: Some(app_id),
+        file_size: Some(orphan_contents.len() as u32),
+        raw_file_size: Some(orphan_contents.len() as u32),
+        file_sha: Some(hex_to_bytes("150c70aa93d10379cd7ffaf26d9850ea33ea833b").unwrap()),
+        timestamp: Some(1_700_000_001),
+        filename: Some("orphan.dat".into()),
+        platforms_to_sync: Some(u32::MAX),
+        cell_id: None,
+        can_encrypt: Some(false),
+        is_shared_file: Some(false),
+        deprecated_realm: None,
+        upload_batch_id: Some(failed_batch),
+    };
+    let reply = execute_rpc(
+        &mut state,
+        &settings,
+        BEGIN_FILE_UPLOAD,
+        &failed_upload.encode_to_vec(),
+    )
+    .unwrap();
+    let target = CloudClientBeginFileUploadResponse::decode(reply.body.as_slice())
+        .unwrap()
+        .block_requests
+        .remove(0);
+    assert!(matches!(
+        vapor_forge_cloud_local::intercept_transfer(
+            target.url_host.as_deref().unwrap(),
+            target.url_path.as_deref().unwrap(),
+            orphan_contents,
+        ),
+        Some(vapor_forge_cloud_local::LocalTransferOutcome::Upload(
+            Ok(())
+        ))
+    ));
+    let orphan = directory.path().join(format!(
+        "{}/{app_id}/blobs/15/150c70aa93d10379cd7ffaf26d9850ea33ea833b",
+        settings.steam_id64.unwrap()
+    ));
+    assert!(orphan.exists());
+
+    let failed_complete = CloudCompleteAppUploadBatchRequest {
+        app_id: Some(app_id),
+        batch_id: Some(failed_batch),
+        batch_eresult: None,
+    };
+    execute_rpc(
+        &mut state,
+        &settings,
+        COMPLETE_BATCH,
+        &failed_complete.encode_to_vec(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while orphan.exists() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!orphan.exists());
 }
 
 fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
@@ -1296,6 +1384,7 @@ fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(client_id),
+        steam_machine_name: Some(format!("device-{client_id}")),
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
@@ -1312,6 +1401,7 @@ fn create_local_manifest_heads(
     let store = vapor_forge_cloud_local::FolderStore::open_account(path, ACCOUNT).unwrap();
     let root = store
         .stage_file(
+            app_id,
             "save.dat",
             b"root",
             &vapor_forge_cloud_core::FileMetadata {
@@ -1337,12 +1427,13 @@ fn create_local_manifest_heads(
         .unwrap();
 
     let root_id = store.view(app_id).unwrap().head_ids().remove(0);
-    let directory = path.join(format!("commits/saves/{ACCOUNT}/{app_id}"));
+    let directory = path.join(format!("{ACCOUNT}/{app_id}/manifests"));
     let root_bytes = std::fs::read(directory.join(format!("{root_id}.json"))).unwrap();
     let root_manifest = serde_json::from_slice::<serde_json::Value>(&root_bytes).unwrap();
     for (client_id, machine_name, revision, contents, sha1) in heads {
         let staged = store
             .stage_file(
+                app_id,
                 "save.dat",
                 contents,
                 &vapor_forge_cloud_core::FileMetadata {
@@ -1603,6 +1694,11 @@ fn stock_local_choice_is_committed_by_the_normal_upload_batch() {
     )
     .unwrap();
     assert_eq!(store.view(app_id).unwrap().heads.len(), 2);
+    let app_directory = directory
+        .path()
+        .join(format!("{}/{app_id}", settings.steam_id64.unwrap()));
+    assert!(!app_directory.join(".lock").exists());
+    assert!(!app_directory.join("resolutions").exists());
 
     let begin = CloudBeginAppUploadBatchRequest {
         app_id: Some(app_id),
@@ -1822,10 +1918,10 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
         .unwrap();
     store.exit_session(app_id, &identity).unwrap();
     let claim_path = directory.path().join(format!(
-        "sessions/{}/{app_id}/claims/7.json",
+        "{}/{app_id}/sessions/claims/7.json",
         settings.steam_id64.unwrap()
     ));
-    let claim_before = std::fs::read(&claim_path).unwrap();
+    assert!(!claim_path.exists());
     let mut state = AdapterState::default();
     let changelist = CloudGetAppFileChangelistRequest {
         app_id: Some(app_id),
@@ -1867,7 +1963,7 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
             .as_deref(),
         Some("Multiple saved versions")
     );
-    assert_eq!(std::fs::read(&claim_path).unwrap(), claim_before);
+    assert!(!claim_path.exists());
     let dialogs = state
         .local_conflicts
         .dialogs(local_conflict_context(&settings));
@@ -1887,7 +1983,7 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
         uploads_required: Some(false),
     };
     execute_rpc(&mut state, &settings, EXIT_SYNC_DONE, &exit.encode_to_vec()).unwrap();
-    assert_eq!(std::fs::read(claim_path).unwrap(), claim_before);
+    assert!(!claim_path.exists());
 }
 
 #[test]
@@ -1898,6 +1994,7 @@ fn local_session_claims_drive_steam_pending_operations() {
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(client_id),
+        steam_machine_name: Some(format!("device-{client_id}")),
         steam_id64: Some(76_561_198_000_000_001),
         bind_device: false,
         timeout_connect_ms: 1,
@@ -1975,6 +2072,7 @@ fn local_session_claims_drive_steam_pending_operations() {
         uploads_completed: Some(true),
         uploads_required: Some(false),
     };
+    second_state = AdapterState::default();
     execute_rpc(
         &mut second_state,
         &settings(8),
@@ -1982,4 +2080,8 @@ fn local_session_claims_drive_steam_pending_operations() {
         &exit.encode_to_vec(),
     )
     .unwrap();
+    assert!(!directory
+        .path()
+        .join("76561198000000001/480/sessions/claims/8.json")
+        .exists());
 }

@@ -25,6 +25,7 @@ pub enum LocalTransferContract {
 
 struct UploadTransfer {
     store: FolderStore,
+    app_id: u32,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
@@ -54,7 +55,7 @@ struct TransferRegistry {
 
 pub fn issue_upload(
     store: FolderStore,
-    _app_id: u32,
+    app_id: u32,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
@@ -65,6 +66,7 @@ pub fn issue_upload(
         expires_at: Instant::now() + TRANSFER_TTL,
         operation: TransferOperation::Upload(Arc::new(UploadTransfer {
             store,
+            app_id,
             path,
             transfer_size,
             metadata,
@@ -193,7 +195,7 @@ fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<StagedFi
     };
     upload
         .store
-        .stage_file(&upload.path, &raw, &upload.metadata)
+        .stage_file(upload.app_id, &upload.path, &raw, &upload.metadata)
 }
 
 fn decode_steam_zip(body: &[u8], raw_size: u64) -> Result<Vec<u8>, BackendError> {

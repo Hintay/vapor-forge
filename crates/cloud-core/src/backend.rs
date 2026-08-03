@@ -201,6 +201,9 @@ pub trait CloudBackend: Send + Sync {
     /// Register this device with the backend before uploading on its behalf.
     fn ensure_device_bound(&self, descriptor: &DeviceDescriptor) -> Result<(), BackendError>;
 
+    /// Whether achievement schemas are part of this backend's protocol.
+    fn accepts_achievement_schemas(&self) -> bool;
+
     fn upload_achievement_schema(
         &self,
         schema: &AchievementSchema,
@@ -212,6 +215,9 @@ pub trait CloudBackend: Send + Sync {
         steam_id64: &str,
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError>;
+
+    /// Whether disconnected-session events are part of this backend's protocol.
+    fn accepts_playtime_sessions(&self) -> bool;
 
     fn upload_playtime_sessions(
         &self,

@@ -5,8 +5,8 @@ use super::conflict_ui::{
 };
 use super::http::{AdapterError, CloudSettings};
 use super::protocol::{
-    build_response_packet, is_cumulus_transfer_report, method_expects_response, request_app_id,
-    RpcReply,
+    build_failure_response_packet, build_response_packet, is_cumulus_transfer_report,
+    method_expects_response, request_app_id, RpcReply,
 };
 use super::transfer_targets::TransferTargetRegistry;
 use super::*;
@@ -306,13 +306,13 @@ impl CloudRpcQueue {
             };
             if worker.sender.try_send(request).is_err() {
                 warn!(app_id, method, "cloud-rpc: request queue unavailable");
-                let packet = build_response_packet(request_header, Err(AdapterError::Overloaded));
+                let packet = build_failure_response_packet(request_header);
                 let _ = sender.send(packet);
                 vapor_forge_features::inject_wake::wake(
                     vapor_forge_features::inject_wake::InjectionSource::Cloud,
                 );
             }
-            let fallback = build_response_packet(request_header, Err(AdapterError::Overloaded));
+            let fallback = build_failure_response_packet(request_header);
             self.track_response(receiver, fallback, response_generation, reservation);
         } else {
             let request = QueuedRequest {
