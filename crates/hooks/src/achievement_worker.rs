@@ -199,11 +199,18 @@ pub fn queue_schema(app_id: u32, schema_version: Option<String>, content: Vec<u8
     if content.is_empty() {
         return;
     }
+    let backend = crate::cloud_backend::backend_context();
+    if backend
+        .as_ref()
+        .is_some_and(|backend| !backend.accepts_achievement_schemas())
+    {
+        return;
+    }
     let Some(worker) = worker() else {
         return;
     };
     let schema = AchievementSchema {
-        owner_scope: crate::cloud_backend::backend_context()
+        owner_scope: backend
             .as_ref()
             .map(|backend| backend.endpoint_scope())
             .unwrap_or_default(),

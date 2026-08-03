@@ -515,18 +515,6 @@ fn stats_response_linux(target: DebugTarget, args: &str, json_mode: bool) -> Str
     }
 
     match args.split_whitespace().collect::<Vec<_>>().as_slice() {
-        ["subscribed"] => match crate::client::user_stats::subscribed_app_ids() {
-            Ok(mut app_ids) => {
-                let config = crate::client::install::config();
-                app_ids.retain(|app_id| !config.apps.inject.iter().any(|app| app.id.0 == *app_id));
-                if json_mode {
-                    format!("ok {}", json!({"app_ids": app_ids}))
-                } else {
-                    format!("ok subscribed app_ids={app_ids:?}")
-                }
-            }
-            Err(error) => format!("err {error}"),
-        },
         // Slot 22 RequestUserStats, the entry the Steam UI uses. Reports whether
         // Steam's stats map ended up populated, which slot 5 RequestCurrentStats
         // does not achieve on this engine pipe.
@@ -604,7 +592,7 @@ fn stats_response_linux(target: DebugTarget, args: &str, json_mode: bool) -> Str
                 format!("ok ids {ids}")
             }
         }
-        _ => "err usage: stats subscribed | stats request APP_ID | stats refresh APP_ID | stats callbacks [status|ids] | stats worker [status|ids]"
+        _ => "err usage: stats request APP_ID | stats refresh APP_ID | stats callbacks [status|ids] | stats worker [status|ids]"
             .to_owned(),
     }
 }

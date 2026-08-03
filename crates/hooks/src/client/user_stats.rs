@@ -31,12 +31,10 @@ const MAX_IN_FLIGHT: usize = 8;
 const MAX_PLAYTIME_PER_PASS: usize = 8;
 /// Callback ids kept for the debug socket, so an id shift stays diagnosable.
 const MAX_TRACKED_IDS: usize = 64;
-// The subscription-query entry points exist for `debug_api` only; the worker
-// side of the queue stays compiled so the job loop needs no cfg of its own.
 #[cfg(any(debug_assertions, test))]
-const MAX_PENDING_SUBSCRIPTION_QUERIES: usize = 4;
+const MAX_PENDING_QUERIES: usize = 4;
 #[cfg(any(debug_assertions, test))]
-const SUBSCRIPTION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static WORKER: OnceLock<Mutex<Option<StatsWorker>>> = OnceLock::new();
 static SNAPSHOT_LAYOUTS: OnceLock<Mutex<HashMap<u32, Arc<SnapshotLayout>>>> = OnceLock::new();
@@ -374,20 +372,6 @@ pub(crate) fn current_backend_refresh_guard() -> Option<StatsRefreshGuard> {
     })
 }
 
-/// Fetch Steam's live subscribed-app inventory from the SteamThreadTools
-/// worker, never from the debug socket thread.
-#[cfg(any(debug_assertions, test))]
-pub(crate) fn subscribed_app_ids() -> Result<Vec<u32>, String> {
-    let worker = worker().ok_or_else(|| "user-stats worker is unavailable".to_owned())?;
-    let (reply, result) = mpsc::sync_channel(1);
-    if !worker.queue_query(WorkerQuery::SubscribedApps(reply)) {
-        return Err("user-stats subscription query queue is full".to_owned());
-    }
-    result
-        .recv_timeout(SUBSCRIPTION_QUERY_TIMEOUT)
-        .map_err(|error| format!("Steam subscription query did not complete: {error}"))?
-}
-
 /// Diagnostic entry point for one stats request and its completion event.
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn request_user_stats(app_id: u32) -> Result<UserStatsProbe, String> {
@@ -405,7 +389,7 @@ pub(crate) fn request_user_stats(app_id: u32) -> Result<UserStatsProbe, String> 
         return Err("user-stats query queue is full".to_owned());
     }
     result
-        .recv_timeout(SUBSCRIPTION_QUERY_TIMEOUT)
+        .recv_timeout(QUERY_TIMEOUT)
         .map_err(|error| format!("Steam user-stats request did not complete: {error}"))?
 }
 
@@ -520,7 +504,7 @@ impl StatsWorker {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.queries.len() >= MAX_PENDING_SUBSCRIPTION_QUERIES {
+        if state.queries.len() >= MAX_PENDING_QUERIES {
             return false;
         }
         state.queries.push_back(query);
@@ -538,7 +522,6 @@ pub(super) struct WorkerShared {
 /// A read-only question answered through the worker's captured Steam interfaces.
 #[cfg(any(debug_assertions, test))]
 enum WorkerQuery {
-    SubscribedApps(mpsc::SyncSender<Result<Vec<u32>, String>>),
     /// Diagnostic: issue `RequestUserStats` for one app and report whether Steam's
     /// stats map ended up populated, with a few values read back.
     UserStats {
@@ -1207,27 +1190,23 @@ fn finish_pending_playtime(
 /// Answer one read-only query on the session this thread already holds.
 #[cfg(any(debug_assertions, test))]
 fn run_query(session: &SteamUserStatsSession, query: WorkerQuery, in_flight: &mut Vec<InFlight>) {
-    match query {
-        WorkerQuery::SubscribedApps(reply) => {
-            let _ = reply.send(session.subscribed_app_ids().map_err(str::to_owned));
+    let WorkerQuery::UserStats {
+        app_id,
+        steam_id64,
+        reply,
+    } = query;
+    match session.request_stats(app_id, steam_id64) {
+        Ok(api_call) => {
+            completion().issued += 1;
+            in_flight.push(InFlight {
+                app_id,
+                api_call,
+                probe_reply: Some(reply),
+            });
         }
-        WorkerQuery::UserStats {
-            app_id,
-            steam_id64,
-            reply,
-        } => match session.request_stats(app_id, steam_id64) {
-            Ok(api_call) => {
-                completion().issued += 1;
-                in_flight.push(InFlight {
-                    app_id,
-                    api_call,
-                    probe_reply: Some(reply),
-                });
-            }
-            Err(error) => {
-                let _ = reply.send(Err(error.to_owned()));
-            }
-        },
+        Err(error) => {
+            let _ = reply.send(Err(error.to_owned()));
+        }
     }
 }
 
@@ -1709,13 +1688,17 @@ mod tests {
     }
 
     #[test]
-    fn subscription_query_is_serviced_without_losing_pending_read() {
+    fn diagnostic_query_is_serviced_without_losing_pending_read() {
         let shared = WorkerShared::default();
         let (reply, _result) = mpsc::sync_channel(1);
         {
             let mut state = shared.state.lock().unwrap();
             queue_read_locked(&mut state, 480);
-            state.queries.push_back(WorkerQuery::SubscribedApps(reply));
+            state.queries.push_back(WorkerQuery::UserStats {
+                app_id: 480,
+                steam_id64: 7,
+                reply,
+            });
         }
 
         assert!(take_query(&shared).is_some());
