@@ -476,7 +476,11 @@ fn apply_choice(choice: &Choice, gc: &LocalGcCoordinator) -> Result<(), String> 
             choice.pending.minimum_revision,
         )
         .map_err(|error| error.to_string())?;
-    gc.queue_inspection(store, choice.key.1);
+    gc.queue_inspection(
+        store,
+        choice.key.1,
+        choice.pending.settings.syncthing.clone(),
+    );
     Ok(())
 }
 
@@ -528,7 +532,9 @@ mod tests {
 
     fn settings() -> CloudSettings {
         CloudSettings {
+            backend: vapor_forge_config::CloudBackendMode::Local,
             local_path: String::new(),
+            syncthing: None,
             server_url: String::new(),
             token: String::new(),
             steam_client_id: Some(7),

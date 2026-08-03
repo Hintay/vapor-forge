@@ -29,15 +29,15 @@ static BACKEND: OnceLock<RwLock<Option<CachedBackend>>> = OnceLock::new();
 
 fn backend_key(config: &vapor_forge_config::RuntimeConfig) -> Option<BackendKey> {
     if config.local_cloud_configured() {
-        return Some(BackendKey::Local(config.cloud.local_path.clone()));
+        return Some(BackendKey::Local(config.cloud.local.path.clone()));
     }
     config.cumulus_configured().then(|| BackendKey::Cumulus {
         credential_fingerprint: vapor_forge_cloud_core::credential_fingerprint(
-            &config.cloud.server_url,
-            &config.cloud.token,
+            &config.cloud.cumulus.server_url,
+            &config.cloud.cumulus.token,
         ),
-        timeout_connect_ms: config.cloud.timeout_connect_ms,
-        timeout_ms: config.cloud.timeout_ms,
+        timeout_connect_ms: config.cloud.cumulus.timeout_connect_ms,
+        timeout_ms: config.cloud.cumulus.timeout_ms,
     })
 }
 
@@ -45,7 +45,7 @@ fn backend_key(config: &vapor_forge_config::RuntimeConfig) -> Option<BackendKey>
 pub(crate) fn refresh(config: &vapor_forge_config::RuntimeConfig) {
     let key = backend_key(config);
     let backend = match key.as_ref() {
-        Some(BackendKey::Local(_)) => match LocalBackend::open(&config.cloud.local_path) {
+        Some(BackendKey::Local(_)) => match LocalBackend::open(&config.cloud.local.path) {
             Ok(backend) => Some(Arc::new(backend) as Arc<dyn CloudBackend>),
             Err(error) => {
                 warn!(%error, "cloud-sync: local backend unavailable");
@@ -53,10 +53,10 @@ pub(crate) fn refresh(config: &vapor_forge_config::RuntimeConfig) {
             }
         },
         Some(BackendKey::Cumulus { .. }) => Some(Arc::new(CumulusBackend::new(CumulusSettings {
-            server_url: config.cloud.server_url.clone(),
-            token: config.cloud.token.clone(),
-            timeout_connect_ms: config.cloud.timeout_connect_ms,
-            timeout_ms: config.cloud.timeout_ms,
+            server_url: config.cloud.cumulus.server_url.clone(),
+            token: config.cloud.cumulus.token.clone(),
+            timeout_connect_ms: config.cloud.cumulus.timeout_connect_ms,
+            timeout_ms: config.cloud.cumulus.timeout_ms,
         })) as Arc<dyn CloudBackend>),
         None => None,
     };

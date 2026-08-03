@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use vapor_forge_cloud_core::{ByteStore, CloudFileStore};
-use vapor_forge_config::{AppId, AppsSection, CloudSection, InjectApp, RuntimeConfig};
+use vapor_forge_config::{
+    AppId, AppsSection, CloudBackendMode, CloudSection, CumulusCloudSection, InjectApp,
+    RuntimeConfig,
+};
 use vapor_forge_steam_protocol::*;
 
 #[derive(Clone, prost::Message)]
@@ -262,7 +265,9 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
             method: COMPLETE_BATCH.into(),
             body: Vec::new(),
             settings: CloudSettings {
+                backend: CloudBackendMode::Cumulus,
                 local_path: String::new(),
+                syncthing: None,
                 server_url: "http://127.0.0.1".into(),
                 token: "token".into(),
                 steam_client_id: Some(7),
@@ -284,7 +289,9 @@ fn critical_notifications_bypass_response_backpressure_without_blocking() {
 fn adapter_state_is_discarded_when_cumulus_scope_changes() {
     let mut state = AdapterState::default();
     let first = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url: "https://cloud-a.example".into(),
         token: "token-a".into(),
         steam_client_id: Some(7),
@@ -334,6 +341,28 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
 }
 
 #[test]
+fn local_syncthing_settings_are_part_of_the_adapter_scope() {
+    let mut state = AdapterState::default();
+    let mut first = local_settings(std::path::Path::new("/tmp/local-cloud"), 7);
+    first.syncthing = Some(vapor_forge_cloud_local::SyncthingGcConfig {
+        url: "http://127.0.0.1:8384".into(),
+        api_key: "first-key".into(),
+        folder_id: "cloud".into(),
+        timeout_ms: 1_000,
+    });
+    state.prepare(&first);
+    state.current_change_numbers.insert(480, 1);
+
+    let mut second = first.clone();
+    second.syncthing.as_mut().unwrap().api_key = "second-key".into();
+    state.prepare(&second);
+
+    assert!(state.current_change_numbers.is_empty());
+    assert!(state.scope() == &CloudStateScope::from_settings(&second));
+    assert_ne!(first.conflict_scope(), second.conflict_scope());
+}
+
+#[test]
 fn response_reservation_is_held_until_the_response_is_drained() {
     let outstanding = Arc::new(AtomicUsize::new(1));
     let reservation = ResponsePermit {
@@ -358,8 +387,12 @@ fn response_reservation_is_held_until_the_response_is_drained() {
 fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
     let config = RuntimeConfig {
         cloud: CloudSection {
-            server_url: "https://cloud.example:8443/base".into(),
-            token: "secret".into(),
+            backend: CloudBackendMode::Cumulus,
+            cumulus: CumulusCloudSection {
+                server_url: "https://cloud.example:8443/base".into(),
+                token: "secret".into(),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -440,7 +473,9 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
 fn forwards_cumulus_transfer_reports_to_cumulus() {
     let (server_url, captured) = scripted_server(&[(204, ""), (204, "")]);
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "report-token".into(),
         steam_client_id: None,
@@ -511,7 +546,9 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
         (200, r#"{"batch_id":"43","app_change_number":1}"#),
     ]);
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "batch-token".into(),
         steam_client_id: None,
@@ -587,7 +624,9 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
         (200, r#"{"batch_id":"43","app_change_number":3}"#),
     ]);
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "conflict-token".into(),
         steam_client_id: None,
@@ -718,8 +757,12 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
             ..Default::default()
         },
         cloud: CloudSection {
-            server_url: "http://127.0.0.1:1".into(),
-            token: "unused".into(),
+            backend: CloudBackendMode::Cumulus,
+            cumulus: CumulusCloudSection {
+                server_url: "http://127.0.0.1:1".into(),
+                token: "unused".into(),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -775,8 +818,12 @@ fn actually_owned_apps_stay_on_steam() {
             ..Default::default()
         },
         cloud: CloudSection {
-            server_url: "http://127.0.0.1:1".into(),
-            token: "unused".into(),
+            backend: CloudBackendMode::Cumulus,
+            cumulus: CumulusCloudSection {
+                server_url: "http://127.0.0.1:1".into(),
+                token: "unused".into(),
+                ..Default::default()
+            },
             ..Default::default()
         },
         ..Default::default()
@@ -830,7 +877,9 @@ fn changelist_http_response_maps_to_steam_rpc() {
         }"#,
     );
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "secret-token".into(),
         steam_client_id: Some(11_047_413_376_560_171_870),
@@ -888,7 +937,9 @@ fn download_uses_external_descriptor_without_cumulus_bearer() {
         ),
     ]);
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "cumulus-secret".into(),
         steam_client_id: None,
@@ -965,7 +1016,9 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
         (200, r#"{"change_number":1}"#),
     ]);
     let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
         local_path: String::new(),
+        syncthing: None,
         server_url,
         token: "lifecycle-token".into(),
         steam_client_id: Some(7),
@@ -1100,7 +1153,9 @@ fn full_upload_lifecycle_maps_rpc_and_http_in_order() {
 fn local_folder_lifecycle_uses_in_process_transfer_targets() {
     let directory = tempfile::tempdir().unwrap();
     let settings = CloudSettings {
+        backend: CloudBackendMode::Local,
         local_path: directory.path().to_string_lossy().into_owned(),
+        syncthing: None,
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(7),
@@ -1380,7 +1435,9 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
 
 fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
     CloudSettings {
+        backend: CloudBackendMode::Local,
         local_path: path.to_string_lossy().into_owned(),
+        syncthing: None,
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(client_id),
@@ -1990,7 +2047,9 @@ fn manifest_heads_create_a_launch_pending_operation_for_the_custom_resolver() {
 fn local_session_claims_drive_steam_pending_operations() {
     let directory = tempfile::tempdir().unwrap();
     let settings = |client_id| CloudSettings {
+        backend: CloudBackendMode::Local,
         local_path: directory.path().to_string_lossy().into_owned(),
+        syncthing: None,
         server_url: String::new(),
         token: String::new(),
         steam_client_id: Some(client_id),

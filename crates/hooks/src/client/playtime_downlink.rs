@@ -134,7 +134,7 @@ fn response_playtime_view(config: &RuntimeConfig) -> PlaytimeView {
     let Some(key) = current_runtime_key() else {
         return PlaytimeView::Cold;
     };
-    let backend = match LocalBackend::open(&config.cloud.local_path) {
+    let backend = match LocalBackend::open(&config.cloud.local.path) {
         Ok(backend) => backend,
         Err(error) => {
             warn!(%error, "playtime-downlink: local state unavailable on Steam pull");

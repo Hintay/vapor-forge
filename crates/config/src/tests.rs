@@ -1,5 +1,7 @@
 use crate::template::{parse_commented_section_header, CommentedSectionHeader, TEMPLATE_EXAMPLES};
-use crate::{AppCategory, AppId, RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE};
+use crate::{
+    AppCategory, AppId, CloudBackendMode, RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE,
+};
 
 #[test]
 fn parses_empty_config() {
@@ -21,6 +23,11 @@ fn template_parses_and_keeps_safe_defaults() {
     assert!(config.apps.shared.enabled);
     assert!(!config.has_any_inject_apps());
     assert!(!config.cloud_enabled_for_controlled_apps());
+    assert_eq!(config.cloud.backend, CloudBackendMode::Disabled);
+    assert!(!config.cloud.local.syncthing.enabled);
+    assert_eq!(config.cloud.local.syncthing.url, "http://127.0.0.1:8384");
+    assert!(config.cloud.local.syncthing.api_key.is_empty());
+    assert!(config.cloud.local.syncthing.folder_id.is_empty());
     assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
     assert!(!config.ticket.auto_delegate);
 }
@@ -391,10 +398,12 @@ fn parses_inject_with_dlc() {
 #[test]
 fn cloud_defaults_to_disabled() {
     let config: RuntimeConfig = toml::from_str("").expect("parse");
+    assert_eq!(config.cloud.backend, CloudBackendMode::Disabled);
     assert!(!config.cloud_enabled_for_controlled_apps());
+    assert!(!config.local_cloud_configured());
     assert!(!config.cumulus_configured());
-    assert_eq!(config.cloud.timeout_connect_ms, 5000);
-    assert_eq!(config.cloud.timeout_ms, 15000);
+    assert_eq!(config.cloud.cumulus.timeout_connect_ms, 5000);
+    assert_eq!(config.cloud.cumulus.timeout_ms, 15000);
 }
 
 #[test]
@@ -402,6 +411,9 @@ fn cumulus_configuration_enables_controlled_cloud() {
     let config: RuntimeConfig = toml::from_str(
         r#"
             [cloud]
+            backend = "cumulus"
+
+            [cloud.cumulus]
             server_url = "https://cloud.example.com/base"
             token = "device-token"
             timeout_connect_ms = 123
@@ -412,8 +424,43 @@ fn cumulus_configuration_enables_controlled_cloud() {
 
     assert!(config.cumulus_configured());
     assert!(config.cloud_enabled_for_controlled_apps());
-    assert_eq!(config.cloud.timeout_connect_ms, 123);
-    assert_eq!(config.cloud.timeout_ms, 456);
+    assert_eq!(config.cloud.cumulus.timeout_connect_ms, 123);
+    assert_eq!(config.cloud.cumulus.timeout_ms, 456);
+}
+
+#[test]
+fn local_configuration_enables_only_the_local_backend() {
+    let config: RuntimeConfig = toml::from_str(
+        r#"
+            [cloud]
+            backend = "local"
+
+            [cloud.local]
+            path = "/tmp/vapor-cloud"
+            "#,
+    )
+    .expect("parse");
+
+    assert!(config.local_cloud_configured());
+    assert!(!config.cumulus_configured());
+    assert!(config.cloud_enabled_for_controlled_apps());
+    assert_eq!(config.cloud.local.path, "/tmp/vapor-cloud");
+}
+
+#[test]
+fn dormant_backend_settings_do_not_enable_cloud() {
+    let config: RuntimeConfig = toml::from_str(
+        r#"
+            [cloud.cumulus]
+            server_url = "https://cloud.example.com/base"
+            token = "device-token"
+            "#,
+    )
+    .expect("parse");
+
+    assert_eq!(config.cloud.backend, CloudBackendMode::Disabled);
+    assert!(!config.cloud_enabled_for_controlled_apps());
+    assert!(!config.cumulus_configured());
 }
 
 #[test]

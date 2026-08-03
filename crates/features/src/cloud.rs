@@ -273,7 +273,9 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vapor_forge_config::{CloudSection, InjectApp};
+    use vapor_forge_config::{
+        CloudBackendMode, CloudSection, CumulusCloudSection, InjectApp, LocalCloudSection,
+    };
 
     const TEST_APP_ID: AppId = AppId(246_813_579);
 
@@ -296,8 +298,12 @@ mod tests {
     #[test]
     fn cumulus_forces_the_remote_storage_enable_gate_open() {
         let config = controlled_config(CloudSection {
-            server_url: "https://cloud.example.com".into(),
-            token: "device-token".into(),
+            backend: CloudBackendMode::Cumulus,
+            cumulus: CumulusCloudSection {
+                server_url: "https://cloud.example.com".into(),
+                token: "device-token".into(),
+                ..Default::default()
+            },
             ..Default::default()
         });
 
@@ -312,7 +318,11 @@ mod tests {
         // that it had no cloud save directory while every sync request for it
         // was being served.
         let config = controlled_config(CloudSection {
-            local_path: "/tmp/vapor-forge-cloud".into(),
+            backend: CloudBackendMode::Local,
+            local: LocalCloudSection {
+                path: "/tmp/vapor-forge-cloud".into(),
+                ..Default::default()
+            },
             ..Default::default()
         });
 
@@ -320,11 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cloud_flag_does_not_force_an_originally_disabled_app_on() {
-        let config = controlled_config(CloudSection {
-            enabled: Some(true),
-            ..Default::default()
-        });
+    fn disabled_backend_does_not_force_an_originally_disabled_app_on() {
+        let config = controlled_config(CloudSection::default());
 
         assert!(!on_is_cloud_enabled(&config, TEST_APP_ID, false));
     }

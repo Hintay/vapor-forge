@@ -6,12 +6,14 @@ use vapor_forge_cloud_core::device_descriptor;
 use vapor_forge_cloud_cumulus::{
     CumulusClient as SharedCumulusClient, CumulusSettings, STEAM_CLIENT_ID_HEADER,
 };
-use vapor_forge_config::RuntimeConfig;
+use vapor_forge_config::{CloudBackendMode, RuntimeConfig};
 use vapor_forge_steam_protocol::CloudHttpHeader;
 
 #[derive(Clone)]
 pub(super) struct CloudSettings {
+    pub(super) backend: CloudBackendMode,
     pub(super) local_path: String,
+    pub(super) syncthing: Option<vapor_forge_cloud_local::SyncthingGcConfig>,
     pub(super) server_url: String,
     pub(super) token: String,
     pub(super) steam_client_id: Option<u64>,
@@ -26,17 +28,25 @@ impl CloudSettings {
     pub(super) fn from_config(config: &RuntimeConfig) -> Self {
         let descriptor = device_descriptor();
         Self {
-            local_path: config.cloud.local_path.trim().to_string(),
-            server_url: config.cloud.server_url.trim().to_string(),
-            token: config.cloud.token.trim().to_string(),
+            backend: config.cloud.backend,
+            local_path: config.cloud.local.path.trim().to_string(),
+            syncthing: (config.local_cloud_configured() && config.cloud.local.syncthing.enabled)
+                .then(|| vapor_forge_cloud_local::SyncthingGcConfig {
+                    url: config.cloud.local.syncthing.url.trim().to_string(),
+                    api_key: config.cloud.local.syncthing.api_key.trim().to_string(),
+                    folder_id: config.cloud.local.syncthing.folder_id.trim().to_string(),
+                    timeout_ms: config.cloud.local.syncthing.timeout_ms,
+                }),
+            server_url: config.cloud.cumulus.server_url.trim().to_string(),
+            token: config.cloud.cumulus.token.trim().to_string(),
             steam_client_id: descriptor.as_ref().map(|descriptor| descriptor.client_id),
             steam_machine_name: descriptor
                 .map(|descriptor| descriptor.machine_name)
                 .filter(|name| !name.trim().is_empty()),
             steam_id64: Some(vapor_forge_features::identity::steam_id()).filter(|id| *id != 0),
             bind_device: true,
-            timeout_connect_ms: config.cloud.timeout_connect_ms,
-            timeout_ms: config.cloud.timeout_ms,
+            timeout_connect_ms: config.cloud.cumulus.timeout_connect_ms,
+            timeout_ms: config.cloud.cumulus.timeout_ms,
         }
     }
 
@@ -47,7 +57,23 @@ impl CloudSettings {
         digest.update([0]);
         digest.update(self.steam_id64.unwrap_or_default().to_le_bytes());
         digest.update(self.steam_client_id.unwrap_or_default().to_le_bytes());
+        if let Some(fingerprint) = self.syncthing_fingerprint() {
+            digest.update(fingerprint.as_bytes());
+        }
         digest.finalize().into()
+    }
+
+    pub(super) fn syncthing_fingerprint(&self) -> Option<String> {
+        self.syncthing.as_ref().map(|settings| {
+            vapor_forge_cloud_core::credential_fingerprint(
+                &format!(
+                    "{}/{}",
+                    settings.url.trim_end_matches('/'),
+                    settings.folder_id
+                ),
+                &settings.api_key,
+            )
+        })
     }
 }
 
@@ -67,18 +93,22 @@ impl Endpoint {
             (false, rest)
         } else {
             return Err(AdapterError::Protocol(
-                "cloud.server_url must use http:// or https://".into(),
+                "cloud.cumulus.server_url must use http:// or https://".into(),
             ));
         };
         if rest.is_empty() || rest.contains('@') || rest.contains('?') || rest.contains('#') {
-            return Err(AdapterError::Protocol("invalid cloud.server_url".into()));
+            return Err(AdapterError::Protocol(
+                "invalid cloud.cumulus.server_url".into(),
+            ));
         }
         let (authority, base_path) = match rest.split_once('/') {
             Some((authority, path)) => (authority, format!("/{}", path.trim_end_matches('/'))),
             None => (rest, String::new()),
         };
         if authority.is_empty() {
-            return Err(AdapterError::Protocol("invalid cloud.server_url".into()));
+            return Err(AdapterError::Protocol(
+                "invalid cloud.cumulus.server_url".into(),
+            ));
         }
         Ok(Self {
             origin: raw.to_string(),

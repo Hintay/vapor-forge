@@ -36,7 +36,7 @@ pub fn privacy_fallback_with_ownership(
         .then_some((app_id, method_expects_response(method)))
 }
 
-pub(super) fn is_cumulus_transfer_report(
+pub(super) fn is_backend_transfer_report(
     method: &str,
     body: &[u8],
     config: &RuntimeConfig,
@@ -48,7 +48,7 @@ pub(super) fn is_cumulus_transfer_report(
     if !config.cumulus_configured() {
         return false;
     }
-    let Ok(endpoint) = Endpoint::parse(&config.cloud.server_url) else {
+    let Ok(endpoint) = Endpoint::parse(&config.cloud.cumulus.server_url) else {
         return false;
     };
     let scope = CloudStateScope::from_config(config);

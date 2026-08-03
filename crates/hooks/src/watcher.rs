@@ -446,6 +446,9 @@ fn finalize_snapshot(
     let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
     let service_config = Arc::clone(&snapshot.config);
     runtime_store.store(Arc::new(snapshot));
+    if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
+        queue.invalidate_local_gc();
+    }
     crate::achievement_worker::notify_context_changed();
     crate::playtime_worker::notify_context_changed();
     crate::playtime_downlink_worker::notify_context_changed();
