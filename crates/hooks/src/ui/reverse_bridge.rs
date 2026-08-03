@@ -1,39 +1,25 @@
-#[cfg(target_pointer_width = "32")]
 use core::ffi::{c_char, c_void};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_pointer_width = "32")]
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-#[cfg(target_pointer_width = "32")]
 use tracing::{info, warn};
-#[cfg(target_pointer_width = "32")]
 use vapor_forge_hook_engine::detour::Detour;
-#[cfg(target_pointer_width = "32")]
 use vapor_forge_hook_engine::original::detour_or_return;
-#[cfg(target_pointer_width = "32")]
 use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTargetInput};
 
-#[cfg(target_pointer_width = "32")]
 use crate::hook_report::HookResult;
-#[cfg(target_pointer_width = "32")]
 use crate::pattern_resolver::CodeRegion;
 
-#[cfg(target_pointer_width = "32")]
 const RESOLVE_METHOD: &[u8] = b"Apps.VaporForgeResolveCloudConflict\0";
-#[cfg(target_pointer_width = "32")]
 const URL_METHOD: &[u8] = b"URL.ExecuteSteamURL";
-#[cfg(target_pointer_width = "32")]
 const CONTINUE_METHOD: &[u8] = b"Apps.ContinueGameAction";
 const TOKEN_LENGTH: usize = 64;
-#[cfg(target_pointer_width = "32")]
 const CALLBACK_CAPACITY: usize = 32;
 
-#[cfg(target_pointer_width = "32")]
 static NEXT_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(1);
-#[cfg(target_pointer_width = "32")]
 static STRING_HANDLER_VPTR: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_CONTEXT_CHANGED: AtomicBool = AtomicBool::new(false);
 static WINDOWS: Lazy<Mutex<HashMap<usize, WindowRegistration>>> =
@@ -59,13 +45,10 @@ impl CallbackToken {
     }
 }
 
-#[cfg(target_pointer_width = "32")]
 type RegisterJsMethodFn = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void, i32);
 
-#[cfg(target_pointer_width = "32")]
 static mut DETOUR: Option<Detour<RegisterJsMethodFn>> = None;
 
-#[cfg(target_pointer_width = "32")]
 #[repr(C)]
 struct StringBinding {
     vptr: usize,
@@ -74,7 +57,8 @@ struct StringBinding {
     adjustment: isize,
 }
 
-#[cfg(target_pointer_width = "32")]
+const _: [(); std::mem::size_of::<usize>() * 4] = [(); std::mem::size_of::<StringBinding>()];
+
 unsafe extern "C" fn hook(
     window: *mut c_void,
     name: *const c_char,
@@ -82,23 +66,29 @@ unsafe extern "C" fn hook(
     kind: i32,
 ) {
     let original = detour_or_return!("CHTMLWindow::RegisterJSMethod", DETOUR);
+    let is_string_handler = !binding.is_null() && kind == 1 && c_string_eq(name, URL_METHOD);
+    let is_window_marker = kind == 1 && c_string_eq(name, CONTINUE_METHOD);
+    let string_handler_vptr = if is_string_handler {
+        // SAFETY: every JS method binding begins with its vtable pointer.
+        unsafe { binding.cast::<usize>().read_unaligned() }
+    } else {
+        0
+    };
     // SAFETY: Steam supplied the arguments to the hooked method.
     unsafe { original(window, name, binding, kind) };
     if window.is_null() || binding.is_null() || kind != 1 {
         return;
     }
 
-    if c_string_eq(name, URL_METHOD) {
-        // SAFETY: every JS method binding begins with its vtable pointer.
-        let vptr = unsafe { binding.cast::<usize>().read_unaligned() };
-        if vptr != 0 {
-            STRING_HANDLER_VPTR.store(vptr, Ordering::Release);
+    if is_string_handler {
+        if string_handler_vptr != 0 {
+            STRING_HANDLER_VPTR.store(string_handler_vptr, Ordering::Release);
             register_waiting_windows(original);
         }
         return;
     }
 
-    if c_string_eq(name, CONTINUE_METHOD) {
+    if is_window_marker {
         let generation = NEXT_WINDOW_GENERATION.fetch_add(1, Ordering::AcqRel);
         WINDOWS
             .lock()
@@ -116,7 +106,6 @@ unsafe extern "C" fn hook(
     }
 }
 
-#[cfg(target_pointer_width = "32")]
 fn register_waiting_windows(original: RegisterJsMethodFn) {
     let windows = WINDOWS
         .lock()
@@ -129,7 +118,6 @@ fn register_waiting_windows(original: RegisterJsMethodFn) {
     }
 }
 
-#[cfg(target_pointer_width = "32")]
 fn register_window(original: RegisterJsMethodFn, window: usize) {
     let vptr = STRING_HANDLER_VPTR.load(Ordering::Acquire);
     if vptr == 0 {
@@ -178,7 +166,6 @@ fn register_window(original: RegisterJsMethodFn, window: usize) {
     );
 }
 
-#[cfg(target_pointer_width = "32")]
 unsafe extern "C" fn receive_choice(context: *mut c_void, token: *const c_char) {
     let window_generation = context as usize as u64;
     if window_generation == 0 || token.is_null() {
@@ -208,7 +195,6 @@ unsafe extern "C" fn receive_choice(context: *mut c_void, token: *const c_char) 
     }
 }
 
-#[cfg(target_pointer_width = "32")]
 fn c_string_eq(value: *const c_char, expected: &[u8]) -> bool {
     if value.is_null() {
         return false;
@@ -245,7 +231,6 @@ pub(super) fn take_window_context_changed() -> bool {
     WINDOW_CONTEXT_CHANGED.swap(false, Ordering::AcqRel)
 }
 
-#[cfg(target_pointer_width = "32")]
 pub(super) fn install(steamui_code: &CodeRegion) -> HookResult {
     const NAME: &str = "CHTMLWindow::RegisterJSMethod";
     let mut result = HookResult {
