@@ -15,6 +15,8 @@ mod ipc;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod loader;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod mapping_event;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod maps;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod nt_types;
@@ -24,14 +26,10 @@ mod pe;
 mod trigger;
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-use core::ffi::{c_uint, c_void};
+use core::ffi::{c_char, c_uint, c_void};
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 const LAV_CURRENT: c_uint = 2;
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-const POLL_INTERVAL_MS: u64 = 50;
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-const POLL_MAX_ATTEMPTS: u32 = 600; // 30 seconds
 
 // ---------------------------------------------------------------------------
 // LD_AUDIT interface
@@ -64,22 +62,43 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
     if loader::install_trigger() {
         return;
     }
-    spawn_poll_thread();
+    if current_executable_is_wine() {
+        mapping_event::spawn_install_worker();
+    }
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[no_mangle]
-/// Observe a loader object-open callback without requesting symbol interception.
+/// Select Wine-to-libc symbol bindings used to observe PE image mappings.
 ///
 /// # Safety
-/// Called by glibc with loader-owned pointers; this implementation does not
-/// dereference them.
+/// Called by glibc with a live loader-owned link_map pointer.
 pub unsafe extern "C" fn la_objopen(
-    _map: *mut c_void,
+    map: *mut c_void,
     _lmid: libc::c_long,
     _cookie: *mut usize,
 ) -> c_uint {
-    0
+    // SAFETY: glibc supplies a valid link_map for this callback.
+    unsafe { mapping_event::object_flags(map) }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[no_mangle]
+/// Redirect Wine's libc mapping calls through the PE mapping observer.
+///
+/// # Safety
+/// glibc supplies valid symbol and name pointers for the duration of this
+/// callback.
+pub unsafe extern "C" fn la_symbind64(
+    symbol: *const mapping_event::Elf64Symbol,
+    _index: c_uint,
+    _reference_cookie: *mut usize,
+    _definition_cookie: *mut usize,
+    _flags: *mut c_uint,
+    symbol_name: *const c_char,
+) -> usize {
+    // SAFETY: the arguments follow glibc's la_symbind64 contract.
+    unsafe { mapping_event::bind_symbol(symbol, symbol_name) }
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -93,21 +112,10 @@ pub unsafe extern "C" fn la_objclose(_cookie: *mut usize) -> c_uint {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Poll thread
-// ---------------------------------------------------------------------------
-
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn spawn_poll_thread() {
-    std::thread::Builder::new()
-        .name("vapor-forge-proton-inject-poll".into())
-        .spawn(|| {
-            for _ in 0..POLL_MAX_ATTEMPTS {
-                if loader::install_trigger() {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-            }
-        })
-        .ok();
+fn current_executable_is_wine() -> bool {
+    std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().contains("wine"))
 }
