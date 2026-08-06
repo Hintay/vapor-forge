@@ -1381,12 +1381,14 @@ mod tests {
         steam_id64: u64,
         identity_generation: u64,
         client_id: u64,
+        runtime_generation: u64,
     ) -> super::super::playtime_downlink::RuntimeKey {
         super::super::playtime_downlink::runtime_key(
             credential_fingerprint.to_owned(),
             steam_id64,
             identity_generation,
             client_id,
+            runtime_generation,
         )
     }
 
@@ -1418,12 +1420,13 @@ mod tests {
 
     #[test]
     fn queued_playtime_is_discarded_across_every_runtime_boundary() {
-        let current = key("credential-a", 76_561_198_000_000_001, 4, 7);
+        let current = key("credential-a", 76_561_198_000_000_001, 4, 7, 9);
         let mut queue = VecDeque::from([
-            playtime(1, key("credential-b", current.steam_id64, 4, 7)),
-            playtime(2, key("credential-a", 76_561_198_000_000_002, 4, 7)),
-            playtime(3, key("credential-a", current.steam_id64, 5, 7)),
-            playtime(4, key("credential-a", current.steam_id64, 4, 8)),
+            playtime(1, key("credential-b", current.steam_id64, 4, 7, 9)),
+            playtime(2, key("credential-a", 76_561_198_000_000_002, 4, 7, 9)),
+            playtime(3, key("credential-a", current.steam_id64, 5, 7, 9)),
+            playtime(4, key("credential-a", current.steam_id64, 4, 8, 9)),
+            playtime(7, key("credential-a", current.steam_id64, 4, 7, 10)),
             QueuedInjection {
                 body: vec![5],
                 generation: 7,
@@ -1434,7 +1437,7 @@ mod tests {
         ]);
 
         let (ordinary, discarded) = take_next_dispatchable(&mut queue, 7, Some(&current));
-        assert_eq!(discarded, 4);
+        assert_eq!(discarded, 5);
         assert_eq!(ordinary.unwrap().body, vec![5]);
 
         let (current_playtime, discarded) = take_next_dispatchable(&mut queue, 7, Some(&current));
@@ -1447,7 +1450,7 @@ mod tests {
     fn queued_playtime_is_discarded_when_backend_is_disabled() {
         let mut queue = VecDeque::from([playtime(
             1,
-            key("credential-a", 76_561_198_000_000_001, 4, 7),
+            key("credential-a", 76_561_198_000_000_001, 4, 7, 9),
         )]);
 
         let (queued, discarded) = take_next_dispatchable(&mut queue, 7, None);

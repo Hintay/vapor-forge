@@ -27,6 +27,7 @@ pub(crate) struct RuntimeKey {
     pub steam_id64: u64,
     pub identity_generation: u64,
     pub client_id: u64,
+    pub runtime_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,12 +52,14 @@ pub(crate) fn runtime_key(
     steam_id64: u64,
     identity_generation: u64,
     client_id: u64,
+    runtime_generation: u64,
 ) -> RuntimeKey {
     RuntimeKey {
         credential_fingerprint,
         steam_id64,
         identity_generation,
         client_id,
+        runtime_generation,
     }
 }
 
@@ -72,6 +75,7 @@ pub(crate) fn current_runtime_key() -> Option<RuntimeKey> {
         steam_id64,
         vapor_forge_features::identity::generation(),
         descriptor.client_id,
+        super::install::runtime_generation(),
     ))
 }
 
@@ -220,11 +224,15 @@ fn store_backend_playtime(
     {
         return None;
     }
-    let changed = games
-        .values()
-        .filter(|entry| cache.games.get(&entry.app_id) != Some(*entry))
-        .cloned()
-        .collect::<Vec<_>>();
+    let changed = if cache.key.as_ref() == Some(&key) {
+        games
+            .values()
+            .filter(|entry| cache.games.get(&entry.app_id) != Some(*entry))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        games.values().cloned().collect::<Vec<_>>()
+    };
     cache.key = Some(key);
     cache.revision = revision;
     cache.games = games;
@@ -390,13 +398,8 @@ fn saturating_i32(value: u32) -> i32 {
 mod tests {
     use super::*;
     use prost::Message;
-    use std::sync::Mutex;
     use vapor_forge_cloud_core::AccountSyncState;
     use vapor_forge_config::{AppsSection, InjectApp};
-
-    /// Serializes tests that touch the process-wide cache or the `apps`
-    /// account state, which they otherwise reset out from under each other.
-    static ACCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn config_with(app_ids: &[u32]) -> RuntimeConfig {
         RuntimeConfig {
@@ -545,7 +548,7 @@ mod tests {
 
     #[test]
     fn owned_controlled_app_keeps_steam_last_played_entry() {
-        let _guard = ACCOUNT_TEST_LOCK
+        let _guard = crate::client::ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let app_id = AppId(482);
@@ -615,12 +618,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_bound_to_runtime_fingerprint_generation_and_client() {
-        let _guard = ACCOUNT_TEST_LOCK
+    fn cache_is_bound_to_runtime_fingerprint_identity_client_and_config() {
+        let _guard = crate::client::ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_account_state();
-        let key = runtime_key("credential-a".into(), 76561198000000001, 2, 7);
+        let key = runtime_key("credential-a".into(), 76561198000000001, 2, 7, 11);
         store_backend_playtime(
             key.clone(),
             state(240).playtime_revision,
@@ -633,19 +636,23 @@ mod tests {
         assert_eq!(cache.games.get(&480).unwrap().playtime_minutes, 240);
         assert_ne!(
             key,
-            runtime_key("credential-b".into(), 76561198000000001, 2, 7)
+            runtime_key("credential-b".into(), 76561198000000001, 2, 7, 11)
         );
         assert_ne!(
             key,
-            runtime_key("credential-a".into(), 76561198000000002, 2, 7)
+            runtime_key("credential-a".into(), 76561198000000002, 2, 7, 11)
         );
         assert_ne!(
             key,
-            runtime_key("credential-a".into(), 76561198000000001, 3, 7)
+            runtime_key("credential-a".into(), 76561198000000001, 3, 7, 11)
         );
         assert_ne!(
             key,
-            runtime_key("credential-a".into(), 76561198000000001, 2, 8)
+            runtime_key("credential-a".into(), 76561198000000001, 2, 8, 11)
+        );
+        assert_ne!(
+            key,
+            runtime_key("credential-a".into(), 76561198000000001, 2, 7, 12)
         );
         drop(cache);
         reset_account_state();
@@ -653,13 +660,13 @@ mod tests {
 
     #[test]
     fn stream_snapshot_builds_native_last_played_notification() {
-        let _guard = ACCOUNT_TEST_LOCK
+        let _guard = crate::client::ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_account_state();
         vapor_forge_features::apps::reset_account_state();
         let app_id = 246_813_579;
-        let key = runtime_key("credential-stream".into(), 76561198000000001, 9, 7);
+        let key = runtime_key("credential-stream".into(), 76561198000000001, 9, 7, 11);
         let packet = apply_stream_snapshot(
             key,
             &stream_snapshot(app_id, 4, 321),
@@ -688,12 +695,12 @@ mod tests {
 
     #[test]
     fn older_stream_revision_cannot_replace_newer_cache() {
-        let _guard = ACCOUNT_TEST_LOCK
+        let _guard = crate::client::ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_account_state();
         let app_id = 246_813_580;
-        let key = runtime_key("credential-order".into(), 76561198000000001, 10, 8);
+        let key = runtime_key("credential-order".into(), 76561198000000001, 10, 8, 11);
         assert!(apply_stream_snapshot(
             key.clone(),
             &stream_snapshot(app_id, 8, 500),
@@ -712,6 +719,22 @@ mod tests {
         assert_eq!(cache.revision, 8);
         assert_eq!(cache.games[&app_id].playtime_minutes, 500);
         drop(cache);
+        reset_account_state();
+    }
+
+    #[test]
+    fn new_runtime_generation_replays_unchanged_baseline() {
+        let _guard = crate::client::ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_account_state();
+        let app_id = 246_813_581;
+        let first = runtime_key("credential-order".into(), 76561198000000001, 10, 8, 11);
+        let second = runtime_key("credential-order".into(), 76561198000000001, 10, 8, 12);
+        let snapshot = stream_snapshot(app_id, 8, 500);
+
+        assert!(apply_stream_snapshot(first, &snapshot, &config_with(&[app_id])).is_some());
+        assert!(apply_stream_snapshot(second, &snapshot, &config_with(&[app_id])).is_some());
         reset_account_state();
     }
 }

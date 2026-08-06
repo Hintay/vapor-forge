@@ -7,8 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use structsy::{Fetch, Filter, Ref, Structsy, StructsyTx};
 use vapor_forge_cloud_core::{
-    AchievementSchema, DeviceDescriptor, PlaytimeEntry, PlaytimeSession, StatsCommit,
-    SteamAppSnapshot,
+    AchievementSchema, DeviceDescriptor, PlaytimeEntry, StatsCommit, SteamAppSnapshot,
 };
 
 use crate::record::*;
@@ -120,7 +119,6 @@ macro_rules! journaled {
 }
 
 journaled!(PlaytimeEntry, PlaytimeRecord);
-journaled!(PlaytimeSession, PlaytimeSessionRecord);
 journaled!(AchievementSchema, SchemaRecord);
 journaled!(SteamAppSnapshot, StatsRecord);
 journaled!(ConflictResolutionEvent, ConflictRecord);
@@ -153,7 +151,6 @@ impl SyncJournal {
         let database = Structsy::open(path)?;
         set_private_file_mode(path)?;
         database.define::<PlaytimeRecord>()?;
-        database.define::<PlaytimeSessionRecord>()?;
         database.define::<SchemaRecord>()?;
         database.define::<StatsRecord>()?;
         database.define::<ConflictRecord>()?;
@@ -225,7 +222,7 @@ impl SyncJournal {
         })
     }
 
-    /// Accounts under `owner_scope` with playtime or sessions due for upload.
+    /// Accounts under `owner_scope` with playtime due for upload.
     pub fn ready_playtime_accounts(
         &self,
         owner_scope: &str,
@@ -239,13 +236,6 @@ impl SyncJournal {
         ) {
             accounts.insert(record.owner_steam_id64);
         }
-        for (_, record) in self.fetch(
-            Filter::<PlaytimeSessionRecord>::new()
-                .scoped(owner_scope.to_owned())
-                .ready(..=now),
-        ) {
-            accounts.insert(record.owner_steam_id64);
-        }
         Ok(accounts.into_iter().collect())
     }
 
@@ -254,18 +244,10 @@ impl SyncJournal {
         &self,
         owner_scope: &str,
     ) -> Result<Option<i64>, SyncJournalError> {
-        let totals = self
+        Ok(self
             .fetch(Filter::<PlaytimeRecord>::new().scoped(owner_scope.to_owned()))
             .map(|(_, record)| record.next_attempt_at)
-            .min();
-        let sessions = self
-            .fetch(Filter::<PlaytimeSessionRecord>::new().scoped(owner_scope.to_owned()))
-            .map(|(_, record)| record.next_attempt_at)
-            .min();
-        Ok(match (totals, sessions) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (some, None) | (None, some) => some,
-        })
+            .min())
     }
 
     pub fn pending_playtime(
@@ -298,71 +280,6 @@ impl SyncJournal {
 
     pub fn playtime_empty(&self) -> Result<bool, SyncJournalError> {
         self.playtime_len().map(|len| len == 0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Steam-authored playtime sessions
-    // -----------------------------------------------------------------------
-
-    /// Persist sessions that Steam has finalized. Re-delivery of a session
-    /// already on file is a no-op, so the CM request can be acknowledged more
-    /// than once.
-    pub fn enqueue_playtime_sessions(
-        &self,
-        sessions: &[PlaytimeSession],
-    ) -> Result<usize, SyncJournalError> {
-        self.write(|tx| {
-            let mut inserted = 0;
-            for session in sessions {
-                let known = Filter::<PlaytimeSessionRecord>::new()
-                    .identified(
-                        session.owner_scope.clone(),
-                        session.owner_steam_id64.clone(),
-                        session.session_id.clone(),
-                    )
-                    .fetch_tx(tx)
-                    .next()
-                    .is_some();
-                if known {
-                    continue;
-                }
-                tx.insert(&PlaytimeSessionRecord::new(session))?;
-                inserted += 1;
-            }
-            Ok(inserted)
-        })
-    }
-
-    pub fn pending_playtime_sessions(
-        &self,
-        owner_scope: &str,
-        owner_steam_id64: &str,
-        now: i64,
-    ) -> Result<Vec<Queued<PlaytimeSession>>, SyncJournalError> {
-        let mut pending = self
-            .fetch(
-                Filter::<PlaytimeSessionRecord>::new()
-                    .owned_by(owner_scope.to_owned(), owner_steam_id64.to_owned())
-                    .ready(..=now),
-            )
-            .map(|(id, record)| {
-                (
-                    (
-                        record.started_at,
-                        record.created_at,
-                        record.session_id.clone(),
-                    ),
-                    Queued::new(&id, record.revision, record.value()),
-                )
-            })
-            .collect::<Vec<_>>();
-        pending.sort_by(|(left, _), (right, _)| left.cmp(right));
-        pending.truncate(PLAYTIME_BATCH_LIMIT);
-        Ok(pending.into_iter().map(|(_, queued)| queued).collect())
-    }
-
-    pub fn playtime_session_len(&self) -> Result<u64, SyncJournalError> {
-        Ok(self.database.scan::<PlaytimeSessionRecord>()?.count() as u64)
     }
 
     // -----------------------------------------------------------------------
@@ -567,19 +484,17 @@ impl SyncJournal {
             .min())
     }
 
-    /// Apps holding a commit that still owes a snapshot from Steam and whose
-    /// backoff has elapsed. Callers ask Steam to produce one.
+    /// Apps holding a commit that still owes a snapshot from Steam. Callers ask
+    /// Steam to produce one when a matching session becomes available.
     pub fn stats_awaiting_snapshot(
         &self,
         owner_scope: &str,
         owner_steam_id64: &str,
-        now: i64,
     ) -> Result<Vec<u32>, SyncJournalError> {
         Ok(self
             .fetch(
                 Filter::<StatsRecord>::new()
-                    .owned_by(owner_scope.to_owned(), owner_steam_id64.to_owned())
-                    .ready(..=now),
+                    .owned_by(owner_scope.to_owned(), owner_steam_id64.to_owned()),
             )
             .filter(|(_, record)| !record.has_snapshot())
             .map(|(_, record)| record.app_id)

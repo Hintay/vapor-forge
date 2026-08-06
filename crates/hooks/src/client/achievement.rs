@@ -49,11 +49,14 @@ pub(crate) fn register_packet_schema(app_id: u32, content: &[u8]) -> bool {
     super::user_stats::register_snapshot_schema(app_id, content)
 }
 
-pub(crate) fn observe_local_snapshot(snapshot: super::user_stats::AchievementSnapshot) -> bool {
+pub(crate) fn observe_local_snapshot(
+    snapshot: super::user_stats::AchievementSnapshot,
+    intent: &super::user_stats::StatsSnapshotIntent,
+) -> bool {
     let app_id = snapshot.app_id;
     let achievements = snapshot.achievements.len();
     let stats = snapshot.stats.len();
-    let persisted = crate::achievement_worker::queue_official_snapshot(snapshot);
+    let persisted = crate::achievement_worker::queue_official_snapshot(snapshot, intent);
     debug!(
         app_id,
         achievements, stats, persisted, "achievement receiver: official Steam snapshot observed"

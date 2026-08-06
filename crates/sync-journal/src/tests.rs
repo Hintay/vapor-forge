@@ -1,7 +1,7 @@
 use super::*;
 use vapor_forge_cloud_core::{
     AchievementSchema, DeviceDescriptor, OfficialAchievementState, OfficialStatState,
-    PlaytimeEntry, PlaytimeSession, StatsCommit, SteamAppSnapshot,
+    PlaytimeEntry, StatsCommit, SteamAppSnapshot,
 };
 
 const SCOPE: &str = "scope-a";
@@ -20,20 +20,6 @@ fn playtime(observed_at: i64, minutes: u32) -> PlaytimeEntry {
         playtime_2weeks_minutes: 20,
         last_played_at: Some(1_800_000_000),
         observed_at,
-    }
-}
-
-fn playtime_session(id: &str) -> PlaytimeSession {
-    PlaytimeSession {
-        owner_scope: SCOPE.into(),
-        owner_steam_id64: STEAM_ID.into(),
-        session_id: id.into(),
-        app_id: 620,
-        started_at: 1_800_000_000,
-        seconds: 125,
-        offline: false,
-        owner_account_id: 39734273,
-        observed_at: 1_800_000_125,
     }
 }
 
@@ -168,66 +154,6 @@ fn a_new_observation_clears_the_backoff() {
 }
 
 #[test]
-fn ready_accounts_cover_both_playtime_and_sessions() {
-    let directory = tempfile::tempdir().unwrap();
-    let journal = journal(&directory);
-    assert!(journal
-        .ready_playtime_accounts(SCOPE, 10)
-        .unwrap()
-        .is_empty());
-
-    journal
-        .enqueue_playtime_sessions(&[playtime_session("session-1")])
-        .unwrap();
-    assert_eq!(
-        journal.ready_playtime_accounts(SCOPE, 10).unwrap(),
-        vec![STEAM_ID.to_owned()]
-    );
-
-    journal.enqueue_playtime(&[playtime(10, 120)]).unwrap();
-    assert_eq!(
-        journal.ready_playtime_accounts(SCOPE, 10).unwrap(),
-        vec![STEAM_ID.to_owned()],
-        "an account with both kinds is reported once"
-    );
-    assert!(journal
-        .ready_playtime_accounts("other-scope", 10)
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn playtime_sessions_are_durable_idempotent_and_exactly_acknowledged() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("sync-journal.stry");
-    let first = playtime_session("session-1");
-    {
-        let journal = SyncJournal::open(&path).unwrap();
-        assert_eq!(
-            journal
-                .enqueue_playtime_sessions(std::slice::from_ref(&first))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            journal
-                .enqueue_playtime_sessions(std::slice::from_ref(&first))
-                .unwrap(),
-            0,
-            "a replayed session must not be queued twice"
-        );
-    }
-
-    let reopened = SyncJournal::open(&path).unwrap();
-    let pending = reopened
-        .pending_playtime_sessions(SCOPE, STEAM_ID, 1_800_000_125)
-        .unwrap();
-    assert_eq!(values(&pending), vec![first]);
-    reopened.acknowledge_all(&pending).unwrap();
-    assert_eq!(reopened.playtime_session_len().unwrap(), 0);
-}
-
-#[test]
 fn schemas_are_attributed_to_the_backend_scope_once_it_is_known() {
     let directory = tempfile::tempdir().unwrap();
     let journal = journal(&directory);
@@ -320,6 +246,40 @@ fn stats_commit_marker_survives_reopen_and_completes_to_snapshot() {
         reopened.pending_stats_commit(SCOPE, STEAM_ID, 620).unwrap(),
         None,
         "a completed record is no longer awaiting Steam"
+    );
+}
+
+#[test]
+fn refused_stats_snapshot_is_immediately_recoverable_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sync-journal.stry");
+    let journal = SyncJournal::open(&path).unwrap();
+    journal
+        .enqueue_stats_commit(&stats_commit("commit-1", 100))
+        .unwrap();
+    assert!(journal
+        .complete_stats_snapshot(&steam_snapshot("commit-1", 101))
+        .unwrap());
+    let queued = journal
+        .pending_stats_snapshots(SCOPE, STEAM_ID, 101)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(journal.reopen_stats_commit(&queued, Some(7), 102).unwrap());
+    drop(journal);
+
+    let reopened = SyncJournal::open(&path).unwrap();
+    assert_eq!(
+        reopened.stats_awaiting_snapshot(SCOPE, STEAM_ID).unwrap(),
+        vec![620]
+    );
+    assert_eq!(
+        reopened
+            .next_stats_snapshot_attempt_at(SCOPE, STEAM_ID)
+            .unwrap(),
+        None,
+        "an awaiting marker must not create an upload retry deadline"
     );
 }
 

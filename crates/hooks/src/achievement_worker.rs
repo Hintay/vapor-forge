@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use prost::Message;
 use tracing::{info, warn};
 use vapor_forge_cloud_core::{
-    AchievementSchema, AppStatsUploadResult, AppStatsUploadStatus, CloudBackend,
-    OfficialAchievementState, OfficialStatState, SchemaUploadOutcome, StatsCommit,
-    SteamAppSnapshot, SteamStateUploadResult, UploadIdentity,
+    AchievementSchema, AppStatsUploadResult, AppStatsUploadStatus, OfficialAchievementState,
+    OfficialStatState, SchemaUploadOutcome, StatsCommit, SteamAppSnapshot, SteamStateUploadResult,
+    UploadIdentity,
 };
 use vapor_forge_core::unix_now;
 use vapor_forge_steam_protocol::{
@@ -24,75 +25,173 @@ struct AchievementWorker {
 
 static WORKER: OnceLock<AchievementWorker> = OnceLock::new();
 static WORKER_INIT: Mutex<()> = Mutex::new(());
+static CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 const READY_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct DeviceBindingGate {
+    permanently_blocked_generation: Option<u64>,
+}
+
+impl DeviceBindingGate {
+    fn allows(&self, generation: u64) -> bool {
+        self.permanently_blocked_generation != Some(generation)
+    }
+
+    fn record_failure(&mut self, generation: u64, retryable: bool) {
+        self.permanently_blocked_generation = (!retryable).then_some(generation);
+    }
+
+    fn record_success(&mut self) {
+        self.permanently_blocked_generation = None;
+    }
+
+    fn deadline(&self, generation: u64, deadline: Option<i64>) -> Option<i64> {
+        if self.allows(generation) {
+            deadline
+        } else {
+            None
+        }
+    }
+}
 
 pub fn ensure_started() {
     let _ = worker();
 }
 
 pub(crate) fn notify_context_changed() {
+    CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
     if let Some(worker) = WORKER.get() {
         worker.wake();
     }
 }
 
-pub(crate) fn stats_awaiting_snapshot() -> Vec<u32> {
-    let Some(worker) = worker() else {
-        return Vec::new();
-    };
-    let Some((backend, identity)) = upload_context() else {
-        return Vec::new();
-    };
-    let Ok(scope) = crate::sync_journal::principal_scope(backend.as_ref()) else {
-        return Vec::new();
-    };
-    worker
-        .journal
-        .stats_awaiting_snapshot(&scope, &identity.steam_id64, unix_now())
-        .unwrap_or_default()
+pub(crate) fn notify_principal_available() {
+    if let Some(worker) = WORKER.get() {
+        worker.wake();
+    }
 }
 
-pub(crate) fn persist_store_commit(app_id: u32, emsg: u32, request: &[u8]) -> bool {
+pub(crate) enum StoreCommitPersistence {
+    Persisted(crate::client::user_stats::StatsSnapshotIntent),
+    Stale,
+    InvalidRequest,
+    Failed,
+}
+
+pub(crate) fn stats_awaiting_snapshot(
+    owner: &crate::client::user_stats::StatsSnapshotOwner,
+) -> Vec<crate::client::user_stats::StatsSnapshotIntent> {
+    if !crate::client::user_stats::stats_snapshot_owner_is_current(owner) {
+        return Vec::new();
+    }
     let Some(worker) = worker() else {
-        return false;
+        return Vec::new();
     };
-    let Some((backend, identity)) = upload_context() else {
-        return false;
-    };
-    let Some(owner_scope) = crate::sync_journal::cached_principal_scope(backend.as_ref()) else {
-        return false;
-    };
-    let (base_crc_stats, mut dirty_stat_ids) = if emsg == EMSG_STORE_USERSTATS2 {
-        match ClientStoreUserStats2Request::decode(request) {
-            Ok(request) => (
-                request.crc_stats,
-                request
-                    .stats
-                    .into_iter()
-                    .filter_map(|stat| stat.stat_id)
-                    .collect(),
-            ),
-            Err(_) => return false,
+    let steam_id64 = owner.guard.steam_id64.to_string();
+    let app_ids = match worker
+        .journal
+        .stats_awaiting_snapshot(&owner.principal_scope, &steam_id64)
+    {
+        Ok(app_ids) => app_ids,
+        Err(error) => {
+            warn!(%error, "achievement-sync: failed to read pending stats commits");
+            return Vec::new();
         }
+    };
+    if !crate::client::user_stats::stats_snapshot_owner_is_current(owner) {
+        return Vec::new();
+    }
+    let intents = app_ids
+        .into_iter()
+        .filter_map(|app_id| {
+            let marker = match worker.journal.pending_stats_commit(
+                &owner.principal_scope,
+                &steam_id64,
+                app_id,
+            ) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    warn!(%error, app_id, "achievement-sync: failed to read pending stats commit");
+                    return None;
+                }
+            }?;
+            crate::client::user_stats::StatsSnapshotIntent::new(marker, owner)
+        })
+        .collect::<Vec<_>>();
+    if crate::client::user_stats::stats_snapshot_owner_is_current(owner) {
+        intents
     } else {
-        (None, Vec::new())
+        Vec::new()
+    }
+}
+
+pub(crate) fn persist_store_commit(
+    app_id: u32,
+    emsg: u32,
+    request: &[u8],
+    owner: &crate::client::user_stats::StatsSnapshotOwner,
+) -> StoreCommitPersistence {
+    if !crate::client::user_stats::stats_snapshot_owner_is_current(owner) {
+        return StoreCommitPersistence::Stale;
+    }
+    let Ok((base_crc_stats, mut dirty_stat_ids)) =
+        decode_store_commit(emsg, request, owner.guard.steam_id64)
+    else {
+        return StoreCommitPersistence::InvalidRequest;
+    };
+    let Some(worker) = worker() else {
+        return StoreCommitPersistence::Failed;
     };
     dirty_stat_ids.sort_unstable();
     dirty_stat_ids.dedup();
+    let owner_steam_id64 = owner.guard.steam_id64.to_string();
     let commit = StatsCommit {
-        owner_scope,
-        owner_steam_id64: identity.steam_id64.clone(),
-        commit_id: vapor_forge_cloud_core::stats_commit_id(&identity.steam_id64, app_id, request),
+        owner_scope: owner.principal_scope.clone(),
+        owner_steam_id64: owner_steam_id64.clone(),
+        commit_id: vapor_forge_cloud_core::stats_commit_id(&owner_steam_id64, app_id, request),
         app_id,
         base_crc_stats,
         dirty_stat_ids,
         observed_at: unix_now(),
     };
-    let persisted = worker.journal.enqueue_stats_commit(&commit).is_ok();
-    if persisted {
-        worker.wake();
+    if !crate::client::user_stats::stats_snapshot_owner_is_current(owner) {
+        return StoreCommitPersistence::Stale;
     }
-    persisted
+    let Some(intent) = crate::client::user_stats::StatsSnapshotIntent::new(commit.clone(), owner)
+    else {
+        return StoreCommitPersistence::Failed;
+    };
+    if worker.journal.enqueue_stats_commit(&commit).is_err() {
+        return StoreCommitPersistence::Failed;
+    }
+    worker.wake();
+    StoreCommitPersistence::Persisted(intent)
+}
+
+fn decode_store_commit(
+    emsg: u32,
+    request: &[u8],
+    owner_steam_id64: u64,
+) -> Result<(Option<u32>, Vec<u32>), ()> {
+    if emsg != EMSG_STORE_USERSTATS2 {
+        return Ok((None, Vec::new()));
+    }
+    let request = ClientStoreUserStats2Request::decode(request).map_err(|_| ())?;
+    if request
+        .settee_steam_id
+        .is_some_and(|steam_id| steam_id != owner_steam_id64)
+    {
+        return Err(());
+    }
+    Ok((
+        request.crc_stats,
+        request
+            .stats
+            .into_iter()
+            .filter_map(|stat| stat.stat_id)
+            .collect(),
+    ))
 }
 
 /// The authoritative unlock time for one achievement, or `None`.
@@ -109,7 +208,14 @@ fn unlocked_at(unlocked: bool, unlock_time: u32) -> Option<i64> {
 
 pub(crate) fn queue_official_snapshot(
     snapshot: crate::client::user_stats::AchievementSnapshot,
+    intent: &crate::client::user_stats::StatsSnapshotIntent,
 ) -> bool {
+    let app_id = snapshot.app_id;
+    if intent.marker.app_id != app_id
+        || !crate::client::user_stats::stats_refresh_guard_is_current(&intent.guard)
+    {
+        return true;
+    }
     // Asked here as well as at the trigger, because this is the last point before
     // the state becomes durable and every trigger drains through it. A genuinely
     // owned game's achievements are Steam's own to sync and must not be uploaded.
@@ -121,28 +227,14 @@ pub(crate) fn queue_official_snapshot(
     let Some(worker) = worker() else {
         return false;
     };
-    let Some((backend, identity)) = upload_context() else {
-        return false;
-    };
-    let Ok(scope) = crate::sync_journal::principal_scope(backend.as_ref()) else {
-        return false;
-    };
-    let commit =
-        match worker
-            .journal
-            .pending_stats_commit(&scope, &identity.steam_id64, snapshot.app_id)
-        {
-            Ok(Some(commit)) => commit,
-            Ok(None) => return true,
-            Err(_) => return false,
-        };
+    let commit = &intent.marker;
     let official = SteamAppSnapshot {
-        owner_scope: scope,
-        owner_steam_id64: identity.steam_id64,
-        commit_id: commit.commit_id,
-        app_id: snapshot.app_id,
+        owner_scope: commit.owner_scope.clone(),
+        owner_steam_id64: commit.owner_steam_id64.clone(),
+        commit_id: commit.commit_id.clone(),
+        app_id,
         base_crc_stats: commit.base_crc_stats,
-        dirty_stat_ids: commit.dirty_stat_ids,
+        dirty_stat_ids: commit.dirty_stat_ids.clone(),
         achievements: snapshot
             .achievements
             .into_iter()
@@ -163,14 +255,17 @@ pub(crate) fn queue_official_snapshot(
             .collect(),
         observed_at: unix_now(),
     };
-    let persisted = worker
-        .journal
-        .complete_stats_snapshot(&official)
-        .unwrap_or(false);
-    if persisted {
-        worker.wake();
+    if !crate::client::user_stats::stats_refresh_guard_is_current(&intent.guard) {
+        return true;
     }
-    persisted
+    match worker.journal.complete_stats_snapshot(&official) {
+        Ok(true) => {
+            worker.wake();
+            true
+        }
+        Ok(false) => true,
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn has_pending_stats(owner_scope: &str, steam_id64: &str, app_id: u32) -> bool {
@@ -250,6 +345,7 @@ fn persist_pending_schema(worker: &AchievementWorker, schema: &AchievementSchema
 fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
     let mut first_pass = true;
     let mut next_attempt_at = None;
+    let mut device_binding = DeviceBindingGate::default();
     loop {
         if !first_pass && !wait_for_upload_work(&wake, next_attempt_at) {
             break;
@@ -257,15 +353,30 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
         first_pass = false;
         persist_current_device_descriptor(&journal);
         for _ in 0..10 {
+            let binding_generation = CONTEXT_GENERATION.load(Ordering::Acquire);
+            let next =
+                device_binding.deadline(binding_generation, next_achievement_attempt_at(&journal));
+            if next.is_none_or(|deadline| deadline > unix_now()) {
+                break;
+            }
             let Some(backend) = crate::cloud_backend::backend_context() else {
                 break;
             };
             let Some(descriptor) = vapor_forge_cloud_core::device_descriptor() else {
                 break;
             };
-            if let Err(error) = backend.ensure_device_bound(&descriptor) {
-                warn!(%error, "achievement-sync: device binding deferred");
-                break;
+            match backend.ensure_device_bound(&descriptor) {
+                Ok(()) => device_binding.record_success(),
+                Err(error) => {
+                    let retryable = error.is_retryable();
+                    device_binding.record_failure(binding_generation, retryable);
+                    if retryable {
+                        warn!(%error, "achievement-sync: device binding deferred");
+                    } else {
+                        warn!(%error, "achievement-sync: device binding paused until context changes");
+                    }
+                    break;
+                }
             }
             let scope = backend.endpoint_scope();
             let mut attempted = false;
@@ -311,12 +422,9 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                 }
                 continue;
             };
-            let stats_scope = match crate::sync_journal::principal_scope(backend.as_ref()) {
-                Ok(scope) => scope,
-                Err(error) => {
-                    warn!(%error, "achievement-sync: principal scope unavailable");
-                    break;
-                }
+            let Some(stats_scope) = crate::sync_journal::cached_principal_scope(backend.as_ref())
+            else {
+                break;
             };
             let snapshots = match journal.pending_stats_snapshots(
                 &stats_scope,
@@ -373,7 +481,10 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                 break;
             }
         }
-        next_attempt_at = next_achievement_attempt_at(&journal);
+        next_attempt_at = device_binding.deadline(
+            CONTEXT_GENERATION.load(Ordering::Acquire),
+            next_achievement_attempt_at(&journal),
+        );
     }
 }
 
@@ -413,18 +524,15 @@ fn next_achievement_attempt_at(journal: &SyncJournal) -> Option<i64> {
     let Some(identity) = upload_identity() else {
         return schema;
     };
-    let stats = match crate::sync_journal::principal_scope(backend.as_ref()) {
-        Ok(scope) => match journal.next_stats_snapshot_attempt_at(&scope, &identity.steam_id64) {
+    let stats = match crate::sync_journal::cached_principal_scope(backend.as_ref()) {
+        Some(scope) => match journal.next_stats_snapshot_attempt_at(&scope, &identity.steam_id64) {
             Ok(next) => next,
             Err(error) => {
                 warn!(%error, "achievement-sync: failed to schedule stats journal");
                 None
             }
         },
-        Err(error) => {
-            warn!(%error, "achievement-sync: principal unavailable while scheduling retry");
-            Some(unix_now().saturating_add(READY_RETRY_DELAY.as_secs() as i64))
-        }
+        None => None,
     };
     match (schema, stats) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -444,24 +552,40 @@ fn refused_app_result<'a>(
 }
 
 fn queue_native_refresh_after_upload(snapshot: &SteamAppSnapshot) {
-    let Some(guard) = crate::client::user_stats::current_backend_refresh_guard() else {
+    let runtime_generation = crate::client::install::runtime_generation();
+    let Some(owner) = crate::client::user_stats::capture_stats_snapshot_owner(runtime_generation)
+    else {
         warn!(
             app_id = snapshot.app_id,
             "achievement-sync: cannot queue stats_out_of_date refresh without current runtime guard"
         );
         return;
     };
-    if !crate::client::user_stats::queue_backend_stats_refresh(snapshot.app_id, guard) {
+    if owner.principal_scope != snapshot.owner_scope
+        || owner.guard.steam_id64.to_string() != snapshot.owner_steam_id64
+    {
+        return;
+    }
+    let Some(worker) = worker() else {
+        return;
+    };
+    let marker = match worker.journal.pending_stats_commit(
+        &snapshot.owner_scope,
+        &snapshot.owner_steam_id64,
+        snapshot.app_id,
+    ) {
+        Ok(Some(marker)) if marker.commit_id == snapshot.commit_id => marker,
+        _ => return,
+    };
+    let Some(intent) = crate::client::user_stats::StatsSnapshotIntent::new(marker, &owner) else {
+        return;
+    };
+    if !crate::client::user_stats::queue_snapshot_refresh_then_read(intent) {
         warn!(
             app_id = snapshot.app_id,
             "achievement-sync: user-stats refresh worker unavailable after stats_out_of_date"
         );
-        return;
     }
-    // The refresh only re-merges Steam's cache; it never produces a snapshot. The
-    // reopened record has had its content cleared, so without this the record waits
-    // for content that nothing will ever supply and stays pending forever.
-    crate::client::user_stats::queue_snapshot_read(snapshot.app_id);
 }
 
 fn persist_current_device_descriptor(journal: &SyncJournal) {
@@ -489,10 +613,6 @@ fn upload_identity() -> Option<UploadIdentity> {
     })
 }
 
-fn upload_context() -> Option<(Arc<dyn CloudBackend>, UploadIdentity)> {
-    Some((crate::cloud_backend::backend_context()?, upload_identity()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +626,36 @@ mod tests {
         // back for a locked achievement describes the previous unlock.
         assert_eq!(unlocked_at(false, 1_515_505_966), None);
         assert_eq!(unlocked_at(false, 0), None);
+    }
+
+    #[test]
+    fn store_stats2_rejects_another_settee() {
+        let request = ClientStoreUserStats2Request {
+            game_id: Some(480),
+            settor_steam_id: Some(7),
+            settee_steam_id: Some(11),
+            crc_stats: Some(19),
+            explicit_reset: None,
+            stats: Vec::new(),
+        }
+        .encode_to_vec();
+
+        assert!(decode_store_commit(EMSG_STORE_USERSTATS2, &request, 11).is_ok());
+        assert!(decode_store_commit(EMSG_STORE_USERSTATS2, &request, 12).is_err());
+    }
+
+    #[test]
+    fn permanent_device_binding_failure_waits_for_a_context_change() {
+        let mut gate = DeviceBindingGate::default();
+        gate.record_failure(7, false);
+
+        assert!(!gate.allows(7));
+        assert_eq!(gate.deadline(7, Some(10)), None);
+        assert!(gate.allows(8));
+        assert_eq!(gate.deadline(8, Some(10)), Some(10));
+
+        gate.record_failure(8, true);
+        assert!(gate.allows(8));
+        assert_eq!(gate.deadline(8, Some(10)), Some(10));
     }
 }

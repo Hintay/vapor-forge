@@ -10,10 +10,8 @@ use std::ops::RangeBounds;
 use structsy::derive::{queries, Persistent, PersistentEmbedded};
 use vapor_forge_cloud_core::{
     AchievementSchema, DeviceDescriptor, OfficialAchievementState, OfficialStatState,
-    PlaytimeEntry, PlaytimeSession, StatsCommit, SteamAppSnapshot,
+    PlaytimeEntry, StatsCommit, SteamAppSnapshot,
 };
-
-use crate::retry::retry_delay;
 
 use crate::ConflictResolutionEvent;
 
@@ -48,35 +46,6 @@ pub(crate) trait PlaytimeQueries {
     fn scoped(self, owner_scope: String) -> Self;
     fn owned_by(self, owner_scope: String, owner_steam_id64: String) -> Self;
     fn for_app(self, app_id: u32) -> Self;
-    fn ready<R: RangeBounds<i64>>(self, next_attempt_at: R) -> Self;
-}
-
-#[derive(Persistent)]
-pub(crate) struct PlaytimeSessionRecord {
-    #[index(mode = "cluster")]
-    pub(crate) owner_scope: String,
-    #[index(mode = "cluster")]
-    pub(crate) owner_steam_id64: String,
-    #[index(mode = "cluster")]
-    pub(crate) session_id: String,
-    pub(crate) app_id: u32,
-    pub(crate) started_at: u32,
-    pub(crate) seconds: u32,
-    pub(crate) offline: bool,
-    pub(crate) owner_account_id: u32,
-    pub(crate) observed_at: i64,
-    pub(crate) revision: Revision,
-    pub(crate) attempts: i64,
-    #[index(mode = "cluster")]
-    pub(crate) next_attempt_at: i64,
-    pub(crate) created_at: i64,
-}
-
-#[queries(PlaytimeSessionRecord)]
-pub(crate) trait PlaytimeSessionQueries {
-    fn scoped(self, owner_scope: String) -> Self;
-    fn owned_by(self, owner_scope: String, owner_steam_id64: String) -> Self;
-    fn identified(self, owner_scope: String, owner_steam_id64: String, session_id: String) -> Self;
     fn ready<R: RangeBounds<i64>>(self, next_attempt_at: R) -> Self;
 }
 
@@ -265,40 +234,6 @@ impl PlaytimeRecord {
     }
 }
 
-impl PlaytimeSessionRecord {
-    pub(crate) fn new(session: &PlaytimeSession) -> Self {
-        Self {
-            owner_scope: session.owner_scope.clone(),
-            owner_steam_id64: session.owner_steam_id64.clone(),
-            session_id: session.session_id.clone(),
-            app_id: session.app_id,
-            started_at: session.started_at,
-            seconds: session.seconds,
-            offline: session.offline,
-            owner_account_id: session.owner_account_id,
-            observed_at: session.observed_at,
-            revision: 0,
-            attempts: 0,
-            next_attempt_at: 0,
-            created_at: session.observed_at,
-        }
-    }
-
-    pub(crate) fn value(&self) -> PlaytimeSession {
-        PlaytimeSession {
-            owner_scope: self.owner_scope.clone(),
-            owner_steam_id64: self.owner_steam_id64.clone(),
-            session_id: self.session_id.clone(),
-            app_id: self.app_id,
-            started_at: self.started_at,
-            seconds: self.seconds,
-            offline: self.offline,
-            owner_account_id: self.owner_account_id,
-            observed_at: self.observed_at,
-        }
-    }
-}
-
 impl SchemaRecord {
     pub(crate) fn new(schema: &AchievementSchema, now: i64) -> Self {
         Self {
@@ -390,9 +325,7 @@ impl StatsRecord {
     /// Return the record to the awaiting-snapshot state after the backend
     /// refused the upload, adopting the baseline the backend reported. Dropping
     /// the snapshot takes the record out of the upload queue until Steam
-    /// rebuilds it from the refreshed cache, so the retry carries merged state
-    /// instead of the state the backend just rejected. The backoff gives that
-    /// refresh time to land.
+    /// rebuilds it from the refreshed cache.
     pub(crate) fn reopen(&mut self, base_crc_stats: Option<u32>, now: i64) {
         self.base_crc_stats = base_crc_stats;
         self.snapshot_observed_at = None;
@@ -400,8 +333,8 @@ impl StatsRecord {
         self.snapshot_stats = Vec::new();
         self.observed_at = now;
         self.revision = self.revision.wrapping_add(1);
-        self.next_attempt_at = now.saturating_add(retry_delay(self.attempts));
-        self.attempts = self.attempts.saturating_add(1);
+        self.attempts = 0;
+        self.next_attempt_at = 0;
     }
 
     pub(crate) fn snapshot(&self) -> Option<SteamAppSnapshot> {

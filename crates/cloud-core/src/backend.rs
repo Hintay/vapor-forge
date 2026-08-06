@@ -1,7 +1,6 @@
 use crate::{
-    AccountPlaytimeSnapshot, AccountStatsWakeup, AccountSyncState, AchievementSchema,
-    AppStatsQuery, AppStatsResult, DeviceDescriptor, PlaytimeEntry, PlaytimeSession,
-    SteamAppSnapshot, SteamStateUploadResult, UploadIdentity,
+    AccountStreamEvent, AccountSyncState, AchievementSchema, AppStatsQuery, AppStatsResult,
+    DeviceDescriptor, PlaytimeEntry, SteamAppSnapshot, SteamStateUploadResult, UploadIdentity,
 };
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
@@ -216,16 +215,6 @@ pub trait CloudBackend: Send + Sync {
         entries: &[PlaytimeEntry],
     ) -> Result<(), BackendError>;
 
-    /// Whether disconnected-session events are part of this backend's protocol.
-    fn accepts_playtime_sessions(&self) -> bool;
-
-    fn upload_playtime_sessions(
-        &self,
-        client_id: u64,
-        steam_id64: &str,
-        sessions: &[PlaytimeSession],
-    ) -> Result<(), BackendError>;
-
     fn upload_steam_app_snapshot(
         &self,
         identity: &UploadIdentity,
@@ -248,28 +237,15 @@ pub trait CloudBackend: Send + Sync {
         query: &AppStatsQuery,
     ) -> Result<AppStatsResult, BackendError>;
 
-    /// Stream committed playtime snapshots until the runtime context expires.
-    /// Implementations reconnect transient transport failures internally and
-    /// invoke `on_snapshot` only with complete authoritative snapshots.
-    fn stream_playtime(
+    /// Stream account synchronization events until the runtime context expires.
+    /// Implementations own one reconnect lifecycle and publish one baseline per
+    /// successful subscription round.
+    fn stream_account_events(
         &self,
         _client_id: u64,
         _steam_id64: &str,
         _cancellation: &StreamCancellation,
-        _on_snapshot: &mut dyn FnMut(AccountPlaytimeSnapshot),
-    ) -> Result<StreamOutcome, BackendError> {
-        Ok(StreamOutcome::Unsupported)
-    }
-
-    /// Stream wakeup-only stats notifications. Implementations must not carry
-    /// achievements or stat values here; callers re-enter Steam's native
-    /// RequestCurrentStats path for the actual state merge.
-    fn stream_stats_wakeup(
-        &self,
-        _client_id: u64,
-        _steam_id64: &str,
-        _cancellation: &StreamCancellation,
-        _on_wakeup: &mut dyn FnMut(AccountStatsWakeup),
+        _on_event: &mut dyn FnMut(AccountStreamEvent),
     ) -> Result<StreamOutcome, BackendError> {
         Ok(StreamOutcome::Unsupported)
     }

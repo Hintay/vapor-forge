@@ -1,5 +1,5 @@
 use serde::Serialize;
-use vapor_forge_cloud_core::{PlaytimeEntry, PlaytimeSession};
+use vapor_forge_cloud_core::PlaytimeEntry;
 
 use crate::{CumulusClient, CumulusError, CumulusSettings};
 
@@ -7,12 +7,6 @@ use crate::{CumulusClient, CumulusError, CumulusSettings};
 struct UploadRequest<'a> {
     steam_id64: &'a str,
     apps: &'a [PlaytimeEntry],
-}
-
-#[derive(Serialize)]
-struct SessionUploadRequest<'a> {
-    steam_id64: &'a str,
-    sessions: &'a [PlaytimeSession],
 }
 
 pub fn upload(
@@ -29,24 +23,6 @@ pub fn upload(
         &UploadRequest {
             steam_id64,
             apps: entries,
-        },
-    )
-}
-
-pub fn upload_sessions(
-    settings: &CumulusSettings,
-    client_id: u64,
-    steam_id64: &str,
-    sessions: &[PlaytimeSession],
-) -> Result<(), CumulusError> {
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    CumulusClient::new(settings, Some(client_id)).post_json_unit(
-        "/api/v1/device/playtime-sessions",
-        &SessionUploadRequest {
-            steam_id64,
-            sessions,
         },
     )
 }
@@ -137,40 +113,5 @@ mod tests {
         assert_eq!(body["steam_id64"], "76561198000000091");
         assert_eq!(body["apps"][0]["app_id"], 620);
         assert!(body["apps"][0].get("owner_scope").is_none());
-    }
-
-    #[test]
-    fn uploads_playtime_session_contract() {
-        let (settings, receiver) = capture_request();
-        let session = PlaytimeSession {
-            owner_scope: "scope-a".into(),
-            owner_steam_id64: "76561198000000091".into(),
-            session_id: "session-a".into(),
-            app_id: 620,
-            started_at: 1_800_000_000,
-            seconds: 90,
-            offline: true,
-            owner_account_id: 91,
-            observed_at: 1_800_000_090,
-        };
-        upload_sessions(
-            &settings,
-            91,
-            "76561198000000091",
-            std::slice::from_ref(&session),
-        )
-        .unwrap();
-
-        let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(request.starts_with("POST /api/v1/device/playtime-sessions HTTP/1.1"));
-        assert!(request
-            .to_ascii_lowercase()
-            .contains("x-cumulus-steam-client-id: 91"));
-        let body: serde_json::Value =
-            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(body["steam_id64"], "76561198000000091");
-        assert_eq!(body["sessions"][0]["session_id"], "session-a");
-        assert_eq!(body["sessions"][0]["seconds"], 90);
-        assert!(body["sessions"][0].get("owner_scope").is_none());
     }
 }
