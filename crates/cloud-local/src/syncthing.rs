@@ -382,6 +382,20 @@ fn retryable(message: impl Into<String>) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread::JoinHandle;
+
+    const CONFIG_SYNC: &str = r#"{"configInSync":true}"#;
+    const IGNORES: &str = r#"{"ignore":[],"expanded":[]}"#;
+    const IDLE_SEQUENCE_7: &str = r#"{"state":"idle","sequence":7}"#;
+    const IDLE_SEQUENCE_8: &str = r#"{"state":"idle","sequence":8}"#;
+    const INDEXED_FOUR_BYTES: &str =
+        r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":4}}"#;
+    const INDEXED_THREE_BYTES: &str =
+        r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":3}}"#;
 
     #[test]
     fn remote_plaintext_api_is_rejected() {
@@ -417,5 +431,321 @@ mod tests {
             expanded: Vec::new(),
         }
         .has_effective_rules());
+    }
+
+    #[test]
+    fn gc_boundary_scans_verifies_and_publishes_in_order() {
+        let (repository, report) = repository_fixture();
+        let server = MockServer::start(vec![
+            ok(CONFIG_SYNC),
+            ok(&folder_config(repository.path())),
+            ok(IGNORES),
+            ok("{}"),
+            ok(IDLE_SEQUENCE_7),
+            ok(INDEXED_FOUR_BYTES),
+            ok(INDEXED_THREE_BYTES),
+            ok("{}"),
+            ok(IDLE_SEQUENCE_8),
+        ]);
+        let settings = settings(&server.url);
+
+        let boundary = settings.prepare_for_gc(repository.path(), &report).unwrap();
+        assert_eq!(boundary.sequence, 7);
+        assert_eq!(boundary.relative_app, report.manifest_scope);
+        settings.publish_gc(boundary).unwrap();
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 9);
+        assert_request(&requests[0], "GET", "/rest/system/config/insync");
+        assert_request(&requests[1], "GET", "/rest/config/folders");
+        assert_request(&requests[2], "GET", "/rest/db/ignores?folder=cloud");
+        assert_scan(&requests[3], &report.manifest_scope);
+        assert_request(&requests[4], "GET", "/rest/db/status?folder=cloud");
+        assert_file_lookup(
+            &requests[5],
+            &format!("{}/retained/manifest.json", report.manifest_scope),
+        );
+        assert_file_lookup(
+            &requests[6],
+            &format!("{}/candidate/files/save.bin", report.manifest_scope),
+        );
+        assert_scan(&requests[7], &report.manifest_scope);
+        assert_request(&requests[8], "GET", "/rest/db/status?folder=cloud");
+        assert!(requests.iter().all(|request| request
+            .to_ascii_lowercase()
+            .contains("x-api-key: secret\r\n")));
+    }
+
+    #[test]
+    fn prepare_fails_closed_before_indexing_an_unsettled_folder() {
+        let (repository, report) = repository_fixture();
+        let server = MockServer::start(vec![
+            ok(CONFIG_SYNC),
+            ok(&folder_config(repository.path())),
+            ok(IGNORES),
+            ok("{}"),
+            ok(r#"{"state":"syncing","sequence":7,"needFiles":1}"#),
+            ok(INDEXED_FOUR_BYTES),
+        ]);
+
+        let error = settings(&server.url)
+            .prepare_for_gc(repository.path(), &report)
+            .err()
+            .unwrap();
+        assert!(error.is_retryable());
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 5);
+        assert!(requests
+            .iter()
+            .all(|request| !request.starts_with("GET /rest/db/file?")));
+    }
+
+    #[test]
+    fn prepare_fails_closed_when_scan_is_rejected() {
+        let (repository, report) = repository_fixture();
+        let server = MockServer::start(vec![
+            ok(CONFIG_SYNC),
+            ok(&folder_config(repository.path())),
+            ok(IGNORES),
+            (500, "{}".into()),
+            ok(IDLE_SEQUENCE_7),
+        ]);
+
+        let error = settings(&server.url)
+            .prepare_for_gc(repository.path(), &report)
+            .err()
+            .unwrap();
+        assert!(error.is_retryable());
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4);
+        assert_scan(&requests[3], &report.manifest_scope);
+    }
+
+    #[test]
+    fn prepare_fails_closed_for_incomplete_index_records() {
+        let cases = [
+            (200, r#"{"local":null}"#),
+            (
+                200,
+                r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":5}}"#,
+            ),
+            (
+                200,
+                r#"{"local":{"deleted":true,"invalid":false,"ignored":false,"size":4}}"#,
+            ),
+            (500, "{}"),
+            (200, "{"),
+        ];
+
+        for (status, index_record) in cases {
+            let (repository, report) = repository_fixture();
+            let server = MockServer::start(vec![
+                ok(CONFIG_SYNC),
+                ok(&folder_config(repository.path())),
+                ok(IGNORES),
+                ok("{}"),
+                ok(IDLE_SEQUENCE_7),
+                (status, index_record.into()),
+                ok(INDEXED_THREE_BYTES),
+            ]);
+
+            let error = settings(&server.url)
+                .prepare_for_gc(repository.path(), &report)
+                .err()
+                .unwrap();
+            assert!(error.is_retryable());
+
+            let requests = server.finish();
+            assert_eq!(requests.len(), 6);
+            assert_file_lookup(
+                &requests[5],
+                &format!("{}/retained/manifest.json", report.manifest_scope),
+            );
+        }
+    }
+
+    #[test]
+    fn publish_requires_a_settled_advanced_sequence() {
+        for status in [
+            IDLE_SEQUENCE_7,
+            r#"{"state":"syncing","sequence":8}"#,
+            r#"{"state":"idle","sequence":8,"needDeletes":1}"#,
+        ] {
+            let server = MockServer::start(vec![ok("{}"), ok(status)]);
+            let boundary = SyncthingBoundary {
+                sequence: 7,
+                relative_app: "76561198000000000/480".into(),
+            };
+
+            let error = settings(&server.url).publish_gc(boundary).err().unwrap();
+            assert!(error.is_retryable());
+
+            let requests = server.finish();
+            assert_eq!(requests.len(), 2);
+            assert_scan(&requests[0], "76561198000000000/480");
+            assert_request(&requests[1], "GET", "/rest/db/status?folder=cloud");
+        }
+    }
+
+    fn repository_fixture() -> (tempfile::TempDir, GcReport) {
+        let repository = tempfile::tempdir().unwrap();
+        let manifest_scope = "76561198000000000/480";
+        let retained = repository.path().join(manifest_scope).join("retained");
+        let candidate = repository
+            .path()
+            .join(manifest_scope)
+            .join("candidate/files");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::create_dir_all(&candidate).unwrap();
+        std::fs::write(retained.join("manifest.json"), b"head").unwrap();
+        std::fs::write(candidate.join("save.bin"), b"xyz").unwrap();
+        (
+            repository,
+            GcReport {
+                app_id: 480,
+                manifest_scope: manifest_scope.into(),
+                retained_manifests: vec!["retained".into()],
+                candidate_manifests: vec!["candidate".into()],
+            },
+        )
+    }
+
+    fn folder_config(repository: &Path) -> String {
+        serde_json::json!([{
+            "id": "cloud",
+            "path": repository.canonicalize().unwrap(),
+            "paused": false,
+            "type": "sendreceive",
+            "ignoreDelete": false,
+        }])
+        .to_string()
+    }
+
+    fn settings(url: &str) -> SyncthingGcConfig {
+        SyncthingGcConfig {
+            url: url.into(),
+            api_key: "secret".into(),
+            folder_id: "cloud".into(),
+            timeout_ms: 1_000,
+        }
+    }
+
+    fn ok(body: &str) -> (u16, String) {
+        (200, body.into())
+    }
+
+    fn assert_request(request: &str, method: &str, target: &str) {
+        assert!(
+            request.starts_with(&format!("{method} {target} HTTP/1.1\r\n")),
+            "unexpected request: {request}"
+        );
+    }
+
+    fn assert_scan(request: &str, relative: &str) {
+        assert_query_request(request, "POST", "/rest/db/scan");
+        assert!(request_line(request).contains("folder=cloud"));
+        assert_query_path(request, "sub", relative);
+    }
+
+    fn assert_file_lookup(request: &str, relative: &str) {
+        assert_query_request(request, "GET", "/rest/db/file");
+        assert!(request_line(request).contains("folder=cloud"));
+        assert_query_path(request, "file", relative);
+    }
+
+    fn assert_query_request(request: &str, method: &str, target: &str) {
+        assert!(
+            request.starts_with(&format!("{method} {target}?")),
+            "unexpected request: {request}"
+        );
+    }
+
+    fn assert_query_path(request: &str, key: &str, value: &str) {
+        let encoded = value.replace('/', "%2F");
+        let line = request_line(request);
+        assert!(
+            line.contains(&format!("{key}={encoded}")) || line.contains(&format!("{key}={value}")),
+            "missing query value in request: {request}"
+        );
+    }
+
+    fn request_line(request: &str) -> &str {
+        request.lines().next().unwrap()
+    }
+
+    struct MockServer {
+        url: String,
+        requests: mpsc::Receiver<String>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl MockServer {
+        fn start(responses: Vec<(u16, String)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sender, requests) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                for (status, body) in responses {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).unwrap();
+                                break stream;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if thread_stop.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("mock Syncthing server failed: {error}"),
+                        }
+                    };
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    loop {
+                        let count = stream.read(&mut buffer).unwrap();
+                        request.extend_from_slice(&buffer[..count]);
+                        if count == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    sender.send(String::from_utf8(request).unwrap()).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            Self {
+                url: format!("http://{address}"),
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            self.stop.store(true, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+            self.requests.try_iter().collect()
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 }
