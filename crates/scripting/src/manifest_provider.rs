@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use tracing::{info, warn};
 use vapor_forge_core::ScriptState;
@@ -137,16 +136,6 @@ impl ManifestCodeProvider {
             }
         }
         Ok(None)
-    }
-
-    pub fn fetch_with_timeout(
-        &self,
-        app_id: u32,
-        depot_id: u32,
-        gid: u64,
-        _timeout: Duration,
-    ) -> Result<Option<u64>, String> {
-        self.fetch(app_id, depot_id, gid)
     }
 
     pub fn has_basic(&self) -> bool {
