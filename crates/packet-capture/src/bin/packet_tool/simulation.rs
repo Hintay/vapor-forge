@@ -55,6 +55,7 @@ pub(super) struct SimulationContext<'a> {
     ownership: Option<&'a HashMap<AppId, OwnershipState>>,
     avatar_map: Option<&'a HashMap<AppId, AppId>>,
     stat_steam_ids: Option<&'a HashMap<AppId, u64>>,
+    manifest_provider_available: Option<bool>,
     missing: RefCell<Vec<&'static str>>,
 }
 
@@ -65,6 +66,7 @@ impl<'a> SimulationContext<'a> {
             ownership: None,
             avatar_map: None,
             stat_steam_ids: None,
+            manifest_provider_available: None,
             missing: RefCell::new(Vec::new()),
         }
     }
@@ -75,12 +77,14 @@ impl<'a> SimulationContext<'a> {
         ownership: &'a HashMap<AppId, OwnershipState>,
         avatar_map: &'a HashMap<AppId, AppId>,
         stat_steam_ids: &'a HashMap<AppId, u64>,
+        manifest_provider_available: bool,
     ) -> Self {
         Self {
             config,
             ownership: Some(ownership),
             avatar_map: Some(avatar_map),
             stat_steam_ids: Some(stat_steam_ids),
+            manifest_provider_available: Some(manifest_provider_available),
             missing: RefCell::new(Vec::new()),
         }
     }
@@ -111,6 +115,16 @@ impl<'a> SimulationContext<'a> {
 
     fn stat_steam_ids(&self) -> Option<&HashMap<AppId, u64>> {
         self.stat_steam_ids
+    }
+
+    fn manifest_provider_available(&self) -> bool {
+        match self.manifest_provider_available {
+            Some(available) => available,
+            None => {
+                self.record_missing("manifest provider availability");
+                true
+            }
+        }
     }
 
     fn record_missing(&self, dependency: &'static str) {
@@ -372,10 +386,14 @@ fn simulate_manifest_request(
             );
         }
     };
+    let app_id = AppId(fetch.app_id);
+    let ownership = context.ownership(app_id);
+    let provider_available = context.manifest_provider_available();
     let intercept = request_code::should_intercept_with_ownership(
-        AppId(fetch.app_id),
+        app_id,
         context.config,
-        |app_id| context.ownership(app_id),
+        provider_available,
+        |_| ownership,
     );
     if !context.missing().is_empty() {
         return missing_runtime_result(

@@ -850,20 +850,25 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
 
     let runtime = crate::client::install::runtime_snapshot();
     let cfg = &runtime.config;
-    if !request_code::should_intercept(AppId(app_id), cfg) {
+    if !request_code::should_intercept(AppId(app_id), cfg, runtime.manifest_code_provider.is_some())
+    {
         return false;
     }
+    let Some(provider) = runtime.manifest_code_provider.clone() else {
+        debug!(
+            app_id,
+            depot_id, gid, "netpacket: manifest request has no script provider, passing through"
+        );
+        return false;
+    };
 
     info!(
         app_id,
         depot_id, gid, job_id, "netpacket: intercepted manifest request code"
     );
-    let provider_timeout = std::time::Duration::from_millis(cfg.manifest.timeout_ms);
-    let lua_callback = runtime.manifest_code_provider.clone().map(|provider| {
-        std::sync::Arc::new(move |app_id, depot_id, gid| {
-            provider.fetch_with_timeout(app_id, depot_id, gid, provider_timeout)
-        }) as request_code::ManifestCodeCallback
-    });
+    let callback =
+        std::sync::Arc::new(move |app_id, depot_id, gid| provider.fetch(app_id, depot_id, gid))
+            as request_code::ManifestCodeCallback;
     PENDING.queue_fetch(
         request_code::ManifestCodeFetch {
             job_id,
@@ -872,8 +877,7 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
             gid,
             req_hdr_bytes,
         },
-        cfg,
-        lua_callback,
+        callback,
         crate::client::network::injection_generation(),
     )
 }

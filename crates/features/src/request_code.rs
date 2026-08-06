@@ -4,11 +4,12 @@
 //! `ContentServerDirectory.GetManifestRequestCode#1` RPCs, all without
 //! any `unsafe` code.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
@@ -58,14 +59,6 @@ pub fn plan_fetch(
 /// ServiceMethod name we intercept.
 pub const TARGET_JOB_NAME: &str = vapor_forge_steam_protocol::MANIFEST_REQUEST_CODE_JOB_NAME;
 
-/// Manifest code provider endpoints.
-/// `{gid}` is replaced with the manifest ID.
-pub const PROVIDERS: &[(&str, &str)] = &[
-    ("opensteamtool", "https://manifest.opensteamtool.com/{gid}"),
-    ("wudrm", "http://gmrc.wudrm.com/manifest/{gid}"),
-    ("steamrun", "https://manifest.steam.run/api/manifest/{gid}"),
-];
-
 const MAX_PENDING_FETCHES: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -104,12 +97,11 @@ impl PendingQueue {
     }
 
     /// Queue a new manifest code fetch. Spawns a background thread to call
-    /// the external providers and stores the result for later draining.
+    /// the configured script callback and stores the result for later draining.
     pub fn queue_fetch(
         &self,
         request: ManifestCodeFetch,
-        config: &RuntimeConfig,
-        lua_callback: Option<ManifestCodeCallback>,
+        callback: ManifestCodeCallback,
         response_generation: u64,
     ) -> bool {
         let ManifestCodeFetch {
@@ -143,27 +135,23 @@ impl PendingQueue {
             list.push(pending);
         }
 
-        let providers: Vec<String> = config.manifest.providers.clone();
-        let timeout_connect_ms = config.manifest.timeout_connect_ms;
-        let timeout_ms = config.manifest.timeout_ms;
-
-        // Spawn a thread to fetch the manifest code
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
         let spawn_result = std::thread::Builder::new()
             .name("manifest-code-fetch".to_owned())
             .spawn(move || {
-                let lua_code =
-                    lua_callback.and_then(|callback| match callback(app_id, depot_id, gid) {
-                        Ok(code) => code,
-                        Err(error) => {
-                            warn!(gid, %error, "request_code: Lua provider unavailable");
-                            None
-                        }
-                    });
-                let code = lua_code.or_else(|| {
-                    fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms)
-                });
+                let code = match catch_unwind(AssertUnwindSafe(|| callback(app_id, depot_id, gid)))
+                {
+                    Ok(Ok(code)) => code,
+                    Ok(Err(error)) => {
+                        warn!(gid, %error, "request_code: script provider unavailable");
+                        None
+                    }
+                    Err(_) => {
+                        warn!(gid, "request_code: script provider panicked");
+                        None
+                    }
+                };
                 {
                     let mut lock = result_clone.lock().unwrap();
                     // Some(0) = failed, Some(n) = success
@@ -227,19 +215,25 @@ impl Default for PendingQueue {
 // Interception check
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if this app's request should be intercepted (dropped from
-/// the outgoing wire and fetched from an external provider instead).
-pub fn should_intercept(app_id: AppId, config: &RuntimeConfig) -> bool {
-    should_intercept_with_ownership(app_id, config, crate::apps::actual_ownership)
+/// Returns `true` if this app requires an injected manifest request code.
+pub fn should_intercept(app_id: AppId, config: &RuntimeConfig, provider_available: bool) -> bool {
+    should_intercept_with_ownership(
+        app_id,
+        config,
+        provider_available,
+        crate::apps::actual_ownership,
+    )
 }
 
 pub fn should_intercept_with_ownership(
     app_id: AppId,
     config: &RuntimeConfig,
+    provider_available: bool,
     ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
 ) -> bool {
-    crate::apps::classify_app_with_ownership(config, app_id, ownership)
-        .requires_injected_ownership()
+    provider_available
+        && crate::apps::classify_app_with_ownership(config, app_id, ownership)
+            .requires_injected_ownership()
 }
 
 // ---------------------------------------------------------------------------
@@ -280,108 +274,6 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
     let emsg_raw = EMSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG;
 
     vapor_forge_steam_protocol::assemble_raw(emsg_raw, &hdr_bytes, &body_bytes)
-}
-
-// ---------------------------------------------------------------------------
-// HTTP fetch with provider fallback
-// ---------------------------------------------------------------------------
-
-/// Fetch the manifest request code from external providers.
-/// Returns `Some(code)` on success, `None` on failure.
-fn fetch_manifest_code(
-    gid: u64,
-    providers: &[String],
-    timeout_connect_ms: u64,
-    timeout_ms: u64,
-) -> Option<u64> {
-    for provider_name in providers {
-        let url_template = match provider_name.as_str() {
-            "opensteamtool" => "https://manifest.opensteamtool.com/{gid}",
-            "wudrm" => "http://gmrc.wudrm.com/manifest/{gid}",
-            "steamrun" => "https://manifest.steam.run/api/manifest/{gid}",
-            unknown => {
-                warn!(
-                    provider = unknown,
-                    "request_code: unknown provider, skipping"
-                );
-                continue;
-            }
-        };
-        let url = url_template.replace("{gid}", &gid.to_string());
-        let name = provider_name.as_str();
-        debug!(provider = name, url = %url, "request_code: trying provider");
-
-        match fetch_from_provider(name, &url, timeout_connect_ms, timeout_ms) {
-            Ok(code) if code > 0 => {
-                info!(
-                    provider = name,
-                    gid, code, "request_code: manifest code obtained"
-                );
-                return Some(code);
-            }
-            Ok(_) => {
-                warn!(provider = name, gid, "request_code: provider returned 0");
-            }
-            Err(e) => {
-                warn!(provider = name, gid, error = %e, "request_code: provider failed");
-            }
-        }
-    }
-
-    error!(gid, "request_code: all providers failed");
-    None
-}
-
-/// User-Agent used only when hitting the opensteamtool endpoint. The other
-/// providers get ureq's default UA — sending "OpenSteamTool/1.0" to them
-/// would pollute their stats and misattribute vapor-forge traffic as OST.
-const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
-
-fn fetch_from_provider(
-    name: &str,
-    url: &str,
-    timeout_connect_ms: u64,
-    timeout_ms: u64,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_millis(timeout_connect_ms)))
-        .timeout_global(Some(std::time::Duration::from_millis(timeout_ms)))
-        .build()
-        .new_agent();
-
-    let mut req = agent.get(url);
-    if name == "opensteamtool" {
-        req = req.header("User-Agent", OPENSTEAMTOOL_USER_AGENT);
-    }
-
-    let body = req.call()?.body_mut().read_to_string()?;
-    let body = body.trim();
-
-    if name == "steamrun" {
-        parse_steamrun_content(body)
-    } else {
-        body.parse::<u64>()
-            .map_err(|e| format!("parse error: {} (body: {:?})", e, body).into())
-    }
-}
-
-/// steam.run returns `{... "content": "12345" ...}`; the value is a quoted
-/// uint string. Extracts and parses it. Matches OpenSteamTool's
-/// `ParseSteamRunJson`.
-fn parse_steamrun_content(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let key = "\"content\"";
-    let pos = body.find(key).ok_or("missing content key")?;
-    let after_key = &body[pos + key.len()..];
-    let q1 = after_key
-        .find('"')
-        .ok_or("missing opening quote after content")?;
-    let value_start = &after_key[q1 + 1..];
-    let q2 = value_start
-        .find('"')
-        .ok_or("missing closing quote after content")?;
-    value_start[..q2]
-        .parse::<u64>()
-        .map_err(|e| format!("parse error: {} (value: {:?})", e, &value_start[..q2]).into())
 }
 
 #[cfg(test)]
@@ -470,8 +362,9 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(should_intercept(AppId(480), &config));
-        assert!(!should_intercept(AppId(999), &config));
+        assert!(should_intercept(AppId(480), &config, true));
+        assert!(!should_intercept(AppId(480), &config, false));
+        assert!(!should_intercept(AppId(999), &config, true));
 
         let owned_app = AppId(246_813_583);
         let owned_config = RuntimeConfig {
@@ -487,7 +380,7 @@ mod tests {
             ..Default::default()
         };
         crate::apps::record_actual_ownership(owned_app, true);
-        assert!(!should_intercept(owned_app, &owned_config));
+        assert!(!should_intercept(owned_app, &owned_config, true));
     }
 
     #[test]
@@ -508,8 +401,7 @@ mod tests {
                 gid: 1234,
                 req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
             },
-            &RuntimeConfig::default(),
-            Some(callback),
+            callback,
             7,
         ));
 
@@ -550,8 +442,7 @@ mod tests {
                     gid: job_id + 100,
                     req_hdr_bytes: Vec::new(),
                 },
-                &RuntimeConfig::default(),
-                Some(Arc::clone(&callback)),
+                Arc::clone(&callback),
                 7,
             ));
         }
@@ -563,33 +454,73 @@ mod tests {
                 gid: 999,
                 req_hdr_bytes: Vec::new(),
             },
-            &RuntimeConfig::default(),
-            Some(callback),
+            callback,
             7,
         ));
         barrier.wait();
     }
 
     #[test]
-    fn parse_steamrun_content_valid() {
-        let body = r#"{"content":"12345678"}"#;
-        assert_eq!(parse_steamrun_content(body).unwrap(), 12345678);
+    fn pending_queue_completes_provider_failure() {
+        let queue = PendingQueue::new();
+        let callback: ManifestCodeCallback = Arc::new(|_, _, _| Err("unavailable".to_owned()));
+        assert!(queue.queue_fetch(
+            ManifestCodeFetch {
+                job_id: 99,
+                app_id: 480,
+                depot_id: 481,
+                gid: 1234,
+                req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
+            },
+            callback,
+            7,
+        ));
+
+        let completed = (0..100)
+            .find_map(|_| {
+                let completed = queue.drain_completed();
+                if completed.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                } else {
+                    Some(completed)
+                }
+            })
+            .expect("provider failure did not complete");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].job_id, 99);
+        assert_eq!(completed[0].code, 0);
     }
 
     #[test]
-    fn parse_steamrun_content_tolerates_whitespace_and_extras() {
-        let body = r#"{ "gid":"1", "content": "9999999999" , "note":"ok" }"#;
-        assert_eq!(parse_steamrun_content(body).unwrap(), 9999999999);
-    }
+    fn pending_queue_completes_provider_panic() {
+        let queue = PendingQueue::new();
+        let callback: ManifestCodeCallback = Arc::new(|_, _, _| panic!("provider panic"));
+        assert!(queue.queue_fetch(
+            ManifestCodeFetch {
+                job_id: 99,
+                app_id: 480,
+                depot_id: 481,
+                gid: 1234,
+                req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
+            },
+            callback,
+            7,
+        ));
 
-    #[test]
-    fn parse_steamrun_content_no_key() {
-        assert!(parse_steamrun_content(r#"{"other":"1"}"#).is_err());
-    }
-
-    #[test]
-    fn parse_steamrun_content_zero() {
-        let body = r#"{"content":"0"}"#;
-        assert_eq!(parse_steamrun_content(body).unwrap(), 0);
+        let completed = (0..100)
+            .find_map(|_| {
+                let completed = queue.drain_completed();
+                if completed.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                } else {
+                    Some(completed)
+                }
+            })
+            .expect("provider panic did not complete");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].job_id, 99);
+        assert_eq!(completed[0].code, 0);
     }
 }
