@@ -1,0 +1,98 @@
+{
+  "iced-x86 1.21.0": {
+    "declared_license": "MIT",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/iced-x86-1.21.0-MIT.txt",
+        "sha256": "93a47598376fd3f276b631e75149340087153c6ff1635a53c5790249e9124e2d",
+        "source": "https://raw.githubusercontent.com/icedland/iced/c50f29b7bc305696895c075f3fc7719751426b12/LICENSE.txt"
+      }
+    ]
+  },
+  "mlua-sys 0.6.8": {
+    "declared_license": "MIT",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/mlua-sys-0.6.8-MIT.txt",
+        "sha256": "63b61a30d3e3abcfcb1bda4b99f4eea9fdb7d6ab05fbc513461fef6cf89baf29",
+        "source": "https://raw.githubusercontent.com/mlua-rs/mlua/31efd0cf727c3aee0b733a8dedac024589e1700c/LICENSE"
+      }
+    ]
+  },
+  "r-efi 6.0.0": {
+    "declared_license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/r-efi-6.0.0-AUTHORS.txt",
+        "sha256": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111",
+        "source": "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS"
+      }
+    ]
+  },
+  "slice-pool2 0.4.3": {
+    "declared_license": "MIT",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/slice-pool2-0.4.3-MIT.txt",
+        "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+        "source": "https://raw.githubusercontent.com/spdx/license-list-data/c4a7237ec8f4654e867546f9f409749300f1bf4c/text/MIT.txt"
+      }
+    ]
+  },
+  "structsy 0.5.2": {
+    "declared_license": "MIT",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/structsy-0.5.2-MIT.txt",
+        "sha256": "ece958f526a8b6e9a9e605722a8d85032910549acc48ac61ea9482e1f7be47ef",
+        "source": "https://gitlab.com/tglman/structsy/-/raw/40039054c88f0a4ae872c10b7cf1b8f48d67efaa/LICENSE"
+      }
+    ]
+  },
+  "structsy-derive 0.5.2": {
+    "declared_license": "MIT",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/structsy-0.5.2-MIT.txt",
+        "sha256": "ece958f526a8b6e9a9e605722a8d85032910549acc48ac61ea9482e1f7be47ef",
+        "source": "https://gitlab.com/tglman/structsy/-/raw/1a2c6251276c81b95a6970c4ee05bf49a231b15b/LICENSE"
+      }
+    ]
+  },
+  "winapi-i686-pc-windows-gnu 0.4.0": {
+    "declared_license": "MIT/Apache-2.0",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/winapi-targets-0.4.0-MIT.txt",
+        "sha256": "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b",
+        "source": "https://raw.githubusercontent.com/retep998/winapi-rs/796a8e6c2971dc2ff1bcff166e6671284f9b5b6b/LICENSE-MIT"
+      }
+    ]
+  },
+  "winapi-x86_64-pc-windows-gnu 0.4.0": {
+    "declared_license": "MIT/Apache-2.0",
+    "package_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "selected_license": "MIT",
+    "notices": [
+      {
+        "path": "third-party-licenses/winapi-targets-0.4.0-MIT.txt",
+        "sha256": "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b",
+        "source": "https://raw.githubusercontent.com/retep998/winapi-rs/796a8e6c2971dc2ff1bcff166e6671284f9b5b6b/LICENSE-MIT"
+      }
+    ]
+  }
+}
