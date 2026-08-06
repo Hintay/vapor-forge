@@ -10,6 +10,25 @@ pub(super) fn request_app_id(method: &str, body: &[u8]) -> Option<u32> {
     vapor_forge_steam_protocol::cloud_request_app_id(method, body)
 }
 
+pub fn requires_queue(method: &str, body: &[u8], config: &RuntimeConfig) -> bool {
+    is_backend_transfer_report_impl(method, body, config, None)
+        || intercepted_request_app_id(method, body, config).is_some()
+}
+
+pub(super) fn intercepted_request_app_id(
+    method: &str,
+    body: &[u8],
+    config: &RuntimeConfig,
+) -> Option<u32> {
+    if !config.local_cloud_configured() && !config.cumulus_configured() {
+        return None;
+    }
+    let app_id = request_app_id(method, body)?;
+    vapor_forge_features::apps::classify_app(config, AppId(app_id))
+        .is_confirmed_unowned()
+        .then_some(app_id)
+}
+
 /// Identify a controlled Cloud request that must not fall through to Valve.
 ///
 /// This is called after the Cumulus adapter declines the request. Unknown and
@@ -42,6 +61,18 @@ pub(super) fn is_backend_transfer_report(
     config: &RuntimeConfig,
     transfer_targets: &TransferTargetRegistry,
 ) -> bool {
+    is_backend_transfer_report_impl(method, body, config, Some(transfer_targets))
+}
+
+fn is_backend_transfer_report_impl(
+    method: &str,
+    body: &[u8],
+    config: &RuntimeConfig,
+    transfer_targets: Option<&TransferTargetRegistry>,
+) -> bool {
+    if !matches!(method, CDN_REPORT | EXTERNAL_TRANSFER_REPORT) {
+        return false;
+    }
     if config.local_cloud_configured() {
         return is_local_transfer_report(method, body);
     }
@@ -59,7 +90,8 @@ pub(super) fn is_backend_transfer_report(
             .and_then(|url| parse_absolute_target(&url))
             .is_some_and(|(https, authority, path)| {
                 (https == endpoint.https && endpoint.matches_transfer_location(&authority, &path))
-                    || transfer_targets.contains(&scope, &authority, &path)
+                    || transfer_targets
+                        .is_some_and(|targets| targets.contains(&scope, &authority, &path))
             }),
         EXTERNAL_TRANSFER_REPORT => {
             let Some(report) = CloudExternalStorageTransferReportNotification::decode(body).ok()
@@ -68,7 +100,8 @@ pub(super) fn is_backend_transfer_report(
             };
             report.host.zip(report.path).is_some_and(|(host, path)| {
                 endpoint.matches_transfer_location(&host, &path)
-                    || transfer_targets.contains(&scope, &host, &path)
+                    || transfer_targets
+                        .is_some_and(|targets| targets.contains(&scope, &host, &path))
             })
         }
         _ => false,

@@ -368,7 +368,7 @@ fn response_reservation_is_held_until_the_response_is_drained() {
         outstanding: Arc::clone(&outstanding),
     };
     let (sender, receiver) = mpsc::channel();
-    let queue = CloudRpcQueue::new();
+    let queue = CloudRpcQueue::try_new().unwrap();
     queue.track_response(receiver, vec![9], 17, reservation);
     sender.send(vec![1, 2, 3]).unwrap();
 
@@ -389,7 +389,7 @@ fn response_registered_before_immediate_disconnect_uses_fallback() {
         outstanding: Arc::clone(&outstanding),
     };
     let (sender, receiver) = mpsc::channel();
-    let queue = CloudRpcQueue::new();
+    let queue = CloudRpcQueue::try_new().unwrap();
     queue.track_response(receiver, vec![9, 8, 7], 23, reservation);
     drop(sender);
 
@@ -415,19 +415,21 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         },
         ..Default::default()
     };
-    let queue = CloudRpcQueue::new();
+    let queue = CloudRpcQueue::try_new().unwrap();
     let header = CMsgProtoBufHeader::default();
 
     let external = CloudExternalStorageTransferReportNotification {
         host: Some("CLOUD.EXAMPLE:8443".into()),
         path: Some("/base/api/v1/upload-batches/b/files/f/blocks/0".into()),
         ..Default::default()
-    };
+    }
+    .encode_to_vec();
+    assert!(requires_queue(EXTERNAL_TRANSFER_REPORT, &external, &config));
     assert!(queue.intercept(
         EXTERNAL_TRANSFER_REPORT,
         &header,
         &[],
-        &external.encode_to_vec(),
+        &external,
         &config,
         0,
     ));
@@ -444,15 +446,10 @@ fn intercepts_only_cumulus_transfer_reports_without_queuing_responses() {
         host: Some("steamcloud-ugc.storage.googleapis.com".into()),
         path: Some("/steamcloud/save.dat".into()),
         ..Default::default()
-    };
-    assert!(!queue.intercept(
-        EXTERNAL_TRANSFER_REPORT,
-        &header,
-        &[],
-        &steam.encode_to_vec(),
-        &config,
-        0,
-    ));
+    }
+    .encode_to_vec();
+    assert!(!requires_queue(EXTERNAL_TRANSFER_REPORT, &steam, &config));
+    assert!(!queue.intercept(EXTERNAL_TRANSFER_REPORT, &header, &[], &steam, &config, 0,));
 
     queue.transfer_targets.register(
         &CloudStateScope::from_config(&config),
@@ -799,7 +796,8 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
         vapor_forge_features::apps::actual_ownership(app_id),
         vapor_forge_features::apps::OwnershipState::Unknown
     );
-    assert!(!CloudRpcQueue::new().intercept(
+    assert!(!requires_queue(QUOTA_USAGE, &request, &config));
+    assert!(!CloudRpcQueue::try_new().unwrap().intercept(
         QUOTA_USAGE,
         &header,
         &header.encode_to_vec(),
@@ -820,6 +818,45 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
         privacy_fallback(GET_FILE_DETAILS, &legacy_request, &config),
         Some((app_id.0, true))
     );
+}
+
+#[test]
+fn confirmed_unowned_cloud_request_requires_queue() {
+    let app_id = AppId(246_813_581);
+    let config = RuntimeConfig {
+        apps: AppsSection {
+            inject: vec![InjectApp {
+                id: app_id,
+                dlc: Vec::new(),
+                ticket: Default::default(),
+                purchase_time: 0,
+            }],
+            ..Default::default()
+        },
+        cloud: CloudSection {
+            backend: CloudBackendMode::Cumulus,
+            cumulus: CumulusCloudSection {
+                server_url: "http://127.0.0.1:1".into(),
+                token: "unused".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let request = CloudClientGetAppQuotaUsageRequest {
+        app_id: Some(app_id.0),
+    }
+    .encode_to_vec();
+
+    vapor_forge_features::apps::record_actual_ownership(app_id, false);
+
+    assert!(requires_queue(QUOTA_USAGE, &request, &config));
+    assert!(!requires_queue(
+        "Player.GetLastPlayedTimes#1",
+        &request,
+        &config
+    ));
 }
 
 #[test]
@@ -857,7 +894,8 @@ fn actually_owned_apps_stay_on_steam() {
         ..Default::default()
     };
 
-    assert!(!CloudRpcQueue::new().intercept(
+    assert!(!requires_queue(QUOTA_USAGE, &request, &config));
+    assert!(!CloudRpcQueue::try_new().unwrap().intercept(
         QUOTA_USAGE,
         &header,
         &header.encode_to_vec(),

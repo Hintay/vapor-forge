@@ -34,6 +34,7 @@ pub(super) struct AdapterState {
     pub(super) local_conflicts: Arc<LocalConflictCoordinator>,
 }
 
+#[cfg(test)]
 impl Default for AdapterState {
     fn default() -> Self {
         Self::with_transfer_targets_and_journal(Arc::new(TransferTargetRegistry::default()), None)
@@ -61,12 +62,13 @@ impl AdapterState {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn with_transfer_targets_and_journal(
         transfer_targets: Arc<TransferTargetRegistry>,
         journal: Option<Arc<SyncJournal>>,
     ) -> Self {
-        let local_gc = Arc::new(LocalGcCoordinator::new());
-        let local_conflicts = LocalConflictCoordinator::new(Arc::clone(&local_gc));
+        let local_gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let local_conflicts = LocalConflictCoordinator::try_new(Arc::clone(&local_gc)).unwrap();
         Self::with_transfer_targets_journal_gc_and_conflicts(
             transfer_targets,
             journal,

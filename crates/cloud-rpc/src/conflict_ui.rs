@@ -105,11 +105,17 @@ pub(crate) struct LocalConflictCoordinator {
 }
 
 impl LocalConflictCoordinator {
-    pub(crate) fn new(gc: Arc<LocalGcCoordinator>) -> Arc<Self> {
-        Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
-            let (choices, receiver) = mpsc::channel::<Choice>();
-            let worker = weak.clone();
-            std::thread::spawn(move || {
+    pub(crate) fn try_new(gc: Arc<LocalGcCoordinator>) -> std::io::Result<Arc<Self>> {
+        let (choices, receiver) = mpsc::channel::<Choice>();
+        let coordinator = Arc::new(Self {
+            state: Mutex::new(State::default()),
+            ui_ready: std::sync::atomic::AtomicBool::new(false),
+            choices,
+        });
+        let worker = Arc::downgrade(&coordinator);
+        std::thread::Builder::new()
+            .name("vapor-cloud-conflict".into())
+            .spawn(move || {
                 while let Ok(choice) = receiver.recv() {
                     let result = apply_choice(&choice, &gc);
                     if let Some(coordinator) = worker.upgrade() {
@@ -118,13 +124,8 @@ impl LocalConflictCoordinator {
                         break;
                     }
                 }
-            });
-            Self {
-                state: Mutex::new(State::default()),
-                ui_ready: std::sync::atomic::AtomicBool::new(false),
-                choices,
-            }
-        })
+            })?;
+        Ok(coordinator)
     }
 
     pub(crate) fn set_ui_ready(&self, ready: bool) {
@@ -762,8 +763,8 @@ mod tests {
 
     #[test]
     fn tokens_are_bound_to_one_ui_context_and_one_choice() {
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let view = StoreView {
             current_change_number: None,
             max_revision: 9,
@@ -819,7 +820,9 @@ mod tests {
 
     #[test]
     fn acknowledgement_receipts_are_context_bound_and_idempotent() {
-        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let coordinator =
+            LocalConflictCoordinator::try_new(Arc::new(LocalGcCoordinator::try_new().unwrap()))
+                .unwrap();
         let target = context();
         let token = "a".repeat(64);
         coordinator.queue_ack(target, ack(&token, 480));
@@ -844,7 +847,9 @@ mod tests {
 
     #[test]
     fn window_changes_preserve_acknowledgements_for_live_windows() {
-        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let coordinator =
+            LocalConflictCoordinator::try_new(Arc::new(LocalGcCoordinator::try_new().unwrap()))
+                .unwrap();
         let first = context();
         let second = ConflictUiContext {
             window_generation: first.window_generation + 1,
@@ -864,8 +869,8 @@ mod tests {
 
     #[test]
     fn registered_conflict_is_presented_only_after_launch_arms_it() {
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let view = StoreView {
             current_change_number: None,
             max_revision: 9,
@@ -885,7 +890,9 @@ mod tests {
 
     #[test]
     fn failed_dialog_delivery_is_rearmed_by_its_cancel_token() {
-        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let coordinator =
+            LocalConflictCoordinator::try_new(Arc::new(LocalGcCoordinator::try_new().unwrap()))
+                .unwrap();
         let view = StoreView {
             current_change_number: None,
             max_revision: 9,
@@ -910,8 +917,8 @@ mod tests {
     #[test]
     fn stored_choice_publishes_resolution_before_ack() {
         let (temporary, store, view) = three_head_store();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         let context = context_for(&settings);
         coordinator.arm(
@@ -949,8 +956,8 @@ mod tests {
     #[test]
     fn current_device_choice_also_publishes_a_resolution() {
         let (temporary, store, view) = three_head_store();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         let context = context_for(&settings);
         coordinator.arm(
@@ -994,8 +1001,8 @@ mod tests {
     #[test]
     fn accepted_choice_resumes_the_game_action() {
         let (temporary, _store, view) = three_head_store();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         let context = context_for(&settings);
         coordinator.arm(
@@ -1025,8 +1032,8 @@ mod tests {
     #[test]
     fn cancel_cancels_the_game_action() {
         let (temporary, _store, view) = three_head_store();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         let context = context_for(&settings);
         coordinator.arm(
@@ -1056,8 +1063,8 @@ mod tests {
     #[test]
     fn changed_cloud_scope_rejects_the_choice() {
         let (temporary, store, view) = three_head_store();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         coordinator.arm(
             &settings,
@@ -1090,8 +1097,8 @@ mod tests {
     fn changed_heads_reject_the_choice_and_allow_a_new_dialog() {
         let temporary = tempfile::tempdir().unwrap();
         FolderStore::open_account(temporary.path(), context().steam_id64).unwrap();
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let settings = settings_at(temporary.path());
         let context = context_for(&settings);
         let view = StoreView {
@@ -1123,8 +1130,8 @@ mod tests {
 
     #[test]
     fn resolved_view_discards_old_multi_head_tokens() {
-        let gc = Arc::new(LocalGcCoordinator::new());
-        let coordinator = LocalConflictCoordinator::new(gc);
+        let gc = Arc::new(LocalGcCoordinator::try_new().unwrap());
+        let coordinator = LocalConflictCoordinator::try_new(gc).unwrap();
         let mut view = StoreView {
             current_change_number: None,
             max_revision: 9,

@@ -11,7 +11,7 @@ mod transfer_targets;
 pub use conflict_ui::{
     ConflictDialog, ConflictDialogCandidate, ConflictSubmitResult, ConflictUiAck, ConflictUiContext,
 };
-pub use protocol::{privacy_fallback, privacy_fallback_with_ownership};
+pub use protocol::{privacy_fallback, privacy_fallback_with_ownership, requires_queue};
 pub use queue::{CloudRpcQueue, CompletedResponse, ResponsePermit};
 
 pub const GET_CHANGELIST: &str = "Cloud.GetAppFileChangelist#1";
@@ -48,7 +48,6 @@ const ERESULT_OK: i32 = 1;
 const ERESULT_FAIL: i32 = 2;
 const ERESULT_TOO_MANY_PENDING: i32 = 108;
 const HTTP_METHOD_PUT: i32 = 4;
-const RPC_WORKER_SHARDS: usize = 4;
 const RPC_QUEUE_CAPACITY: usize = 64;
 const RPC_CHANNEL_CAPACITY: usize = RPC_QUEUE_CAPACITY * 2;
 
