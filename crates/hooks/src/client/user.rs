@@ -64,13 +64,16 @@ fn hooked_steam_id(this: *mut c_void, username: *const c_char) -> u64 {
         return 0;
     };
     let real = call_get_steam_id(original, this, username);
-    if !super::steam_context::checked_call_active()
+    if crate::capability::is_ready(crate::capability::Capability::CallbackEvents)
+        && !super::steam_context::checked_call_active()
         && (real == 0 || vapor_forge_features::identity::is_valid_individual_steam_id(real))
     {
         publish_real_steam_id(real);
     }
 
-    let delegate = vapor_forge_features::ticket::delegate_steamid();
+    let delegate = crate::capability::is_ready(crate::capability::Capability::TicketOverrides)
+        .then(vapor_forge_features::ticket::delegate_steamid)
+        .unwrap_or(0);
     if delegate != 0 {
         debug!(
             real,

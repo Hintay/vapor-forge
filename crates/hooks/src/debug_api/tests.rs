@@ -47,7 +47,7 @@ fn status_aliases_dump() {
 fn toast_command_queues_work() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("steamui toast Plain body text");
     assert!(response.contains("queued toast"));
@@ -55,14 +55,14 @@ fn toast_command_queues_work() {
     assert_eq!(vapor_forge_features::toast::pending_count(), 1);
 
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_command_accepts_warning_kind() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("steamui toast warning body=\"Warning Body\"");
     assert!(response.contains("kind=warning"));
@@ -74,14 +74,14 @@ fn toast_command_accepts_warning_kind() {
     assert!(script.contains("style:\"banner\""));
     assert!(script.contains("critical:false"));
 
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_command_accepts_error_kind() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("toast err body=\"Error Body\"");
     assert!(response.contains("kind=error"));
@@ -93,14 +93,14 @@ fn toast_command_accepts_error_kind() {
     assert!(script.contains("style:\"banner\""));
     assert!(script.contains("critical:true"));
 
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_command_accepts_explicit_style() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("steamui toast warning accent body=\"Accent Body\"");
     assert!(response.contains("kind=warning"));
@@ -111,14 +111,14 @@ fn toast_command_accepts_explicit_style() {
     assert!(script.contains("kind:\"warning\""));
     assert!(script.contains("style:\"accent\""));
 
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_command_accepts_key_value_options() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch(
         "steamui toast kind=warning style=accent title=\"Readable Title\" body=\"Readable Body\" duration=1234 icon=https://example.invalid/icon.png",
@@ -137,14 +137,14 @@ fn toast_command_accepts_key_value_options() {
     assert!(script.contains("body:\"Readable Body\""));
     assert!(script.contains("icon:\"https://example.invalid/icon.png\""));
 
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_command_accepts_flag_options() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch(
         "steamui toast warning banner --title \"Flag Title\" --body \"Flag Body\" --duration 2345",
@@ -157,14 +157,14 @@ fn toast_command_accepts_flag_options() {
 
     let pending = vapor_forge_features::toast::take_pending();
     assert_eq!(pending.len(), 1);
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 }
 
 #[test]
 fn toast_is_steamui_only() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("steamclient toast body=\"Body\"");
     assert_eq!(response, "err toast is a steamui command");
@@ -175,7 +175,7 @@ fn toast_is_steamui_only() {
 fn invalid_toast_duration_is_rejected() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("toast body=\"Body\" duration=nope");
     assert_eq!(response, "err invalid duration_ms: \"nope\"");
@@ -186,7 +186,7 @@ fn invalid_toast_duration_is_rejected() {
 fn invalid_key_value_toast_option_is_rejected() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();
-    vapor_forge_features::toast::mark_idle_if_empty();
+    let _ = vapor_forge_features::toast::take_ui_work();
 
     let response = dispatch("toast unknown=value body=hello");
     assert_eq!(response, "err unknown toast option: \"unknown\"");

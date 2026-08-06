@@ -169,20 +169,10 @@ pub fn store_stats_action_with_ownership(
             if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
-            let response = ClientStoreUserStatsResponse {
-                game_id: Some(game_id),
-                eresult: Some(ERESULT_OK),
-                crc_stats: None,
-                stats_failed_validation: Vec::new(),
-                stats_out_of_date: Some(false),
-            };
             PrivacyAction::Respond {
                 app_id,
-                packet: emsg_response(
-                    EMSG_STORE_USERSTATS_RESPONSE,
-                    header_bytes,
-                    response.encode_to_vec(),
-                ),
+                packet: store_stats_response(emsg, header_bytes, body, ERESULT_OK)
+                    .expect("decoded StoreUserStats request must build a response"),
             }
         }
         EMSG_STORE_USERSTATS2 => {
@@ -198,18 +188,56 @@ pub fn store_stats_action_with_ownership(
             if !protected_with_ownership(config, app_id, &mut ownership) {
                 return PrivacyAction::Pass;
             }
-            let response = ClientStatsUpdated {
-                steam_id: request.settee_steam_id.or(request.settor_steam_id),
-                game_id: Some(game_id),
-                crc_stats: request.crc_stats,
-                updated_stats: request.stats,
-            };
             PrivacyAction::Respond {
                 app_id,
-                packet: emsg_response(EMSG_STATS_UPDATED, header_bytes, response.encode_to_vec()),
+                packet: store_stats_response(emsg, header_bytes, body, ERESULT_OK)
+                    .expect("decoded StoreUserStats2 request must build a response"),
             }
         }
         _ => PrivacyAction::Pass,
+    }
+}
+
+/// Build a terminal response for an intercepted StoreStats request.
+pub fn store_stats_response(
+    emsg: u32,
+    header_bytes: &[u8],
+    body: &[u8],
+    eresult: i32,
+) -> Option<Vec<u8>> {
+    match emsg {
+        EMSG_STORE_USERSTATS => {
+            let game_id = legacy_store_user_stats_game_id(body)?;
+            let response = ClientStoreUserStatsResponse {
+                game_id: Some(game_id),
+                eresult: Some(eresult),
+                crc_stats: None,
+                stats_failed_validation: Vec::new(),
+                stats_out_of_date: Some(false),
+            };
+            Some(emsg_response_with_result(
+                EMSG_STORE_USERSTATS_RESPONSE,
+                header_bytes,
+                response.encode_to_vec(),
+                eresult,
+            ))
+        }
+        EMSG_STORE_USERSTATS2 => {
+            let request = ClientStoreUserStats2Request::decode(body).ok()?;
+            let response = ClientStatsUpdated {
+                steam_id: request.settee_steam_id.or(request.settor_steam_id),
+                game_id: request.game_id,
+                crc_stats: request.crc_stats,
+                updated_stats: request.stats,
+            };
+            Some(emsg_response_with_result(
+                EMSG_STATS_UPDATED,
+                header_bytes,
+                response.encode_to_vec(),
+                eresult,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -233,13 +261,22 @@ pub fn service_response(header_bytes: &[u8], body: Vec<u8>, eresult: i32) -> Vec
 }
 
 pub fn emsg_response(emsg: u32, header_bytes: &[u8], body: Vec<u8>) -> Vec<u8> {
+    emsg_response_with_result(emsg, header_bytes, body, ERESULT_OK)
+}
+
+pub fn emsg_response_with_result(
+    emsg: u32,
+    header_bytes: &[u8],
+    body: Vec<u8>,
+    eresult: i32,
+) -> Vec<u8> {
     let request = CMsgProtoBufHeader::decode(header_bytes).unwrap_or_default();
     let response = CMsgProtoBufHeader {
         steamid: request.steamid,
         jobid_source: None,
         jobid_target: request.jobid_source,
         target_job_name: request.target_job_name,
-        eresult: Some(ERESULT_OK),
+        eresult: Some(eresult),
         transport_error: None,
         seq_num: None,
         ..Default::default()
@@ -370,6 +407,38 @@ mod tests {
             ClientStoreUserStatsResponse::decode(body).unwrap().eresult,
             Some(ERESULT_OK)
         );
+    }
+
+    #[test]
+    fn store_stats2_owner_mismatch_has_a_terminal_error_response() {
+        const ERESULT_INVALID_PARAM: i32 = 8;
+
+        let header = header("store-stats").encode_to_vec();
+        let request = ClientStoreUserStats2Request {
+            game_id: Some(736_262),
+            settor_steam_id: Some(7),
+            settee_steam_id: Some(11),
+            crc_stats: Some(19),
+            explicit_reset: None,
+            stats: Vec::new(),
+        };
+        let packet = store_stats_response(
+            EMSG_STORE_USERSTATS2,
+            &header,
+            &request.encode_to_vec(),
+            ERESULT_INVALID_PARAM,
+        )
+        .expect("response should be built");
+        let (emsg, header, body) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
+
+        assert_eq!(emsg, EMSG_STATS_UPDATED | K_MSG_HDR_PROTO_FLAG);
+        assert_eq!(
+            CMsgProtoBufHeader::decode(header).unwrap().eresult,
+            Some(ERESULT_INVALID_PARAM)
+        );
+        let response = ClientStatsUpdated::decode(body).unwrap();
+        assert_eq!(response.steam_id, Some(11));
+        assert_eq!(response.game_id, Some(736_262));
     }
 
     #[test]

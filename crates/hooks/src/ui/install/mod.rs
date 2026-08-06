@@ -1,15 +1,12 @@
 // SteamUI library management: refresh the Steam library UI after
 // pkg0 injection (add/remove apps, stamp purchase time).
 //
-// Two functions in steamui.so are hooked to capture their `this` pointers:
-// - CSteamUIAppController::GetAppByID(controller, appId, bCreate) -> CSteamApp*
-// - CUpdateManager::MarkAppChange(source, appId, flags)
-//
-// After capture, we can call them directly via trampoline to manipulate
-// the library UI without restarting Steam.
+// RunFrame supplies the live app controller when UI work is drained.
+// GetAppByID provides a trampoline for app lookup, while MarkAppChange captures
+// the update manager used to publish the completed library change.
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 #[cfg(target_pointer_width = "64")]
 use tracing::error;
@@ -27,35 +24,37 @@ use vapor_forge_patterns::Pattern;
 
 pub use super::library::queue_removal;
 use super::state::{
-    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, CONFLICT_UI_READY,
-    CONTROLLER, GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
+    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, GET_APP_BY_ID_DETOUR,
+    MARK_APP_CHANGE_DETOUR,
 };
 
 type RunFrameFn = unsafe extern "C" fn(*mut c_void);
 type FillInAppOverviewFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 type BuildCompleteChangeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+#[cfg(target_pointer_width = "64")]
+const MAX_REPEATED_FIELD_CANDIDATES: usize = 256;
 
 static mut REPEATED_FIELD_ADD: Option<RepeatedFieldAddFn> = None;
 static mut RUN_FRAME_DETOUR: Option<Detour<RunFrameFn>> = None;
 static mut FILL_IN_OVERVIEW_DETOUR: Option<Detour<FillInAppOverviewFn>> = None;
 static mut BUILD_COMPLETE_DETOUR: Option<Detour<BuildCompleteChangeFn>> = None;
-static INIT_TOAST_QUEUED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn hk_run_frame(controller: *mut c_void) {
-    if CONTROLLER.load(Ordering::Relaxed) == 0 {
-        CONTROLLER.store(controller as usize, Ordering::Release);
-    }
-    if super::library::HAS_PENDING.load(Ordering::Acquire) {
-        super::library::drain_pending_removals(controller);
-    }
-    crate::ui::toast_bridge::bootstrap();
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CSteamUIAppController::RunFrame", RUN_FRAME_DETOUR);
     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
     unsafe { original(controller) };
-    maybe_show_init_toast();
-    crate::ui::toast_bridge::pump();
+    let ui_work_ready = crate::capability::is_ready(crate::capability::Capability::LibraryUi)
+        || crate::capability::is_ready(crate::capability::Capability::ConflictUiBridge);
+    if ui_work_ready && vapor_forge_features::toast::take_ui_work() {
+        drain_ui_work(controller);
+    }
+}
+
+fn drain_ui_work(controller: *mut c_void) {
+    super::library::drain_pending_removals(controller);
+    crate::ui::toast_bridge::drain();
 }
 
 unsafe extern "C" fn hk_fill_in_app_overview(
@@ -63,6 +62,15 @@ unsafe extern "C" fn hk_fill_in_app_overview(
     app_overview: *mut c_void,
     app: *mut c_void,
 ) -> *mut c_void {
+    let original = detour_or_return!(
+        "CSteamUIAppController::FillInAppOverview",
+        FILL_IN_OVERVIEW_DETOUR,
+        std::ptr::null_mut()
+    );
+    if !crate::capability::is_ready(crate::capability::Capability::OverviewMetadata) {
+        // SAFETY: forwards Steam's untouched overview arguments.
+        return unsafe { original(this, app_overview, app) };
+    }
     if !app.is_null() {
         // SAFETY: app is a CSteamApp* passed by SteamUI.
         let steam_app = app.cast::<CSteamApp>();
@@ -93,13 +101,7 @@ unsafe extern "C" fn hk_fill_in_app_overview(
             }
         }
     }
-    // SAFETY: detour set before hook enabled.
-    let original = detour_or_return!(
-        "CSteamUIAppController::FillInAppOverview",
-        FILL_IN_OVERVIEW_DETOUR,
-        std::ptr::null_mut()
-    );
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    // SAFETY: forwards Steam's overview arguments after applying configured metadata.
     unsafe { original(this, app_overview, app) }
 }
 
@@ -117,9 +119,11 @@ unsafe extern "C" fn hk_build_complete_change(
     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
     unsafe { original(controller, change, callback_slot) };
 
-    // SAFETY: REPEATED_FIELD_ADD resolved once at install time.
-    let add_fn = unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) };
-    super::library::append_removed_appids(change, add_fn);
+    if crate::capability::is_ready(crate::capability::Capability::LibrarySnapshot) {
+        // SAFETY: REPEATED_FIELD_ADD resolved once at install time.
+        let add_fn = unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) };
+        super::library::append_removed_appids(change, add_fn);
+    }
 }
 
 unsafe extern "C" fn hk_get_app_by_id(
@@ -127,30 +131,28 @@ unsafe extern "C" fn hk_get_app_by_id(
     app_id: u32,
     b_create: bool,
 ) -> *mut c_void {
-    if CONTROLLER.load(Ordering::Relaxed) == 0 {
-        CONTROLLER.store(controller as usize, Ordering::Release);
-    }
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!(
         "CSteamUIAppController::GetAppByID",
         GET_APP_BY_ID_DETOUR,
         std::ptr::null_mut()
     );
-    let app = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
-unsafe { original(controller, app_id, b_create) };
-    crate::ui::toast_bridge::pump();
-    app
+    // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+    unsafe { original(controller, app_id, b_create) }
 }
 
 unsafe extern "C" fn hk_mark_app_change(source: *mut c_void, app_id: u32, flags: u32) {
-    if APP_CHANGE_SOURCE.load(Ordering::Relaxed) == 0 {
-        APP_CHANGE_SOURCE.store(source as usize, Ordering::Release);
+    if crate::capability::is_ready(crate::capability::Capability::LibraryUi)
+        && APP_CHANGE_SOURCE
+            .compare_exchange(0, source as usize, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+    {
+        vapor_forge_features::toast::request_ui_work();
     }
     // SAFETY: detour set before hook enabled.
     let original = detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
     unsafe { original(source, app_id, flags) };
-    crate::ui::toast_bridge::pump();
 }
 
 /// Install the steamui.so hooks after the loader reaches a consistent state.
@@ -181,9 +183,21 @@ pub fn install(
         };
         let short = name.rsplit("::").next().unwrap_or(name);
         match resolve_pattern_entry(steamui_code, short, &entry) {
-            Some(a) => addrs[i] = a,
+            Some(a)
+                if crate::pattern_resolver::validate_resolved_pattern(
+                    "steamui",
+                    steamui_code,
+                    name,
+                    a,
+                ) =>
+            {
+                addrs[i] = a;
+            }
             None => {
                 warn!(name, "steamui: pattern not found in steamui.so");
+                all_found = false;
+            }
+            Some(_) => {
                 all_found = false;
             }
         };
@@ -252,17 +266,6 @@ pub fn install(
         },
     ];
 
-    // GetAppByID and MarkAppChange are required capture hooks.
-    if addrs[3] == 0 || addrs[4] == 0 {
-        warn!("steamui: required capture hooks not found, aborting");
-        log_drift_summary("steamui.so", &hook_results);
-        store_results("steamui.so", &hook_results);
-        if crate::client::install::config().runtime.diagnostics {
-            log_hook_details("steamui.so", &hook_results);
-        }
-        return false;
-    }
-
     hook_results[0].installed = try_detour!(
         "RunFrame",
         addrs[0],
@@ -307,16 +310,40 @@ pub fn install(
     }
 
     let reverse_bridge = super::reverse_bridge::install(steamui_code);
-    let conflict_ui_ready = hook_results[0].installed && reverse_bridge.installed;
-    hook_results.push(reverse_bridge);
+    let window_lifecycle_installed = reverse_bridge.iter().all(|result| result.installed);
+    let conflict_bridge_installed = hook_results[0].installed && window_lifecycle_installed;
+    hook_results.extend(reverse_bridge);
 
-    let library_ready =
-        hook_results[0].installed && hook_results[3].installed && hook_results[4].installed;
-    INSTALLED.store(library_ready, Ordering::Release);
-    CONFLICT_UI_READY.store(conflict_ui_ready, Ordering::Release);
+    let library_ready = crate::capability::set_from_requirements(
+        crate::capability::Capability::LibraryUi,
+        &[
+            (hook_results[0].name, hook_results[0].installed),
+            (hook_results[2].name, hook_results[2].installed),
+            (hook_results[3].name, hook_results[3].installed),
+            (hook_results[4].name, hook_results[4].installed),
+            (hook_results[5].name, hook_results[5].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::OverviewMetadata,
+        &[(hook_results[1].name, hook_results[1].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::LibrarySnapshot,
+        &[
+            (hook_results[2].name, hook_results[2].installed),
+            (hook_results[5].name, hook_results[5].installed),
+        ],
+    );
+    super::reverse_bridge::set_runtime_ready(conflict_bridge_installed);
+    let conflict_ui_ready = crate::ui::conflict_ui_ready();
+    if conflict_bridge_installed {
+        let config = crate::client::install::config();
+        vapor_forge_features::toast::show_init_toast(&config);
+    }
 
     if !all_found {
-        warn!("steamui: some optional hooks missing, partial UI management");
+        warn!("steamui: hook capabilities are incomplete");
     }
     log_drift_summary("steamui.so", &hook_results);
     store_results("steamui.so", &hook_results);
@@ -334,30 +361,32 @@ pub fn install(
         mark = format_args!("{:#x}", addrs[4]),
         repeated_field_add = rfa,
         library_ready,
+        conflict_bridge_installed,
         conflict_ui_ready,
         "steamui: hooks installed"
     );
-    library_ready || conflict_ui_ready
-}
-
-fn maybe_show_init_toast() {
-    if INIT_TOAST_QUEUED.load(Ordering::Acquire) {
-        return;
-    }
-
-    if INIT_TOAST_QUEUED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-
-    let cfg = crate::client::install::config();
-    vapor_forge_features::toast::show_init_toast(&cfg);
+    library_ready || conflict_bridge_installed
 }
 
 /// Resolve RepeatedField<uint32>::Add from steamui.so.
 fn resolve_repeated_field_add(
+    steamui_code: &CodeRegion,
+    registry: &vapor_forge_patterns::registry::PatternRegistry,
+) -> Option<usize> {
+    let addr = resolve_repeated_field_add_address(steamui_code, registry)?;
+
+    // SAFETY: addr passed the live semantic validator for this concrete ABI.
+    let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: single-threaded init writes the resolver slot once.
+    unsafe { std::ptr::addr_of_mut!(REPEATED_FIELD_ADD).write(Some(f)) };
+    info!(
+        addr = format_args!("{:#x}", addr),
+        "steamui: RepeatedField<uint32>::Add resolved"
+    );
+    Some(addr)
+}
+
+pub(crate) fn resolve_repeated_field_add_address(
     steamui_code: &CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
@@ -374,7 +403,14 @@ fn resolve_repeated_field_add(
                     return None;
                 }
             };
-            let matches = pattern.find_all(steamui_code.bytes);
+            let matches =
+                match pattern.find_all_bounded(steamui_code.bytes, MAX_REPEATED_FIELD_CANDIDATES) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        error!(%error, "steamui: RepeatedField<uint32>::Add pattern is too broad");
+                        return None;
+                    }
+                };
             match_count += matches.len();
             if let Some(offset) = matches.into_iter().find(|&offset| {
                 is_repeated_field_u32_add_abi(steamui_code, steamui_code.base + offset)
@@ -405,14 +441,15 @@ fn resolve_repeated_field_add(
         &entry,
     )?;
 
-    // SAFETY: addr is a validated function address in steamui.so .text.
-    let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };
-    // SAFETY: single-threaded init writes the resolver slot once.
-    unsafe { std::ptr::addr_of_mut!(REPEATED_FIELD_ADD).write(Some(f)) };
-    info!(
-        addr = format_args!("{:#x}", addr),
-        "steamui: RepeatedField<uint32>::Add resolved"
-    );
+    if !crate::pattern_resolver::validate_resolved_pattern(
+        "steamui",
+        steamui_code,
+        "google::protobuf::RepeatedField<uint32>::Add",
+        addr,
+    ) {
+        return None;
+    }
+
     Some(addr)
 }
 

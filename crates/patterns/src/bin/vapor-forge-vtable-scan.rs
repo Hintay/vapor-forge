@@ -16,7 +16,16 @@ fn run() -> Result<(), String> {
     let mut reports = Vec::new();
 
     for path in &args.paths {
-        reports.push(scan_file(path, interfaces.as_deref())?);
+        let report = scan_file(path, interfaces.as_deref())?;
+        if report
+            .interfaces
+            .iter()
+            .any(|interface| interface.name == "IClientConfigStore")
+        {
+            vapor_forge_patterns::vtable_scan::validate_config_store_uint64_abi(path, &report)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        reports.push(report);
     }
 
     if args.json {
@@ -113,9 +122,10 @@ fn print_text(reports: &[vapor_forge_patterns::vtable_scan::VtableScanReport]) {
                 .filter(|method| !method.name.is_empty())
                 .count();
             println!(
-                "  {} vtable=0x{:x} slots={} named={}",
+                "  {} vtable=0x{:x} candidates={} slots={} named={}",
                 iface.name,
                 iface.vtable_va,
+                iface.candidate_count,
                 iface.methods.len(),
                 named
             );
@@ -133,6 +143,12 @@ fn print_text(reports: &[vapor_forge_patterns::vtable_scan::VtableScanReport]) {
                 }
             }
         }
+        if let Some(summary) = config_store_summary(report) {
+            println!(
+                "  IClientConfigStore uint64 ABI get_slot={} set_slot={} get_hash=0x{:08x} set_hash=0x{:08x}",
+                summary.get_slot, summary.set_slot, summary.get_hash, summary.set_hash
+            );
+        }
     }
 }
 
@@ -141,14 +157,22 @@ fn print_json(
 ) -> Result<(), String> {
     let value = json!({
         "modules": reports.iter().map(|report| {
+            let config_store = config_store_summary(report);
             json!({
                 "path": report.path,
                 "elf_class": report.elf_class.label(),
                 "candidate_count": report.candidate_count,
+                "config_store_uint64_abi": config_store.map(|summary| json!({
+                    "get_slot": summary.get_slot,
+                    "set_slot": summary.set_slot,
+                    "get_hash": format!("0x{:08x}", summary.get_hash),
+                    "set_hash": format!("0x{:08x}", summary.set_hash),
+                })),
                 "interfaces": report.interfaces.iter().map(|iface| {
                     json!({
                         "name": iface.name,
                         "vtable_va": format!("0x{:x}", iface.vtable_va),
+                        "candidate_count": iface.candidate_count,
                         "methods": iface.methods.iter().map(|method| {
                             json!({
                                 "slot": method.slot,
@@ -169,4 +193,20 @@ fn print_json(
     let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
     println!("{text}");
     Ok(())
+}
+
+fn config_store_summary(
+    report: &vapor_forge_patterns::vtable_scan::VtableScanReport,
+) -> Option<vapor_forge_patterns::vtable_scan::ConfigStoreUint64AbiSummary> {
+    report
+        .interfaces
+        .iter()
+        .any(|interface| interface.name == "IClientConfigStore")
+        .then(|| {
+            vapor_forge_patterns::vtable_scan::validate_config_store_uint64_abi(
+                &PathBuf::from(&report.path),
+                report,
+            )
+            .expect("config-store semantics were validated before reporting")
+        })
 }

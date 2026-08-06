@@ -10,13 +10,12 @@ use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::state::{
     RepeatedFieldAddFn, APP_CHANGE_SOURCE, EAPPCHANGE_ADDED_OR_CREATED, EAPP_OWNERSHIP_FLAGS_NONE,
-    EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR, INSTALLED, MARK_APP_CHANGE_DETOUR,
+    EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR, MARK_APP_CHANGE_DETOUR,
 };
 
 // Pending removals queued from the FileWatcher thread, drained on the
 // UI thread inside hk_run_frame.
 static PENDING_REMOVALS: Mutex<Vec<AppId>> = Mutex::new(Vec::new());
-pub(crate) static HAS_PENDING: AtomicBool = AtomicBool::new(false);
 
 // Apps confirmed removed. Appended to CAppOverview_Change.removed_appid
 // during full rebuilds to prevent removed apps from reappearing.
@@ -24,7 +23,10 @@ static REMOVED_APP_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static HAS_REMOVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<RepeatedFieldAddFn>) {
-    if change.is_null() || !HAS_REMOVED.load(Ordering::Acquire) {
+    if !crate::capability::is_ready(crate::capability::Capability::LibrarySnapshot)
+        || change.is_null()
+        || !HAS_REMOVED.load(Ordering::Acquire)
+    {
         return;
     }
     let Some(add_fn) = add_fn else {
@@ -53,10 +55,11 @@ pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<Repeated
     );
 }
 
-/// Queue an app for removal from the library UI. The actual removal
-/// happens on the UI thread when GetAppByID is next called by Steam.
+/// Queue an app for removal from the library UI.
+///
+/// The next UI work drain applies it on Steam's UI thread.
 pub fn queue_removal(app_id: AppId) {
-    if !INSTALLED.load(Ordering::Acquire) {
+    if !crate::capability::is_ready(crate::capability::Capability::LibraryUi) {
         return;
     }
     let Ok(mut pending) = PENDING_REMOVALS.lock() else {
@@ -64,11 +67,15 @@ pub fn queue_removal(app_id: AppId) {
         return;
     };
     pending.push(app_id);
-    HAS_PENDING.store(true, Ordering::Release);
+    drop(pending);
+    vapor_forge_features::toast::request_ui_work();
     debug!(app = app_id.0, "steamui: removal queued");
 }
 
 pub(crate) fn drain_pending_removals(controller: *mut c_void) {
+    if !crate::capability::is_ready(crate::capability::Capability::LibraryUi) {
+        return;
+    }
     let src = APP_CHANGE_SOURCE.load(Ordering::Acquire);
     if src == 0 {
         return;
@@ -81,12 +88,10 @@ pub(crate) fn drain_pending_removals(controller: *mut c_void) {
         };
         let v = std::mem::take(&mut *pending);
         if v.is_empty() {
-            HAS_PENDING.store(false, Ordering::Release);
             return;
         }
         v
     };
-    HAS_PENDING.store(false, Ordering::Release);
 
     for app_id in draining {
         do_remove_app(controller, src, app_id);

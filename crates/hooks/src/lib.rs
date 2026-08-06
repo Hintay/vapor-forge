@@ -3,6 +3,8 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) mod achievement_worker;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod capability;
 #[cfg(target_os = "linux")]
 pub(crate) mod client;
 #[cfg(target_os = "linux")]

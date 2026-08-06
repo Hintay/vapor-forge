@@ -7,7 +7,8 @@ use vapor_forge_patterns::registry::{
     parse_toml_patterns, FollowMode, PatternDef, RuntimePatternEntry, EMBEDDED_PATTERNS,
 };
 use vapor_forge_patterns::scan::{
-    group_variants, resolve_entry_group, PatternRef, ResolveError, ResolveResult,
+    group_variants, resolve_entry_group, select_variants_for_library_path, PatternRef,
+    ResolveError, ResolveResult,
 };
 use vapor_forge_patterns::vtable_scan::{self, ElfClass};
 use vapor_forge_patterns::Pattern;
@@ -32,7 +33,7 @@ fn run() -> Result<(), String> {
     }
 
     if failed {
-        Err("one or more required patterns failed".to_owned())
+        Err("one or more patterns failed".to_owned())
     } else {
         Ok(())
     }
@@ -185,8 +186,8 @@ struct ScanEntry {
     follow: FollowMode,
     prologue: Option<Vec<u8>>,
     callee_pattern: Option<String>,
-    optional: bool,
     pic_entry: bool,
+    steamrt_variant: bool,
     module: String,
 }
 
@@ -198,8 +199,8 @@ impl<'a> From<&'a ScanEntry> for PatternRef<'a> {
             follow: entry.follow,
             prologue: entry.prologue.as_deref(),
             callee_pattern: entry.callee_pattern.as_deref(),
-            optional: entry.optional,
             pic_entry: entry.pic_entry,
+            steamrt_variant: entry.steamrt_variant,
             module: &entry.module,
         }
     }
@@ -213,8 +214,8 @@ impl From<&PatternDef> for ScanEntry {
             follow: entry.follow,
             prologue: entry.prologue.map(<[u8]>::to_vec),
             callee_pattern: entry.callee_pattern.map(str::to_owned),
-            optional: entry.optional,
             pic_entry: entry.pic_entry,
+            steamrt_variant: entry.steamrt_variant,
             module: entry.module.to_owned(),
         }
     }
@@ -228,8 +229,8 @@ impl From<(String, RuntimePatternEntry)> for ScanEntry {
             follow: entry.follow,
             prologue: entry.prologue,
             callee_pattern: entry.callee_pattern,
-            optional: entry.optional,
             pic_entry: entry.pic_entry,
+            steamrt_variant: entry.steamrt_variant,
             module: entry.module,
         }
     }
@@ -267,6 +268,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         .iter()
         .map(|entry| PatternRef::from(*entry))
         .collect::<Vec<_>>();
+    let variants = select_variants_for_library_path(&variants, path);
     for group in group_variants(&variants) {
         let entry = group[0];
         let resolution = if is_elf64 && entry.name == "google::protobuf::RepeatedField<uint32>::Add"
@@ -299,18 +301,12 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
                 resolved.insert(entry.name, result.target_offset);
             }
             Err(error) => {
-                let severity = if entry.optional {
-                    "optional"
-                } else {
-                    failed = true;
-                    "required"
-                };
+                failed = true;
                 println!(
-                    "  {:<4} {:<58} hits={} {} ({})",
+                    "  {:<4} {:<58} hits={} required ({})",
                     error.status().label(),
                     entry.name,
                     error.match_count(),
-                    severity,
                     error
                 );
             }
@@ -324,6 +320,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         } else {
             scan_steamclient32_layouts(segment.bytes, segment.vaddr, &resolved)
         };
+        failed |= scan_config_store_uint64_wrapper_abi(path);
         failed |= scan_user_stats_wrapper_abi(path, &data);
         failed |= scan_cuser_stats_adapters(
             path,
@@ -413,10 +410,11 @@ fn scan_public_wrapper_collisions(
     };
 
     let mut failed = false;
-    let mut allowed = 0usize;
     let mut implementation_required = 0usize;
     for (&entry_name, &target_offset) in resolved {
-        let policy = wrapper_policy(entry_name);
+        if !requires_interface_implementation(entry_name) {
+            continue;
+        }
         let Some(method_name) = entry_name.rsplit("::").next() else {
             continue;
         };
@@ -427,21 +425,13 @@ fn scan_public_wrapper_collisions(
             }
             for method in &iface.methods {
                 if method.name == method_name && method.func_va == target_va {
-                    match policy {
-                        WrapperPolicy::ImplementationRequired => {
-                            println!(
-                                "  FAIL {:<58} va=0x{:x} matches public {}::{} slot {}",
-                                entry_name, target_va, iface.name, method.name, method.slot
-                            );
-                            print_possible_implementations(path, &iface.name, method.slot);
-                            failed = true;
-                            implementation_required += 1;
-                        }
-                        WrapperPolicy::WrapperAllowed => {
-                            allowed += 1;
-                        }
-                        WrapperPolicy::NotApplicable => {}
-                    }
+                    println!(
+                        "  FAIL {:<58} va=0x{:x} matches public {}::{} slot {}",
+                        entry_name, target_va, iface.name, method.name, method.slot
+                    );
+                    print_possible_implementations(path, &iface.name, method.slot);
+                    failed = true;
+                    implementation_required += 1;
                 }
             }
         }
@@ -449,8 +439,8 @@ fn scan_public_wrapper_collisions(
 
     if !failed {
         println!(
-            "  OK   {:<58} allowed={} blocked={}",
-            "IClient public wrapper policy", allowed, implementation_required
+            "  OK   {:<58} blocked={}",
+            "IClient public wrapper check", implementation_required
         );
     }
 
@@ -1323,22 +1313,6 @@ mod tests {
                 &HashMap::new(),
             ),
             Some(implementation)
-        );
-    }
-
-    #[test]
-    fn classifies_public_wrapper_policy() {
-        assert_eq!(
-            wrapper_policy("IClientRemoteStorage::RunIPCFrame"),
-            WrapperPolicy::WrapperAllowed
-        );
-        assert_eq!(
-            wrapper_policy("IClientUser::BUpdateAppOwnershipTicket"),
-            WrapperPolicy::ImplementationRequired
-        );
-        assert_eq!(
-            wrapper_policy("CUser::CheckAppOwnership"),
-            WrapperPolicy::NotApplicable
         );
     }
 }

@@ -86,6 +86,10 @@ unsafe { original(
         context,
     ) };
 
+    if !crate::capability::is_ready(crate::capability::Capability::LaunchEnvironment) {
+        return result;
+    }
+
     if game_id.is_null() || env_map.is_null() {
         return result;
     }
@@ -213,6 +217,25 @@ pub(crate) unsafe extern "C" fn hk_spawn_process(
     flags3: u32,
     p_pid: *mut u32,
 ) -> i32 {
+    let original = detour_or_return!("SpawnProcess", SPAWN_PROCESS_DETOUR, -1);
+    if !crate::capability::is_ready(crate::capability::Capability::LaunchEnvironment) {
+        // SAFETY: forwards Steam's untouched launch arguments.
+        return unsafe {
+            original(
+                this,
+                exe_path,
+                command_line,
+                working_dir,
+                game_id,
+                extra,
+                flags1,
+                flags2,
+                launch_source,
+                flags3,
+                p_pid,
+            )
+        };
+    }
     // Extract AppId from CGameID (low 24 bits).
     if !game_id.is_null() {
         // SAFETY: game_id is a non-null CGameID pointer supplied by Steam.
@@ -244,8 +267,7 @@ pub(crate) unsafe extern "C" fn hk_spawn_process(
         }
     }
 
-    let original = detour_or_return!("SpawnProcess", SPAWN_PROCESS_DETOUR, -1);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    // SAFETY: forwards Steam's launch arguments after recording the configured flags.
     unsafe {
         original(
             this,
@@ -348,6 +370,14 @@ pub(crate) fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegi
             Some(a) => a,
             None => return,
         };
+    if !crate::pattern_resolver::validate_resolved_pattern(
+        "steamclient",
+        code,
+        "SetEnvString",
+        call_addr,
+    ) {
+        return;
+    }
     // SAFETY: call_addr is a validated code address.
     let f: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
     // SAFETY: hook installation is single-threaded and publishes this slot once.
@@ -356,4 +386,9 @@ pub(crate) fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegi
         addr = format_args!("0x{:x}", call_addr),
         "SetEnvString resolved"
     );
+}
+
+pub(crate) fn set_env_string_ready() -> bool {
+    // SAFETY: installation is the only writer and publishes the slot before this read.
+    unsafe { (*std::ptr::addr_of!(SET_ENV_STRING_FN)).is_some() }
 }

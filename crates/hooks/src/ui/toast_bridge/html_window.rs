@@ -1,26 +1,17 @@
 use core::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracing::{info, warn};
-
-use super::monotonic_ns;
 
 type ExecuteJavaScriptFn = unsafe extern "C" fn(*mut c_void, *const c_char);
 
 const CHTML_WINDOW_RTTI_NAME: &[u8] = b"11CHTMLWindow\0";
-const CHTML_WINDOW_MIN_SIZE: usize = 0x3c;
-const MAX_HTML_WINDOWS: usize = 64;
-const BOOTSTRAP_RETRY_NS: u64 = 1_000_000_000;
-const BOOTSTRAP_SCAN_BUDGET: usize = 32 * 1024 * 1024;
-const MAX_BOOTSTRAP_HIT_LOGS: usize = 32;
+const REGISTER_JS_METHOD_SLOT: usize = 6;
+// This is the non-deleting destructor on both supported ABIs.
+const DESTRUCTOR_SLOT: usize = 8;
 
 static HTML_WINDOW_VTABLE: AtomicUsize = AtomicUsize::new(0);
 static EXEC_JS_ADDR: AtomicUsize = AtomicUsize::new(0);
-static NEXT_BOOTSTRAP_NS: AtomicU64 = AtomicU64::new(0);
-static BOOTSTRAP_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static BOOTSTRAP_HIT_LOGS: AtomicUsize = AtomicUsize::new(0);
-static HTML_WINDOWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Debug)]
 struct MapsEntry {
@@ -30,103 +21,41 @@ struct MapsEntry {
     path: String,
 }
 
-pub(super) fn execute_javascript(script: &str) -> bool {
-    let maps = match read_maps() {
-        Some(maps) => maps,
-        None => return false,
-    };
-
-    let windows = match find_html_windows(&maps) {
-        Some(windows) if !windows.is_empty() => windows,
-        _ => return false,
-    };
-
-    let exec_addr = EXEC_JS_ADDR.load(Ordering::Acquire);
-    if exec_addr == 0 || !is_executable_addr(exec_addr, &maps) {
-        return false;
-    }
-
-    let Ok(script_cstr) = std::ffi::CString::new(script) else {
-        warn!("toast: script contains unexpected NUL byte");
-        return false;
-    };
-
-    // SAFETY: exec_addr is CHTMLWindow::ExecuteJavaScript from the validated
-    // CHTMLWindow primary vtable. The selected windows are validated against
-    // that same vtable before calling.
-    let execute: ExecuteJavaScriptFn = unsafe { std::mem::transmute(exec_addr) };
-    for window in windows {
-        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-        unsafe { execute(window as *mut c_void, script_cstr.as_ptr()) };
-    }
-    true
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecuteResult {
+    Executed,
+    Unavailable,
 }
 
-pub(crate) fn is_html_window(window: usize) -> bool {
-    let Some(maps) = read_maps() else {
-        return false;
-    };
-    let Some(vtable) = resolve_html_window_vtable(&maps) else {
-        return false;
-    };
-    is_html_window_candidate(window, vtable, &maps)
-}
-
-pub(crate) fn execute_javascript_on(window: usize, script: &str) -> bool {
-    let Some(maps) = read_maps() else {
-        return false;
-    };
-    let Some(vtable) = resolve_html_window_vtable(&maps) else {
-        return false;
-    };
-    if !is_html_window_candidate(window, vtable, &maps) {
-        return false;
-    }
+pub(super) fn execute_javascript_on(window: usize, script: &str) -> ExecuteResult {
     let exec_addr = EXEC_JS_ADDR.load(Ordering::Acquire);
-    if !is_executable_addr(exec_addr, &maps) {
-        return false;
+    if window == 0 || exec_addr == 0 {
+        return ExecuteResult::Unavailable;
     }
     let Ok(script) = std::ffi::CString::new(script) else {
-        return false;
+        warn!("toast: script contains unexpected NUL byte");
+        return ExecuteResult::Unavailable;
     };
-    // SAFETY: the window and slot are validated against the current mappings.
+    // SAFETY: installation validates the method address. The RegisterJSMethod
+    // and destructor hooks make the exact CHTMLWindow registry authoritative.
     let execute: ExecuteJavaScriptFn = unsafe { std::mem::transmute(exec_addr) };
     // SAFETY: the string remains live for the synchronous Steam call.
     unsafe { execute(window as *mut c_void, script.as_ptr()) };
-    true
+    ExecuteResult::Executed
 }
 
-pub(crate) fn register_js_method_address() -> Option<usize> {
-    const REGISTER_JS_METHOD_SLOT: usize = 6;
+pub(crate) fn lifecycle_method_addresses() -> Option<(usize, usize)> {
     let maps = read_maps()?;
     let vtable = resolve_html_window_vtable(&maps)?;
-    let address = read_usize(
-        vtable + REGISTER_JS_METHOD_SLOT * std::mem::size_of::<usize>(),
-        &maps,
-    )?;
-    is_executable_addr(address, &maps).then_some(address)
+    let register = vtable_method_address(vtable, REGISTER_JS_METHOD_SLOT, &maps)?;
+    let destructor = vtable_method_address(vtable, DESTRUCTOR_SLOT, &maps)?;
+    Some((register, destructor))
 }
 
-fn find_html_windows(maps: &[MapsEntry]) -> Option<Vec<usize>> {
-    let vtable = resolve_html_window_vtable(maps)?;
-
-    if let Some(windows) = cached_html_windows(vtable, maps) {
-        return Some(windows);
-    }
-
-    let now = monotonic_ns();
-    let next = NEXT_BOOTSTRAP_NS.load(Ordering::Acquire);
-    if now < next {
-        return None;
-    }
-    NEXT_BOOTSTRAP_NS.store(now.saturating_add(BOOTSTRAP_RETRY_NS), Ordering::Release);
-
-    let windows = bootstrap_html_windows(vtable, maps)?;
-    if windows.is_empty() {
-        return None;
-    }
-    store_html_windows(&windows);
-    Some(windows)
+fn vtable_method_address(vtable: usize, slot: usize, maps: &[MapsEntry]) -> Option<usize> {
+    let offset = slot.checked_mul(std::mem::size_of::<usize>())?;
+    let address = read_usize(vtable.checked_add(offset)?, maps)?;
+    is_executable_addr(address, maps).then_some(address)
 }
 
 fn resolve_html_window_vtable(maps: &[MapsEntry]) -> Option<usize> {
@@ -199,179 +128,6 @@ fn find_primary_vtable(typeinfo: usize, maps: &[MapsEntry]) -> Option<usize> {
         }
     }
     None
-}
-
-fn cached_html_windows(vtable: usize, maps: &[MapsEntry]) -> Option<Vec<usize>> {
-    let Ok(mut windows) = HTML_WINDOWS.lock() else {
-        warn!("toast: CHTMLWindow cache lock poisoned");
-        return None;
-    };
-    windows.retain(|&window| is_html_window_candidate(window, vtable, maps));
-    if windows.is_empty() {
-        None
-    } else {
-        Some(windows.clone())
-    }
-}
-
-fn store_html_windows(windows: &[usize]) {
-    let Ok(mut cached) = HTML_WINDOWS.lock() else {
-        warn!("toast: CHTMLWindow cache lock poisoned");
-        return;
-    };
-    cached.clear();
-    cached.extend_from_slice(windows);
-}
-
-fn bootstrap_html_windows(vtable: usize, maps: &[MapsEntry]) -> Option<Vec<usize>> {
-    let mut budget = BOOTSTRAP_SCAN_BUDGET;
-    let mut cursor = BOOTSTRAP_CURSOR.load(Ordering::Acquire);
-    let mut saw_cursor_entry = cursor == 0;
-    let mut windows = Vec::new();
-
-    for entry in maps.iter().filter(|entry| is_bootstrap_scan_entry(entry)) {
-        if !saw_cursor_entry {
-            if cursor < entry.end {
-                saw_cursor_entry = true;
-            } else {
-                continue;
-            }
-        }
-
-        let start = if cursor >= entry.start && cursor < entry.end {
-            cursor
-        } else {
-            entry.start
-        };
-        let start = align_up(start, std::mem::size_of::<usize>());
-        if start.saturating_add(CHTML_WINDOW_MIN_SIZE) > entry.end {
-            cursor = 0;
-            continue;
-        }
-
-        let scan_len = budget.min(entry.end.saturating_sub(start));
-        let scan_end = start.saturating_add(scan_len);
-        scan_window_candidates(entry, start, scan_end, vtable, maps, &mut windows);
-        if windows.len() >= MAX_HTML_WINDOWS {
-            BOOTSTRAP_CURSOR.store(0, Ordering::Release);
-            info!(count = windows.len(), "toast: CHTMLWindow scan resolved");
-            return Some(windows);
-        }
-
-        budget = budget.saturating_sub(scan_len);
-        if scan_end < entry.end {
-            if !windows.is_empty() {
-                BOOTSTRAP_CURSOR.store(0, Ordering::Release);
-                info!(count = windows.len(), "toast: CHTMLWindow scan resolved");
-                return Some(windows);
-            }
-            BOOTSTRAP_CURSOR.store(scan_end, Ordering::Release);
-            return None;
-        }
-        cursor = 0;
-        if budget == 0 {
-            BOOTSTRAP_CURSOR.store(0, Ordering::Release);
-            return None;
-        }
-    }
-
-    BOOTSTRAP_CURSOR.store(0, Ordering::Release);
-    if !windows.is_empty() {
-        info!(count = windows.len(), "toast: CHTMLWindow scan resolved");
-    }
-    Some(windows)
-}
-
-pub(super) fn bootstrap_scan_pending() -> bool {
-    BOOTSTRAP_CURSOR.load(Ordering::Acquire) != 0
-}
-
-fn is_bootstrap_scan_entry(entry: &MapsEntry) -> bool {
-    entry.perms.starts_with("rw")
-        && entry.end > entry.start
-        && (entry.path.is_empty() || entry.path == "[heap]" || entry.path.starts_with("[anon"))
-}
-
-fn scan_window_candidates(
-    entry: &MapsEntry,
-    start: usize,
-    end: usize,
-    vtable: usize,
-    maps: &[MapsEntry],
-    windows: &mut Vec<usize>,
-) {
-    if end <= start {
-        return;
-    }
-
-    let len = end - start;
-    let mut bytes = vec![0u8; len];
-    if !read_process_bytes(start, &mut bytes) {
-        return;
-    }
-
-    let word = std::mem::size_of::<usize>();
-    let mut offset = 0usize;
-    while offset.saturating_add(word) <= bytes.len() {
-        if read_usize_from_bytes(&bytes[offset..offset + word]) == vtable {
-            let window = start + offset;
-            let accepted = is_html_window_candidate(window, vtable, maps);
-            log_bootstrap_hit(entry, window, accepted);
-            if accepted && !windows.contains(&window) {
-                windows.push(window);
-                if windows.len() >= MAX_HTML_WINDOWS {
-                    return;
-                }
-            }
-        }
-        offset = offset.saturating_add(word);
-    }
-}
-
-fn is_html_window_candidate(window: usize, vtable: usize, maps: &[MapsEntry]) -> bool {
-    if !is_readable_range(window, CHTML_WINDOW_MIN_SIZE, maps) {
-        return false;
-    }
-    if read_usize(window, maps) != Some(vtable) {
-        return false;
-    }
-
-    object_has_readable_member_pointer(window, CHTML_WINDOW_MIN_SIZE, maps)
-}
-
-fn object_has_readable_member_pointer(object: usize, scan_size: usize, maps: &[MapsEntry]) -> bool {
-    let word = std::mem::size_of::<usize>();
-    let mut offset = word;
-    while offset.saturating_add(word) <= scan_size {
-        if read_usize(object.saturating_add(offset), maps)
-            .is_some_and(|addr| is_readable_addr(addr, maps))
-        {
-            return true;
-        }
-        offset = offset.saturating_add(word);
-    }
-    false
-}
-
-fn log_bootstrap_hit(entry: &MapsEntry, window: usize, accepted: bool) {
-    if BOOTSTRAP_HIT_LOGS.fetch_add(1, Ordering::Relaxed) >= MAX_BOOTSTRAP_HIT_LOGS {
-        return;
-    }
-
-    let path = if entry.path.is_empty() {
-        "[anonymous]"
-    } else {
-        &entry.path
-    };
-    info!(
-        window = format_args!("{:#x}", window),
-        accepted,
-        region_start = format_args!("{:#x}", entry.start),
-        region_end = format_args!("{:#x}", entry.end),
-        perms = %entry.perms,
-        path = %path,
-        "toast: CHTMLWindow vtable pointer hit"
-    );
 }
 
 fn find_steamui_bytes(needle: &[u8], maps: &[MapsEntry]) -> Option<usize> {
@@ -547,35 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_scan_accepts_heap_and_anonymous_mappings() {
-        let heap = MapsEntry {
-            start: 0x1000,
-            end: 0x2000,
-            perms: "rw-p".to_owned(),
-            path: "[heap]".to_owned(),
-        };
-        let anon = MapsEntry {
-            start: 0x2000,
-            end: 0x3000,
-            perms: "rw-p".to_owned(),
-            path: String::new(),
-        };
-        assert!(is_bootstrap_scan_entry(&heap));
-        assert!(is_bootstrap_scan_entry(&anon));
-    }
-
-    #[test]
-    fn bootstrap_scan_rejects_file_backed_mappings() {
-        let entry = MapsEntry {
-            start: 0x1000,
-            end: 0x2000,
-            perms: "rw-p".to_owned(),
-            path: "/memfd/steam-object-arena".to_owned(),
-        };
-        assert!(!is_bootstrap_scan_entry(&entry));
-    }
-
-    #[test]
     fn primary_vtable_uses_pointer_sized_itanium_slots() {
         let typeinfo = 0x1234_5000usize;
         let executable = primary_vtable_uses_pointer_sized_itanium_slots as *const () as usize;
@@ -643,31 +370,34 @@ mod tests {
     }
 
     #[test]
-    fn window_candidate_validation_scans_pointer_sized_members() {
-        let mut target = Box::new(42usize);
-        let mut object = Box::new([0usize, target.as_mut() as *mut usize as usize]);
-        let object_base = object.as_mut_ptr() as usize;
-        let target_addr = target.as_mut() as *mut usize as usize;
-
+    fn lifecycle_methods_use_pointer_sized_vtable_slots() {
+        let executable = lifecycle_methods_use_pointer_sized_vtable_slots as *const () as usize;
+        let mut methods = Box::new([0usize; DESTRUCTOR_SLOT + 1]);
+        methods[REGISTER_JS_METHOD_SLOT] = executable;
+        methods[DESTRUCTOR_SLOT] = executable;
+        let vtable = methods.as_mut_ptr() as usize;
         let maps = vec![
             MapsEntry {
-                start: object_base,
-                end: object_base + std::mem::size_of_val(&*object),
-                perms: "rw-p".to_owned(),
-                path: "[heap]".to_owned(),
+                start: vtable,
+                end: vtable + std::mem::size_of_val(&*methods),
+                perms: "r--p".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
             },
             MapsEntry {
-                start: target_addr,
-                end: target_addr + std::mem::size_of::<usize>(),
-                perms: "rw-p".to_owned(),
-                path: "[heap]".to_owned(),
+                start: executable,
+                end: executable.saturating_add(1),
+                perms: "r-xp".to_owned(),
+                path: "/tmp/steamui.so".to_owned(),
             },
         ];
 
-        assert!(object_has_readable_member_pointer(
-            object_base,
-            std::mem::size_of_val(&*object),
-            &maps
-        ));
+        assert_eq!(
+            vtable_method_address(vtable, REGISTER_JS_METHOD_SLOT, &maps),
+            Some(executable)
+        );
+        assert_eq!(
+            vtable_method_address(vtable, DESTRUCTOR_SLOT, &maps),
+            Some(executable)
+        );
     }
 }

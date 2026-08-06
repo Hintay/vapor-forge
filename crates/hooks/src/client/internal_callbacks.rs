@@ -292,7 +292,7 @@ pub(crate) unsafe extern "C" fn hk_register_internal_callback(handler: *mut Inte
         unsafe { original(handler) };
     }
 
-    if observed != 0 {
+    if crate::capability::is_ready(crate::capability::Capability::CallbackEvents) && observed != 0 {
         observe_user(observed);
     }
 }
@@ -301,6 +301,9 @@ pub(crate) unsafe extern "C" fn hk_register_internal_callback(handler: *mut Inte
 ///
 /// Called only by the worker. No handler collection lock is held while entering Steam.
 pub(super) fn register_observed_handlers() {
+    if !crate::capability::is_ready(crate::capability::Capability::CallbackEvents) {
+        return;
+    }
     let Some(original) = original_register() else {
         return;
     };

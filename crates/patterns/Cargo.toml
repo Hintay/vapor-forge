@@ -9,6 +9,7 @@ autobins = false
 [features]
 default = []
 tools = ["dep:iced-x86", "dep:keyvalues-parser", "dep:serde", "dep:serde_json", "dep:sha2", "dep:ureq", "dep:zip"]
+runtime-semantic = ["dep:iced-x86"]
 
 [[bin]]
 name = "vapor-forge-pattern-scan"

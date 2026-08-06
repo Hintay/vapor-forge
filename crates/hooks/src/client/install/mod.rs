@@ -4,10 +4,12 @@ use std::sync::OnceLock;
 
 use tracing::{debug, error, info, warn};
 use vapor_forge_memory::{find_proc_self_maps_targets, ProcMapsEntry};
-use vapor_forge_patterns::registry::PatternRegistry;
+use vapor_forge_patterns::registry::{
+    PatternArchitecture, PatternRegistry, PatternTarget, SteamBinaryFamily,
+};
 
 use crate::hook_report::{log_drift_summary, log_hook_details, store_results, HookResult};
-use crate::pattern_resolver::{resolve_pattern_entry, CodeRegion};
+use crate::pattern_resolver::{resolve_pattern_entry, validate_resolved_pattern, CodeRegion};
 use vapor_forge_hook_engine::detour::{self, PendingDetour};
 use vapor_forge_hook_engine::plan::{
     validate_hook_target, AddressRange, HookPlanError, HookTargetInput, ValidatedHookTarget,
@@ -21,8 +23,8 @@ mod steamui;
 pub use runtime::ensure_runtime_initialized;
 pub(crate) use runtime::{
     build_runtime, build_script_dirs, config, effective_ticket_mode,
-    ensure_runtime_services_for_config, merge_script_apps, package_state, runtime_snapshot,
-    script_state, sync_config_template, RuntimeSnapshot, IPC_SERVER, TICKET_CACHE,
+    ensure_runtime_services_for_config, merge_script_apps, package_state, runtime_generation,
+    runtime_snapshot, script_state, RuntimeSnapshot, IPC_SERVER, TICKET_CACHE,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,15 +67,53 @@ pub enum HookBatch {
     SteamUi,
 }
 
+const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
+    crate::capability::Capability::CallbackEvents,
+    crate::capability::Capability::Ownership,
+    crate::capability::Capability::PackageInjection,
+    crate::capability::Capability::TicketOverrides,
+    crate::capability::Capability::DepotInjection,
+    crate::capability::Capability::DlcOverrides,
+    crate::capability::Capability::CmInterception,
+    crate::capability::Capability::NativeResponseDelivery,
+    crate::capability::Capability::CloudControl,
+    crate::capability::Capability::CloudHttp,
+    crate::capability::Capability::LaunchEnvironment,
+];
+
+const STEAMUI_CAPABILITIES: &[crate::capability::Capability] = &[
+    crate::capability::Capability::LibraryUi,
+    crate::capability::Capability::OverviewMetadata,
+    crate::capability::Capability::LibrarySnapshot,
+    crate::capability::Capability::ConflictUiBridge,
+];
+
+pub(crate) fn disable_hook_batch_capabilities(batch: HookBatch, reason: &str) {
+    let capabilities = match batch {
+        HookBatch::SteamClient => STEAMCLIENT_CAPABILITIES,
+        HookBatch::SteamUi => STEAMUI_CAPABILITIES,
+    };
+    crate::capability::disable_all(capabilities, reason);
+}
+
 /// Install one hook batch. Safe to call multiple times.
 pub fn install_hook_batch(batch: HookBatch) {
-    ensure_runtime_initialized();
+    if !ensure_runtime_initialized() {
+        warn!(
+            ?batch,
+            "hook-install: hook batch rejected because runtime initialization failed"
+        );
+        disable_hook_batch_capabilities(batch, "runtime initialization failed");
+        mark_hook_batch_finished(batch);
+        return;
+    }
     if !steam_hook_batch_supported(batch) {
         warn!(
             batch = ?batch,
             arch = current_hook_architecture(),
             "hook-install: Steam hook batch skipped on unsupported process architecture"
         );
+        disable_hook_batch_capabilities(batch, "process architecture is unsupported");
         mark_hook_batch_finished(batch);
         return;
     }
@@ -136,17 +176,170 @@ fn current_hook_architecture() -> &'static str {
 // Pattern registry
 // ---------------------------------------------------------------------------
 
-/// Load patterns: try external override file, fall back to embedded.
-pub(crate) fn load_pattern_registry() -> PatternRegistry {
-    if let Ok(home) = std::env::var("HOME") {
-        let path = std::path::Path::new(&home).join(".config/vapor-forge/patterns.toml");
-        if path.exists() {
-            let reg = PatternRegistry::with_overrides(&path);
-            info!(path = %path.display(), "patterns: loaded external overrides");
-            return reg;
+/// Load a target-specific hotfix after validating it against the live module.
+pub(crate) fn load_pattern_registry(module: &str, code: &CodeRegion) -> Option<PatternRegistry> {
+    let Some(target) = current_pattern_target(module, code) else {
+        error!(
+            module,
+            "patterns: Steam binary family is unknown; hook batch rejected"
+        );
+        return None;
+    };
+    let patterns_url = config().runtime.patterns_url.clone();
+    if !patterns_url.is_empty() {
+        validate_hotfix_candidate(&patterns_url, target, module, code);
+    }
+
+    let registry = vapor_forge_features::online_patterns::pattern_cache_path(target, module)
+        .filter(|path| path.is_file())
+        .and_then(|path| match PatternRegistry::with_hotfix(&path, target) {
+            Ok(registry) => match validate_live_hotfix(&registry, module, code) {
+                Ok(()) => {
+                    info!(
+                        path = %path.display(),
+                        architecture = target.architecture.as_str(),
+                        binary_family = target.binary_family.as_str(),
+                        "patterns: validated active hotfix"
+                    );
+                    Some(registry)
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "patterns: active hotfix rejected");
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(path = %path.display(), %error, "patterns: active hotfix rejected");
+                None
+            }
+        })
+        .unwrap_or_else(|| PatternRegistry::embedded_for_target(target));
+
+    Some(registry)
+}
+
+fn validate_hotfix_candidate(
+    patterns_url: &str,
+    target: PatternTarget,
+    module: &str,
+    code: &CodeRegion,
+) {
+    let result = vapor_forge_features::online_patterns::validate_and_promote_candidate(
+        patterns_url,
+        target,
+        module,
+        |content| validate_hotfix_candidate_content(content, target, module, code),
+    );
+    let active_path = match result {
+        Ok(vapor_forge_features::online_patterns::PromotionResult::NoCandidate) => return,
+        Ok(vapor_forge_features::online_patterns::PromotionResult::AlreadyActive(path)) => {
+            debug!(path = %path.display(), module, "patterns: candidate is already active");
+            return;
+        }
+        Ok(vapor_forge_features::online_patterns::PromotionResult::Published(path)) => path,
+        Err(error) => {
+            warn!(%error, module, "patterns: candidate promotion rejected");
+            return;
+        }
+    };
+    info!(
+        path = %active_path.display(),
+        architecture = target.architecture.as_str(),
+        binary_family = target.binary_family.as_str(),
+        module,
+        "patterns: candidate validated and published"
+    );
+}
+
+fn validate_hotfix_candidate_content(
+    content: &[u8],
+    target: PatternTarget,
+    module: &str,
+    code: &CodeRegion,
+) -> Result<(), String> {
+    let text =
+        std::str::from_utf8(content).map_err(|error| format!("candidate is not UTF-8: {error}"))?;
+    let registry = PatternRegistry::from_hotfix_text(text, target)
+        .map_err(|error| format!("candidate rejected: {error}"))?;
+    validate_live_hotfix(&registry, module, code)
+        .map_err(|error| format!("semantic validation failed: {error}"))
+}
+
+fn validate_live_hotfix(
+    registry: &PatternRegistry,
+    module: &str,
+    code: &CodeRegion,
+) -> Result<(), String> {
+    for name in registry.override_names_for_module(module) {
+        let entry = registry
+            .get(name)
+            .ok_or_else(|| format!("hotfix entry {name:?} disappeared"))?;
+        let address =
+            if module == "steamui" && name == "google::protobuf::RepeatedField<uint32>::Add" {
+                crate::ui::install::resolve_repeated_field_add_address(code, registry)
+            } else {
+                resolve_pattern_entry(code, name, &entry)
+            }
+            .ok_or_else(|| format!("hotfix pattern {name:?} did not resolve uniquely"))?;
+        let offset = address
+            .checked_sub(code.base)
+            .ok_or_else(|| format!("hotfix pattern {name:?} resolved outside the module"))?;
+        vapor_forge_patterns::full_semantic::validate_live_pattern(
+            module,
+            std::mem::size_of::<usize>(),
+            name,
+            code.bytes,
+            offset,
+        )
+        .map_err(|error| format!("hotfix pattern {name:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn current_pattern_target(module: &str, code: &CodeRegion) -> Option<PatternTarget> {
+    let architecture = PatternArchitecture::current()?;
+    let entries = find_proc_self_maps_targets(64).ok()?;
+    let binary_family = binary_family_for_code_region(&entries, module, code)?;
+    Some(PatternTarget {
+        architecture,
+        binary_family,
+    })
+}
+
+fn binary_family_for_code_region(
+    entries: &[ProcMapsEntry],
+    module: &str,
+    code: &CodeRegion,
+) -> Option<SteamBinaryFamily> {
+    let file_name = format!("{module}.so");
+    let suffix = format!("/{file_name}");
+    let code_end = code.base.checked_add(code.bytes.len())?;
+    let mapping = entries.iter().find(|entry| {
+        entry.permissions.contains('x')
+            && entry.range.base.0 <= code.base
+            && entry.range.end.0 >= code_end
+            && (entry.path.ends_with(&suffix) || entry.path == file_name.as_str())
+    })?;
+    steam_binary_family_from_path(std::path::Path::new(&mapping.path))
+}
+
+fn steam_binary_family_from_path(path: &std::path::Path) -> Option<SteamBinaryFamily> {
+    let mut ordinary = false;
+    for component in path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+    {
+        if matches!(component, "steamrt32" | "steamrt64") {
+            return Some(SteamBinaryFamily::SteamRt);
+        }
+        if matches!(
+            component,
+            "ubuntu12_32" | "ubuntu12_64" | "linux32" | "linux64"
+        ) {
+            ordinary = true;
         }
     }
-    PatternRegistry::embedded()
+    ordinary.then_some(SteamBinaryFamily::Ordinary)
 }
 
 /// Resolve a function address from the registry and create a pending detour.
@@ -170,7 +363,8 @@ pub(crate) fn resolve_address_from_registry(
         None
     })?;
 
-    resolve_pattern_entry(code, name, &entry)
+    let address = resolve_pattern_entry(code, name, &entry)?;
+    validate_resolved_pattern("steamclient", code, name, address).then_some(address)
 }
 
 fn resolve_from_address<F: vapor_forge_hook_engine::detour::HookFn>(
@@ -236,6 +430,54 @@ fn resolve_interface_method<F: vapor_forge_hook_engine::detour::HookFn>(
     method: &str,
     replacement: F,
 ) -> Option<PendingDetour<F>> {
+    let address = resolve_interface_method_address(code, name, interface, method)?;
+    resolve_from_address(code, name, address, replacement)
+}
+
+fn resolve_interface_method_address(
+    code: &CodeRegion,
+    name: &str,
+    interface: &str,
+    method: &str,
+) -> Option<usize> {
+    if interface == "IClientConfigStore" {
+        let method_kind = match method {
+            "GetUint64" => vapor_forge_patterns::vtable_scan::ConfigStoreUint64Method::Get,
+            "SetUint64" => vapor_forge_patterns::vtable_scan::ConfigStoreUint64Method::Set,
+            _ => {
+                error!(
+                    hook = name,
+                    interface, method, "unsupported config-store method"
+                );
+                return None;
+            }
+        };
+        let address = match crate::vtable_scan::config_store_uint64_method_address(method_kind) {
+            Ok(address) => address,
+            Err(error) => {
+                error!(hook = name, interface, method, %error, "interface method semantic validation failed");
+                return None;
+            }
+        };
+        if address < code.base || address >= code.base.saturating_add(code.bytes.len()) {
+            error!(
+                hook = name,
+                interface,
+                method,
+                address = format_args!("0x{address:x}"),
+                "interface method is outside steamclient executable code"
+            );
+            return None;
+        }
+        debug!(
+            hook = name,
+            interface,
+            method,
+            address = format_args!("0x{address:x}"),
+            "interface method semantic validation passed"
+        );
+        return Some(address);
+    }
     let slots = crate::vtable_scan::slots_of(interface, method);
     if slots.len() != 1 {
         error!(
@@ -255,7 +497,17 @@ fn resolve_interface_method<F: vapor_forge_hook_engine::detour::HookFn>(
         );
         return None;
     };
-    resolve_from_address(code, name, address, replacement)
+    if address < code.base || address >= code.base.saturating_add(code.bytes.len()) {
+        error!(
+            hook = name,
+            interface,
+            method,
+            address = format_args!("0x{address:x}"),
+            "interface method is outside steamclient executable code"
+        );
+        return None;
+    }
+    Some(address)
 }
 
 fn resolve_cuser_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
@@ -372,46 +624,6 @@ fn validate_hook_eligibility(
     Ok(target)
 }
 
-pub(crate) fn plan_vmt_hook(
-    name: &str,
-    original_addr: usize,
-    replacement_addr: usize,
-) -> Option<ValidatedHookTarget> {
-    let Some(&(base, end)) = CODE_RANGE.get() else {
-        warn!(hook = name, "VMT validation failed: code range not set");
-        return None;
-    };
-    let result = validate_hook_target(HookTargetInput {
-        target_address: original_addr,
-        replacement_address: replacement_addr,
-        executable_range: AddressRange { start: base, end },
-    });
-    let target = result
-        .inspect_err(|error| warn!(hook = name, %error, "VMT hook boundary validation failed"))
-        .ok()?;
-    debug!(
-        hook = name,
-        original = format_args!("0x{:x}", original_addr),
-        replacement = format_args!("0x{:x}", replacement_addr),
-        "VMT hook boundary: eligible"
-    );
-    Some(target)
-}
-
-pub(crate) fn validate_steamclient_code_address(name: &str, address: usize) -> bool {
-    let valid = CODE_RANGE
-        .get()
-        .is_some_and(|&(base, end)| base <= address && address < end);
-    if !valid {
-        warn!(
-            hook = name,
-            address = format_args!("0x{address:x}"),
-            "captured function is outside steamclient executable code"
-        );
-    }
-    valid
-}
-
 // ---------------------------------------------------------------------------
 // Core installation logic
 // ---------------------------------------------------------------------------
@@ -419,12 +631,23 @@ pub(crate) fn validate_steamclient_code_address(name: &str, address: usize) -> b
 fn do_install() {
     let code = match get_steamclient_code() {
         Some(c) => c,
-        None => return,
+        None => {
+            disable_hook_batch_capabilities(
+                HookBatch::SteamClient,
+                "steamclient executable mapping is unavailable",
+            );
+            return;
+        }
     };
     let _ = CODE_RANGE.set((code.base, code.base + code.bytes.len()));
 
-    // Load pattern registry: try external file first, fall back to embedded
-    let registry = load_pattern_registry();
+    let Some(registry) = load_pattern_registry("steamclient", &code) else {
+        disable_hook_batch_capabilities(
+            HookBatch::SteamClient,
+            "steamclient pattern target is unavailable",
+        );
+        return;
+    };
     info!(patterns = registry.len(), "patterns loaded");
 
     if vmt_scanner_supported() {
@@ -455,76 +678,82 @@ fn do_install() {
     }
 
     // Create every detour before finalizing their shared trampoline storage.
-    let d_set_api_call_result = resolve_set_api_call_result(&registry, &code);
-    let d_register_internal_callback = resolve_from_registry(
+    let mut d_set_api_call_result = resolve_set_api_call_result(&registry, &code);
+    let mut d_register_internal_callback = resolve_from_registry(
         &registry,
         &code,
         "CSteamEngine::RegisterInternalCallback",
         super::internal_callbacks::hk_register_internal_callback
             as super::internal_callbacks::RegisterInternalCallbackFn,
     );
-    let d_get_steam_id = resolve_interface_method(
+    let mut d_get_steam_id = resolve_interface_method(
         &code,
         super::user::GET_STEAM_ID_NAME,
         "IClientUser",
         "GetSteamID",
         super::user::hk_get_steam_id as super::user::GetSteamIdFn,
     );
-    let d_user_interface_init = resolve_from_registry(
+    let mut d_set_client_id = resolve_interface_method(
+        &code,
+        super::client_id::SET_UINT64_NAME,
+        "IClientConfigStore",
+        "SetUint64",
+        super::client_id::hk_set_uint64 as super::client_id::SetUint64Fn,
+    );
+    let mut d_user_interface_init = resolve_from_registry(
         &registry,
         &code,
         super::steam_context::USER_INTERFACE_INIT_NAME,
         super::steam_context::hk_user_interface_init as super::steam_context::UserInterfaceInitFn,
     );
-    let d_user_interface_destructor = resolve_from_registry(
+    let mut d_user_interface_destructor = resolve_from_registry(
         &registry,
         &code,
         super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
         super::steam_context::hk_user_interface_destructor
             as super::steam_context::UserInterfaceDestructorFn,
     );
-    let d_ownership = resolve_from_registry(
+    let mut d_ownership = resolve_from_registry(
         &registry,
         &code,
         "CUser::CheckAppOwnership",
         super::ownership::hk_check_app_ownership as super::ownership::CheckAppOwnershipFn,
     );
-    let d_subscribed = resolve_from_registry(
+    let mut d_subscribed = resolve_from_registry(
         &registry,
         &code,
         "CUser::GetSubscribedApps",
         super::ownership::hk_get_subscribed_apps as super::ownership::GetSubscribedAppsFn,
     );
-    let d_remote_storage_ipc = if vmt_scanner_supported() {
-        resolve_from_registry(
-            &registry,
-            &code,
-            "IClientRemoteStorage::RunIPCFrame",
-            super::cloud::hk_remote_storage_run_ipc_frame as super::cloud::RunIPCFrameFn,
-        )
-    } else {
-        None
-    };
-    let d_app_mgr_ipc = if vmt_scanner_supported() {
-        resolve_from_registry(
-            &registry,
-            &code,
-            "IClientAppManager::RunIPCFrame",
-            super::dlc::hk_app_manager_run_ipc_frame as super::cloud::RunIPCFrameFn,
-        )
-    } else {
-        None
-    };
-    let d_client_apps_ipc = if vmt_scanner_supported() {
-        resolve_from_registry(
-            &registry,
-            &code,
-            "IClientApps::RunIPCFrame",
-            super::dlc::hk_client_apps_run_ipc_frame as super::cloud::RunIPCFrameFn,
-        )
-    } else {
-        None
-    };
+    let mut d_is_cloud_enabled = resolve_interface_method(
+        &code,
+        super::cloud::IS_CLOUD_ENABLED_NAME,
+        "IClientRemoteStorage",
+        "IsCloudEnabledForApp",
+        super::cloud::hk_is_cloud_enabled_for_app as super::cloud::IsCloudEnabledForAppFn,
+    );
+    if let Some(address) = resolve_interface_method_address(
+        &code,
+        "IClientRemoteStorage::SetCloudEnabledForApp",
+        "IClientRemoteStorage",
+        "SetCloudEnabledForApp",
+    ) {
+        super::cloud::set_set_cloud_function(address);
+    }
+    let mut d_is_app_dlc_installed = resolve_interface_method(
+        &code,
+        super::dlc::IS_APP_DLC_INSTALLED_NAME,
+        "IClientAppManager",
+        "IsAppDlcInstalled",
+        super::dlc::hk_is_app_dlc_installed as super::dlc::IsAppDlcInstalledFn,
+    );
+    let mut d_b_is_dlc_enabled = resolve_interface_method(
+        &code,
+        super::dlc::B_IS_DLC_ENABLED_NAME,
+        "IClientAppManager",
+        "BIsDlcEnabled",
+        super::dlc::hk_b_is_dlc_enabled as super::dlc::BIsDlcEnabledFn,
+    );
     super::current_app::resolve(&code);
     let d_get_pkg_info = if package_injection_supported() {
         package_info::create_detour()
@@ -532,53 +761,53 @@ fn do_install() {
         None
     };
     let check_ownership = d_ownership.as_ref().map(|detour| detour.callee_addr);
-    let d_ticket_ext = resolve_cuser_adapter(
+    let mut d_ticket_ext = resolve_cuser_adapter(
         &code,
         super::ticket::TICKET_EXT_DATA_NAME,
         "GetAppOwnershipTicketExtendedData",
         check_ownership,
         super::ticket::hk_ticket_ext_data as super::ticket::TicketExtDataFn,
     );
-    let d_update_ticket = resolve_cuser_adapter(
+    let mut d_update_ticket = resolve_cuser_adapter(
         &code,
         super::ticket::UPDATE_TICKET_NAME,
         "BUpdateAppOwnershipTicket",
         check_ownership,
         super::ticket::hk_update_ticket as super::ticket::UpdateTicketFn,
     );
-    let d_is_sub_ticket = resolve_cuser_adapter(
+    let mut d_is_sub_ticket = resolve_cuser_adapter(
         &code,
         super::ticket::IS_SUBSCRIBED_IN_TICKET_NAME,
         "IsUserSubscribedAppInTicket",
         check_ownership,
         super::ticket::hk_is_subscribed_in_ticket as super::ticket::IsSubscribedInTicketFn,
     );
-    let d_get_enc = resolve_cuser_adapter(
+    let mut d_get_enc = resolve_cuser_adapter(
         &code,
         super::eticket::GET_ENCRYPTED_NAME,
         "GetEncryptedAppTicket",
         check_ownership,
         super::eticket::hk_get_encrypted_app_ticket as super::eticket::GetEncryptedAppTicketFn,
     );
-    let d_build_depot = resolve_from_registry(
+    let mut d_build_depot = resolve_from_registry(
         &registry,
         &code,
         "BuildDepotDependency",
         super::depot::hk_build_depot_dependency as super::depot::BuildDepotDependencyFn,
     );
-    let d_depot_key = resolve_from_registry(
+    let mut d_depot_key = resolve_from_registry(
         &registry,
         &code,
         "LoadDepotDecryptionKey",
         super::depot::hk_load_depot_decryption_key as super::depot::LoadDepotDecryptionKeyFn,
     );
-    let d_send_frame = resolve_from_registry(
+    let mut d_send_frame = resolve_from_registry(
         &registry,
         &code,
         "CWebSocketConnection::BBuildAndAsyncSendFrame",
         super::network::hk_send_frame as super::network::BBuildAndAsyncSendFrameFn,
     );
-    let d_recv_pkt = resolve_from_registry(
+    let mut d_recv_pkt = resolve_from_registry(
         &registry,
         &code,
         "CCMConnection::RecvPkt",
@@ -600,7 +829,7 @@ fn do_install() {
         super::cloud_http::HTTP_JOB_START_NAME,
         super::cloud_http::hk_http_job_start as super::cloud_http::HttpJobStartFn,
     );
-    let d_write_vdf = if vmt_scanner_supported() {
+    let mut d_write_vdf = if vmt_scanner_supported() {
         resolve_from_registry(
             &registry,
             &code,
@@ -610,7 +839,7 @@ fn do_install() {
     } else {
         None
     };
-    let d_build_spawn_env = if env_hooks_supported() {
+    let mut d_build_spawn_env = if env_hooks_supported() {
         resolve_from_registry(
             &registry,
             &code,
@@ -620,7 +849,7 @@ fn do_install() {
     } else {
         None
     };
-    let d_spawn_process = if env_hooks_supported() {
+    let mut d_spawn_process = if env_hooks_supported() {
         resolve_from_registry(
             &registry,
             &code,
@@ -634,6 +863,62 @@ fn do_install() {
     // Resolve SetEnvString as a raw fn pointer for library injection.
     if env_hooks_supported() {
         super::env::resolve_set_env_string(&registry, &code);
+    }
+
+    let callback_group_resolved = d_set_api_call_result.is_some()
+        && d_register_internal_callback.is_some()
+        && d_get_steam_id.is_some()
+        && d_set_client_id.is_some()
+        && d_user_interface_init.is_some()
+        && d_user_interface_destructor.is_some();
+    if !callback_group_resolved {
+        d_set_api_call_result = None;
+        d_register_internal_callback = None;
+        d_get_steam_id = None;
+        d_set_client_id = None;
+        d_user_interface_init = None;
+        d_user_interface_destructor = None;
+    }
+
+    if d_ownership.is_none() || d_subscribed.is_none() {
+        d_ownership = None;
+        d_subscribed = None;
+    }
+    if d_ticket_ext.is_none()
+        || d_update_ticket.is_none()
+        || d_is_sub_ticket.is_none()
+        || d_get_enc.is_none()
+    {
+        d_ticket_ext = None;
+        d_update_ticket = None;
+        d_is_sub_ticket = None;
+        d_get_enc = None;
+    }
+    if d_build_depot.is_none() || d_depot_key.is_none() {
+        d_build_depot = None;
+        d_depot_key = None;
+    }
+    if d_is_app_dlc_installed.is_none() || d_b_is_dlc_enabled.is_none() {
+        d_is_app_dlc_installed = None;
+        d_b_is_dlc_enabled = None;
+    }
+    if d_send_frame.is_none() || d_recv_pkt.is_none() {
+        d_send_frame = None;
+        d_recv_pkt = None;
+    }
+    if d_is_cloud_enabled.is_none()
+        || d_write_vdf.is_none()
+        || !super::cloud::set_cloud_function_ready()
+    {
+        d_is_cloud_enabled = None;
+        d_write_vdf = None;
+    }
+    if d_build_spawn_env.is_none()
+        || d_spawn_process.is_none()
+        || !super::env::set_env_string_ready()
+    {
+        d_build_spawn_env = None;
+        d_spawn_process = None;
     }
 
     macro_rules! hr {
@@ -653,6 +938,7 @@ fn do_install() {
             d_register_internal_callback
         ),
         hr!(super::user::GET_STEAM_ID_NAME, d_get_steam_id),
+        hr!(super::client_id::SET_UINT64_NAME, d_set_client_id),
         hr!(
             super::steam_context::USER_INTERFACE_INIT_NAME,
             d_user_interface_init
@@ -663,9 +949,12 @@ fn do_install() {
         ),
         hr!("CUser::CheckAppOwnership", d_ownership),
         hr!("CUser::GetSubscribedApps", d_subscribed),
-        hr!("IClientRemoteStorage::RunIPCFrame", d_remote_storage_ipc),
-        hr!("IClientAppManager::RunIPCFrame", d_app_mgr_ipc),
-        hr!("IClientApps::RunIPCFrame", d_client_apps_ipc),
+        hr!(super::cloud::IS_CLOUD_ENABLED_NAME, d_is_cloud_enabled),
+        hr!(
+            super::dlc::IS_APP_DLC_INSTALLED_NAME,
+            d_is_app_dlc_installed
+        ),
+        hr!(super::dlc::B_IS_DLC_ENABLED_NAME, d_b_is_dlc_enabled),
         HookResult {
             name: package_info::hook_name(),
             installed: d_get_pkg_info.is_some(),
@@ -691,137 +980,254 @@ fn do_install() {
         hr!("CUser::SpawnProcess", d_spawn_process),
     ];
 
-    // Finalize and enable the resolved detours.
-    // SAFETY: each static is written once during initialization.
-    unsafe {
-        let api_call_result_ready = detour::store_and_finalize(
-            "CSteamEngine::SetAPICallResult",
-            std::ptr::addr_of_mut!(super::callback_notify::SET_API_CALL_RESULT_DETOUR),
-            d_set_api_call_result,
-        );
-        let internal_callback_ready = detour::store_and_finalize(
-            "CSteamEngine::RegisterInternalCallback",
-            std::ptr::addr_of_mut!(super::internal_callbacks::REGISTER_INTERNAL_CALLBACK_DETOUR),
-            d_register_internal_callback,
-        );
-        let get_steam_id_ready = detour::store_and_finalize(
-            super::user::GET_STEAM_ID_NAME,
-            std::ptr::addr_of_mut!(super::user::GET_STEAM_ID_DETOUR),
-            d_get_steam_id,
-        );
-        let user_interface_init_ready = detour::store_and_finalize(
-            super::steam_context::USER_INTERFACE_INIT_NAME,
-            std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_INIT_DETOUR),
-            d_user_interface_init,
-        );
-        let user_interface_destructor_ready = detour::store_and_finalize(
-            super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
-            std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_DESTRUCTOR_DETOUR),
-            d_user_interface_destructor,
-        );
-        hook_results[0].installed = api_call_result_ready;
-        hook_results[1].installed = internal_callback_ready;
-        hook_results[2].installed = get_steam_id_ready;
-        hook_results[3].installed = user_interface_init_ready;
-        hook_results[4].installed = user_interface_destructor_ready;
-        super::callback_notify::set_hooks_ready(
-            api_call_result_ready
-                && internal_callback_ready
-                && get_steam_id_ready
-                && user_interface_init_ready
-                && user_interface_destructor_ready,
-        );
-        detour::store_and_finalize(
-            "CUser::CheckAppOwnership",
-            std::ptr::addr_of_mut!(super::ownership::OWNERSHIP_DETOUR),
-            d_ownership,
-        );
-        detour::store_and_finalize(
-            "CUser::GetSubscribedApps",
-            std::ptr::addr_of_mut!(super::ownership::SUBSCRIBED_DETOUR),
-            d_subscribed,
-        );
-        detour::store_and_finalize(
-            "IClientRemoteStorage::RunIPCFrame",
-            std::ptr::addr_of_mut!(super::cloud::REMOTE_STORAGE_RUN_IPC_DETOUR),
-            d_remote_storage_ipc,
-        );
-        detour::store_and_finalize(
-            "IClientAppManager::RunIPCFrame",
-            std::ptr::addr_of_mut!(super::dlc::APP_MANAGER_DETOUR),
-            d_app_mgr_ipc,
-        );
-        detour::store_and_finalize(
-            "IClientApps::RunIPCFrame",
-            std::ptr::addr_of_mut!(super::dlc::CLIENT_APPS_DETOUR),
-            d_client_apps_ipc,
-        );
-        detour::store_and_finalize(
-            package_info::hook_name(),
-            std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
-            d_get_pkg_info,
-        );
-        detour::store_and_finalize(
-            "IClientUser::GetAppOwnershipTicketExtendedData",
-            std::ptr::addr_of_mut!(super::ticket::TICKET_EXT_DATA_DETOUR),
-            d_ticket_ext,
-        );
-        detour::store_and_finalize(
-            "IClientUser::BUpdateAppOwnershipTicket",
-            std::ptr::addr_of_mut!(super::ticket::UPDATE_TICKET_DETOUR),
-            d_update_ticket,
-        );
-        detour::store_and_finalize(
-            "IClientUser::IsUserSubscribedAppInTicket",
-            std::ptr::addr_of_mut!(super::ticket::IS_SUBSCRIBED_IN_TICKET_DETOUR),
-            d_is_sub_ticket,
-        );
-        detour::store_and_finalize(
-            "IClientUser::GetEncryptedAppTicket",
-            std::ptr::addr_of_mut!(super::eticket::GET_ENCRYPTED_DETOUR),
-            d_get_enc,
-        );
-        detour::store_and_finalize(
-            "BuildDepotDependency",
-            std::ptr::addr_of_mut!(super::depot::BUILD_DEPOT_DETOUR),
-            d_build_depot,
-        );
-        detour::store_and_finalize(
-            "LoadDepotDecryptionKey",
-            std::ptr::addr_of_mut!(super::depot::DEPOT_KEY_DETOUR),
-            d_depot_key,
-        );
-        detour::store_and_finalize(
-            "CWebSocketConnection::BBuildAndAsyncSendFrame",
-            std::ptr::addr_of_mut!(super::network::SEND_FRAME_DETOUR),
-            d_send_frame,
-        );
-        detour::store_and_finalize(
-            "CCMConnection::RecvPkt",
-            std::ptr::addr_of_mut!(super::network::RECV_PKT_DETOUR),
-            d_recv_pkt,
-        );
-        detour::store_and_finalize(
-            super::cloud_http::HTTP_JOB_START_NAME,
-            std::ptr::addr_of_mut!(super::cloud_http::HTTP_JOB_START_DETOUR),
-            d_http_job_start,
-        );
-        detour::store_and_finalize(
-            "CConfigStore::WriteVdfFile",
-            std::ptr::addr_of_mut!(super::cloud::WRITE_VDF_DETOUR),
-            d_write_vdf,
-        );
-        detour::store_and_finalize(
-            "CUser::BuildSpawnEnvBlock",
-            std::ptr::addr_of_mut!(super::env::BUILD_SPAWN_ENV_DETOUR),
-            d_build_spawn_env,
-        );
-        detour::store_and_finalize(
-            "CUser::SpawnProcess",
-            std::ptr::addr_of_mut!(super::env::SPAWN_PROCESS_DETOUR),
-            d_spawn_process,
-        );
+    macro_rules! finalize {
+        ($index:expr, $name:expr, $storage:expr, $pending:expr) => {{
+            // SAFETY: each process-lifetime detour slot is written once during initialization.
+            let installed = unsafe { detour::store_and_finalize($name, $storage, $pending) };
+            hook_results[$index].installed = installed;
+            installed
+        }};
     }
+
+    finalize!(
+        0,
+        "CSteamEngine::SetAPICallResult",
+        std::ptr::addr_of_mut!(super::callback_notify::SET_API_CALL_RESULT_DETOUR),
+        d_set_api_call_result
+    );
+    finalize!(
+        1,
+        "CSteamEngine::RegisterInternalCallback",
+        std::ptr::addr_of_mut!(super::internal_callbacks::REGISTER_INTERNAL_CALLBACK_DETOUR),
+        d_register_internal_callback
+    );
+    finalize!(
+        2,
+        super::user::GET_STEAM_ID_NAME,
+        std::ptr::addr_of_mut!(super::user::GET_STEAM_ID_DETOUR),
+        d_get_steam_id
+    );
+    finalize!(
+        3,
+        super::client_id::SET_UINT64_NAME,
+        std::ptr::addr_of_mut!(super::client_id::SET_UINT64_DETOUR),
+        d_set_client_id
+    );
+    finalize!(
+        4,
+        super::steam_context::USER_INTERFACE_INIT_NAME,
+        std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_INIT_DETOUR),
+        d_user_interface_init
+    );
+    finalize!(
+        5,
+        super::steam_context::USER_INTERFACE_DESTRUCTOR_NAME,
+        std::ptr::addr_of_mut!(super::steam_context::USER_INTERFACE_DESTRUCTOR_DETOUR),
+        d_user_interface_destructor
+    );
+    finalize!(
+        6,
+        "CUser::CheckAppOwnership",
+        std::ptr::addr_of_mut!(super::ownership::OWNERSHIP_DETOUR),
+        d_ownership
+    );
+    finalize!(
+        7,
+        "CUser::GetSubscribedApps",
+        std::ptr::addr_of_mut!(super::ownership::SUBSCRIBED_DETOUR),
+        d_subscribed
+    );
+    finalize!(
+        8,
+        super::cloud::IS_CLOUD_ENABLED_NAME,
+        std::ptr::addr_of_mut!(super::cloud::IS_CLOUD_ENABLED_DETOUR),
+        d_is_cloud_enabled
+    );
+    finalize!(
+        9,
+        super::dlc::IS_APP_DLC_INSTALLED_NAME,
+        std::ptr::addr_of_mut!(super::dlc::IS_APP_DLC_INSTALLED_DETOUR),
+        d_is_app_dlc_installed
+    );
+    finalize!(
+        10,
+        super::dlc::B_IS_DLC_ENABLED_NAME,
+        std::ptr::addr_of_mut!(super::dlc::B_IS_DLC_ENABLED_DETOUR),
+        d_b_is_dlc_enabled
+    );
+    finalize!(
+        11,
+        package_info::hook_name(),
+        std::ptr::addr_of_mut!(package_info::GET_PKG_INFO_DETOUR),
+        d_get_pkg_info
+    );
+    finalize!(
+        12,
+        "IClientUser::GetAppOwnershipTicketExtendedData",
+        std::ptr::addr_of_mut!(super::ticket::TICKET_EXT_DATA_DETOUR),
+        d_ticket_ext
+    );
+    finalize!(
+        13,
+        "IClientUser::BUpdateAppOwnershipTicket",
+        std::ptr::addr_of_mut!(super::ticket::UPDATE_TICKET_DETOUR),
+        d_update_ticket
+    );
+    finalize!(
+        14,
+        "IClientUser::IsUserSubscribedAppInTicket",
+        std::ptr::addr_of_mut!(super::ticket::IS_SUBSCRIBED_IN_TICKET_DETOUR),
+        d_is_sub_ticket
+    );
+    finalize!(
+        15,
+        "IClientUser::GetEncryptedAppTicket",
+        std::ptr::addr_of_mut!(super::eticket::GET_ENCRYPTED_DETOUR),
+        d_get_enc
+    );
+    finalize!(
+        16,
+        "BuildDepotDependency",
+        std::ptr::addr_of_mut!(super::depot::BUILD_DEPOT_DETOUR),
+        d_build_depot
+    );
+    finalize!(
+        17,
+        "LoadDepotDecryptionKey",
+        std::ptr::addr_of_mut!(super::depot::DEPOT_KEY_DETOUR),
+        d_depot_key
+    );
+    finalize!(
+        18,
+        "CWebSocketConnection::BBuildAndAsyncSendFrame",
+        std::ptr::addr_of_mut!(super::network::SEND_FRAME_DETOUR),
+        d_send_frame
+    );
+    finalize!(
+        19,
+        "CCMConnection::RecvPkt",
+        std::ptr::addr_of_mut!(super::network::RECV_PKT_DETOUR),
+        d_recv_pkt
+    );
+    finalize!(
+        20,
+        super::cloud_http::HTTP_JOB_START_NAME,
+        std::ptr::addr_of_mut!(super::cloud_http::HTTP_JOB_START_DETOUR),
+        d_http_job_start
+    );
+    finalize!(
+        21,
+        "CConfigStore::WriteVdfFile",
+        std::ptr::addr_of_mut!(super::cloud::WRITE_VDF_DETOUR),
+        d_write_vdf
+    );
+    finalize!(
+        22,
+        "CUser::BuildSpawnEnvBlock",
+        std::ptr::addr_of_mut!(super::env::BUILD_SPAWN_ENV_DETOUR),
+        d_build_spawn_env
+    );
+    finalize!(
+        23,
+        "CUser::SpawnProcess",
+        std::ptr::addr_of_mut!(super::env::SPAWN_PROCESS_DETOUR),
+        d_spawn_process
+    );
+
+    super::callback_notify::set_hooks_ready(&[
+        (hook_results[0].name, hook_results[0].installed),
+        (hook_results[1].name, hook_results[1].installed),
+        (hook_results[2].name, hook_results[2].installed),
+        (hook_results[3].name, hook_results[3].installed),
+        (hook_results[4].name, hook_results[4].installed),
+        (hook_results[5].name, hook_results[5].installed),
+    ]);
+    let cm_ready = crate::capability::set_from_requirements(
+        crate::capability::Capability::CmInterception,
+        &[
+            (hook_results[18].name, hook_results[18].installed),
+            (hook_results[19].name, hook_results[19].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::NativeResponseDelivery,
+        &[
+            ("cm-interception", cm_ready),
+            (
+                "CNetPacket and work-item callables",
+                super::network::native_packet_functions_ready(),
+            ),
+        ],
+    );
+    let ownership_ready = crate::capability::set_from_requirements(
+        crate::capability::Capability::Ownership,
+        &[
+            ("cm-interception", cm_ready),
+            (hook_results[6].name, hook_results[6].installed),
+            (hook_results[7].name, hook_results[7].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::PackageInjection,
+        &[
+            ("ownership", ownership_ready),
+            (hook_results[11].name, hook_results[11].installed),
+            (
+                "package callables",
+                super::package::all_functions_resolved(),
+            ),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::TicketOverrides,
+        &[
+            ("cm-interception", cm_ready),
+            (hook_results[12].name, hook_results[12].installed),
+            (hook_results[13].name, hook_results[13].installed),
+            (hook_results[14].name, hook_results[14].installed),
+            (hook_results[15].name, hook_results[15].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::DepotInjection,
+        &[
+            ("cm-interception", cm_ready),
+            (hook_results[16].name, hook_results[16].installed),
+            (hook_results[17].name, hook_results[17].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::DlcOverrides,
+        &[
+            ("cm-interception", cm_ready),
+            (hook_results[9].name, hook_results[9].installed),
+            (hook_results[10].name, hook_results[10].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::CloudControl,
+        &[
+            ("cm-interception", cm_ready),
+            (hook_results[8].name, hook_results[8].installed),
+            (
+                "SetCloudEnabledForApp",
+                super::cloud::set_cloud_function_ready(),
+            ),
+            (hook_results[21].name, hook_results[21].installed),
+        ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::CloudHttp,
+        &[(hook_results[20].name, hook_results[20].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::LaunchEnvironment,
+        &[
+            (hook_results[22].name, hook_results[22].installed),
+            (hook_results[23].name, hook_results[23].installed),
+            ("SetEnvString", super::env::set_env_string_ready()),
+        ],
+    );
 
     log_drift_summary("steamclient.so", &hook_results);
     store_results("steamclient.so", &hook_results);
@@ -833,10 +1239,14 @@ fn do_install() {
     // Background fetch of online pattern updates
     let cfg = config();
     if !cfg.runtime.patterns_url.is_empty() {
-        vapor_forge_features::online_patterns::spawn_fetch(
-            cfg.runtime.patterns_url.clone(),
-            vapor_forge_patterns::registry::EMBEDDED_PATTERNS_HASH,
-        );
+        if let Some(target) = current_pattern_target("steamclient", &code) {
+            vapor_forge_features::online_patterns::spawn_fetch(
+                cfg.runtime.patterns_url.clone(),
+                target,
+            );
+        } else {
+            warn!("online-patterns: Steam binary family is unknown; update skipped");
+        }
     }
 }
 
@@ -897,4 +1307,118 @@ fn find_steamclient_exec_mapping(entries: &[ProcMapsEntry]) -> Option<&ProcMapsE
         e.permissions.contains('x')
             && (e.path.ends_with("/steamclient.so") || e.path == "steamclient.so")
     })
+}
+
+#[cfg(test)]
+mod pattern_target_tests {
+    use super::*;
+    use vapor_forge_core::Address;
+
+    static CODE_BYTES: [u8; 0x100] = [0; 0x100];
+    static INVALID_HOTFIX_CODE: [u8; 8] = [0xc3, 0xc2, 0xc1, 0xc0, 0, 0, 0, 0];
+
+    fn mapping(base: usize, end: usize, path: &str) -> ProcMapsEntry {
+        ProcMapsEntry {
+            range: vapor_forge_memory::ModuleRange {
+                base: Address(base),
+                end: Address(end),
+                size: end - base,
+            },
+            permissions: "r-xp".to_owned(),
+            file_offset: 0,
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn classifies_ordinary_and_steamrt_paths() {
+        assert_eq!(
+            steam_binary_family_from_path(std::path::Path::new(
+                "/home/user/.steam/ubuntu12_32/steamclient.so"
+            )),
+            Some(SteamBinaryFamily::Ordinary)
+        );
+        assert_eq!(
+            steam_binary_family_from_path(std::path::Path::new(
+                "/home/user/.steam/linux64/steamclient.so"
+            )),
+            Some(SteamBinaryFamily::Ordinary)
+        );
+        assert_eq!(
+            steam_binary_family_from_path(std::path::Path::new(
+                "/home/user/.steam/steamrt64/steamclient.so"
+            )),
+            Some(SteamBinaryFamily::SteamRt)
+        );
+        assert_eq!(
+            steam_binary_family_from_path(std::path::Path::new("/tmp/steamclient.so")),
+            None
+        );
+    }
+
+    #[test]
+    fn target_family_uses_the_mapping_that_contains_the_code_region() {
+        let entries = [
+            mapping(0x1000, 0x2000, "/home/user/.steam/linux64/steamclient.so"),
+            mapping(0x3000, 0x4000, "/home/user/.steam/steamrt64/steamclient.so"),
+        ];
+        let code = CodeRegion {
+            base: 0x3000,
+            bytes: &CODE_BYTES,
+        };
+
+        assert_eq!(
+            binary_family_for_code_region(&entries, "steamclient", &code),
+            Some(SteamBinaryFamily::SteamRt)
+        );
+    }
+
+    #[test]
+    fn target_family_rejects_a_different_module_mapping() {
+        let entries = [mapping(
+            0x3000,
+            0x4000,
+            "/home/user/.steam/steamrt64/steamui.so",
+        )];
+        let code = CodeRegion {
+            base: 0x3000,
+            bytes: &CODE_BYTES,
+        };
+
+        assert_eq!(
+            binary_family_for_code_region(&entries, "steamclient", &code),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_content_passes_through_the_live_semantic_gate() {
+        let architecture = PatternArchitecture::current().unwrap();
+        let target = PatternTarget {
+            architecture,
+            binary_family: SteamBinaryFamily::SteamRt,
+        };
+        let content = format!(
+            r#"[hotfix]
+format = 1
+revision = 1
+architecture = "{}"
+binary_family = "steamrt"
+
+[steamclient."CUser::CheckAppOwnership"]
+pattern = "C3 C2 C1 C0"
+"#,
+            architecture.as_str()
+        );
+        let code = CodeRegion {
+            base: INVALID_HOTFIX_CODE.as_ptr() as usize,
+            bytes: &INVALID_HOTFIX_CODE,
+        };
+
+        let error =
+            validate_hotfix_candidate_content(content.as_bytes(), target, "steamclient", &code)
+                .unwrap_err();
+
+        assert!(error.contains("semantic validation failed"));
+    }
 }

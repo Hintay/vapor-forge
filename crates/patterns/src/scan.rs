@@ -23,8 +23,8 @@ pub struct PatternRef<'a> {
     pub follow: FollowMode,
     pub prologue: Option<&'a [u8]>,
     pub callee_pattern: Option<&'a str>,
-    pub optional: bool,
     pub pic_entry: bool,
+    pub steamrt_variant: bool,
     pub module: &'a str,
 }
 
@@ -36,8 +36,8 @@ impl<'a> From<&'a PatternDef> for PatternRef<'a> {
             follow: entry.follow,
             prologue: entry.prologue,
             callee_pattern: entry.callee_pattern,
-            optional: entry.optional,
             pic_entry: entry.pic_entry,
+            steamrt_variant: entry.steamrt_variant,
             module: entry.module,
         }
     }
@@ -55,14 +55,14 @@ pub struct ModuleScanReport {
 }
 
 impl ModuleScanReport {
-    pub fn required_failures(&self) -> impl Iterator<Item = &PatternScanEntry> {
+    pub fn failures(&self) -> impl Iterator<Item = &PatternScanEntry> {
         self.entries
             .iter()
-            .filter(|entry| !entry.optional && entry.status != PatternScanStatus::Ok)
+            .filter(|entry| entry.status != PatternScanStatus::Ok)
     }
 
     pub fn failure_count(&self) -> usize {
-        self.required_failures().count()
+        self.failures().count()
     }
 
     pub fn ok_count(&self) -> usize {
@@ -83,7 +83,6 @@ impl ModuleScanReport {
 #[derive(Clone, Debug)]
 pub struct PatternScanEntry {
     pub name: String,
-    pub optional: bool,
     pub status: PatternScanStatus,
     pub match_count: usize,
     pub target_offset: Option<usize>,
@@ -96,6 +95,12 @@ pub enum PatternScanStatus {
     Miss,
     Ambiguous,
     Fail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LibraryFamily {
+    Ordinary,
+    SteamRt,
 }
 
 impl PatternScanStatus {
@@ -124,6 +129,7 @@ pub fn scan_module(module: &str, path: &Path) -> Result<ModuleScanReport, String
         .iter()
         .map(|entry| PatternRef::from(*entry))
         .collect::<Vec<_>>();
+    let variants = select_variants_for_library_path(&variants, path);
     let entries = group_variants(&variants)
         .into_iter()
         .map(|group| scan_entry_group(segment.bytes, &group))
@@ -138,6 +144,37 @@ pub fn scan_module(module: &str, path: &Path) -> Result<ModuleScanReport, String
         text_size: segment.bytes.len(),
         entries,
     })
+}
+
+/// Select the ordinary wildcard entry or the steamrt variants for each group.
+pub fn select_variants_for_library_path<'a>(
+    entries: &[PatternRef<'a>],
+    path: &Path,
+) -> Vec<PatternRef<'a>> {
+    let family = path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .fold(None, |family, component| match component {
+            "steamrt32" | "steamrt64" => Some(LibraryFamily::SteamRt),
+            "ubuntu12_32" | "ubuntu12_64" | "linux32" | "linux64" if family.is_none() => {
+                Some(LibraryFamily::Ordinary)
+            }
+            _ => family,
+        });
+    let Some(family) = family else {
+        return entries.to_vec();
+    };
+
+    group_variants(entries)
+        .into_iter()
+        .flat_map(|group| {
+            let use_steamrt =
+                family == LibraryFamily::SteamRt && group.iter().any(|entry| entry.steamrt_variant);
+            group
+                .into_iter()
+                .filter(move |entry| entry.steamrt_variant == use_steamrt)
+        })
+        .collect()
 }
 
 /// Group consecutive variants that share a name and module.
@@ -161,7 +198,6 @@ fn scan_entry_group(haystack: &[u8], entries: &[PatternRef<'_>]) -> PatternScanE
     match resolve_entry_group(haystack, entries) {
         Ok(result) => PatternScanEntry {
             name: entry.name.to_owned(),
-            optional: entry.optional,
             status: PatternScanStatus::Ok,
             match_count: result.match_count,
             target_offset: Some(result.target_offset),
@@ -169,7 +205,6 @@ fn scan_entry_group(haystack: &[u8], entries: &[PatternRef<'_>]) -> PatternScanE
         },
         Err(error) => PatternScanEntry {
             name: entry.name.to_owned(),
-            optional: entry.optional,
             status: error.status(),
             match_count: error.match_count(),
             target_offset: None,
@@ -453,8 +488,8 @@ mod tests {
         follow: FollowMode::None,
         prologue: None,
         callee_pattern: None,
-        optional: false,
         pic_entry: false,
+        steamrt_variant: false,
         module: "steamclient",
     };
 
@@ -464,8 +499,8 @@ mod tests {
         follow: FollowMode::None,
         prologue: None,
         callee_pattern: None,
-        optional: false,
         pic_entry: false,
+        steamrt_variant: true,
         module: "steamclient",
     };
 
@@ -495,6 +530,59 @@ mod tests {
             Ok(_) => panic!("variant conflict should not resolve as OK"),
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn library_path_selects_the_matching_binary_family() {
+        let entries = [PatternRef::from(&VARIANT_A), PatternRef::from(&VARIANT_B)];
+        let ordinary_x86 = select_variants_for_library_path(
+            &entries,
+            Path::new("/steam/ubuntu12_32/steamclient.so"),
+        );
+        let ordinary_x64 =
+            select_variants_for_library_path(&entries, Path::new("/steam/linux64/steamclient.so"));
+        let steamrt = select_variants_for_library_path(
+            &entries,
+            Path::new("/steam/steamrt64/steamclient.so"),
+        );
+        assert_eq!(ordinary_x86.len(), 1);
+        assert_eq!(ordinary_x86[0].pattern, VARIANT_A.pattern);
+        assert_eq!(ordinary_x64.len(), 1);
+        assert_eq!(ordinary_x64[0].pattern, VARIANT_A.pattern);
+        assert_eq!(steamrt.len(), 1);
+        assert_eq!(steamrt[0].pattern, VARIANT_B.pattern);
+    }
+
+    #[test]
+    fn every_non_ok_entry_counts_as_a_failure() {
+        let report = ModuleScanReport {
+            module: "steamclient".to_owned(),
+            path: PathBuf::from("steamclient.so"),
+            elf_class: ElfClass::Elf64,
+            text_file_off: 0,
+            text_vaddr: 0,
+            text_size: 0,
+            entries: [
+                PatternScanStatus::Ok,
+                PatternScanStatus::Miss,
+                PatternScanStatus::Ambiguous,
+                PatternScanStatus::Fail,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| PatternScanEntry {
+                name: format!("pattern-{index}"),
+                status,
+                match_count: 0,
+                target_offset: None,
+                error: None,
+            })
+            .collect(),
+        };
+
+        assert_eq!(report.ok_count(), 1);
+        assert_eq!(report.failure_count(), 3);
+        assert_eq!(report.failures().count(), 3);
     }
 
     #[test]

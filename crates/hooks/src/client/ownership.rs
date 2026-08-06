@@ -40,12 +40,18 @@ pub(crate) unsafe extern "C" fn hk_check_app_ownership(
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, out) };
 
+    if !crate::capability::is_ready(crate::capability::Capability::Ownership) {
+        return result;
+    }
+
     // SAFETY: `this` is the live CUser receiver for this hook callback.
     unsafe { super::package::capture_cuser(this) };
 
     // This is the first stable post-login CUser boundary. Starting the Steam-owned
     // worker here avoids creating a thread from inside the audit loader callback.
-    super::user_stats::ensure_worker_started();
+    if crate::capability::is_ready(crate::capability::Capability::CallbackEvents) {
+        super::user_stats::ensure_worker_started();
+    }
 
     if !pkg0_was_injected && !out.is_null() {
         // SAFETY: the original call populated `out` and it remains valid for this callback.
@@ -60,33 +66,35 @@ unsafe { original(this, app_id, out) };
         return result;
     }
 
-    // SAFETY: this scope exists only for the dynamic extent of this callback.
-    let mut package_scope = unsafe { super::package::SteamPackageHookScope::enter() };
-    let mut package_access = super::package::SteamPackageAccess::from_hook(&mut package_scope);
+    if crate::capability::is_ready(crate::capability::Capability::PackageInjection) {
+        // SAFETY: this scope exists only for the dynamic extent of this callback.
+        let mut package_scope = unsafe { super::package::SteamPackageHookScope::enter() };
+        let mut package_access = super::package::SteamPackageAccess::from_hook(&mut package_scope);
 
-    // pkg0 injection: triggered after GetPackageInfo hook captures CPackageInfo* + pkg0
-    if let Some(access) = package_access.as_mut() {
-        if !PKG0_INJECTED.swap(true, Ordering::AcqRel) {
-            let runtime = runtime_snapshot();
-            let controlled = vapor_forge_features::package::controlled_app_ids(
-                &runtime.config,
-                &runtime.script_state.apps,
-            );
-            let pkg_state = package_state();
-            let plan = pkg_state.compute_injection(&controlled);
+        // pkg0 injection begins after GetPackageInfo captures CPackageInfo and pkg0.
+        if let Some(access) = package_access.as_mut() {
+            if !PKG0_INJECTED.swap(true, Ordering::AcqRel) {
+                let runtime = runtime_snapshot();
+                let controlled = vapor_forge_features::package::controlled_app_ids(
+                    &runtime.config,
+                    &runtime.script_state.apps,
+                );
+                let pkg_state = package_state();
+                let plan = pkg_state.compute_injection(&controlled);
 
-            snapshot_with_original(original, this, &plan.app_ids);
+                snapshot_with_original(original, this, &plan.app_ids);
 
-            let injected = access.inject(&plan.app_ids);
-            pkg_state.record_injected(&injected);
-            pkg_state.set_active();
+                let injected = access.inject(&plan.app_ids);
+                pkg_state.record_injected(&injected);
+                pkg_state.set_active();
+            }
         }
-    }
 
-    if let Some(access) = package_access.as_mut() {
-        super::package::pump_reload(access, |app_ids| {
-            snapshot_with_original(original, this, app_ids)
-        });
+        if let Some(access) = package_access.as_mut() {
+            super::package::pump_reload(access, |app_ids| {
+                snapshot_with_original(original, this, app_ids)
+            });
+        }
     }
 
     let cfg = config();
@@ -147,6 +155,10 @@ pub(crate) unsafe extern "C" fn hk_get_subscribed_apps(
     let original = detour_or_return!("GetSubscribedApps", SUBSCRIBED_DETOUR, 0);
     let count = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_list, size, a3) };
+
+    if !crate::capability::is_ready(crate::capability::Capability::Ownership) {
+        return count;
+    }
 
     let cfg = config();
 

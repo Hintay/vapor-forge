@@ -1,12 +1,10 @@
 use core::ffi::c_void;
-use tracing::{debug, warn};
 use vapor_forge_config::AppId;
 use vapor_forge_hook_engine::detour::Detour;
 
-use vapor_forge_hook_engine::original::{detour_or_return, vmt_or_return};
-use vapor_forge_hook_engine::vmt;
+use vapor_forge_hook_engine::original::detour_or_return;
 
-use super::install::{config, plan_vmt_hook, read_vtable_slot};
+use super::install::config;
 
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -14,193 +12,60 @@ use super::install::{config, plan_vmt_hook, read_vtable_slot};
 
 pub(crate) type IsAppDlcInstalledFn = unsafe extern "C" fn(*mut c_void, u32, u32) -> bool;
 pub(crate) type BIsDlcEnabledFn = unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) -> bool;
-pub(crate) type LaunchAppFn = unsafe extern "C" fn(
-    *mut c_void,
-    *mut u32,
-    *mut c_void,
-    *mut c_void,
-    *mut c_void,
-) -> *mut c_void;
 
-// Re-use RunIPCFrameFn from cloud module
-use super::cloud::RunIPCFrameFn;
+pub(crate) const IS_APP_DLC_INSTALLED_NAME: &str = "IClientAppManager::IsAppDlcInstalled";
+pub(crate) const B_IS_DLC_ENABLED_NAME: &str = "IClientAppManager::BIsDlcEnabled";
 
 // ---------------------------------------------------------------------------
 // Static state
 // ---------------------------------------------------------------------------
 
-pub(crate) static mut APP_MANAGER_DETOUR: Option<Detour<RunIPCFrameFn>> = None;
-pub(crate) static mut CLIENT_APPS_DETOUR: Option<Detour<RunIPCFrameFn>> = None;
-pub(crate) static mut ORIG_IS_APP_DLC_INSTALLED: Option<IsAppDlcInstalledFn> = None;
-pub(crate) static mut ORIG_B_IS_DLC_ENABLED: Option<BIsDlcEnabledFn> = None;
-pub(crate) static mut ORIG_LAUNCH_APP: Option<LaunchAppFn> = None;
-static IS_APP_DLC_INSTALLED_GATE: vmt::InstallGate = vmt::InstallGate::new();
-static B_IS_DLC_ENABLED_GATE: vmt::InstallGate = vmt::InstallGate::new();
-static LAUNCH_APP_GATE: vmt::InstallGate = vmt::InstallGate::new();
+pub(crate) static mut IS_APP_DLC_INSTALLED_DETOUR: Option<Detour<IsAppDlcInstalledFn>> = None;
+pub(crate) static mut B_IS_DLC_ENABLED_DETOUR: Option<Detour<BIsDlcEnabledFn>> = None;
 
 // ---------------------------------------------------------------------------
-// Hook replacement functions: IClientAppManager::RunIPCFrame (DLC VMT)
+// Hook replacement functions: IClientAppManager DLC gates
 // ---------------------------------------------------------------------------
 
-pub(crate) unsafe extern "C" fn hk_app_manager_run_ipc_frame(
+pub(crate) unsafe extern "C" fn hk_is_app_dlc_installed(
     this: *mut c_void,
-    a1: *mut c_void,
-    a2: *mut c_void,
-    a3: *mut c_void,
-) {
-    if !app_manager_vmt_settled() {
-        install_app_manager_vmt(this);
-    }
-
-    // SAFETY: APP_MANAGER_DETOUR set before enabled.
-    let original = detour_or_return!("IClientAppManager::RunIPCFrame", APP_MANAGER_DETOUR);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-    unsafe { original(this, a1, a2, a3) };
-}
-
-unsafe extern "C" fn hk_is_app_dlc_installed(this: *mut c_void, app_id: u32, dlc_id: u32) -> bool {
-    // SAFETY: original function pointer set before VMT swap.
-    let original = vmt_or_return!("IsAppDlcInstalled", ORIG_IS_APP_DLC_INSTALLED, false);
+    app_id: u32,
+    dlc_id: u32,
+) -> bool {
+    // SAFETY: installation initializes the detour before enabling it.
+    let original = detour_or_return!(
+        IS_APP_DLC_INSTALLED_NAME,
+        IS_APP_DLC_INSTALLED_DETOUR,
+        false
+    );
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, dlc_id) };
+
+    if !crate::capability::is_ready(crate::capability::Capability::DlcOverrides) {
+        return result;
+    }
 
     let cfg = config();
     vapor_forge_features::dlc::on_is_dlc_installed(&cfg, AppId(app_id), AppId(dlc_id), result)
 }
 
-unsafe extern "C" fn hk_b_is_dlc_enabled(
+pub(crate) unsafe extern "C" fn hk_b_is_dlc_enabled(
     this: *mut c_void,
     app_id: u32,
     dlc_id: u32,
     unknown: *mut c_void,
 ) -> bool {
-    // SAFETY: original function pointer set before VMT swap.
-    let original = vmt_or_return!("BIsDlcEnabled", ORIG_B_IS_DLC_ENABLED, false);
+    // SAFETY: installation initializes the detour before enabling it.
+    let original = detour_or_return!(B_IS_DLC_ENABLED_NAME, B_IS_DLC_ENABLED_DETOUR, false);
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, dlc_id, unknown) };
 
+    if !crate::capability::is_ready(crate::capability::Capability::DlcOverrides) {
+        return result;
+    }
+
     let cfg = config();
     vapor_forge_features::dlc::on_is_dlc_enabled(&cfg, AppId(app_id), AppId(dlc_id), result)
-}
-
-unsafe extern "C" fn hk_launch_app(
-    this: *mut c_void,
-    p_app_id: *mut u32,
-    a2: *mut c_void,
-    a3: *mut c_void,
-    a4: *mut c_void,
-) -> *mut c_void {
-    if !p_app_id.is_null() {
-        // SAFETY: p_app_id is a non-null pointer supplied by Steam.
-        let app_id = unsafe { *p_app_id };
-        debug!(app_id, "LaunchApp");
-    }
-    // Flag evaluation moved to SpawnProcess hook (has pCommandLine directly).
-    let original = vmt_or_return!("LaunchApp", ORIG_LAUNCH_APP, std::ptr::null_mut());
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-    unsafe { original(this, p_app_id, a2, a3, a4) }
-}
-
-fn install_app_manager_vmt(this: *mut c_void) {
-    if let Some(attempt) = IS_APP_DLC_INSTALLED_GATE.begin() {
-        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "IsAppDlcInstalled") {
-            // SAFETY: this is the live IClientAppManager object passed by Steam.
-            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-                let repl = hk_is_app_dlc_installed as *const () as usize;
-                if let Some(plan) = plan_vmt_hook("IsAppDlcInstalled", addr, repl) {
-                    // SAFETY: original is stored before replacing the validated slot.
-                    unsafe {
-                        std::ptr::addr_of_mut!(ORIG_IS_APP_DLC_INSTALLED).write(Some(
-                            std::mem::transmute::<usize, IsAppDlcInstalledFn>(addr),
-                        ));
-                        if vmt::swap_vtable_slot("IsAppDlcInstalled", this, slot, plan).is_some() {
-                            attempt.commit();
-                        }
-                    }
-                } else {
-                    attempt.disable();
-                }
-            }
-        } else {
-            warn!("hook-install: IsAppDlcInstalled slot not found");
-            attempt.disable();
-        }
-    }
-
-    if let Some(attempt) = B_IS_DLC_ENABLED_GATE.begin() {
-        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "BIsDlcEnabled") {
-            // SAFETY: this is the live IClientAppManager object passed by Steam.
-            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-                let repl = hk_b_is_dlc_enabled as *const () as usize;
-                if let Some(plan) = plan_vmt_hook("BIsDlcEnabled", addr, repl) {
-                    // SAFETY: original is stored before replacing the validated slot.
-                    unsafe {
-                        std::ptr::addr_of_mut!(ORIG_B_IS_DLC_ENABLED)
-                            .write(Some(std::mem::transmute::<usize, BIsDlcEnabledFn>(addr)));
-                        if vmt::swap_vtable_slot("BIsDlcEnabled", this, slot, plan).is_some() {
-                            attempt.commit();
-                        }
-                    }
-                } else {
-                    attempt.disable();
-                }
-            }
-        } else {
-            warn!("hook-install: BIsDlcEnabled slot not found");
-            attempt.disable();
-        }
-    }
-
-    // LaunchApp: intercept to evaluate AppAvatar flag rules at game-launch time.
-    if let Some(attempt) = LAUNCH_APP_GATE.begin() {
-        if let Some(slot) = crate::vtable_scan::slot_of("IClientAppManager", "LaunchApp") {
-            // SAFETY: this is the live IClientAppManager object passed by Steam.
-            if let Some(addr) = unsafe { read_vtable_slot(this, slot) } {
-                let repl = hk_launch_app as *const () as usize;
-                if let Some(plan) = plan_vmt_hook("LaunchApp", addr, repl) {
-                    // SAFETY: original is stored before replacing the validated slot.
-                    unsafe {
-                        std::ptr::addr_of_mut!(ORIG_LAUNCH_APP).write(Some(std::mem::transmute::<
-                            usize,
-                            LaunchAppFn,
-                        >(
-                            addr
-                        )));
-                        if vmt::swap_vtable_slot("LaunchApp", this, slot, plan).is_some() {
-                            attempt.commit();
-                        }
-                    }
-                } else {
-                    attempt.disable();
-                }
-            }
-        } else {
-            debug!("hook-install: LaunchApp slot not found (app-avatar flag rules inactive)");
-            attempt.disable();
-        }
-    }
-}
-
-fn app_manager_vmt_settled() -> bool {
-    IS_APP_DLC_INSTALLED_GATE.is_settled()
-        && B_IS_DLC_ENABLED_GATE.is_settled()
-        && LAUNCH_APP_GATE.is_settled()
-}
-
-// ---------------------------------------------------------------------------
-// Hook replacement functions: IClientApps::RunIPCFrame (DLC count/data VMT)
-// ---------------------------------------------------------------------------
-
-pub(crate) unsafe extern "C" fn hk_client_apps_run_ipc_frame(
-    this: *mut c_void,
-    a1: *mut c_void,
-    a2: *mut c_void,
-    a3: *mut c_void,
-) {
-    // SAFETY: CLIENT_APPS_DETOUR set before enabled.
-    let original = detour_or_return!("IClientApps::RunIPCFrame", CLIENT_APPS_DETOUR);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-    unsafe { original(this, a1, a2, a3) };
 }
 
 // DLC enumeration (GetDLCCount / BGetDLCDataByIndex) is NOT hooked.

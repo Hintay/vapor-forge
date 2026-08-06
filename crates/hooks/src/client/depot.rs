@@ -47,7 +47,6 @@ pub(crate) unsafe extern "C" fn hk_build_depot_dependency(
     p_build_id: *mut u32,
     pb_beta_fallback: *mut bool,
 ) -> bool {
-    // SAFETY: calling original.
     let original = detour_or_return!("BuildDepotDependency", BUILD_DEPOT_DETOUR, false);
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(
@@ -60,6 +59,10 @@ unsafe { original(
         p_build_id,
         pb_beta_fallback,
     ) };
+
+    if !crate::capability::is_ready(crate::capability::Capability::DepotInjection) {
+        return result;
+    }
 
     if !p_depot_info.is_null() {
         let ss = script_state();
@@ -118,6 +121,11 @@ pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
     key_buf: *mut u8,
     key_size: u32,
 ) -> i32 {
+    let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
+    if !crate::capability::is_ready(crate::capability::Capability::DepotInjection) {
+        // SAFETY: forwards Steam's untouched key query.
+        return unsafe { original(this, unknown, key_name, key_buf, key_size) };
+    }
     if !key_name.is_null() && key_size >= 32 && !key_buf.is_null() {
         if let Some(depot_id_raw) =
             /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
@@ -141,9 +149,7 @@ pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
         }
     }
 
-    // SAFETY: calling original.
-    let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    // SAFETY: forwards Steam's untouched key query.
     unsafe { original(this, unknown, key_name, key_buf, key_size) }
 }
 

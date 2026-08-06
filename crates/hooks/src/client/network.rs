@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use tracing::{info, warn};
 use vapor_forge_hook_engine::detour::Detour;
@@ -42,26 +42,18 @@ static ADD_WORK_ITEM_ADDR: AtomicUsize = AtomicUsize::new(0);
 static INJECTION_QUEUE: OnceLock<Mutex<VecDeque<QueuedInjection>>> = OnceLock::new();
 // Steam's own bare-CWorkItem post site, decoded once at install.
 static WORK_ITEM_SITE: OnceLock<WorkItemSite> = OnceLock::new();
-// The CCMConnection captured from RecvPkt (the receiver we dispatch onto).
-static CM_RECEIVER: AtomicUsize = AtomicUsize::new(0);
-// The thread RecvPkt is delivered on, so dispatch can refuse to run anywhere else.
-static RECV_PTHREAD: AtomicUsize = AtomicUsize::new(0);
-// The connection id read from a real incoming packet's first field.
-static CM_CONN_ID: AtomicUsize = AtomicUsize::new(0);
-static CM_CONN_ID_SET: AtomicBool = AtomicBool::new(false);
-// Every fabricated response is bound to the connection/account context in
-// which its request was accepted. A reconnect or context reset invalidates it.
-static INJECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+// Serializes context publication, invalidation, work-item claims, and native delivery.
+static DISPATCH: DispatchCoordinator = DispatchCoordinator::new();
 // One-shot native-dispatch self-test, armed from the debug socket.
 static NATIVE_INJECT_ARMED: AtomicBool = AtomicBool::new(false);
 // One-shot flush of anything a source queued before dispatch context was ready.
 static WARMUP_FLUSH_DONE: AtomicBool = AtomicBool::new(false);
-static WORK_ITEM_POSTED: AtomicBool = AtomicBool::new(false);
 // One real inbound body, captured once, replayed by the own-thread dispatch test
 // (a safe payload Steam has already handled). Gated by the atomic so the hot path
 // pays only an atomic load once captured.
 static LAST_INBOUND_CAPTURED: AtomicBool = AtomicBool::new(false);
 static LAST_INBOUND_BODY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static CM_FAIL_CLOSED_REPORTED: AtomicBool = AtomicBool::new(false);
 
 // Covers the doubles the embedded cumulative timers hold on either arch.
 const WORK_ITEM_ALIGN: usize = 16;
@@ -111,6 +103,14 @@ pub(crate) fn resolve_native_packet_functions(registry: &PatternRegistry, code: 
         add_work_item = %format_resolved_addr(add_work_item),
         "native-packet: Steam CNetPacket and work-item functions resolved"
     );
+}
+
+pub(crate) fn native_packet_functions_ready() -> bool {
+    WORK_ITEM_SITE.get().is_some()
+        && ADD_WORK_ITEM_ADDR.load(Ordering::Acquire) != 0
+        && PACKET_ALLOC_ADDR.load(Ordering::Acquire) != 0
+        && PACKET_INIT_ADDR.load(Ordering::Acquire) != 0
+        && PACKET_RELEASE_ADDR.load(Ordering::Acquire) != 0
 }
 
 /// Read back the three build-specific values injection needs from Steam's own
@@ -198,6 +198,18 @@ pub(crate) unsafe extern "C" fn hk_send_frame(
     size: u32,
 ) -> bool {
     const WEBSOCKET_BINARY: i32 = 2;
+    // SAFETY: SEND_FRAME_DETOUR is initialized before this replacement is enabled.
+    let original = detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
+    if !crate::capability::is_ready(crate::capability::Capability::CmInterception) {
+        if opcode == WEBSOCKET_BINARY && !data.is_null() && size > 0 {
+            if !CM_FAIL_CLOSED_REPORTED.swap(true, Ordering::AcqRel) {
+                warn!("netpacket: CM interception is incomplete; binary sends are blocked");
+            }
+            return false;
+        }
+        // SAFETY: forwards the untouched non-binary frame to Steam.
+        return unsafe { original(this, opcode, data, size) };
+    }
     if opcode == WEBSOCKET_BINARY && !data.is_null() && size > 0 {
         // SAFETY: data is a valid buffer of `size` bytes, provided by Steam.
         let slice = unsafe { std::slice::from_raw_parts(data, size as usize) };
@@ -207,23 +219,20 @@ pub(crate) unsafe extern "C" fn hk_send_frame(
             SendFrameDecision::Drop => return true,
             SendFrameDecision::Retry => return false,
             SendFrameDecision::Rewrite(rewritten) => {
-                // SAFETY: calling original with rewritten data.
-                let original =
-                    detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
-                return // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
-unsafe { original(
-                    this,
-                    opcode,
-                    rewritten.as_ptr() as *mut u8,
-                    rewritten.len() as u32,
-                ) };
+                // SAFETY: the rewritten buffer remains live through the synchronous call.
+                return unsafe {
+                    original(
+                        this,
+                        opcode,
+                        rewritten.as_ptr() as *mut u8,
+                        rewritten.len() as u32,
+                    )
+                };
             }
         }
     }
 
-    // SAFETY: SEND_FRAME_DETOUR set before hook enabled, never modified after.
-    let original = detour_or_return!("BBuildAndAsyncSendFrame", SEND_FRAME_DETOUR, false);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    // SAFETY: forwards the untouched frame to Steam.
     unsafe { original(this, opcode, data, size) }
 }
 
@@ -232,15 +241,20 @@ unsafe { original(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) {
+    // SAFETY: RECV_PKT_DETOUR is initialized before this replacement is enabled.
+    let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR);
+    if !crate::capability::is_ready(crate::capability::Capability::CmInterception) {
+        // SAFETY: forwards the untouched packet to Steam.
+        unsafe { original(this, packet) };
+        return;
+    }
     // One-shot capture of the receiver / conn id for native dispatch (worker_this
     // comes from the post-item hook).
-    capture_dispatch_context(this, packet);
+    let context_captured = capture_dispatch_context(this, packet);
+    let captured_generation = injection_generation();
     maybe_warmup_flush();
     capture_last_inbound_body(packet);
     maybe_fire_armed_selftest(packet);
-
-    // SAFETY: RECV_PKT_DETOUR set before hook enabled, never modified after.
-    let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR);
 
     // Injection is driven per-source (each fabricated response dispatches itself
     // the moment it is ready); no sweep is needed on the inbound path.
@@ -249,21 +263,29 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // original call, then restore Steam's owned payload before its caller
     // releases the CNetPacket.
     // SAFETY: packet is the live CNetPacket supplied by Steam's caller.
-    match unsafe { crate::netpacket::prepare_recv_packet(packet) } {
-        crate::netpacket::PreparedRecvPacket::Pass => {
+    let prepared = unsafe { crate::netpacket::prepare_recv_packet(packet) };
+    let delivered = match prepared.decision {
+        crate::netpacket::PreparedRecvDecision::Pass => {
             // SAFETY: forwarding this callback's unchanged object and packet pointers.
             unsafe { original(this, packet) };
+            true
         }
-        crate::netpacket::PreparedRecvPacket::Drop => {}
-        crate::netpacket::PreparedRecvPacket::Rewrite(_guard) => {
+        crate::netpacket::PreparedRecvDecision::Drop => false,
+        crate::netpacket::PreparedRecvDecision::Rewrite(_guard) => {
             // SAFETY: forwarding this callback's unchanged object and rewritten packet bytes.
             unsafe { original(this, packet) };
+            true
         }
+    };
+    if delivered {
+        prepared.post_dispatch.complete();
     }
     // Packet routing can discover an account transition and invalidate the
     // context above. This same real packet is authoritative for the new context.
-    capture_dispatch_context(this, packet);
-    maybe_warmup_flush();
+    if !context_captured || injection_generation() != captured_generation {
+        capture_dispatch_context(this, packet);
+        maybe_warmup_flush();
+    }
 }
 
 // Work-item vtable. `#[repr(C)]` of 9 function pointers auto-scales to the
@@ -329,59 +351,459 @@ fn injection_queue() -> &'static Mutex<VecDeque<QueuedInjection>> {
     INJECTION_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Refresh the native dispatch context from a real inbound packet.
-pub(crate) fn capture_dispatch_context(this: *mut c_void, packet: *mut c_void) {
-    if this.is_null() || packet.is_null() {
-        return;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DispatchContext {
+    receiver: usize,
+    conn_id: u32,
+    recv_pthread: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveDispatch {
+    generation: u64,
+    pthread: usize,
+}
+
+struct DispatchState {
+    generation: u64,
+    context: Option<DispatchContext>,
+    posted_generation: u64,
+    active_dispatch: Option<ActiveDispatch>,
+    transition_in_progress: bool,
+    release_transition_on_idle: bool,
+}
+
+impl DispatchState {
+    const fn new() -> Self {
+        Self {
+            generation: 1,
+            context: None,
+            posted_generation: 0,
+            active_dispatch: None,
+            transition_in_progress: false,
+            release_transition_on_idle: false,
+        }
     }
-    let receiver = this as usize;
+}
+
+struct DispatchCoordinator {
+    // Coordinator methods acquire this state before the injection queue.
+    state: Mutex<DispatchState>,
+    idle: Condvar,
+    published_generation: AtomicU64,
+}
+
+struct TransitionOutcome {
+    previous_generation: u64,
+    discarded: VecDeque<QueuedInjection>,
+}
+
+struct CaptureOutcome {
+    connection_changed: bool,
+    published: bool,
+    discarded: VecDeque<QueuedInjection>,
+}
+
+enum BeginDispatch<'a> {
+    Stale,
+    WrongThread {
+        expected: usize,
+    },
+    Empty {
+        discarded: usize,
+    },
+    Ready {
+        context: DispatchContext,
+        injection: QueuedInjection,
+        discarded: usize,
+        _lease: DispatchLease<'a>,
+    },
+}
+
+struct DispatchLease<'a> {
+    coordinator: &'a DispatchCoordinator,
+    active: ActiveDispatch,
+}
+
+struct PostClaim<'a> {
+    state: MutexGuard<'a, DispatchState>,
+    generation: u64,
+}
+
+impl DispatchCoordinator {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(DispatchState::new()),
+            idle: Condvar::new(),
+            published_generation: AtomicU64::new(1),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DispatchState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.published_generation.load(Ordering::Acquire)
+    }
+
+    fn generation_is_current(&self, generation: u64) -> bool {
+        self.lock().generation == generation
+    }
+
+    fn context(&self) -> Option<DispatchContext> {
+        let state = self.lock();
+        (!state.transition_in_progress)
+            .then_some(state.context)
+            .flatten()
+    }
+
+    fn advance_generation(
+        &self,
+        state: &mut DispatchState,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+    ) -> TransitionOutcome {
+        let previous_generation = state.generation;
+        state.generation = next_injection_generation(previous_generation);
+        state.posted_generation = 0;
+        let discarded = {
+            let mut queue = queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *queue)
+        };
+        TransitionOutcome {
+            previous_generation,
+            discarded,
+        }
+    }
+
+    fn finish_transition(&self, state: &mut DispatchState, reentrant: bool) {
+        if reentrant {
+            state.release_transition_on_idle = true;
+        } else {
+            self.published_generation
+                .store(state.generation, Ordering::Release);
+            state.transition_in_progress = false;
+            self.idle.notify_all();
+        }
+    }
+
+    fn invalidate_generation(
+        &self,
+        expected_generation: Option<u64>,
+        pthread: usize,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+    ) -> Option<TransitionOutcome> {
+        let mut state = self.lock();
+        while state.transition_in_progress {
+            if state
+                .active_dispatch
+                .is_some_and(|active| active.pthread == pthread)
+            {
+                return None;
+            }
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if expected_generation.is_some_and(|expected| state.generation != expected) {
+            return None;
+        }
+
+        state.transition_in_progress = true;
+        state.context = None;
+        self.idle.notify_all();
+        let reentrant = state
+            .active_dispatch
+            .is_some_and(|active| active.pthread == pthread);
+        while state.active_dispatch.is_some() && !reentrant {
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+
+        let outcome = self.advance_generation(&mut state, queue);
+        self.finish_transition(&mut state, reentrant);
+        Some(outcome)
+    }
+
+    fn capture(
+        &self,
+        context: DispatchContext,
+        pthread: usize,
+        observed_generation: u64,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+    ) -> CaptureOutcome {
+        let mut state = self.lock();
+        while state.transition_in_progress {
+            if state
+                .active_dispatch
+                .is_some_and(|active| active.pthread == pthread)
+            {
+                return CaptureOutcome {
+                    connection_changed: false,
+                    published: false,
+                    discarded: VecDeque::new(),
+                };
+            }
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if state.generation != observed_generation {
+            return CaptureOutcome {
+                connection_changed: false,
+                published: false,
+                discarded: VecDeque::new(),
+            };
+        }
+
+        let connection_changed = state.context.is_some_and(|previous| {
+            previous.receiver != context.receiver || previous.conn_id != context.conn_id
+        });
+        let mut discarded = VecDeque::new();
+        if connection_changed {
+            state.transition_in_progress = true;
+            state.context = None;
+            self.idle.notify_all();
+            while state.active_dispatch.is_some() {
+                if state
+                    .active_dispatch
+                    .is_some_and(|active| active.pthread == pthread)
+                {
+                    let outcome = self.advance_generation(&mut state, queue);
+                    discarded = outcome.discarded;
+                    self.finish_transition(&mut state, true);
+                    return CaptureOutcome {
+                        connection_changed: true,
+                        published: false,
+                        discarded,
+                    };
+                }
+                state = self
+                    .idle
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            discarded = self.advance_generation(&mut state, queue).discarded;
+        }
+
+        state.context = Some(context);
+        if connection_changed {
+            self.finish_transition(&mut state, false);
+        }
+        CaptureOutcome {
+            connection_changed,
+            published: true,
+            discarded,
+        }
+    }
+
+    fn enqueue_if_current(
+        &self,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+        injection: QueuedInjection,
+    ) -> Result<usize, QueuedInjection> {
+        let state = self.lock();
+        if state.transition_in_progress || injection.generation != state.generation {
+            return Err(injection);
+        }
+        let mut queue = queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_len = queue.len();
+        queue.push_back(injection);
+        Ok(previous_len)
+    }
+
+    fn claim_posted<'a>(
+        &'a self,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+    ) -> Option<PostClaim<'a>> {
+        let mut state = self.lock();
+        if state.transition_in_progress || state.context.is_none() || state.posted_generation != 0 {
+            return None;
+        }
+        if queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            return None;
+        }
+        let generation = state.generation;
+        state.posted_generation = generation;
+        Some(PostClaim { state, generation })
+    }
+
+    fn begin_dispatch<'a>(
+        &'a self,
+        queue: &Mutex<VecDeque<QueuedInjection>>,
+        generation: u64,
+        pthread: usize,
+        current: Option<&super::playtime_downlink::RuntimeKey>,
+    ) -> BeginDispatch<'a> {
+        let mut state = self.lock();
+        if state.transition_in_progress
+            || state.generation != generation
+            || state.posted_generation != generation
+            || state.active_dispatch.is_some()
+        {
+            return BeginDispatch::Stale;
+        }
+        let Some(context) = state.context else {
+            return BeginDispatch::Stale;
+        };
+        if context.recv_pthread != pthread {
+            return BeginDispatch::WrongThread {
+                expected: context.recv_pthread,
+            };
+        }
+
+        let (injection, discarded) = {
+            let mut queue = queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            take_next_dispatchable(&mut queue, generation, current)
+        };
+        let Some(injection) = injection else {
+            return BeginDispatch::Empty { discarded };
+        };
+        let active = ActiveDispatch {
+            generation,
+            pthread,
+        };
+        state.active_dispatch = Some(active);
+        BeginDispatch::Ready {
+            context,
+            injection,
+            discarded,
+            _lease: DispatchLease {
+                coordinator: self,
+                active,
+            },
+        }
+    }
+
+    fn disarm_posted(&self, generation: u64) -> bool {
+        let mut state = self.lock();
+        if state.posted_generation != generation {
+            return false;
+        }
+        state.posted_generation = 0;
+        true
+    }
+
+    #[cfg(test)]
+    fn wait_for_transition(&self) {
+        let mut state = self.lock();
+        while !state.transition_in_progress {
+            state = self
+                .idle
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl Drop for DispatchLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.coordinator.lock();
+        if state.active_dispatch != Some(self.active) {
+            return;
+        }
+        state.active_dispatch = None;
+        if state.release_transition_on_idle {
+            state.release_transition_on_idle = false;
+            self.coordinator
+                .published_generation
+                .store(state.generation, Ordering::Release);
+            state.transition_in_progress = false;
+        }
+        self.coordinator.idle.notify_all();
+    }
+}
+
+fn next_injection_generation(generation: u64) -> u64 {
+    let next = generation.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
+/// Refresh the native dispatch context from a real inbound packet.
+pub(crate) fn capture_dispatch_context(this: *mut c_void, packet: *mut c_void) -> bool {
+    if this.is_null() || packet.is_null() {
+        return false;
+    }
+    let observed_generation = injection_generation();
     // SAFETY: packet is the live CNetPacket; its first field is the conn id.
-    let conn_id = unsafe { *(packet as *const u32) } as usize;
-    let previous_receiver = CM_RECEIVER.load(Ordering::Acquire);
-    let previous_conn_set = CM_CONN_ID_SET.load(Ordering::Acquire);
-    let previous_conn_id = CM_CONN_ID.load(Ordering::Acquire);
-    let connection_changed = (previous_receiver != 0 && previous_receiver != receiver)
-        || (previous_conn_set && previous_conn_id != conn_id);
-    if connection_changed {
-        INJECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let conn_id = unsafe { *(packet as *const u32) };
+    let pthread = current_pthread();
+    let outcome = DISPATCH.capture(
+        DispatchContext {
+            receiver: this as usize,
+            conn_id,
+            recv_pthread: pthread,
+        },
+        pthread,
+        observed_generation,
+        injection_queue(),
+    );
+    if outcome.connection_changed {
         WARMUP_FLUSH_DONE.store(false, Ordering::Release);
+        if !outcome.discarded.is_empty() {
+            info!(
+                discarded = outcome.discarded.len(),
+                "native-inject: discarded responses from the old connection"
+            );
+        }
         if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
             queue.cancel_pending_conflicts();
         }
+        crate::netpacket::notify_stats_context_changed();
     }
-    CM_RECEIVER.store(receiver, Ordering::Release);
-    CM_CONN_ID.store(conn_id, Ordering::Release);
-    CM_CONN_ID_SET.store(true, Ordering::Release);
-    // A reconnect can move delivery to a different thread.
-    RECV_PTHREAD.store(current_pthread(), Ordering::Release);
+    if !outcome.published {
+        warn!("native-inject: ignored stale or recursive dispatch-context capture");
+    }
+    outcome.published
 }
 
 pub(crate) fn injection_generation() -> u64 {
-    INJECTION_GENERATION.load(Ordering::Acquire)
+    DISPATCH.current_generation()
 }
 
 /// Invalidate queued responses and require a fresh real packet before dispatch.
 pub(crate) fn invalidate_injection_context() {
-    INJECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
-    CM_RECEIVER.store(0, Ordering::Release);
-    CM_CONN_ID_SET.store(false, Ordering::Release);
-    RECV_PTHREAD.store(0, Ordering::Release);
+    let outcome = DISPATCH.invalidate_generation(None, current_pthread(), injection_queue());
     WARMUP_FLUSH_DONE.store(false, Ordering::Release);
-    WORK_ITEM_POSTED.store(false, Ordering::Release);
+    if let Some(outcome) = outcome {
+        if !outcome.discarded.is_empty() {
+            info!(
+                discarded = outcome.discarded.len(),
+                "native-inject: discarded responses from invalidated context"
+            );
+        }
+        crate::netpacket::notify_stats_context_changed();
+    }
 }
 
 fn dispatch_ready() -> bool {
-    WORK_ITEM_SITE.get().is_some()
-        && CM_RECEIVER.load(Ordering::Acquire) != 0
-        && CM_CONN_ID_SET.load(Ordering::Acquire)
-        && ADD_WORK_ITEM_ADDR.load(Ordering::Acquire) != 0
-        && PACKET_ALLOC_ADDR.load(Ordering::Acquire) != 0
-        && PACKET_INIT_ADDR.load(Ordering::Acquire) != 0
-        && PACKET_RELEASE_ADDR.load(Ordering::Acquire) != 0
+    native_packet_functions_ready() && DISPATCH.context().is_some()
 }
 
 pub(crate) fn response_delivery_ready() -> bool {
-    if !dispatch_ready() || RECV_PTHREAD.load(Ordering::Acquire) == 0 {
+    if !crate::capability::is_ready(crate::capability::Capability::NativeResponseDelivery)
+        || !dispatch_ready()
+    {
         return false;
     }
     let Some(site) = WORK_ITEM_SITE.get() else {
@@ -392,21 +814,27 @@ pub(crate) fn response_delivery_ready() -> bool {
     !unsafe { (site.pool_slot as *const *mut c_void).read() }.is_null()
 }
 
-fn terminate_dispatch_generation(reason: &'static str) {
-    let discarded = {
-        let mut queue = injection_queue().lock().unwrap();
-        let discarded = queue.len();
-        queue.clear();
-        discarded
+fn terminate_dispatch_generation(generation: u64, reason: &'static str) {
+    let Some(outcome) =
+        DISPATCH.invalidate_generation(Some(generation), current_pthread(), injection_queue())
+    else {
+        info!(
+            generation,
+            reason, "native-inject: ignored stale work-item failure"
+        );
+        return;
     };
     warn!(
-        discarded,
-        reason, "native-inject: terminated connection generation"
+        generation,
+        discarded = outcome.discarded.len(),
+        reason,
+        "native-inject: terminated connection generation"
     );
-    invalidate_injection_context();
+    WARMUP_FLUSH_DONE.store(false, Ordering::Release);
     if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
         queue.cancel_pending_conflicts();
     }
+    crate::netpacket::notify_stats_context_changed();
 }
 
 /// Queue a fabricated response and post a worker item to deliver it. If the
@@ -447,15 +875,23 @@ pub(crate) fn enqueue_playtime_injection(
 }
 
 fn enqueue(injection: QueuedInjection) {
-    {
-        let mut queue = injection_queue().lock().unwrap();
-        if queue.len() >= MAX_QUEUED_INJECTIONS {
-            warn!(
-                queued = queue.len(),
-                "native-inject: queue exceeded its expected bound; retaining accepted responses"
+    let generation = injection.generation;
+    let previous_len = match DISPATCH.enqueue_if_current(injection_queue(), injection) {
+        Ok(previous_len) => previous_len,
+        Err(_) => {
+            info!(
+                generation,
+                current_generation = injection_generation(),
+                "native-inject: discarded stale response before enqueue"
             );
+            return;
         }
-        queue.push_back(injection);
+    };
+    if previous_len >= MAX_QUEUED_INJECTIONS {
+        warn!(
+            queued = previous_len,
+            "native-inject: queue exceeded its expected bound; retaining accepted responses"
+        );
     }
     schedule_injection_drain();
 }
@@ -476,32 +912,40 @@ fn maybe_warmup_flush() {
 /// calls `AddWorkItem` and returns, with no separate wake: the enqueue starts the
 /// pool's threads and signals them itself.
 fn schedule_injection_drain() {
-    if !dispatch_ready() {
-        return;
-    }
-    if injection_queue().lock().unwrap().is_empty() {
-        return;
-    }
-    if WORK_ITEM_POSTED.swap(true, Ordering::AcqRel) {
+    if !crate::capability::is_ready(crate::capability::Capability::NativeResponseDelivery) {
         return;
     }
     let Some(site) = WORK_ITEM_SITE.get() else {
-        WORK_ITEM_POSTED.store(false, Ordering::Release);
         return;
     };
+    let add_work_item_addr = ADD_WORK_ITEM_ADDR.load(Ordering::Acquire);
+    if add_work_item_addr == 0
+        || PACKET_ALLOC_ADDR.load(Ordering::Acquire) == 0
+        || PACKET_INIT_ADDR.load(Ordering::Acquire) == 0
+        || PACKET_RELEASE_ADDR.load(Ordering::Acquire) == 0
+    {
+        return;
+    }
+
     // SAFETY: the slot was checked to be a pointer-aligned address inside a
     // steamclient mapping when the site was decoded.
     let pool = unsafe { (site.pool_slot as *const *mut c_void).read() };
     if pool.is_null() {
         // CNet has not published its pool yet; the next enqueue retries.
-        WORK_ITEM_POSTED.store(false, Ordering::Release);
         return;
     }
     // SAFETY: address resolved inside steamclient.so via pattern; ABI matches.
     let add_work_item: WorkThreadPoolAddWorkItemFn =
-        unsafe { std::mem::transmute(ADD_WORK_ITEM_ADDR.load(Ordering::Acquire)) };
-    let item = NativeWorkItem::allocate(site);
+        unsafe { std::mem::transmute(add_work_item_addr) };
+    let Some(mut claim) = DISPATCH.claim_posted(injection_queue()) else {
+        return;
+    };
+    let generation = claim.generation;
+    let item = NativeWorkItem::allocate(site, generation);
 
+    // Keep the lifecycle lock through Steam's ownership handoff. A completed
+    // invalidation therefore cannot be followed by a late post for its old
+    // generation.
     // SAFETY: pool is the CNet CWorkThreadPool; item is an ABI-shaped CWorkItem.
     let posted = unsafe { add_work_item(pool, item) };
     info!(
@@ -513,8 +957,22 @@ fn schedule_injection_drain() {
     if !posted {
         // SAFETY: Steam rejected the item, so ownership never left us.
         unsafe { NativeWorkItem::free(item) };
-        WORK_ITEM_POSTED.store(false, Ordering::Release);
-        terminate_dispatch_generation("Steam rejected CNet work item");
+        claim.state.transition_in_progress = true;
+        claim.state.context = None;
+        let outcome = DISPATCH.advance_generation(&mut claim.state, injection_queue());
+        DISPATCH.finish_transition(&mut claim.state, false);
+        debug_assert_eq!(outcome.previous_generation, generation);
+        drop(claim);
+        WARMUP_FLUSH_DONE.store(false, Ordering::Release);
+        warn!(
+            generation,
+            discarded = outcome.discarded.len(),
+            reason = "Steam rejected CNet work item",
+            "native-inject: terminated connection generation"
+        );
+        if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
+            queue.cancel_pending_conflicts();
+        }
     }
 }
 
@@ -541,11 +999,14 @@ struct NativeWorkItem;
 
 impl NativeWorkItem {
     fn layout(size: usize) -> Layout {
+        let allocation_size = size
+            .checked_add(std::mem::size_of::<u64>())
+            .expect("work item allocation size");
         // The size was range-checked at decode; align is a fixed power of two.
-        Layout::from_size_align(size, WORK_ITEM_ALIGN).expect("work item layout")
+        Layout::from_size_align(allocation_size, WORK_ITEM_ALIGN).expect("work item layout")
     }
 
-    fn allocate(site: &WorkItemSite) -> *mut c_void {
+    fn allocate(site: &WorkItemSite, generation: u64) -> *mut c_void {
         // SAFETY: the layout has a non-zero size, checked when the site decoded.
         let base = unsafe { std::alloc::alloc_zeroed(Self::layout(site.item_size)) };
         if base.is_null() {
@@ -573,8 +1034,28 @@ impl NativeWorkItem {
                     _ => field.write_unaligned(u8::MAX),
                 }
             }
+            // The ABI-visible object ends at item_size. This process-owned trailer
+            // binds the completion to the connection that posted it.
+            base.add(site.item_size)
+                .cast::<u64>()
+                .write_unaligned(generation);
         }
         base.cast::<c_void>()
+    }
+
+    /// # Safety
+    /// `item` must be a pointer previously returned by [`NativeWorkItem::allocate`].
+    unsafe fn generation(item: *mut c_void) -> u64 {
+        let Some(site) = WORK_ITEM_SITE.get() else {
+            return 0;
+        };
+        // SAFETY: allocate reserves and writes the trailer immediately after item_size.
+        unsafe {
+            item.cast::<u8>()
+                .add(site.item_size)
+                .cast::<u64>()
+                .read_unaligned()
+        }
     }
 
     /// # Safety
@@ -620,46 +1101,75 @@ unsafe extern "C" fn native_inject_deleting_destroy(item: *mut c_void) {
 /// Steam delivers inbound packets. Returning true suppresses Steam's "job no
 /// longer existed to notify" warning.
 unsafe extern "C" fn native_inject_execute(item: *mut c_void, _arg: *mut c_void) -> bool {
+    // SAFETY: Steam invokes this slot only for an item allocated above.
+    let generation = unsafe { NativeWorkItem::generation(item) };
     let pthread = current_pthread();
     // Drop the caller-owned reference now that Steam's queue reference drives
     // destruction after this returns.
     release_inject_caller_ref(item);
-    let expected = RECV_PTHREAD.load(Ordering::Acquire);
-    if pthread != expected {
-        // Calling RecvPkt off its own thread is what the whole native dispatch
-        // exists to avoid, so leave the queue alone and say so.
-        warn!(
-            pthread = format_args!("0x{pthread:x}"),
-            expected = format_args!("0x{expected:x}"),
-            "native-inject: completion ran off the RecvPkt thread, skipping dispatch"
+    if generation == 0 {
+        info!(
+            generation,
+            "native-inject: stale work item completed without dispatch"
         );
-        terminate_dispatch_generation("CNet work item completed on the wrong thread");
         return true;
     }
-    info!(
-        pthread = format_args!("0x{pthread:x}"),
-        item = format_args!("{item:p}"),
-        "native-inject: completion on the RecvPkt thread"
-    );
-    drain_injections();
+    match drain_injections(generation, pthread) {
+        DrainResult::Complete => {
+            info!(
+                pthread = format_args!("0x{pthread:x}"),
+                item = format_args!("{item:p}"),
+                "native-inject: completion on the RecvPkt thread"
+            );
+        }
+        DrainResult::Stale => {
+            DISPATCH.disarm_posted(generation);
+            info!(
+                generation,
+                "native-inject: stale work item completed without dispatch"
+            );
+            return true;
+        }
+        DrainResult::WrongThread { expected } => {
+            // Calling RecvPkt off its own thread is what the whole native dispatch
+            // exists to avoid, so leave the queue alone and say so.
+            warn!(
+                pthread = format_args!("0x{pthread:x}"),
+                expected = format_args!("0x{expected:x}"),
+                "native-inject: completion ran off the RecvPkt thread, skipping dispatch"
+            );
+            DISPATCH.disarm_posted(generation);
+            terminate_dispatch_generation(
+                generation,
+                "CNet work item completed on the wrong thread",
+            );
+            return true;
+        }
+    }
     // Producers that raced the drain observed the armed state and left their
     // response queued. Disarm first, then publish one successor if needed.
-    WORK_ITEM_POSTED.store(false, Ordering::Release);
-    schedule_injection_drain();
+    DISPATCH.disarm_posted(generation);
+    if injection_generation() == generation {
+        schedule_injection_drain();
+    }
     true
 }
 
-fn drain_injections() {
-    let receiver = CM_RECEIVER.load(Ordering::Acquire);
-    let conn_id = CM_CONN_ID.load(Ordering::Acquire) as u32;
+enum DrainResult {
+    Complete,
+    Stale,
+    WrongThread { expected: usize },
+}
+
+fn drain_injections(generation: u64, pthread: usize) -> DrainResult {
     let alloc_addr = PACKET_ALLOC_ADDR.load(Ordering::Acquire);
     let init_addr = PACKET_INIT_ADDR.load(Ordering::Acquire);
     let release_addr = PACKET_RELEASE_ADDR.load(Ordering::Acquire);
-    if receiver == 0 || alloc_addr == 0 || init_addr == 0 || release_addr == 0 {
-        return;
+    if alloc_addr == 0 || init_addr == 0 || release_addr == 0 {
+        return DrainResult::Stale;
     }
     let Some(recv_pkt) = original_recv_pkt_probe() else {
-        return;
+        return DrainResult::Stale;
     };
     // SAFETY: addresses resolved inside steamclient.so via pattern; ABIs match.
     let packet_alloc: PacketAllocFn = unsafe { std::mem::transmute(alloc_addr) };
@@ -670,21 +1180,35 @@ fn drain_injections() {
 
     loop {
         let current = super::playtime_downlink::current_runtime_key();
-        let generation = injection_generation();
-        let (queued, discarded) = take_next_dispatchable(
-            &mut injection_queue().lock().unwrap(),
-            generation,
-            current.as_ref(),
-        );
+        let (context, mut queued, discarded, _lease) =
+            match DISPATCH.begin_dispatch(injection_queue(), generation, pthread, current.as_ref())
+            {
+                BeginDispatch::Stale => return DrainResult::Stale,
+                BeginDispatch::WrongThread { expected } => {
+                    return DrainResult::WrongThread { expected };
+                }
+                BeginDispatch::Empty { discarded } => {
+                    if discarded != 0 {
+                        info!(
+                            discarded,
+                            "native-inject: discarded stale playtime notifications"
+                        );
+                    }
+                    return DrainResult::Complete;
+                }
+                BeginDispatch::Ready {
+                    context,
+                    injection,
+                    discarded,
+                    _lease,
+                } => (context, injection, discarded, _lease),
+            };
         if discarded != 0 {
             info!(
                 discarded,
                 "native-inject: discarded stale playtime notifications"
             );
         }
-        let Some(mut queued) = queued else {
-            break;
-        };
         if queued.body.is_empty() {
             continue;
         }
@@ -696,21 +1220,34 @@ fn drain_injections() {
         let packet = unsafe { packet_alloc() };
         if packet.is_null() {
             warn!("native-inject: packet allocation failed");
-            terminate_dispatch_generation("CNetPacket allocation failed");
-            return;
+            terminate_dispatch_generation(generation, "CNetPacket allocation failed");
+            return DrainResult::Stale;
+        }
+        if !DISPATCH.generation_is_current(generation) {
+            // A same-thread hook may invalidate reentrantly while allocation is
+            // running. External invalidation remains blocked by the lease.
+            // SAFETY: packet is live and has not been handed to RecvPkt.
+            unsafe { packet_release(packet) };
+            return DrainResult::Stale;
         }
         // SAFETY: packet is live; conn_id is a real connection id; body outlives
         // the synchronous dispatch below.
-        unsafe {
-            packet_init(packet, conn_id, ptr, len, std::ptr::null_mut(), 1);
-            recv_pkt(receiver as *mut c_void, packet);
+        unsafe { packet_init(packet, context.conn_id, ptr, len, std::ptr::null_mut(), 1) };
+        if !DISPATCH.generation_is_current(generation) {
+            // Do not enter the old receiver if PacketInit caused a reentrant
+            // account or connection transition on this thread.
+            // SAFETY: packet remains live and RecvPkt has not taken ownership.
+            unsafe { packet_release(packet) };
+            return DrainResult::Stale;
         }
+        // SAFETY: the lease keeps this context valid through the synchronous call.
+        unsafe { recv_pkt(context.receiver as *mut c_void, packet) };
         let owned_after = read_word_at(
             packet,
             vapor_forge_steam_native_abi::cnet_packet::OWNED_DATA_OFFSET,
         );
         info!(
-            conn_id = format_args!("0x{conn_id:x}"),
+            conn_id = format_args!("0x{:x}", context.conn_id),
             len,
             packet = format_args!("{packet:p}"),
             owned_after = %format_optional_word(owned_after),
@@ -752,10 +1289,11 @@ fn maybe_fire_armed_selftest(packet: *mut c_void) {
     }
     // SAFETY: data points to `size` bytes for this dispatch.
     let body = unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec();
+    let context = DISPATCH.context();
     info!(
         len = body.len(),
-        conn_id = format_args!("0x{:x}", CM_CONN_ID.load(Ordering::Acquire)),
-        recv_pthread = format_args!("0x{:x}", RECV_PTHREAD.load(Ordering::Acquire)),
+        conn_id = format_args!("0x{:x}", context.map_or(0, |context| context.conn_id)),
+        recv_pthread = format_args!("0x{:x}", context.map_or(0, |context| context.recv_pthread)),
         "native-inject: self-test replaying one inbound packet through dispatch"
     );
     enqueue_injection(body);
@@ -836,6 +1374,7 @@ fn format_optional_word(value: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
 
     fn key(
         credential_fingerprint: &str,
@@ -857,6 +1396,23 @@ mod tests {
             generation: 7,
             playtime_context: Some(context),
             _cloud_permit: None,
+        }
+    }
+
+    fn ordinary(body: u8, generation: u64) -> QueuedInjection {
+        QueuedInjection {
+            body: vec![body],
+            generation,
+            playtime_context: None,
+            _cloud_permit: None,
+        }
+    }
+
+    fn context(receiver: usize, conn_id: u32, recv_pthread: usize) -> DispatchContext {
+        DispatchContext {
+            receiver,
+            conn_id,
+            recv_pthread,
         }
     }
 
@@ -911,5 +1467,207 @@ mod tests {
         let (queued, discarded) = take_next_dispatchable(&mut queue, 7, None);
         assert!(queued.is_none());
         assert_eq!(discarded, 1);
+    }
+
+    #[test]
+    fn stale_work_item_cannot_disarm_the_current_generation() {
+        let coordinator = DispatchCoordinator::new();
+        let queue = Mutex::new(VecDeque::new());
+        assert!(
+            coordinator
+                .capture(context(1, 10, 100), 100, 1, &queue)
+                .published
+        );
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(1, 1))
+            .is_ok());
+        let old_claim = coordinator.claim_posted(&queue).unwrap();
+        assert_eq!(old_claim.generation, 1);
+        drop(old_claim);
+
+        let invalidated = coordinator
+            .invalidate_generation(None, 200, &queue)
+            .unwrap();
+        assert_eq!(invalidated.previous_generation, 1);
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(9, 1))
+            .is_err());
+        assert!(
+            coordinator
+                .capture(context(2, 20, 200), 200, 2, &queue)
+                .published
+        );
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(2, 2))
+            .is_ok());
+        let new_claim = coordinator.claim_posted(&queue).unwrap();
+        assert_eq!(new_claim.generation, 2);
+        drop(new_claim);
+
+        assert!(!coordinator.disarm_posted(1));
+        assert_eq!(coordinator.lock().posted_generation, 2);
+        assert!(coordinator.disarm_posted(2));
+    }
+
+    #[test]
+    fn invalidation_waits_for_a_dequeued_dispatch_to_finish() {
+        let coordinator = Arc::new(DispatchCoordinator::new());
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        assert!(
+            coordinator
+                .capture(context(1, 10, 100), 100, 1, &queue)
+                .published
+        );
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(1, 1))
+            .is_ok());
+        drop(coordinator.claim_posted(&queue).unwrap());
+        let lease = match coordinator.begin_dispatch(&queue, 1, 100, None) {
+            BeginDispatch::Ready { _lease, .. } => _lease,
+            _ => panic!("dispatch did not start"),
+        };
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_coordinator = Arc::clone(&coordinator);
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let outcome = worker_coordinator
+                .invalidate_generation(None, 200, &worker_queue)
+                .unwrap();
+            done_tx.send(outcome.previous_generation).unwrap();
+        });
+        started_rx.recv().unwrap();
+        coordinator.wait_for_transition();
+        assert!(done_rx.try_recv().is_err());
+        assert!(coordinator.context().is_none());
+        assert_eq!(coordinator.current_generation(), 1);
+
+        drop(lease);
+        assert_eq!(done_rx.recv().unwrap(), 1);
+        worker.join().unwrap();
+        assert_eq!(coordinator.current_generation(), 2);
+    }
+
+    #[test]
+    fn connection_replacement_waits_for_a_dequeued_dispatch_to_finish() {
+        let coordinator = Arc::new(DispatchCoordinator::new());
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let old = context(1, 10, 100);
+        let new = context(2, 20, 200);
+        assert!(coordinator.capture(old, 100, 1, &queue).published);
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(1, 1))
+            .is_ok());
+        drop(coordinator.claim_posted(&queue).unwrap());
+        let lease = match coordinator.begin_dispatch(&queue, 1, 100, None) {
+            BeginDispatch::Ready { _lease, .. } => _lease,
+            _ => panic!("dispatch did not start"),
+        };
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_coordinator = Arc::clone(&coordinator);
+        let worker_queue = Arc::clone(&queue);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let outcome = worker_coordinator.capture(new, 200, 1, &worker_queue);
+            done_tx
+                .send((outcome.connection_changed, outcome.published))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        coordinator.wait_for_transition();
+        assert!(done_rx.try_recv().is_err());
+        assert!(coordinator.context().is_none());
+        assert_eq!(coordinator.current_generation(), 1);
+
+        drop(lease);
+        assert_eq!(done_rx.recv().unwrap(), (true, true));
+        worker.join().unwrap();
+        assert_eq!(coordinator.current_generation(), 2);
+        assert_eq!(coordinator.context(), Some(new));
+    }
+
+    #[test]
+    fn reentrant_invalidation_is_released_after_dispatch_returns() {
+        let coordinator = DispatchCoordinator::new();
+        let queue = Mutex::new(VecDeque::new());
+        assert!(
+            coordinator
+                .capture(context(1, 10, 100), 100, 1, &queue)
+                .published
+        );
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(1, 1))
+            .is_ok());
+        drop(coordinator.claim_posted(&queue).unwrap());
+        let lease = match coordinator.begin_dispatch(&queue, 1, 100, None) {
+            BeginDispatch::Ready { _lease, .. } => _lease,
+            _ => panic!("dispatch did not start"),
+        };
+
+        let outcome = coordinator
+            .invalidate_generation(None, 100, &queue)
+            .unwrap();
+        assert_eq!(outcome.previous_generation, 1);
+        assert!(coordinator.lock().transition_in_progress);
+        assert!(coordinator.context().is_none());
+        assert_eq!(coordinator.current_generation(), 1);
+
+        drop(lease);
+        assert!(!coordinator.lock().transition_in_progress);
+        assert_eq!(coordinator.current_generation(), 2);
+    }
+
+    #[test]
+    fn invalidation_does_not_publish_the_old_connection_in_the_new_generation() {
+        let coordinator = DispatchCoordinator::new();
+        let queue = Mutex::new(VecDeque::new());
+        let old = context(1, 10, 100);
+        let new = context(2, 20, 200);
+        assert!(coordinator.capture(old, 100, 1, &queue).published);
+
+        coordinator
+            .invalidate_generation(None, 200, &queue)
+            .unwrap();
+        assert_eq!(coordinator.current_generation(), 2);
+        assert!(coordinator.context().is_none());
+        assert!(!coordinator.capture(old, 100, 1, &queue).published);
+        assert!(coordinator.context().is_none());
+
+        assert!(coordinator.capture(new, 200, 2, &queue).published);
+        assert_eq!(coordinator.context(), Some(new));
+    }
+
+    #[test]
+    fn enqueue_between_empty_drain_and_disarm_gets_a_successor_post() {
+        let coordinator = DispatchCoordinator::new();
+        let queue = Mutex::new(VecDeque::new());
+        assert!(
+            coordinator
+                .capture(context(1, 10, 100), 100, 1, &queue)
+                .published
+        );
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(1, 1))
+            .is_ok());
+        let current_claim = coordinator.claim_posted(&queue).unwrap();
+        queue.lock().unwrap().clear();
+        drop(current_claim);
+
+        assert!(coordinator
+            .enqueue_if_current(&queue, ordinary(2, 1))
+            .is_ok());
+        assert!(coordinator.disarm_posted(1));
+        let successor = coordinator.claim_posted(&queue).unwrap();
+        assert_eq!(successor.generation, 1);
+    }
+
+    #[test]
+    fn connection_generation_never_uses_the_unarmed_value() {
+        assert_eq!(next_injection_generation(u64::MAX), 1);
+        assert_eq!(next_injection_generation(7), 8);
     }
 }

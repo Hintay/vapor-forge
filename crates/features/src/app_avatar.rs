@@ -2,7 +2,7 @@
 //! sees the avatar AppId in CMsgClientGamesPlayed.
 //!
 //! Priority order for lookups:
-//!   1. Runtime map (flag-driven, set at LaunchApp time)
+//!   1. Runtime map (flag-driven, set at process launch time)
 //!   2. Static map  (config + lua setavatar)
 //!   3. Wildcard    (static map key 0)
 //!
@@ -16,7 +16,7 @@ use tracing::{debug, info};
 use vapor_forge_config::{AppAvatarRule, AppId};
 use vapor_forge_steam_protocol::app_id_from_game_id;
 
-// Runtime flag-driven mappings (set at LaunchApp, per-launch).
+// Runtime flag-driven mappings set for each process launch.
 // Writes happen on Steam main thread; reads on IPC threads.
 static RUNTIME_MAP: Mutex<Option<HashMap<AppId, AppId>>> = Mutex::new(None);
 
@@ -72,7 +72,7 @@ pub fn rewrite_games_played(
     }
 }
 
-/// Called from the LaunchApp hook (hooks crate) after reading launch options.
+/// Called from the SpawnProcess hook after reading launch options.
 ///
 /// Evaluates flag rules and updates the runtime map for this app.
 /// The CConfigStore read is done in the hooks layer (unsafe territory);

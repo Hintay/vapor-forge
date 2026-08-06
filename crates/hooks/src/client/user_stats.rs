@@ -332,6 +332,17 @@ pub(crate) fn signal_router_playtime(app_id: u32) -> bool {
     signal_playtime(app_id)
 }
 
+pub(crate) fn queue_client_id_capture(steam_id64: u64) -> bool {
+    let identity_generation = vapor_forge_features::identity::generation();
+    if steam_id64 == 0
+        || identity_generation == 0
+        || steam_id64 != vapor_forge_features::identity::steam_id()
+    {
+        return false;
+    }
+    worker().is_some_and(|worker| worker.queue_client_id(steam_id64, identity_generation))
+}
+
 fn signal_playtime_for_generation(app_id: u32, generation: u64) -> bool {
     if app_id == 0 || vapor_forge_features::identity::steam_id() == 0 {
         return false;
@@ -419,6 +430,7 @@ pub(crate) fn notify_context_changed() {
             state.pending_refreshes.clear();
             state.active_refreshes.clear();
             state.pending_playtime.clear();
+            state.pending_client_id = None;
             #[cfg(any(debug_assertions, test))]
             state.queries.clear();
         }
@@ -497,6 +509,21 @@ impl StatsWorker {
         outcome
     }
 
+    fn queue_client_id(&self, steam_id64: u64, identity_generation: u64) -> bool {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_client_id = Some(PendingClientId {
+            steam_id64,
+            identity_generation,
+        });
+        drop(state);
+        callback_notify::notify();
+        true
+    }
+
     #[cfg(any(debug_assertions, test))]
     fn queue_query(&self, query: WorkerQuery) -> bool {
         let mut state = self
@@ -542,6 +569,7 @@ struct WorkerState {
     pending_refreshes: HashMap<u32, RefreshRequest>,
     active_refreshes: HashSet<u32>,
     pending_playtime: HashMap<u32, PendingPlaytime>,
+    pending_client_id: Option<PendingClientId>,
     #[cfg(any(debug_assertions, test))]
     queries: VecDeque<WorkerQuery>,
     next_playtime_revision: u64,
@@ -552,6 +580,12 @@ struct PendingPlaytime {
     identity_generation: u64,
     revision: u64,
     ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingClientId {
+    steam_id64: u64,
+    identity_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -660,10 +694,43 @@ fn service_until_quiescent(
     identity_generation: u64,
     in_flight: &mut Vec<InFlight>,
 ) {
+    process_pending_client_id(session, shared, steam_id64, identity_generation);
     consume_callback_events(session, shared, steam_id64, identity_generation, in_flight);
     while process_pending_playtime_pass(session, shared, steam_id64, identity_generation) {}
     process_pending_reads(session, shared);
     admit_refreshes(session, shared, steam_id64, in_flight);
+}
+
+fn process_pending_client_id(
+    session: &SteamUserStatsSession,
+    shared: &WorkerShared,
+    steam_id64: u64,
+    identity_generation: u64,
+) {
+    let pending = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pending_client_id
+        .take();
+    let Some(pending) = pending else {
+        return;
+    };
+    if pending.steam_id64 != steam_id64
+        || pending.identity_generation != identity_generation
+        || !session.is_current()
+    {
+        crate::netpacket::cancel_client_id_capture();
+        return;
+    }
+    match session.read_client_id_or_arm() {
+        Ok(Some(client_id)) => crate::netpacket::complete_client_id_capture(client_id),
+        Ok(None) => debug!(steam_id64, "CM login: waiting for Steam to create ClientID"),
+        Err(error) => {
+            crate::netpacket::cancel_client_id_capture();
+            warn!(steam_id64, error, "CM login: ClientID read failed");
+        }
+    }
 }
 
 /// Consume bounded chunks until the process-owned event queue is empty.

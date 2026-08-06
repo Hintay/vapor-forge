@@ -46,6 +46,10 @@ unsafe extern "C" fn hk_get_package_info(
     // the validated 32-bit GetPackageInfo ABI.
     let result = unsafe { original(this, package_id, access_token) };
 
+    if !crate::capability::is_ready(crate::capability::Capability::PackageInjection) {
+        return result;
+    }
+
     // Capture CPackageInfo* on first call, then use it to get pkg0.
     if !CPKG_INFO_CAPTURED.swap(true, Ordering::AcqRel) {
         // SAFETY: `this` is the live CPackageInfo receiver for this hook callback.
@@ -75,6 +79,10 @@ unsafe extern "C" fn hk_get_package_info64(this: *mut c_void, key: *const u64) -
     );
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, key) };
+
+    if !crate::capability::is_ready(crate::capability::Capability::PackageInjection) {
+        return result;
+    }
 
     // Linux x86_64 receives the CPackageInfo package-store subobject plus a
     // package-token key pointer. The function walks the token map discovered by

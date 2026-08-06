@@ -80,6 +80,12 @@ pub(crate) unsafe extern "C" fn hk_http_job_start(
     request: *mut c_void,
     flag: bool,
 ) {
+    let original = detour_or_return!(HTTP_JOB_START_NAME, HTTP_JOB_START_DETOUR);
+    if !crate::capability::is_ready(crate::capability::Capability::CloudHttp) {
+        // SAFETY: forwards Steam's untouched HTTP job arguments.
+        unsafe { original(manager, job, request, flag) };
+        return;
+    }
     // Only a target issued by the local adapter can admit a candidate layout.
     // All reads use process_vm_readv, so layout drift is a clean miss.
     let Some(admitted) = HTTP_LAYOUTS.iter().find_map(|layout| {
@@ -91,7 +97,6 @@ pub(crate) unsafe extern "C" fn hk_http_job_start(
         // admission validates every remaining field before returning it.
         unsafe { admit_local_transfer(job, request, layout, identity, contract) }
     }) else {
-        let original = detour_or_return!(HTTP_JOB_START_NAME, HTTP_JOB_START_DETOUR);
         // SAFETY: forwards Steam's untouched hook arguments to the trampoline.
         unsafe { original(manager, job, request, flag) };
         return;
@@ -107,7 +112,6 @@ pub(crate) unsafe extern "C" fn hk_http_job_start(
         &admitted.identity.path,
         &admitted.body,
     ) else {
-        let original = detour_or_return!(HTTP_JOB_START_NAME, HTTP_JOB_START_DETOUR);
         // SAFETY: forwards Steam's untouched hook arguments to the trampoline.
         unsafe { original(manager, job, request, flag) };
         return;

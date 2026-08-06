@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "runtime-semantic")]
+extern crate self as vapor_forge_patterns;
+
 use thiserror::Error;
 
 pub mod elf;
+#[cfg(feature = "runtime-semantic")]
+pub mod full_semantic;
 pub mod semantic;
 pub mod vtable_scan;
 
@@ -22,6 +27,8 @@ pub enum PatternError {
     NoMatch,
     #[error("pattern is not unique: found {0} matches")]
     Ambiguous(usize),
+    #[error("pattern exceeds the {0}-match scan limit")]
+    TooManyMatches(usize),
     #[error("relative follow target is out of bounds")]
     FollowOutOfBounds,
     #[error("relative follow requires a call/jmp rel32 opcode at the match offset")]
@@ -83,16 +90,34 @@ impl Pattern {
     }
 
     pub fn find_all(&self, haystack: &[u8]) -> Vec<usize> {
+        self.find_matches(haystack, usize::MAX).0
+    }
+
+    pub fn find_all_bounded(
+        &self,
+        haystack: &[u8],
+        max_matches: usize,
+    ) -> Result<Vec<usize>, PatternError> {
+        let (matches, truncated) = self.find_matches(haystack, max_matches);
+        if truncated {
+            Err(PatternError::TooManyMatches(max_matches))
+        } else {
+            Ok(matches)
+        }
+    }
+
+    fn find_matches(&self, haystack: &[u8], max_matches: usize) -> (Vec<usize>, bool) {
         if haystack.len() < self.tokens.len() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let limit = haystack.len() - self.tokens.len();
 
         let Some((anchor_index, anchor_bytes)) = self.longest_literal_run() else {
-            return (0..=limit).collect();
+            let count = limit.saturating_add(1);
+            return ((0..count.min(max_matches)).collect(), count > max_matches);
         };
 
-        let mut matches = Vec::new();
+        let mut matches = Vec::with_capacity(max_matches.min(16));
         let finder = memchr::memmem::Finder::new(&anchor_bytes);
         let mut search_from = 0usize;
         while let Some(relative) = finder.find(&haystack[search_from..]) {
@@ -100,20 +125,24 @@ impl Pattern {
             if anchor_offset >= anchor_index {
                 let candidate = anchor_offset - anchor_index;
                 if candidate <= limit && self.matches_at(haystack, candidate) {
+                    if matches.len() == max_matches {
+                        return (matches, true);
+                    }
                     matches.push(candidate);
                 }
             }
             search_from = anchor_offset + 1;
         }
 
-        matches
+        (matches, false)
     }
 
     pub fn find_unique(&self, haystack: &[u8]) -> Result<usize, PatternError> {
-        let matches = self.find_all(haystack);
+        let (matches, truncated) = self.find_matches(haystack, 2);
         match matches.len() {
             0 => Err(PatternError::NoMatch),
             1 => Ok(matches[0]),
+            _ if truncated => Err(PatternError::Ambiguous(2)),
             n => Err(PatternError::Ambiguous(n)),
         }
     }
@@ -325,6 +354,26 @@ mod tests {
         assert_eq!(pattern.find_all(&haystack), vec![0, 1]);
         assert_eq!(
             pattern.find_unique(&haystack),
+            Err(PatternError::Ambiguous(2))
+        );
+    }
+
+    #[test]
+    fn bounded_scan_rejects_broad_literal_and_wildcard_patterns() {
+        let literal = Pattern::parse("AA").unwrap();
+        let wildcard = Pattern::parse("?").unwrap();
+        let haystack = [0xaa; 32];
+
+        assert_eq!(
+            literal.find_all_bounded(&haystack, 4),
+            Err(PatternError::TooManyMatches(4))
+        );
+        assert_eq!(
+            wildcard.find_all_bounded(&haystack, 4),
+            Err(PatternError::TooManyMatches(4))
+        );
+        assert_eq!(
+            wildcard.find_unique(&haystack),
             Err(PatternError::Ambiguous(2))
         );
     }

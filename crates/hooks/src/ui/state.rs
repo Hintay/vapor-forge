@@ -14,7 +14,5 @@ pub(crate) type RepeatedFieldAddFn = unsafe extern "C" fn(*mut c_void, *const u3
 pub(crate) static mut GET_APP_BY_ID_DETOUR: Option<Detour<GetAppByIdFn>> = None;
 pub(crate) static mut MARK_APP_CHANGE_DETOUR: Option<Detour<MarkAppChangeFn>> = None;
 
-pub(crate) static CONTROLLER: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static APP_CHANGE_SOURCE: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static INSTALLED: AtomicBool = AtomicBool::new(false);
 pub(crate) static CONFLICT_UI_READY: AtomicBool = AtomicBool::new(false);

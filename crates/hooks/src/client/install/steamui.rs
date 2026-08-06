@@ -17,11 +17,24 @@ pub(super) fn install_hook_batch() {
             warn!(
                 "hook-install: steamui.so executable mapping unavailable, skipping steamui hooks"
             );
+            super::disable_hook_batch_capabilities(
+                super::HookBatch::SteamUi,
+                "steamui executable mapping is unavailable",
+            );
             STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
             info!(installed = false, "hook-install: steamui batch finished");
             return;
         };
-        let registry = super::load_pattern_registry();
+        let Some(registry) = super::load_pattern_registry("steamui", &ui_code) else {
+            warn!("hook-install: steamui pattern target rejected");
+            super::disable_hook_batch_capabilities(
+                super::HookBatch::SteamUi,
+                "steamui pattern target is unavailable",
+            );
+            STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
+            info!(installed = false, "hook-install: steamui batch finished");
+            return;
+        };
         let installed = crate::ui::install::install(&ui_code, &registry);
         STEAMUI_BATCH_FINISHED.store(true, Ordering::Release);
         info!(installed, "hook-install: steamui batch finished");

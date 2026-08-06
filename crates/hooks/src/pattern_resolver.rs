@@ -4,9 +4,39 @@ use vapor_forge_patterns::{
     find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
 };
 
+const MAX_CALLSITE_MATCHES: usize = 256;
+
 pub(crate) struct CodeRegion {
     pub(crate) base: usize,
     pub(crate) bytes: &'static [u8],
+}
+
+pub(crate) fn validate_resolved_pattern(
+    module: &str,
+    code: &CodeRegion,
+    name: &str,
+    address: usize,
+) -> bool {
+    let Some(offset) = address.checked_sub(code.base) else {
+        error!(hook = name, "pattern resolved outside the module");
+        return false;
+    };
+    match vapor_forge_patterns::full_semantic::validate_live_pattern(
+        module,
+        std::mem::size_of::<usize>(),
+        name,
+        code.bytes,
+        offset,
+    ) {
+        Ok(()) => {
+            debug!(hook = name, "pattern semantic validation passed");
+            true
+        }
+        Err(error) => {
+            error!(hook = name, %error, "pattern semantic validation failed");
+            false
+        }
+    }
 }
 
 pub(crate) fn resolve_pattern_entry(
@@ -164,7 +194,13 @@ fn resolve_follow_call(
         },
         None => None,
     };
-    let matches = pattern.find_all(code.bytes);
+    let matches = match pattern.find_all_bounded(code.bytes, MAX_CALLSITE_MATCHES) {
+        Ok(matches) => matches,
+        Err(error) => {
+            warn!(hook = name, %error, "callsite pattern is too broad");
+            return None;
+        }
+    };
     if matches.is_empty() {
         warn!(hook = name, "callsite pattern did not match");
         return None;

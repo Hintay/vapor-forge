@@ -74,31 +74,15 @@ fn main() {
         };
 
         code.push_str(&format!(
-            "    crate::registry::PatternDef {{ name: {:?}, pattern: {:?}, follow: crate::registry::FollowMode::{}, prologue: {}, callee_pattern: {}, optional: {}, pic_entry: {}, module: {:?} }},\n",
-            entry.name, entry.pattern, follow, prologue, callee_pattern, entry.optional, entry.pic_entry, entry.module
+            "    crate::registry::PatternDef {{ name: {:?}, pattern: {:?}, follow: crate::registry::FollowMode::{}, prologue: {}, callee_pattern: {}, pic_entry: {}, steamrt_variant: {}, module: {:?} }},\n",
+            entry.name, entry.pattern, follow, prologue, callee_pattern, entry.pic_entry, entry.ordinal != 0, entry.module
         ));
     }
 
-    code.push_str("];\n\n");
-
-    // Content hash of the source TOML for online update comparison
-    let hash = fnv1a_64(toml_str.as_bytes());
-    code.push_str(&format!(
-        "pub const EMBEDDED_PATTERNS_HASH: u64 = 0x{:016x};\n",
-        hash
-    ));
+    code.push_str("];\n");
 
     fs::write(&out_path, code)
         .unwrap_or_else(|e| panic!("failed to write {}: {}", out_path.display(), e));
-}
-
-fn fnv1a_64(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn parse_hex_bytes(hex_str: &str) -> Vec<u8> {
@@ -116,12 +100,12 @@ struct TomlRoot {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlEntry {
     pattern: String,
     follow: Option<String>,
     prologue: Option<String>,
     callee_pattern: Option<String>,
-    optional: Option<bool>,
     pic_entry: Option<bool>,
     variants: Option<Vec<TomlVariant>>,
 }
@@ -144,7 +128,6 @@ struct GeneratedEntry {
     follow: Option<String>,
     prologue: Option<String>,
     callee_pattern: Option<String>,
-    optional: bool,
     pic_entry: bool,
 }
 
@@ -154,7 +137,6 @@ fn push_generated_entries(
     module: &str,
     entry: &TomlEntry,
 ) {
-    let optional = entry.optional.unwrap_or(false);
     out.push(GeneratedEntry {
         name: name.to_owned(),
         module: module.to_owned(),
@@ -163,7 +145,6 @@ fn push_generated_entries(
         follow: entry.follow.clone(),
         prologue: entry.prologue.clone(),
         callee_pattern: entry.callee_pattern.clone(),
-        optional,
         pic_entry: entry.pic_entry.unwrap_or(false),
     });
 
@@ -179,7 +160,6 @@ fn push_generated_entries(
                 .callee_pattern
                 .clone()
                 .or_else(|| entry.callee_pattern.clone()),
-            optional,
             pic_entry: variant
                 .pic_entry
                 .unwrap_or_else(|| entry.pic_entry.unwrap_or(false)),
