@@ -584,9 +584,10 @@ mod tests {
             client_id: 1,
             machine_name: "root".into(),
         };
+        let operation = store.begin_operation(480, &[], None).unwrap();
         let staged = store
             .stage_file(
-                480,
+                &operation,
                 "save.dat",
                 b"root",
                 &FileMetadata {
@@ -598,12 +599,13 @@ mod tests {
             )
             .unwrap();
         store
-            .commit_batch(480, &[], &[staged], &BTreeSet::new(), &identity, None)
+            .commit_operation(&operation, &[staged], &BTreeSet::new(), &identity)
             .unwrap();
 
         let root = store.view(480).unwrap().head_ids().remove(0);
-        let directory = temporary.path().join(format!("{ACCOUNT}/480/manifests"));
-        let root_bytes = std::fs::read(directory.join(format!("{root}.json"))).unwrap();
+        let directory = temporary.path().join(format!("{ACCOUNT}/480"));
+        let root_directory = directory.join(&root);
+        let root_bytes = std::fs::read(root_directory.join("manifest.json")).unwrap();
         let root_manifest = serde_json::from_slice::<serde_json::Value>(&root_bytes).unwrap();
         for (client_id, machine_name) in [(7, "deck"), (8, "desktop"), (9, "laptop")] {
             let mut manifest = root_manifest.clone();
@@ -617,7 +619,17 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            std::fs::write(directory.join(format!("{id}.json")), bytes).unwrap();
+            let head_directory = directory.join(id);
+            std::fs::create_dir_all(head_directory.join("blobs")).unwrap();
+            for entry in std::fs::read_dir(root_directory.join("blobs")).unwrap() {
+                let entry = entry.unwrap();
+                std::fs::copy(
+                    entry.path(),
+                    head_directory.join("blobs").join(entry.file_name()),
+                )
+                .unwrap();
+            }
+            std::fs::write(head_directory.join("manifest.json"), bytes).unwrap();
         }
         let view = store.view(480).unwrap();
         assert_eq!(view.heads.len(), 3);

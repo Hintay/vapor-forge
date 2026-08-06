@@ -5,7 +5,7 @@ use super::transfer_targets::{CloudStateScope, TransferTargetRegistry};
 use super::*;
 use prost::Message;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
@@ -24,7 +24,6 @@ pub(super) struct AdapterState {
     pub(super) active_batches: HashMap<u32, u64>,
     pub(super) batches: HashMap<u64, BatchState>,
     pub(super) local_apps: HashMap<u32, LocalAppState>,
-    pub(super) local_sessions: HashSet<u32>,
     pub(super) files: HashMap<(u32, String), CumulusFile>,
     /// Shared with every other journal user in this process; structsy allows
     /// only one open database per file, so this is never opened here directly.
@@ -89,7 +88,6 @@ impl AdapterState {
             active_batches: HashMap::new(),
             batches: HashMap::new(),
             local_apps: HashMap::new(),
-            local_sessions: HashSet::new(),
             files: HashMap::new(),
             journal,
             transfer_targets,
@@ -107,13 +105,12 @@ impl AdapterState {
         if self.scope.is_some() {
             warn!("cloud-rpc: backend scope changed; discarded transient adapter state");
         }
-        self.unregister_local_batches();
+        self.abort_local_operations();
         self.current_change_numbers.clear();
         self.client_change_numbers.clear();
         self.active_batches.clear();
         self.batches.clear();
         self.local_apps.clear();
-        self.local_sessions.clear();
         self.files.clear();
         self.principal_scope = None;
         self.scope = Some(scope);
@@ -125,10 +122,12 @@ impl AdapterState {
             .expect("adapter scope prepared before RPC dispatch")
     }
 
-    fn unregister_local_batches(&self) {
-        for (batch_id, batch) in &self.batches {
-            if batch.local_identity.is_some() {
-                self.local_gc.unregister_batch(*batch_id);
+    fn abort_local_operations(&self) {
+        for batch in self.batches.values() {
+            if let Some(operation) = &batch.local_operation {
+                if let Err(error) = operation.abort() {
+                    warn!(%error, "cloud-rpc: failed to discard local upload operation");
+                }
             }
         }
     }
@@ -139,10 +138,9 @@ pub(super) struct BatchState {
     pub(super) upload_paths: BTreeSet<String>,
     pub(super) delete_paths: BTreeSet<String>,
     pub(super) files: HashMap<String, String>,
-    pub(super) local_base_heads: Vec<String>,
     pub(super) local_files: HashMap<String, vapor_forge_cloud_local::StagedFile>,
+    pub(super) local_operation: Option<vapor_forge_cloud_local::SaveOperation>,
     pub(super) local_identity: Option<vapor_forge_cloud_local::CommitIdentity>,
-    pub(super) local_resolution_heads: Option<Vec<String>>,
     pub(super) conflict_resolution: Option<Queued<ConflictResolutionEvent>>,
 }
 
@@ -340,10 +338,9 @@ pub(super) fn handle_begin_batch(
         upload_paths: request.files_to_upload.into_iter().collect(),
         delete_paths: request.files_to_delete.into_iter().collect(),
         files: HashMap::new(),
-        local_base_heads: Vec::new(),
         local_files: HashMap::new(),
+        local_operation: None,
         local_identity: None,
-        local_resolution_heads: None,
         conflict_resolution,
     };
     state.active_batches.insert(app_id, batch_id);
