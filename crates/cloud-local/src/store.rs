@@ -16,9 +16,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const FORMAT_VERSION: u32 = 1;
 const FORMAT_FILE: &str = "format.json";
-static REPOSITORY_COORDINATORS: OnceLock<
-    Mutex<HashMap<PathBuf, Weak<RepositoryCoordination>>>,
-> = OnceLock::new();
+static REPOSITORY_COORDINATORS: OnceLock<Mutex<HashMap<PathBuf, Weak<RepositoryCoordination>>>> =
+    OnceLock::new();
 
 #[derive(Clone)]
 pub struct FolderStore {
