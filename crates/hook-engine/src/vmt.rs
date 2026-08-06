@@ -119,17 +119,32 @@ pub unsafe fn swap_vtable_slot(
 
     // SAFETY: write to vtable slot. Need mprotect since .data.rel.ro may be read-only.
     unsafe {
-        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let page_size_raw = libc::sysconf(libc::_SC_PAGESIZE);
+        if page_size_raw <= 0 {
+            error!(hook = name, "VMT swap failed: page size unavailable");
+            return None;
+        }
+        let page_size = page_size_raw as usize;
         let slot_addr = slot_ptr as usize;
         let page_start = slot_addr & !(page_size - 1);
-        let page_end =
-            (slot_addr + std::mem::size_of::<usize>() + page_size - 1) & !(page_size - 1);
+        let page_end = slot_addr
+            .checked_add(std::mem::size_of::<usize>())
+            .and_then(|end| end.checked_add(page_size - 1))
+            .map(|end| end & !(page_size - 1));
+        let Some(page_end) = page_end else {
+            error!(hook = name, "VMT swap failed: slot range overflow");
+            return None;
+        };
         let region_size = page_end - page_start;
+        let Some(original_protection) = mapping_protection(page_start, region_size) else {
+            error!(hook = name, "VMT swap failed: page protection unavailable");
+            return None;
+        };
 
         if libc::mprotect(
             page_start as *mut libc::c_void,
             region_size,
-            libc::PROT_READ | libc::PROT_WRITE,
+            original_protection | libc::PROT_WRITE,
         ) != 0
         {
             error!(hook = name, "mprotect(RW) failed for VMT swap");
@@ -141,15 +156,41 @@ pub unsafe fn swap_vtable_slot(
         if libc::mprotect(
             page_start as *mut libc::c_void,
             region_size,
-            libc::PROT_READ,
+            original_protection,
         ) != 0
         {
-            error!(hook = name, "mprotect(R) restore failed after VMT swap");
+            error!(hook = name, "mprotect restore failed after VMT swap");
         }
     }
 
     info!(hook = name, slot = slot, "VMT hook INSTALLED");
     Some(original)
+}
+
+fn mapping_protection(address: usize, len: usize) -> Option<i32> {
+    let end = address.checked_add(len)?;
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let mut bounds = fields.next()?.splitn(2, '-');
+        let start = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        let mapping_end = usize::from_str_radix(bounds.next()?, 16).ok()?;
+        let permissions = fields.next()?.as_bytes();
+        if address < start || end > mapping_end || permissions.len() < 3 {
+            return None;
+        }
+        let mut protection = libc::PROT_NONE;
+        if permissions[0] == b'r' {
+            protection |= libc::PROT_READ;
+        }
+        if permissions[1] == b'w' {
+            protection |= libc::PROT_WRITE;
+        }
+        if permissions[2] == b'x' {
+            protection |= libc::PROT_EXEC;
+        }
+        Some(protection)
+    })
 }
 
 #[cfg(test)]
@@ -202,5 +243,16 @@ mod tests {
 
         assert_eq!(result, None);
         assert_eq!(vtable[0], 0x1200);
+    }
+
+    #[test]
+    fn mapping_protection_preserves_current_page_flags() {
+        let value = Box::new(7usize);
+        let address = (&*value) as *const usize as usize;
+        let protection =
+            super::mapping_protection(address, std::mem::size_of::<usize>()).expect("heap mapping");
+
+        assert_ne!(protection & libc::PROT_READ, 0);
+        assert_ne!(protection & libc::PROT_WRITE, 0);
     }
 }
