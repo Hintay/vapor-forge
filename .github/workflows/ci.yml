@@ -167,6 +167,8 @@ jobs:
         env:
           CFLAGS_i686_unknown_linux_gnu: -DLUAJIT_NO_UNWIND
           CFLAGS_x86_64_unknown_linux_gnu: -DLUAJIT_NO_UNWIND
+          GIT_COMMIT: ${{ steps.version.outputs.commit }}
+          VAPOR_FORGE_BUILD_VERSION: ${{ steps.version.outputs.tag_version || steps.version.outputs.version }}
         run: |
           set -eux
           cargo zigbuild --release -p vapor-forge-audit-loader --target "i686-unknown-linux-gnu.${STEAM_GLIBC_BASELINE}" --locked
