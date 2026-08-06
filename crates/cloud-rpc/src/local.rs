@@ -239,11 +239,17 @@ fn begin_batch(
         }
     };
     if let Some(previous) = state.active_batches.remove(&app_id) {
-        state.local_gc.unregister_batch(previous);
+        if let Some(operation) = state
+            .batches
+            .get(&previous)
+            .and_then(|batch| batch.local_operation.as_ref())
+        {
+            operation.abort()?;
+        }
         state.batches.remove(&previous);
     }
+    let operation = store.begin_operation(app_id, &base_heads, resolution_heads.as_deref())?;
     let batch_id = next_batch_id();
-    let gc_manifest_roots = resolution_heads.as_deref().unwrap_or(&base_heads).to_vec();
     state.active_batches.insert(app_id, batch_id);
     state.batches.insert(
         batch_id,
@@ -252,16 +258,12 @@ fn begin_batch(
             upload_paths: request.files_to_upload.into_iter().collect(),
             delete_paths: request.files_to_delete.into_iter().collect(),
             files: HashMap::new(),
-            local_base_heads: base_heads,
             local_files: HashMap::new(),
+            local_operation: Some(operation),
             local_identity: Some(identity),
-            local_resolution_heads: resolution_heads,
             conflict_resolution: None,
         },
     );
-    state
-        .local_gc
-        .register_batch(batch_id, store, app_id, &gc_manifest_roots);
     Ok(RpcReply::ok(
         CloudBeginAppUploadBatchResponse {
             batch_id: Some(batch_id),
@@ -295,7 +297,6 @@ fn begin_file_upload(
     if sha1.len() != 40 {
         return Err(AdapterError::Protocol("file_sha is not a SHA-1".into()));
     }
-    state.local_gc.retain_blob(batch_id, &sha1);
     let metadata = FileMetadata {
         sha1,
         raw_size,
@@ -303,7 +304,10 @@ fn begin_file_upload(
             .map_err(|_| AdapterError::Protocol("timestamp exceeds local range".into()))?,
         platforms_to_sync: request.platforms_to_sync.unwrap_or(u32::MAX),
     };
-    let (token, target) = issue_upload(store, app_id, path.clone(), transfer_size, metadata)?;
+    let operation = batch.local_operation.clone().ok_or_else(|| {
+        AdapterError::Protocol("local upload batch has no storage operation".into())
+    })?;
+    let (token, target) = issue_upload(store, operation, path.clone(), transfer_size, metadata)?;
     state
         .batches
         .get_mut(&batch_id)
@@ -394,14 +398,11 @@ fn complete_batch(
         let identity = batch.local_identity.as_ref().ok_or_else(|| {
             AdapterError::Protocol("local upload batch has no bound identity".into())
         })?;
-        let change_number = store.commit_batch(
-            app_id,
-            &batch.local_base_heads,
-            &staged,
-            &batch.delete_paths,
-            identity,
-            batch.local_resolution_heads.as_deref(),
-        )?;
+        let operation = batch.local_operation.as_ref().ok_or_else(|| {
+            AdapterError::Protocol("local upload batch has no storage operation".into())
+        })?;
+        let change_number =
+            store.commit_operation(operation, &staged, &batch.delete_paths, identity)?;
         state.current_change_numbers.insert(app_id, change_number);
         let view = store.view(app_id)?;
         let app = state.local_apps.get_mut(&app_id).ok_or_else(|| {
@@ -413,8 +414,13 @@ fn complete_batch(
         app.pending_keep_local = None;
     }
     state.active_batches.remove(&app_id);
-    state.batches.remove(&batch_id);
-    state.local_gc.unregister_batch(batch_id);
+    if let Some(batch) = state.batches.remove(&batch_id) {
+        if !committed {
+            if let Some(operation) = batch.local_operation {
+                operation.abort()?;
+            }
+        }
+    }
     state
         .local_gc
         .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
@@ -506,6 +512,9 @@ fn launch(
     let app_id = local_app_id(request.app_id)?;
     let identity = identity_for(settings, request.client_id, request.machine_name)?;
     let view = store.view(app_id)?;
+    state
+        .local_gc
+        .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
     let conflict = conflict_from_view(&view, identity.client_id);
     let custom_resolution = view.is_conflicted()
         && (view.heads.len() > 2
@@ -542,11 +551,6 @@ fn launch(
             request.ignore_pending_operations.unwrap_or(false),
         )?
     };
-    if !custom_pending && peers.is_empty() {
-        state.local_sessions.insert(app_id);
-    } else {
-        state.local_sessions.remove(&app_id);
-    }
     let mut pending_remote_operations = peers
         .into_iter()
         .map(|peer| CloudPendingRemoteOperation {
@@ -651,7 +655,6 @@ fn exit(
 ) -> Result<RpcReply, AdapterError> {
     let request = CloudAppExitSyncDoneNotification::decode(body)?;
     let app_id = local_app_id(request.app_id)?;
-    state.local_sessions.remove(&app_id);
     let machine_name = state
         .local_apps
         .get(&app_id)
@@ -681,9 +684,9 @@ fn identity_for(
     let request_client_id = request_client_id.filter(|client_id| *client_id != 0);
     if let (Some(expected), Some(actual)) = (settings_client_id, request_client_id) {
         if expected != actual {
-            return Err(AdapterError::Protocol(
-                "local cloud request ClientID does not match the active Steam device".into(),
-            ));
+            return Err(AdapterError::Protocol(format!(
+                "local cloud request ClientID does not match the active Steam device: expected {expected}, received {actual}"
+            )));
         }
     }
     let client_id = request_client_id.or(settings_client_id).ok_or_else(|| {

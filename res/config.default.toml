@@ -27,12 +27,12 @@ backend = "disabled"        # disabled, local, or cumulus
 [cloud.local]
 path = ""
 
-# Optional Syncthing guard for local backend garbage collection.
+# Optional Syncthing index boundary for local cloud garbage collection.
 [cloud.local.syncthing]
 enabled = false
 url = "http://127.0.0.1:8384"
 api_key = ""
-folder_id = ""             # Syncthing folder containing cloud.local.path
+folder_id = ""             # Folder whose path exactly equals cloud.local.path
 timeout_ms = 2000
 
 [cloud.cumulus]

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use vapor_forge_cloud_core::{BackendError, ByteStore, FileMetadata, HttpTarget};
 
-use crate::{FolderStore, StagedFile};
+use crate::{FolderStore, SaveOperation, StagedFile};
 
 pub const LOCAL_TRANSFER_AUTHORITY: &str = "vapor-forge.local";
 const TRANSFER_TTL: Duration = Duration::from_secs(15 * 60);
@@ -25,7 +25,7 @@ pub enum LocalTransferContract {
 
 struct UploadTransfer {
     store: FolderStore,
-    app_id: u32,
+    operation: SaveOperation,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
@@ -55,7 +55,7 @@ struct TransferRegistry {
 
 pub fn issue_upload(
     store: FolderStore,
-    app_id: u32,
+    operation: SaveOperation,
     path: String,
     transfer_size: u64,
     metadata: FileMetadata,
@@ -66,7 +66,7 @@ pub fn issue_upload(
         expires_at: Instant::now() + TRANSFER_TTL,
         operation: TransferOperation::Upload(Arc::new(UploadTransfer {
             store,
-            app_id,
+            operation,
             path,
             transfer_size,
             metadata,
@@ -195,7 +195,7 @@ fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<StagedFi
     };
     upload
         .store
-        .stage_file(upload.app_id, &upload.path, &raw, &upload.metadata)
+        .stage_file(&upload.operation, &upload.path, &raw, &upload.metadata)
 }
 
 fn decode_steam_zip(body: &[u8], raw_size: u64) -> Result<Vec<u8>, BackendError> {
@@ -308,11 +308,12 @@ mod tests {
     #[test]
     fn upload_and_download_are_completed_without_network_io() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = FolderStore::open(temporary.path()).unwrap();
+        let store = FolderStore::open_account(temporary.path(), 76_561_198_000_000_001).unwrap();
         let contents = b"in-process save";
+        let operation = store.begin_operation(480, &[], None).unwrap();
         let (token, target) = issue_upload(
             store.clone(),
-            480,
+            operation.clone(),
             "save.dat".into(),
             contents.len() as u64,
             metadata(contents),
@@ -343,13 +344,11 @@ mod tests {
             machine_name: "deck".into(),
         };
         store
-            .commit_batch(
-                480,
-                &[],
+            .commit_operation(
+                &operation,
                 &[staged],
                 &std::collections::BTreeSet::new(),
                 &identity,
-                None,
             )
             .unwrap();
 

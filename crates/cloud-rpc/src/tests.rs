@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vapor_forge_cloud_core::{ByteStore, CloudFileStore};
 use vapor_forge_config::{
     AppId, AppsSection, CloudBackendMode, CloudSection, CumulusCloudSection, InjectApp,
@@ -315,10 +315,9 @@ fn adapter_state_is_discarded_when_cumulus_scope_changes() {
             upload_paths: BTreeSet::new(),
             delete_paths: BTreeSet::new(),
             files: HashMap::new(),
-            local_base_heads: Vec::new(),
             local_files: HashMap::new(),
+            local_operation: None,
             local_identity: None,
-            local_resolution_heads: None,
             conflict_resolution: None,
         },
     );
@@ -1427,11 +1426,17 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
             Ok(())
         ))
     ));
-    let orphan = directory.path().join(format!(
-        "{}/{app_id}/blobs/15/150c70aa93d10379cd7ffaf26d9850ea33ea833b",
-        settings.steam_id64.unwrap()
-    ));
-    assert!(orphan.exists());
+    let store = vapor_forge_cloud_local::FolderStore::open_account(
+        directory.path(),
+        settings.steam_id64.unwrap(),
+    )
+    .unwrap();
+    let heads_before_abort = store.view(app_id).unwrap().head_ids();
+    assert_eq!(heads_before_abort.len(), 1);
+    assert!(!directory
+        .path()
+        .join(format!("{}/{app_id}/blobs", settings.steam_id64.unwrap()))
+        .exists());
 
     let failed_complete = CloudCompleteAppUploadBatchRequest {
         app_id: Some(app_id),
@@ -1445,11 +1450,7 @@ fn local_folder_lifecycle_uses_in_process_transfer_targets() {
         &failed_complete.encode_to_vec(),
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while orphan.exists() && Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    assert!(!orphan.exists());
+    assert_eq!(store.view(app_id).unwrap().head_ids(), heads_before_abort);
 }
 
 fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
@@ -1468,6 +1469,25 @@ fn local_settings(path: &std::path::Path, client_id: u64) -> CloudSettings {
     }
 }
 
+#[test]
+fn syncthing_integration_does_not_disable_local_cloud() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = local_settings(directory.path(), 7);
+    settings.syncthing = Some(vapor_forge_cloud_local::SyncthingGcConfig {
+        url: "http://127.0.0.1:8384".into(),
+        api_key: "secret".into(),
+        folder_id: "cloud".into(),
+        timeout_ms: 1_000,
+    });
+    let mut state = AdapterState::default();
+    let request = CloudClientGetAppQuotaUsageRequest { app_id: Some(480) };
+
+    let reply = execute_rpc(&mut state, &settings, QUOTA_USAGE, &request.encode_to_vec()).unwrap();
+    let quota = CloudClientGetAppQuotaUsageResponse::decode(reply.body.as_slice()).unwrap();
+
+    assert_eq!(quota.existing_files, Some(0));
+}
+
 fn create_local_manifest_heads(
     path: &std::path::Path,
     app_id: u32,
@@ -1475,9 +1495,10 @@ fn create_local_manifest_heads(
 ) -> vapor_forge_cloud_local::FolderStore {
     const ACCOUNT: u64 = 76_561_198_000_000_001;
     let store = vapor_forge_cloud_local::FolderStore::open_account(path, ACCOUNT).unwrap();
+    let operation = store.begin_operation(app_id, &[], None).unwrap();
     let root = store
         .stage_file(
-            app_id,
+            &operation,
             "save.dat",
             b"root",
             &vapor_forge_cloud_core::FileMetadata {
@@ -1489,16 +1510,14 @@ fn create_local_manifest_heads(
         )
         .unwrap();
     store
-        .commit_batch(
-            app_id,
-            &[],
+        .commit_operation(
+            &operation,
             &[root],
             &BTreeSet::new(),
             &vapor_forge_cloud_local::CommitIdentity {
                 client_id: 1,
                 machine_name: "root".into(),
             },
-            None,
         )
         .unwrap();
 
@@ -1521,7 +1540,7 @@ fn create_local_manifest_heads(
 
 #[allow(clippy::too_many_arguments)]
 fn append_local_manifest_head(
-    store: &vapor_forge_cloud_local::FolderStore,
+    _store: &vapor_forge_cloud_local::FolderStore,
     path: &std::path::Path,
     app_id: u32,
     parent_id: &str,
@@ -1532,21 +1551,9 @@ fn append_local_manifest_head(
     sha1: &str,
 ) -> String {
     const ACCOUNT: u64 = 76_561_198_000_000_001;
-    let staged = store
-        .stage_file(
-            app_id,
-            "save.dat",
-            contents,
-            &vapor_forge_cloud_core::FileMetadata {
-                sha1: sha1.into(),
-                raw_size: contents.len() as u64,
-                mtime: revision as i64,
-                platforms_to_sync: u32::MAX,
-            },
-        )
-        .unwrap();
-    let directory = path.join(format!("{ACCOUNT}/{app_id}/manifests"));
-    let parent_bytes = std::fs::read(directory.join(format!("{parent_id}.json"))).unwrap();
+    let directory = path.join(format!("{ACCOUNT}/{app_id}"));
+    let parent_directory = directory.join(parent_id);
+    let parent_bytes = std::fs::read(parent_directory.join("manifest.json")).unwrap();
     let mut manifest = serde_json::from_slice::<serde_json::Value>(&parent_bytes).unwrap();
     manifest["revision"] = serde_json::json!(revision);
     manifest["parents"] = serde_json::json!([parent_id]);
@@ -1554,14 +1561,17 @@ fn append_local_manifest_head(
     manifest["machine_name"] = serde_json::json!(machine_name);
     manifest["created_at_ms"] = serde_json::json!(revision * 1_000);
     manifest["files"]["save.dat"] = serde_json::json!({
-        "sha1": staged.blob_sha1,
-        "raw_size": staged.metadata.raw_size,
-        "mtime": staged.metadata.mtime,
-        "platforms_to_sync": staged.metadata.platforms_to_sync,
+        "sha1": sha1,
+        "raw_size": contents.len(),
+        "mtime": revision,
+        "platforms_to_sync": u32::MAX,
     });
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let id = bytes_to_hex(&Sha256::digest(&bytes));
-    std::fs::write(directory.join(format!("{id}.json")), bytes).unwrap();
+    let head_directory = directory.join(&id);
+    std::fs::create_dir_all(head_directory.join("blobs")).unwrap();
+    std::fs::write(head_directory.join("blobs").join(sha1), contents).unwrap();
+    std::fs::write(head_directory.join("manifest.json"), bytes).unwrap();
     id
 }
 
@@ -2150,9 +2160,10 @@ fn launch_binds_stock_conflict_to_heads_changed_after_changelist() {
     let app_id = 480;
     let store =
         vapor_forge_cloud_local::FolderStore::open_account(directory.path(), ACCOUNT).unwrap();
+    let operation = store.begin_operation(app_id, &[], None).unwrap();
     let root = store
         .stage_file(
-            app_id,
+            &operation,
             "save.dat",
             b"root",
             &vapor_forge_cloud_core::FileMetadata {
@@ -2164,16 +2175,14 @@ fn launch_binds_stock_conflict_to_heads_changed_after_changelist() {
         )
         .unwrap();
     store
-        .commit_batch(
-            app_id,
-            &[],
+        .commit_operation(
+            &operation,
             &[root],
             &BTreeSet::new(),
             &vapor_forge_cloud_local::CommitIdentity {
                 client_id: 1,
                 machine_name: "root".into(),
             },
-            None,
         )
         .unwrap();
     let root_id = store.view(app_id).unwrap().head_ids().remove(0);
