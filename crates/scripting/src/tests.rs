@@ -195,6 +195,98 @@ fn manifest_callback_receives_exact_64_bit_gid() {
 }
 
 #[test]
+fn manifest_callback_instruction_budget_stops_infinite_loop() {
+    let dir = std::env::temp_dir().join(format!("lua-provider-budget-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("manifest.lua");
+    std::fs::write(
+        &path,
+        "function fetch_manifest_code(gid) while true do end end\n",
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let registry = runtime.registry.unwrap();
+    let error = registry.invoke_basic(1).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("manifest provider instruction budget exhausted"));
+
+    let errors = registry.parse_file(
+        &path,
+        "function fetch_manifest_code(gid) return tostring(gid + 1) end\n",
+    );
+    assert!(errors.is_empty());
+    assert_eq!(registry.invoke_basic(41).unwrap(), Some(42));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn manifest_callback_instruction_budget_allows_normal_provider() {
+    let dir =
+        std::env::temp_dir().join(format!("lua-provider-budget-normal-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("manifest.lua"),
+        concat!(
+            "function fetch_manifest_code(gid)\n",
+            "  local total = 0\n",
+            "  for i = 1, 1000 do total = total + i end\n",
+            "  return tostring(gid + total)\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let provider = runtime.manifest_code_provider.unwrap();
+    assert_eq!(provider.fetch(1, 1, 9).unwrap(), Some(500_509));
+    assert_eq!(provider.fetch(1, 1, 10).unwrap(), Some(500_510));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn manifest_callback_allows_only_one_http_request() {
+    let dir = std::env::temp_dir().join(format!("lua-provider-http-budget-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("manifest.lua");
+    std::fs::write(
+        &path,
+        concat!(
+            "function fetch_manifest_code(gid)\n",
+            "  http_get(\"invalid://first\")\n",
+            "  http_get(\"invalid://second\")\n",
+            "  return tostring(gid)\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let registry = runtime.registry.unwrap();
+    let error = registry.invoke_basic(1).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("manifest provider HTTP request budget exhausted"));
+
+    let errors = registry.parse_file(
+        &path,
+        concat!(
+            "function fetch_manifest_code(gid)\n",
+            "  http_get(\"invalid://only\")\n",
+            "  return tostring(gid)\n",
+            "end\n",
+        ),
+    );
+    assert!(errors.is_empty());
+    assert_eq!(registry.invoke_basic(9).unwrap(), Some(9));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scripts_share_one_vm_and_continue_after_runtime_errors() {
     let dir = std::env::temp_dir().join(format!("lua-shared-runtime-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -232,25 +324,47 @@ fn scripts_share_one_vm_and_continue_after_runtime_errors() {
 #[test]
 fn provider_scripts_execute_top_level_side_effects_once() {
     let dir = std::env::temp_dir().join(format!("lua-single-execution-{}", std::process::id()));
-    let marker = dir.join("runs.txt");
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(
         dir.join("manifest.lua"),
-        format!(
-            concat!(
-                "side_effect_file = assert(io.open(\"{}\", \"a\"))\n",
-                "side_effect_file:write(\"x\")\n",
-                "side_effect_file:close()\n",
-                "function fetch_manifest_code(gid) return \"1\" end\n",
-            ),
-            marker.display()
+        concat!(
+            "load_count = (load_count or 0) + 1\n",
+            "function fetch_manifest_code(gid) return tostring(load_count) end\n",
         ),
     )
     .unwrap();
 
     let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
-    assert!(runtime.manifest_code_provider.is_some());
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+    let provider = runtime.manifest_code_provider.unwrap();
+    assert_eq!(provider.fetch(1, 1, 1).unwrap(), Some(1));
+    assert_eq!(provider.fetch(1, 1, 2).unwrap(), Some(1));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn script_registry_excludes_blocking_and_escape_libraries() {
+    let dir = std::env::temp_dir().join(format!("lua-restricted-libs-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("restricted.lua"),
+        concat!(
+            "assert(io == nil and os == nil and package == nil)\n",
+            "assert(debug == nil and ffi == nil and jit == nil)\n",
+            "assert(require == nil and dofile == nil and loadfile == nil)\n",
+            "assert(print == nil and coroutine == nil)\n",
+            "assert(math.floor(1.9) == 1)\n",
+            "assert(string.lower(\"A\") == \"a\")\n",
+            "assert(table.concat({\"a\", \"b\"}) == \"ab\")\n",
+            "assert(bit.bxor(1, 3) == 2)\n",
+            "addappid(480)\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert!(report.files.iter().all(|file| file.result.is_ok()));
+    assert_eq!(report.state.apps, [AppId(480)].into_iter().collect());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
