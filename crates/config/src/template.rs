@@ -13,7 +13,6 @@ pub(crate) const TEMPLATE_EXAMPLES: &[&str] = &[
     "runtime.patterns_url",
     "apps.shared.include",
     "apps.shared.exclude",
-    "manifest.providers",
     "[debug]",
     "debug.control_api",
     "[[apps.inject]]",
