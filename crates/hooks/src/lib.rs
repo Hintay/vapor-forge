@@ -2,6 +2,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(target_os = "linux")]
+pub(crate) mod account_downlink_worker;
+#[cfg(target_os = "linux")]
 pub(crate) mod achievement_worker;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod capability;
@@ -28,13 +30,9 @@ pub(crate) mod packet_capture;
 #[cfg(target_os = "linux")]
 pub(crate) mod pattern_resolver;
 #[cfg(target_os = "linux")]
-pub(crate) mod playtime_downlink_worker;
-#[cfg(target_os = "linux")]
 pub(crate) mod playtime_worker;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod stats_merge;
-#[cfg(target_os = "linux")]
-pub(crate) mod stats_wakeup_worker;
 #[cfg(target_os = "linux")]
 pub(crate) mod sync_journal;
 #[cfg(target_os = "linux")]

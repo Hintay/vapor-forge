@@ -38,8 +38,7 @@ pub(crate) fn reset_account_state() {
     vapor_forge_features::rich_presence::reset_account_state();
     crate::achievement_worker::notify_context_changed();
     crate::playtime_worker::notify_context_changed();
-    crate::playtime_downlink_worker::notify_context_changed();
-    crate::stats_wakeup_worker::notify_context_changed();
+    crate::account_downlink_worker::notify_context_changed();
     user_stats::notify_context_changed();
     crate::netpacket::notify_stats_context_changed();
 }

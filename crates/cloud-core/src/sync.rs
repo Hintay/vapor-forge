@@ -32,22 +32,6 @@ pub struct PlaytimeEntry {
     pub observed_at: i64,
 }
 
-/// One playtime segment Steam reports after a connection interruption.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaytimeSession {
-    #[serde(skip)]
-    pub owner_scope: String,
-    #[serde(skip)]
-    pub owner_steam_id64: String,
-    pub session_id: String,
-    pub app_id: u32,
-    pub started_at: u32,
-    pub seconds: u32,
-    pub offline: bool,
-    pub owner_account_id: u32,
-    pub observed_at: i64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsCommit {
     pub owner_scope: String,
@@ -206,4 +190,12 @@ pub struct AccountStatsWakeup {
     pub steam_id64: String,
     pub origin_client_id: Option<String>,
     pub app_ids: Vec<u32>,
+}
+
+/// One event from a backend's account-scoped synchronization stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountStreamEvent {
+    Baseline(AccountSyncState),
+    Playtime(AccountPlaytimeSnapshot),
+    StatsWakeup(AccountStatsWakeup),
 }

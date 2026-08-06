@@ -3,13 +3,11 @@
 //! The free functions in this crate stay the transport layer; this module owns
 //! the settings and maps Cumulus errors onto the neutral port types.
 
-use std::collections::BTreeSet;
-
 use vapor_forge_cloud_core::{
-    credential_fingerprint, endpoint_scope, AccountPlaytimeSnapshot, AccountStatsWakeup,
-    AccountSyncState, AchievementSchema, AppStatsQuery, AppStatsResult, BackendError, CloudBackend,
-    DeviceDescriptor, PlaytimeEntry, PlaytimeSession, SchemaUploadOutcome, SteamAppSnapshot,
-    SteamStateUploadResult, StreamCancellation, StreamOutcome, UploadIdentity,
+    credential_fingerprint, endpoint_scope, AccountStreamEvent, AccountSyncState,
+    AchievementSchema, AppStatsQuery, AppStatsResult, BackendError, CloudBackend, DeviceDescriptor,
+    PlaytimeEntry, SchemaUploadOutcome, SteamAppSnapshot, SteamStateUploadResult,
+    StreamCancellation, StreamOutcome, UploadIdentity,
 };
 
 use crate::{
@@ -82,20 +80,6 @@ impl CloudBackend for CumulusBackend {
         playtime::upload(&self.settings, client_id, steam_id64, entries).map_err(BackendError::from)
     }
 
-    fn accepts_playtime_sessions(&self) -> bool {
-        true
-    }
-
-    fn upload_playtime_sessions(
-        &self,
-        client_id: u64,
-        steam_id64: &str,
-        sessions: &[PlaytimeSession],
-    ) -> Result<(), BackendError> {
-        playtime::upload_sessions(&self.settings, client_id, steam_id64, sessions)
-            .map_err(BackendError::from)
-    }
-
     fn upload_steam_app_snapshot(
         &self,
         identity: &UploadIdentity,
@@ -132,99 +116,23 @@ impl CloudBackend for CumulusBackend {
             .map_err(BackendError::from)
     }
 
-    fn stream_playtime(
+    fn stream_account_events(
         &self,
         client_id: u64,
         steam_id64: &str,
         cancellation: &StreamCancellation,
-        on_snapshot: &mut dyn FnMut(AccountPlaytimeSnapshot),
+        on_event: &mut dyn FnMut(AccountStreamEvent),
     ) -> Result<StreamOutcome, BackendError> {
-        let mut on_connected = || {
-            self.pull_account_state(client_id, steam_id64)
-                .map(|state| Some(playtime_snapshot(steam_id64, state)))
-        };
-        crate::device_stream::run(
+        let mut on_connected = || self.pull_account_state(client_id, steam_id64);
+        crate::device_stream::run_account(
             &self.settings,
             client_id,
             steam_id64,
-            crate::device_stream::StreamSpec {
-                route: "/api/v1/device/playtime-events",
-                event_name: "playtime_snapshot",
-                stream_name: "playtime",
-            },
             cancellation,
             &mut on_connected,
-            on_snapshot,
+            on_event,
         )
     }
-
-    fn stream_stats_wakeup(
-        &self,
-        client_id: u64,
-        steam_id64: &str,
-        cancellation: &StreamCancellation,
-        on_wakeup: &mut dyn FnMut(AccountStatsWakeup),
-    ) -> Result<StreamOutcome, BackendError> {
-        let mut on_connected = || {
-            self.pull_account_state(client_id, steam_id64)
-                .map(|state| stats_wakeup(steam_id64, state))
-        };
-        crate::device_stream::run(
-            &self.settings,
-            client_id,
-            steam_id64,
-            crate::device_stream::StreamSpec {
-                route: "/api/v1/device/stats-events",
-                event_name: "stats_wakeup",
-                stream_name: "stats",
-            },
-            cancellation,
-            &mut on_connected,
-            on_wakeup,
-        )
-    }
-}
-
-fn playtime_snapshot(steam_id64: &str, state: AccountSyncState) -> AccountPlaytimeSnapshot {
-    AccountPlaytimeSnapshot {
-        steam_id64: steam_id64.to_owned(),
-        playtime_revision: state.playtime_revision,
-        origin_client_id: None,
-        playtime: state.playtime,
-    }
-}
-
-fn stats_wakeup(steam_id64: &str, state: AccountSyncState) -> Option<AccountStatsWakeup> {
-    let mut app_ids = BTreeSet::new();
-    app_ids.extend(
-        state
-            .stats_crcs
-            .into_iter()
-            .map(|state| state.app_id)
-            .filter(|app_id| *app_id != 0),
-    );
-    app_ids.extend(
-        state
-            .achievements
-            .into_iter()
-            .map(|state| state.app_id)
-            .filter(|app_id| *app_id != 0),
-    );
-    app_ids.extend(
-        state
-            .stats
-            .into_iter()
-            .map(|state| state.app_id)
-            .filter(|app_id| *app_id != 0),
-    );
-    if app_ids.is_empty() {
-        return None;
-    }
-    Some(AccountStatsWakeup {
-        steam_id64: steam_id64.to_owned(),
-        origin_client_id: None,
-        app_ids: app_ids.into_iter().collect(),
-    })
 }
 
 #[cfg(test)]
@@ -306,19 +214,6 @@ mod tests {
 
         let permanent: BackendError = CumulusError::HttpStatus(400).into();
         assert!(!permanent.is_retryable());
-    }
-
-    #[test]
-    fn reconnect_stats_baseline_is_deduplicated_and_sorted() {
-        let state = serde_json::from_str::<AccountSyncState>(
-            r#"{"stats_crcs":[{"app_id":620,"crc_stats":1}],"playtime_revision":0,"achievements":[{"app_id":480,"achievement_key":"ACH_WIN","unlocked":true,"progress_current":null,"progress_max":null,"observed_at":20,"unlocked_at":10}],"stats":[{"app_id":620,"stat_key":"STAT_SCORE","value_type":"int","value":"3","observed_at":20}],"playtime":[]}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            stats_wakeup("76561198000000001", state).unwrap().app_ids,
-            vec![480, 620]
-        );
     }
 
     #[test]

@@ -480,7 +480,7 @@ fn backend_query_blocked_by_pending_stats(
     steam_id64: &str,
     app_id: u32,
 ) -> bool {
-    let owner_scope = match crate::sync_journal::principal_scope(context.backend.as_ref()) {
+    let owner_scope = match crate::sync_journal::resolve_principal_scope(context.backend.as_ref()) {
         Ok(scope) => scope,
         Err(error) => {
             warn!(%error, app_id, "netpacket: backend principal unavailable for stats pull");

@@ -19,28 +19,12 @@ pub use files::{
     HttpTarget, Quota, Transfer, UploadBlock,
 };
 pub use sync::{
-    AccountPlaytimeSnapshot, AccountStatsWakeup, AccountSyncState, AchievementSchema,
-    AchievementSyncState, AppStatsCrc, AppStatsQuery, AppStatsResult, AppStatsUploadResult,
-    AppStatsUploadStatus, OfficialAchievementState, OfficialStatState, PlaytimeEntry,
-    PlaytimeSession, StatSyncState, StatsCommit, SteamAppSnapshot, SteamStateUploadResult,
+    AccountPlaytimeSnapshot, AccountStatsWakeup, AccountStreamEvent, AccountSyncState,
+    AchievementSchema, AchievementSyncState, AppStatsCrc, AppStatsQuery, AppStatsResult,
+    AppStatsUploadResult, AppStatsUploadStatus, OfficialAchievementState, OfficialStatState,
+    PlaytimeEntry, StatSyncState, StatsCommit, SteamAppSnapshot, SteamStateUploadResult,
     UploadIdentity,
 };
-
-/// Stable identity for a Steam-authored playtime session.
-pub fn playtime_session_id(
-    steam_id64: &str,
-    app_id: u32,
-    started_at: u32,
-    seconds: u32,
-    offline: bool,
-    owner_account_id: u32,
-) -> String {
-    let identity = format!(
-        "{steam_id64}\0{app_id}\0{started_at}\0{seconds}\0{}\0{owner_account_id}",
-        u8::from(offline)
-    );
-    scope_digest(b"playtime-session", &[identity.as_bytes()])
-}
 
 pub fn stats_commit_id(steam_id64: &str, app_id: u32, request: &[u8]) -> String {
     let request_digest = Sha256::digest(request);

@@ -444,8 +444,7 @@ fn finalize_snapshot(
     crate::client::install::ensure_runtime_services_for_config(&service_config);
     crate::achievement_worker::notify_context_changed();
     crate::playtime_worker::notify_context_changed();
-    crate::playtime_downlink_worker::notify_context_changed();
-    crate::stats_wakeup_worker::notify_context_changed();
+    crate::account_downlink_worker::notify_context_changed();
     crate::client::user_stats::notify_context_changed();
     crate::netpacket::notify_stats_context_changed();
     crate::client::package::queue_reload(controlled);

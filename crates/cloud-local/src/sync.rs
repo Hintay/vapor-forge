@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use vapor_forge_cloud_core::{
     AccountSyncState, AchievementSchema, AchievementSyncState, AppStatsQuery, AppStatsResult,
     AppStatsUploadResult, AppStatsUploadStatus, BackendError, CloudBackend, DeviceDescriptor,
-    PlaytimeEntry, PlaytimeSession, SchemaUploadOutcome, StatSyncState, SteamAppSnapshot,
-    SteamStateUploadResult, UploadIdentity,
+    PlaytimeEntry, SchemaUploadOutcome, StatSyncState, SteamAppSnapshot, SteamStateUploadResult,
+    UploadIdentity,
 };
 
 use crate::store::atomic_replace;
@@ -349,19 +349,6 @@ impl CloudBackend for LocalBackend {
             let bytes = serde_json::to_vec(&record).map_err(json_error)?;
             atomic_replace(&path, &bytes)?;
         }
-        Ok(())
-    }
-
-    fn accepts_playtime_sessions(&self) -> bool {
-        false
-    }
-
-    fn upload_playtime_sessions(
-        &self,
-        _client_id: u64,
-        _steam_id64: &str,
-        _sessions: &[PlaytimeSession],
-    ) -> Result<(), BackendError> {
         Ok(())
     }
 
@@ -810,24 +797,6 @@ mod tests {
                 &[playtime_entry(&identity.steam_id64, app_id, 120)],
             )
             .unwrap();
-        backend
-            .upload_playtime_sessions(
-                identity.client_id,
-                &identity.steam_id64,
-                &[PlaytimeSession {
-                    owner_scope: String::new(),
-                    owner_steam_id64: identity.steam_id64.clone(),
-                    session_id: "session".into(),
-                    app_id,
-                    started_at: 1_800_000_000,
-                    seconds: 60,
-                    offline: true,
-                    owner_account_id: 39_734_273,
-                    observed_at: 1_800_000_060,
-                }],
-            )
-            .unwrap();
-
         let app_root = temporary
             .path()
             .join(&identity.steam_id64)
@@ -842,7 +811,6 @@ mod tests {
             .is_file());
         assert_eq!(json_files(&app_root.join(PLAYTIME_DIR)), 1);
         assert!(!app_root.join("playtime/totals").exists());
-        assert!(!app_root.join("playtime/sessions").exists());
         assert!(!temporary.path().join("records").exists());
     }
 
@@ -934,7 +902,7 @@ mod tests {
         assert_eq!(backend.pull_playtime(steam_id64).unwrap().len(), 1);
         assert_eq!(
             backend
-                .stream_playtime(
+                .stream_account_events(
                     7,
                     steam_id64,
                     &vapor_forge_cloud_core::StreamCancellation::new(),
@@ -1042,35 +1010,6 @@ mod tests {
         assert_eq!(state.playtime[0].playtime_minutes, 40);
         assert_eq!(state.playtime[0].playtime_2weeks_minutes, 4);
         assert_eq!(state.playtime[0].last_played_at, Some(100));
-    }
-
-    #[test]
-    fn local_backend_does_not_persist_playtime_sessions() {
-        let temporary = tempfile::tempdir().unwrap();
-        let backend = LocalBackend::open(temporary.path()).unwrap();
-        let steam_id64 = "76561198000000001";
-        assert!(!backend.accepts_playtime_sessions());
-        backend
-            .upload_playtime_sessions(
-                7,
-                steam_id64,
-                &[PlaytimeSession {
-                    owner_scope: String::new(),
-                    owner_steam_id64: steam_id64.to_owned(),
-                    session_id: "lonely".into(),
-                    app_id: 480,
-                    started_at: 1_800_000_000,
-                    seconds: 3600,
-                    offline: false,
-                    owner_account_id: 39734273,
-                    observed_at: 1_800_003_600,
-                }],
-            )
-            .unwrap();
-
-        let state = backend.pull_account_state(7, steam_id64).unwrap();
-        assert!(state.playtime.is_empty());
-        assert!(!temporary.path().join(steam_id64).exists());
     }
 
     #[test]

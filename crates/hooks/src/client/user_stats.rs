@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(debug_assertions, test))]
 use std::sync::mpsc;
@@ -10,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tracing::{debug, warn};
+use vapor_forge_cloud_core::StatsCommit;
 use vapor_forge_config::AppId;
 use vapor_forge_steam_protocol::{parse_achievement_bit_mappings, parse_stat_mappings};
 
@@ -197,12 +199,68 @@ pub(super) struct SnapshotStat {
     pub(super) kind: SnapshotStatKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct StatsRefreshGuard {
     pub credential_fingerprint: String,
     pub steam_id64: u64,
     pub identity_generation: u64,
     pub client_id: u64,
+    pub runtime_generation: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct StatsSnapshotOwner {
+    pub guard: StatsRefreshGuard,
+    pub principal_scope: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StatsSnapshotIntent {
+    pub marker: StatsCommit,
+    pub guard: StatsRefreshGuard,
+}
+
+impl StatsSnapshotIntent {
+    pub(crate) fn new(marker: StatsCommit, owner: &StatsSnapshotOwner) -> Option<Self> {
+        (marker.owner_scope == owner.principal_scope
+            && marker.owner_steam_id64 == owner.guard.steam_id64.to_string())
+        .then(|| Self {
+            marker,
+            guard: owner.guard.clone(),
+        })
+    }
+
+    fn app_id(&self) -> u32 {
+        self.marker.app_id
+    }
+}
+
+// A retried frame may rewrite the marker timestamp. The request ID and effective
+// backend baseline still identify the same snapshot intent.
+impl PartialEq for StatsSnapshotIntent {
+    fn eq(&self, other: &Self) -> bool {
+        self.guard == other.guard
+            && self.marker.owner_scope == other.marker.owner_scope
+            && self.marker.owner_steam_id64 == other.marker.owner_steam_id64
+            && self.marker.app_id == other.marker.app_id
+            && self.marker.commit_id == other.marker.commit_id
+            && self.marker.base_crc_stats == other.marker.base_crc_stats
+            && self.marker.dirty_stat_ids == other.marker.dirty_stat_ids
+    }
+}
+
+impl Eq for StatsSnapshotIntent {}
+
+impl Hash for StatsSnapshotIntent {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.guard.hash(state);
+        self.marker.owner_scope.hash(state);
+        self.marker.owner_steam_id64.hash(state);
+        self.marker.app_id.hash(state);
+        self.marker.commit_id.hash(state);
+        self.marker.base_crc_stats.hash(state);
+        self.marker.dirty_stat_ids.hash(state);
+    }
 }
 
 /// Cache the names and types already present in Steam's schema response.
@@ -309,11 +367,25 @@ fn snapshot_layout(app_id: u32) -> Option<Arc<SnapshotLayout>> {
         .cloned()
 }
 
-/// Read the stats map Steam has already loaded for this app.
-pub(crate) fn queue_snapshot_read(app_id: u32) {
-    if !worker().is_some_and(|worker| worker.queue_read(app_id)) {
+/// Read the stats map Steam has already loaded for this commit.
+pub(crate) fn queue_snapshot_read(intent: StatsSnapshotIntent) -> bool {
+    let app_id = intent.app_id();
+    let queued =
+        worker().is_some_and(|worker| worker.queue_snapshot(intent, SnapshotRequest::Read));
+    if !queued {
         warn!(app_id, "user-stats snapshot-read worker is unavailable");
     }
+    queued
+}
+
+pub(crate) fn queue_snapshot_refresh_then_read(intent: StatsSnapshotIntent) -> bool {
+    let app_id = intent.app_id();
+    let queued = worker()
+        .is_some_and(|worker| worker.queue_snapshot(intent, SnapshotRequest::RefreshThenRead));
+    if !queued {
+        warn!(app_id, "user-stats refresh-read worker is unavailable");
+    }
+    queued
 }
 
 /// Signal that Steam's native playtime value for an app should be sampled.
@@ -368,19 +440,38 @@ pub(crate) fn queue_backend_stats_refresh(app_id: u32, guard: StatsRefreshGuard)
     worker().is_some_and(|worker| worker.queue_refresh(app_id, Some(guard)))
 }
 
-pub(crate) fn current_backend_refresh_guard() -> Option<StatsRefreshGuard> {
+pub(crate) fn capture_stats_snapshot_owner(runtime_generation: u64) -> Option<StatsSnapshotOwner> {
+    capture_stats_snapshot_owner_for(
+        runtime_generation,
+        vapor_forge_features::identity::steam_id(),
+        vapor_forge_features::identity::generation(),
+    )
+}
+
+pub(crate) fn capture_stats_snapshot_owner_for(
+    runtime_generation: u64,
+    steam_id64: u64,
+    identity_generation: u64,
+) -> Option<StatsSnapshotOwner> {
     let backend = crate::cloud_backend::backend_context()?;
-    let descriptor = vapor_forge_cloud_core::device_descriptor()?;
-    let steam_id64 = vapor_forge_features::identity::steam_id();
+    let credential_fingerprint = backend.credential_fingerprint();
+    let principal_scope =
+        crate::sync_journal::cached_principal_for_credential(&credential_fingerprint)?;
     if steam_id64 == 0 {
         return None;
     }
-    Some(StatsRefreshGuard {
-        credential_fingerprint: backend.credential_fingerprint(),
-        steam_id64,
-        identity_generation: vapor_forge_features::identity::generation(),
-        client_id: descriptor.client_id,
-    })
+    let descriptor = vapor_forge_cloud_core::device_descriptor()?;
+    let owner = StatsSnapshotOwner {
+        guard: StatsRefreshGuard {
+            credential_fingerprint,
+            steam_id64,
+            identity_generation,
+            client_id: descriptor.client_id,
+            runtime_generation,
+        },
+        principal_scope,
+    };
+    stats_snapshot_owner_is_current(&owner).then_some(owner)
 }
 
 /// Diagnostic entry point for one stats request and its completion event.
@@ -424,7 +515,6 @@ pub(crate) fn notify_context_changed() {
             state.pending_reads.clear();
             state.queued_reads.clear();
             state.active_reads.clear();
-            state.read_recovery_attempted.clear();
             state.reads_after_refresh.clear();
             state.pending_refresh_order.clear();
             state.pending_refreshes.clear();
@@ -434,6 +524,13 @@ pub(crate) fn notify_context_changed() {
             #[cfg(any(debug_assertions, test))]
             state.queries.clear();
         }
+    }
+    callback_notify::notify();
+}
+
+pub(crate) fn notify_principal_available() {
+    if let Some(worker) = worker() {
+        queue_durable_stats_recovery(&worker.shared);
     }
     callback_notify::notify();
 }
@@ -466,7 +563,8 @@ impl StatsWorker {
         Some(Self { shared })
     }
 
-    fn queue_read(&self, app_id: u32) -> bool {
+    fn queue_snapshot(&self, intent: StatsSnapshotIntent, request: SnapshotRequest) -> bool {
+        let app_id = intent.app_id();
         if app_id == 0 {
             return false;
         }
@@ -475,8 +573,7 @@ impl StatsWorker {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.read_recovery_attempted.remove(&app_id);
-        queue_read_locked(&mut state, app_id);
+        queue_snapshot_locked(&mut state, intent, request);
         callback_notify::notify();
         true
     }
@@ -560,11 +657,10 @@ enum WorkerQuery {
 
 #[derive(Default)]
 struct WorkerState {
-    pending_reads: VecDeque<u32>,
-    queued_reads: HashSet<u32>,
-    active_reads: HashSet<u32>,
-    read_recovery_attempted: HashSet<u32>,
-    reads_after_refresh: HashSet<u32>,
+    pending_reads: VecDeque<StatsSnapshotIntent>,
+    queued_reads: HashSet<StatsSnapshotIntent>,
+    active_reads: HashSet<StatsSnapshotIntent>,
+    reads_after_refresh: HashSet<StatsSnapshotIntent>,
     pending_refresh_order: VecDeque<u32>,
     pending_refreshes: HashMap<u32, RefreshRequest>,
     active_refreshes: HashSet<u32>,
@@ -573,6 +669,12 @@ struct WorkerState {
     #[cfg(any(debug_assertions, test))]
     queries: VecDeque<WorkerQuery>,
     next_playtime_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotRequest {
+    Read,
+    RefreshThenRead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -604,6 +706,7 @@ struct RefreshRequest {
 struct InFlight {
     app_id: u32,
     api_call: u64,
+    refresh_guard: Option<StatsRefreshGuard>,
     #[cfg(any(debug_assertions, test))]
     probe_reply: Option<mpsc::SyncSender<Result<UserStatsProbe, String>>>,
 }
@@ -625,20 +728,7 @@ pub(super) fn run_worker(shared: &WorkerShared) {
         let steam_id64 = vapor_forge_features::identity::steam_id();
         let context_epoch = shared.context_epoch.load(Ordering::Acquire);
         let mut in_flight: Vec<InFlight> = Vec::new();
-        {
-            let config = super::install::config();
-            let mut state = shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for app_id in crate::achievement_worker::stats_awaiting_snapshot()
-                .into_iter()
-                .filter(|app_id| config.is_controlled_app(AppId(*app_id)))
-            {
-                state.read_recovery_attempted.remove(&app_id);
-                queue_read_locked(&mut state, app_id);
-            }
-        }
+        queue_durable_stats_recovery(shared);
         debug!(
             user = session.user(),
             generation, "user-stats: session open"
@@ -666,7 +756,7 @@ pub(super) fn run_worker(shared: &WorkerShared) {
                             continue;
                         }
                     }
-                    finish_refresh(shared, entry.app_id);
+                    finish_refresh(shared, entry.app_id, false);
                 }
                 drop(session);
                 break;
@@ -674,6 +764,24 @@ pub(super) fn run_worker(shared: &WorkerShared) {
             service_until_quiescent(&session, shared, steam_id64, generation, &mut in_flight);
             callback_notify::wait(observed);
         }
+    }
+}
+
+fn queue_durable_stats_recovery(shared: &WorkerShared) {
+    let runtime = super::install::runtime_snapshot();
+    let Some(owner) = capture_stats_snapshot_owner(runtime.generation) else {
+        return;
+    };
+    let intents = crate::achievement_worker::stats_awaiting_snapshot(&owner);
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for intent in intents
+        .into_iter()
+        .filter(|intent| runtime.config.is_controlled_app(AppId(intent.app_id())))
+    {
+        queue_snapshot_locked(&mut state, intent, SnapshotRequest::RefreshThenRead);
     }
 }
 
@@ -803,6 +911,15 @@ fn route_api_call_result(
         return;
     };
     let app_id = entry.app_id;
+    if entry
+        .refresh_guard
+        .as_ref()
+        .is_some_and(|guard| !stats_refresh_guard_is_current(guard))
+    {
+        debug!(app_id, "discarded stale backend stats completion");
+        finish_refresh(shared, app_id, false);
+        return;
+    }
     let Some(received) = decode_user_stats_result(&completed) else {
         completion().handle_contract += 1;
         warn!(
@@ -820,7 +937,7 @@ fn route_api_call_result(
             )));
             return;
         }
-        finish_refresh(shared, app_id);
+        finish_refresh(shared, app_id, false);
         return;
     };
     if !user_stats_result_matches(received, app_id, expected_steam_id64) {
@@ -842,7 +959,7 @@ fn route_api_call_result(
             ));
             return;
         }
-        finish_refresh(shared, app_id);
+        finish_refresh(shared, app_id, false);
         return;
     }
     let result = received.result;
@@ -865,7 +982,7 @@ fn route_api_call_result(
 
     if result == ERESULT_OK {
         completion().by_handle += 1;
-        finish_refresh(shared, app_id);
+        finish_refresh(shared, app_id, true);
     } else {
         completion().handle_not_ok += 1;
         warn!(
@@ -874,7 +991,7 @@ fn route_api_call_result(
             result,
             "user-stats: completed API call returned a non-OK result"
         );
-        finish_refresh(shared, app_id);
+        finish_refresh(shared, app_id, false);
     }
 }
 
@@ -895,52 +1012,65 @@ fn user_stats_result_matches(received: UserStatsReceived, app_id: u32, steam_id6
     received.game_id == u64::from(app_id) && received.steam_id == steam_id64
 }
 
-fn read_snapshot(session: &SteamUserStatsSession, app_id: u32) -> bool {
+enum GuardedSnapshotRead<T, E> {
+    Ready(T),
+    StaleBeforeRead,
+    StaleAfterRead,
+    Failed(E),
+}
+
+fn guarded_snapshot_read<T, E>(
+    guard: &StatsRefreshGuard,
+    mut is_current: impl FnMut(&StatsRefreshGuard) -> bool,
+    read: impl FnOnce() -> Result<T, E>,
+) -> GuardedSnapshotRead<T, E> {
+    if !is_current(guard) {
+        return GuardedSnapshotRead::StaleBeforeRead;
+    }
+    let value = match read() {
+        Ok(value) => value,
+        Err(error) => return GuardedSnapshotRead::Failed(error),
+    };
+    if !is_current(guard) {
+        return GuardedSnapshotRead::StaleAfterRead;
+    }
+    GuardedSnapshotRead::Ready(value)
+}
+
+fn read_snapshot(session: &SteamUserStatsSession, intent: &StatsSnapshotIntent) {
+    let app_id = intent.app_id();
     let layout = snapshot_layout(app_id);
-    match session.read_snapshot(app_id, layout.as_deref()) {
-        Ok(snapshot) => super::achievement::observe_local_snapshot(snapshot),
-        Err(error) => {
-            warn!(app_id, error, "user-stats snapshot read failed");
-            false
-        }
+    let snapshot =
+        match guarded_snapshot_read(&intent.guard, stats_refresh_guard_is_current, || {
+            session.read_snapshot(app_id, layout.as_deref())
+        }) {
+            GuardedSnapshotRead::Ready(snapshot) => snapshot,
+            GuardedSnapshotRead::StaleBeforeRead => {
+                debug!(app_id, "discarded stale user-stats snapshot read");
+                return;
+            }
+            GuardedSnapshotRead::StaleAfterRead => {
+                debug!(app_id, "discarded user-stats snapshot after context change");
+                return;
+            }
+            GuardedSnapshotRead::Failed(error) => {
+                warn!(app_id, error, "user-stats native snapshot read failed");
+                return;
+            }
+        };
+    if !super::achievement::observe_local_snapshot(snapshot, intent) {
+        warn!(
+            app_id,
+            "user-stats snapshot persistence failed; event terminated"
+        );
     }
 }
 
 fn process_pending_reads(session: &SteamUserStatsSession, shared: &WorkerShared) {
-    while let Some(app_id) = take_read(shared) {
-        let succeeded = read_snapshot(session, app_id);
-        finish_read(shared, app_id);
-        if succeeded {
-            clear_read_recovery(shared, app_id);
-        } else {
-            queue_read_recovery(shared, app_id);
-        }
+    while let Some(intent) = take_read(shared) {
+        read_snapshot(session, &intent);
+        finish_read(shared, &intent);
     }
-}
-
-fn clear_read_recovery(shared: &WorkerShared, app_id: u32) {
-    shared
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .read_recovery_attempted
-        .remove(&app_id);
-}
-
-/// A failed getter gets one event-driven cache refresh. Its completion queues
-/// the second and final read through `reads_after_refresh`.
-fn queue_read_recovery(shared: &WorkerShared, app_id: u32) {
-    let mut state = shared
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !state.read_recovery_attempted.insert(app_id) {
-        warn!(app_id, "user-stats snapshot recovery was exhausted");
-        return;
-    }
-    state.reads_after_refresh.insert(app_id);
-    queue_refresh_locked(&mut state, app_id, None);
-    callback_notify::notify();
 }
 
 /// Take as much refresh work as the in-flight bound allows.
@@ -978,7 +1108,7 @@ fn issue_refresh(
     if let Some(guard) = request.refresh_guard.as_ref() {
         if !stats_refresh_guard_is_current(guard) {
             debug!(app_id, "discarded stale backend stats refresh");
-            finish_refresh(shared, app_id);
+            finish_refresh(shared, app_id, false);
             return;
         }
     }
@@ -989,24 +1119,47 @@ fn issue_refresh(
             in_flight.push(InFlight {
                 app_id,
                 api_call,
+                refresh_guard: request.refresh_guard,
                 #[cfg(any(debug_assertions, test))]
                 probe_reply: None,
             });
         }
         Err(error) => {
             warn!(app_id, error, "user-stats request could not be issued");
-            finish_refresh(shared, app_id);
+            finish_refresh(shared, app_id, false);
         }
     }
 }
 
-fn queue_read_locked(state: &mut WorkerState, app_id: u32) {
+fn queue_read_locked(state: &mut WorkerState, intent: StatsSnapshotIntent) {
+    let app_id = intent.app_id();
     if state.active_refreshes.contains(&app_id) || state.pending_refreshes.contains_key(&app_id) {
-        state.reads_after_refresh.insert(app_id);
+        state.reads_after_refresh.insert(intent);
         return;
     }
-    if state.queued_reads.insert(app_id) {
-        state.pending_reads.push_back(app_id);
+    if state.queued_reads.insert(intent.clone()) {
+        state.pending_reads.push_back(intent);
+    }
+}
+
+fn queue_snapshot_locked(
+    state: &mut WorkerState,
+    intent: StatsSnapshotIntent,
+    request: SnapshotRequest,
+) {
+    let app_id = intent.app_id();
+    match request {
+        SnapshotRequest::Read => queue_read_locked(state, intent),
+        SnapshotRequest::RefreshThenRead => {
+            if state.queued_reads.contains(&intent)
+                || state.active_reads.contains(&intent)
+                || state.reads_after_refresh.contains(&intent)
+            {
+                return;
+            }
+            state.reads_after_refresh.insert(intent.clone());
+            queue_refresh_locked(state, app_id, Some(intent.guard));
+        }
     }
 }
 
@@ -1024,13 +1177,26 @@ fn queue_refresh_locked(
 
     // A queued or currently executing read was requested against the pre-refresh
     // cache. Preserve that intent, but satisfy it only after the latest refresh.
-    if state.queued_reads.remove(&app_id) {
-        state.pending_reads.retain(|queued| *queued != app_id);
-        state.reads_after_refresh.insert(app_id);
+    let queued_for_app = state
+        .queued_reads
+        .iter()
+        .filter(|intent| intent.app_id() == app_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for intent in queued_for_app {
+        state.queued_reads.remove(&intent);
+        state.reads_after_refresh.insert(intent);
     }
-    if state.active_reads.contains(&app_id) {
-        state.reads_after_refresh.insert(app_id);
-    }
+    state
+        .pending_reads
+        .retain(|intent| intent.app_id() != app_id);
+    let active_for_app = state
+        .active_reads
+        .iter()
+        .filter(|intent| intent.app_id() == app_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    state.reads_after_refresh.extend(active_for_app);
 
     state.pending_refresh_order.push_back(app_id);
     state.pending_refreshes.insert(
@@ -1268,6 +1434,7 @@ fn run_query(session: &SteamUserStatsSession, query: WorkerQuery, in_flight: &mu
             in_flight.push(InFlight {
                 app_id,
                 api_call,
+                refresh_guard: None,
                 probe_reply: Some(reply),
             });
         }
@@ -1286,15 +1453,15 @@ fn note_event_id(callback: i32) {
     }
 }
 
-fn finish_read(shared: &WorkerShared, app_id: u32) {
+fn finish_read(shared: &WorkerShared, intent: &StatsSnapshotIntent) {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.active_reads.remove(&app_id);
+    state.active_reads.remove(intent);
 }
 
-fn finish_refresh(shared: &WorkerShared, app_id: u32) {
+fn finish_refresh(shared: &WorkerShared, app_id: u32, succeeded: bool) {
     let mut state = shared
         .state
         .lock()
@@ -1305,19 +1472,37 @@ fn finish_refresh(shared: &WorkerShared, app_id: u32) {
         callback_notify::notify();
         return;
     }
-    if state.reads_after_refresh.remove(&app_id) {
-        queue_read_locked(&mut state, app_id);
+    let reads = state
+        .reads_after_refresh
+        .iter()
+        .filter(|intent| intent.app_id() == app_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    for intent in &reads {
+        state.reads_after_refresh.remove(intent);
+    }
+    if succeeded && !reads.is_empty() {
+        for intent in reads {
+            queue_read_locked(&mut state, intent);
+        }
         callback_notify::notify();
     }
 }
 
-fn stats_refresh_guard_is_current(guard: &StatsRefreshGuard) -> bool {
+pub(crate) fn stats_refresh_guard_is_current(guard: &StatsRefreshGuard) -> bool {
     vapor_forge_features::identity::steam_id() == guard.steam_id64
         && vapor_forge_features::identity::generation() == guard.identity_generation
         && vapor_forge_cloud_core::device_descriptor()
             .is_some_and(|descriptor| descriptor.client_id == guard.client_id)
+        && super::install::runtime_generation() == guard.runtime_generation
         && crate::cloud_backend::backend_context()
             .is_some_and(|backend| backend.credential_fingerprint() == guard.credential_fingerprint)
+}
+
+pub(crate) fn stats_snapshot_owner_is_current(owner: &StatsSnapshotOwner) -> bool {
+    stats_refresh_guard_is_current(&owner.guard)
+        && crate::sync_journal::cached_principal_for_credential(&owner.guard.credential_fingerprint)
+            .is_some_and(|scope| scope == owner.principal_scope)
 }
 
 /// Both takers are non-blocking. The service loop owns all waiting.
@@ -1331,15 +1516,15 @@ fn take_query(shared: &WorkerShared) -> Option<WorkerQuery> {
         .pop_front()
 }
 
-fn take_read(shared: &WorkerShared) -> Option<u32> {
+fn take_read(shared: &WorkerShared) -> Option<StatsSnapshotIntent> {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let app_id = state.pending_reads.pop_front()?;
-    state.queued_reads.remove(&app_id);
-    state.active_reads.insert(app_id);
-    Some(app_id)
+    let intent = state.pending_reads.pop_front()?;
+    state.queued_reads.remove(&intent);
+    state.active_reads.insert(intent.clone());
+    Some(intent)
 }
 
 fn take_refresh(shared: &WorkerShared) -> Option<RefreshRequest> {
@@ -1347,7 +1532,13 @@ fn take_refresh(shared: &WorkerShared) -> Option<RefreshRequest> {
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while let Some(app_id) = state.pending_refresh_order.pop_front() {
+    let pending_count = state.pending_refresh_order.len();
+    for _ in 0..pending_count {
+        let app_id = state.pending_refresh_order.pop_front()?;
+        if state.active_refreshes.contains(&app_id) {
+            state.pending_refresh_order.push_back(app_id);
+            continue;
+        }
         let Some(request) = state.pending_refreshes.remove(&app_id) else {
             continue;
         };
@@ -1458,9 +1649,49 @@ mod tests {
         InFlight {
             app_id: api_call as u32,
             api_call,
+            refresh_guard: None,
             #[cfg(any(debug_assertions, test))]
             probe_reply: None,
         }
+    }
+
+    fn owned_snapshot_intent(
+        app_id: u32,
+        owner_scope: &str,
+        steam_id64: u64,
+        identity_generation: u64,
+        runtime_generation: u64,
+        commit_id: &str,
+    ) -> StatsSnapshotIntent {
+        StatsSnapshotIntent {
+            marker: StatsCommit {
+                owner_scope: owner_scope.to_owned(),
+                owner_steam_id64: steam_id64.to_string(),
+                commit_id: commit_id.to_owned(),
+                app_id,
+                base_crc_stats: None,
+                dirty_stat_ids: Vec::new(),
+                observed_at: 1,
+            },
+            guard: StatsRefreshGuard {
+                credential_fingerprint: format!("credential:{owner_scope}"),
+                steam_id64,
+                identity_generation,
+                client_id: 9,
+                runtime_generation,
+            },
+        }
+    }
+
+    fn snapshot_intent(app_id: u32, commit_id: &str) -> StatsSnapshotIntent {
+        owned_snapshot_intent(
+            app_id,
+            "principal-a",
+            TEST_STEAM_ID,
+            TEST_GENERATION,
+            11,
+            commit_id,
+        )
     }
 
     #[test]
@@ -1643,61 +1874,180 @@ mod tests {
     #[test]
     fn cache_reads_are_deduplicated() {
         let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
         {
             let mut state = shared.state.lock().unwrap();
-            queue_read_locked(&mut state, 480);
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, intent.clone());
+            queue_read_locked(&mut state, intent.clone());
         }
 
-        assert_eq!(take_read(&shared), Some(480));
+        assert_eq!(take_read(&shared), Some(intent.clone()));
         assert_eq!(take_read(&shared), None);
-        finish_read(&shared, 480);
+        finish_read(&shared, &intent);
         let state = shared.state.lock().unwrap();
-        assert!(!state.active_reads.contains(&480));
+        assert!(!state.active_reads.contains(&intent));
         assert!(state.pending_reads.is_empty());
     }
 
     #[test]
-    fn failed_cache_read_gets_one_event_driven_refresh() {
+    fn cache_reads_keep_distinct_commits_and_owners() {
         let shared = WorkerShared::default();
+        let first = snapshot_intent(480, "commit-1");
+        let second = snapshot_intent(480, "commit-2");
+        let other_owner = owned_snapshot_intent(
+            480,
+            "principal-b",
+            TEST_STEAM_ID + 1,
+            TEST_GENERATION + 1,
+            11,
+            "commit-1",
+        );
+        let mut next_session = first.clone();
+        next_session.guard.identity_generation += 1;
         {
             let mut state = shared.state.lock().unwrap();
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, first.clone());
+            queue_read_locked(&mut state, second.clone());
+            queue_read_locked(&mut state, other_owner.clone());
+            queue_read_locked(&mut state, next_session.clone());
         }
-        assert_eq!(take_read(&shared), Some(480));
-        finish_read(&shared, 480);
 
-        queue_read_recovery(&shared, 480);
+        assert_eq!(take_read(&shared), Some(first));
+        assert_eq!(take_read(&shared), Some(second));
+        assert_eq!(take_read(&shared), Some(other_owner));
+        assert_eq!(take_read(&shared), Some(next_session));
+        assert_eq!(take_read(&shared), None);
+    }
+
+    #[test]
+    fn snapshot_intent_rejects_a_marker_from_another_owner() {
+        let intent = snapshot_intent(480, "commit-1");
+        let owner = StatsSnapshotOwner {
+            guard: intent.guard.clone(),
+            principal_scope: "principal-b".to_owned(),
+        };
+
+        assert!(StatsSnapshotIntent::new(intent.marker, &owner).is_none());
+    }
+
+    #[test]
+    fn newer_commit_survives_an_active_read_for_the_same_app() {
+        let shared = WorkerShared::default();
+        let first = snapshot_intent(480, "commit-1");
+        let second = snapshot_intent(480, "commit-2");
         {
-            let state = shared.state.lock().unwrap();
-            assert!(state.read_recovery_attempted.contains(&480));
-            assert!(state.reads_after_refresh.contains(&480));
-            assert!(state.pending_refreshes.contains_key(&480));
+            let mut state = shared.state.lock().unwrap();
+            queue_read_locked(&mut state, first.clone());
+        }
+        assert_eq!(take_read(&shared), Some(first.clone()));
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_read_locked(&mut state, second.clone());
         }
 
+        finish_read(&shared, &first);
+        assert_eq!(take_read(&shared), Some(second));
+    }
+
+    #[test]
+    fn snapshot_read_revalidates_guard_after_native_access() {
+        let guard = snapshot_intent(480, "commit-1").guard;
+        let mut checks = [true, false].into_iter();
+        let result = guarded_snapshot_read(
+            &guard,
+            |_| checks.next().expect("unexpected guard check"),
+            || Ok::<_, ()>(7),
+        );
+
+        assert!(matches!(result, GuardedSnapshotRead::StaleAfterRead));
+        assert!(checks.next().is_none());
+    }
+
+    #[test]
+    fn stale_snapshot_guard_prevents_native_access() {
+        let guard = snapshot_intent(480, "commit-1").guard;
+        let mut called = false;
+        let result = guarded_snapshot_read(
+            &guard,
+            |_| false,
+            || {
+                called = true;
+                Ok::<_, ()>(7)
+            },
+        );
+
+        assert!(matches!(result, GuardedSnapshotRead::StaleBeforeRead));
+        assert!(!called);
+    }
+
+    #[test]
+    fn refresh_then_read_is_explicit() {
+        let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_snapshot_locked(&mut state, intent.clone(), SnapshotRequest::RefreshThenRead);
+        }
+        assert_eq!(take_read(&shared), None);
+        let refresh = take_refresh(&shared).expect("refresh should be queued");
+        assert_eq!(refresh.app_id, 480);
+        assert_eq!(refresh.refresh_guard, Some(intent.guard.clone()));
+        finish_refresh(&shared, 480, true);
+        assert_eq!(take_read(&shared), Some(intent));
+    }
+
+    #[test]
+    fn duplicate_refresh_then_read_merges_while_refresh_is_active() {
+        let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_snapshot_locked(&mut state, intent.clone(), SnapshotRequest::RefreshThenRead);
+        }
         assert_eq!(
             take_refresh(&shared).map(|request| request.app_id),
             Some(480)
         );
-        finish_refresh(&shared, 480);
-        assert_eq!(take_read(&shared), Some(480));
-        finish_read(&shared, 480);
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_snapshot_locked(&mut state, intent.clone(), SnapshotRequest::RefreshThenRead);
+        }
 
-        queue_read_recovery(&shared, 480);
+        assert_eq!(take_refresh(&shared), None);
+        finish_refresh(&shared, 480, true);
+        assert_eq!(take_read(&shared), Some(intent));
+        assert_eq!(take_refresh(&shared), None);
+    }
+
+    #[test]
+    fn failed_refresh_terminates_read_intent() {
+        let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_snapshot_locked(&mut state, intent.clone(), SnapshotRequest::RefreshThenRead);
+        }
+        assert_eq!(
+            take_refresh(&shared).map(|request| request.app_id),
+            Some(480)
+        );
+        finish_refresh(&shared, 480, false);
+
         let state = shared.state.lock().unwrap();
-        assert!(state.read_recovery_attempted.contains(&480));
-        assert!(!state.reads_after_refresh.contains(&480));
+        assert!(!state.reads_after_refresh.contains(&intent));
         assert!(state.pending_refreshes.is_empty());
         assert!(state.pending_refresh_order.is_empty());
+        assert!(state.pending_reads.is_empty());
     }
 
     #[test]
     fn cache_read_waits_for_refresh_completion() {
         let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
         {
             let mut state = shared.state.lock().unwrap();
             queue_refresh_locked(&mut state, 480, None);
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, intent.clone());
         }
 
         assert_eq!(take_read(&shared), None);
@@ -1705,16 +2055,17 @@ mod tests {
             take_refresh(&shared).map(|request| request.app_id),
             Some(480)
         );
-        finish_refresh(&shared, 480);
-        assert_eq!(take_read(&shared), Some(480));
+        finish_refresh(&shared, 480, true);
+        assert_eq!(take_read(&shared), Some(intent));
     }
 
     #[test]
     fn later_refresh_moves_a_queued_read_behind_it() {
         let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
         {
             let mut state = shared.state.lock().unwrap();
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, intent.clone());
             queue_refresh_locked(&mut state, 480, None);
         }
 
@@ -1723,13 +2074,14 @@ mod tests {
             take_refresh(&shared).map(|request| request.app_id),
             Some(480)
         );
-        finish_refresh(&shared, 480);
-        assert_eq!(take_read(&shared), Some(480));
+        finish_refresh(&shared, 480, true);
+        assert_eq!(take_read(&shared), Some(intent));
     }
 
     #[test]
     fn refresh_rerun_keeps_read_behind_the_latest_request() {
         let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
         {
             let mut state = shared.state.lock().unwrap();
             queue_refresh_locked(&mut state, 480, None);
@@ -1740,27 +2092,52 @@ mod tests {
         );
         {
             let mut state = shared.state.lock().unwrap();
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, intent.clone());
             queue_refresh_locked(&mut state, 480, None);
         }
 
-        finish_refresh(&shared, 480);
+        finish_refresh(&shared, 480, true);
         assert_eq!(take_read(&shared), None);
         assert_eq!(
             take_refresh(&shared).map(|request| request.app_id),
             Some(480)
         );
-        finish_refresh(&shared, 480);
-        assert_eq!(take_read(&shared), Some(480));
+        finish_refresh(&shared, 480, true);
+        assert_eq!(take_read(&shared), Some(intent));
+    }
+
+    #[test]
+    fn refresh_rerun_is_not_admitted_while_the_same_app_is_active() {
+        let shared = WorkerShared::default();
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_refresh_locked(&mut state, 480, None);
+        }
+        assert_eq!(
+            take_refresh(&shared).map(|request| request.app_id),
+            Some(480)
+        );
+        {
+            let mut state = shared.state.lock().unwrap();
+            queue_refresh_locked(&mut state, 480, None);
+        }
+
+        assert_eq!(take_refresh(&shared), None);
+        finish_refresh(&shared, 480, true);
+        assert_eq!(
+            take_refresh(&shared).map(|request| request.app_id),
+            Some(480)
+        );
     }
 
     #[test]
     fn diagnostic_query_is_serviced_without_losing_pending_read() {
         let shared = WorkerShared::default();
+        let intent = snapshot_intent(480, "commit-1");
         let (reply, _result) = mpsc::sync_channel(1);
         {
             let mut state = shared.state.lock().unwrap();
-            queue_read_locked(&mut state, 480);
+            queue_read_locked(&mut state, intent.clone());
             state.queries.push_back(WorkerQuery::UserStats {
                 app_id: 480,
                 steam_id64: 7,
@@ -1770,7 +2147,7 @@ mod tests {
 
         assert!(take_query(&shared).is_some());
         assert!(take_query(&shared).is_none());
-        assert_eq!(take_read(&shared), Some(480));
+        assert_eq!(take_read(&shared), Some(intent));
     }
 
     // Takers are non-blocking; the epoch/futex boundary owns all parking.

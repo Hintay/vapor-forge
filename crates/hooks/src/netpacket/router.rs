@@ -5,12 +5,11 @@
 //! Feature decisions live in `vapor_forge_features`.
 
 use prost::Message;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
-use vapor_forge_core::unix_now;
 use vapor_forge_features::achievements;
 use vapor_forge_features::identity;
 use vapor_forge_features::request_code::{self, PendingQueue};
@@ -432,6 +431,8 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
     if emsg == EMSG_STORE_USERSTATS || emsg == EMSG_STORE_USERSTATS2 {
         let response_generation = crate::client::network::injection_generation();
         let runtime = crate::client::install::runtime_snapshot();
+        let store_steam_id64 = identity::steam_id();
+        let store_identity_generation = identity::generation();
         match valve_filter::store_stats_action(emsg, header_bytes, body_bytes, &runtime.config) {
             PrivacyAction::Pass => {}
             PrivacyAction::Drop { app_id } => {
@@ -452,21 +453,64 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                     return SendFrameDecision::Retry;
                 }
                 let requires_marker = runtime.config.cloud_enabled_for_controlled_apps();
-                let persisted = !requires_marker
-                    || crate::achievement_worker::persist_store_commit(app_id, emsg, body_bytes);
-                if persisted {
-                    if requires_marker {
-                        crate::client::user_stats::queue_snapshot_read(app_id);
+                if requires_marker {
+                    let Some(owner) = crate::client::user_stats::capture_stats_snapshot_owner_for(
+                        runtime.generation,
+                        store_steam_id64,
+                        store_identity_generation,
+                    ) else {
+                        warn!(app_id, emsg, "netpacket: StoreStats owner is unavailable");
+                        return SendFrameDecision::Retry;
+                    };
+                    match crate::achievement_worker::persist_store_commit(
+                        app_id, emsg, body_bytes, &owner,
+                    ) {
+                        crate::achievement_worker::StoreCommitPersistence::Persisted(intent) => {
+                            if !crate::client::user_stats::queue_snapshot_read(intent) {
+                                warn!(
+                                    app_id,
+                                    emsg,
+                                    "netpacket: StoreStats snapshot deferred to durable recovery"
+                                );
+                            }
+                        }
+                        crate::achievement_worker::StoreCommitPersistence::Stale => {
+                            warn!(app_id, emsg, "netpacket: StoreStats owner changed");
+                            return SendFrameDecision::Retry;
+                        }
+                        crate::achievement_worker::StoreCommitPersistence::InvalidRequest => {
+                            warn!(app_id, emsg, "netpacket: StoreStats owner mismatch");
+                            let Some(packet) = valve_filter::store_stats_response(
+                                emsg,
+                                header_bytes,
+                                body_bytes,
+                                ERESULT_INVALID_PARAM,
+                            ) else {
+                                return SendFrameDecision::Retry;
+                            };
+                            if crate::client::network::injection_generation() != response_generation
+                            {
+                                return SendFrameDecision::Retry;
+                            }
+                            queue_local_response_for_generation(packet, response_generation);
+                            capture_dropped(data);
+                            return SendFrameDecision::Drop;
+                        }
+                        crate::achievement_worker::StoreCommitPersistence::Failed => {
+                            warn!(
+                                app_id,
+                                emsg, "netpacket: StoreStats commit marker could not be persisted"
+                            );
+                            return SendFrameDecision::Retry;
+                        }
                     }
-                    info!(app_id, emsg, "netpacket: acknowledged StoreStats locally");
-                } else {
-                    warn!(
-                        app_id,
-                        emsg, "netpacket: StoreStats commit marker could not be persisted"
-                    );
+                }
+                if crate::client::network::injection_generation() != response_generation {
+                    warn!(app_id, emsg, "netpacket: StoreStats connection changed");
                     return SendFrameDecision::Retry;
                 }
-                queue_local_response(packet);
+                info!(app_id, emsg, "netpacket: acknowledged StoreStats locally");
+                queue_local_response_for_generation(packet, response_generation);
                 capture_dropped(data);
                 return SendFrameDecision::Drop;
             }
@@ -588,8 +632,7 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
 fn notify_device_context_changed() {
     crate::achievement_worker::notify_context_changed();
     crate::playtime_worker::notify_context_changed();
-    crate::playtime_downlink_worker::notify_context_changed();
-    crate::stats_wakeup_worker::notify_context_changed();
+    crate::account_downlink_worker::notify_context_changed();
     crate::client::user_stats::notify_context_changed();
     stats_proxy::notify_context_changed();
 }
@@ -614,7 +657,7 @@ fn handle_record_disconnected_playtime(
             return SendFrameDecision::Drop;
         }
     };
-    let mut protected_sessions = Vec::new();
+    let mut protected_apps = BTreeSet::new();
     let mut valve_sessions = Vec::new();
     for session in request.play_sessions {
         let Some(app_id) = session.app_id.filter(|app_id| *app_id != 0) else {
@@ -622,102 +665,16 @@ fn handle_record_disconnected_playtime(
             continue;
         };
         if config.is_controlled_app(AppId(app_id)) {
-            protected_sessions.push((app_id, session));
+            protected_apps.insert(app_id);
         } else {
             valve_sessions.push(session);
         }
     }
-    if protected_sessions.is_empty() {
+    if protected_apps.is_empty() {
         return SendFrameDecision::Pass;
     }
 
-    let Some(backend) = crate::cloud_backend::backend_context() else {
-        if config.cloud_enabled_for_controlled_apps() {
-            warn!("playtime-sync: configured backend unavailable");
-            return SendFrameDecision::Retry;
-        }
-        for (app_id, _) in &protected_sessions {
-            crate::client::user_stats::signal_router_playtime(*app_id);
-        }
-        return finish_disconnected_playtime(
-            emsg_raw,
-            header_bytes,
-            original_packet,
-            valve_sessions,
-            0,
-        );
-    };
-    if !backend.accepts_playtime_sessions() {
-        for (app_id, _) in &protected_sessions {
-            crate::client::user_stats::signal_router_playtime(*app_id);
-        }
-        return finish_disconnected_playtime(
-            emsg_raw,
-            header_bytes,
-            original_packet,
-            valve_sessions,
-            protected_sessions.len(),
-        );
-    }
-    let steam_id64 = identity::steam_id();
-    if steam_id64 == 0 {
-        warn!("playtime-sync: account unavailable; controlled sessions were not recorded");
-        return SendFrameDecision::Retry;
-    }
-    let Some(scope) = crate::sync_journal::cached_principal_scope(backend.as_ref()) else {
-        warn!("playtime-sync: principal unavailable; controlled sessions were not recorded");
-        return SendFrameDecision::Retry;
-    };
-    let observed_at = unix_now();
-    let mut protected = Vec::new();
-    for (app_id, session) in protected_sessions {
-        let Some(started_at) = session.session_time_start else {
-            warn!(
-                app_id,
-                "playtime-sync: protected session omitted start time"
-            );
-            continue;
-        };
-        if started_at == 0 {
-            warn!(
-                app_id,
-                "playtime-sync: protected session has zero start time"
-            );
-            continue;
-        }
-        let Some(seconds) = session.seconds.filter(|seconds| *seconds != 0) else {
-            warn!(app_id, "playtime-sync: protected session omitted duration");
-            continue;
-        };
-        let offline = session.offline.unwrap_or(false);
-        let owner_account_id = session.owner.unwrap_or(steam_id64 as u32);
-        protected.push(vapor_forge_cloud_core::PlaytimeSession {
-            owner_scope: scope.clone(),
-            owner_steam_id64: steam_id64.to_string(),
-            session_id: vapor_forge_cloud_core::playtime_session_id(
-                &steam_id64.to_string(),
-                app_id,
-                started_at,
-                seconds,
-                offline,
-                owner_account_id,
-            ),
-            app_id,
-            started_at,
-            seconds,
-            offline,
-            owner_account_id,
-            observed_at,
-        });
-    }
-    if !crate::playtime_worker::persist_sessions(backend.as_ref(), &protected) {
-        warn!("playtime-sync: controlled sessions could not be persisted");
-        return SendFrameDecision::Retry;
-    }
-    // Also sample the cumulative value for each disconnected-playtime report.
-    // This supplements this recovery path only; ordinary exits rely on Steam's
-    // minutes-played notification.
-    for app_id in protected.iter().map(|session| session.app_id) {
+    for &app_id in &protected_apps {
         crate::client::user_stats::signal_router_playtime(app_id);
     }
     finish_disconnected_playtime(
@@ -725,7 +682,7 @@ fn handle_record_disconnected_playtime(
         header_bytes,
         original_packet,
         valve_sessions,
-        protected.len(),
+        protected_apps.len(),
     )
 }
 
@@ -734,7 +691,7 @@ fn finish_disconnected_playtime(
     header_bytes: &[u8],
     original_packet: &[u8],
     valve_sessions: Vec<PlayerPlayHistory>,
-    persisted: usize,
+    controlled_count: usize,
 ) -> SendFrameDecision {
     if valve_sessions.is_empty() {
         if !crate::client::network::response_delivery_ready() {
@@ -747,7 +704,7 @@ fn finish_disconnected_playtime(
             ERESULT_OK,
         ));
         info!(
-            count = persisted,
+            count = controlled_count,
             "playtime-sync: completed controlled Steam session response"
         );
         capture_dropped(original_packet);
@@ -1411,5 +1368,46 @@ mod tests {
             ),
             SendFrameDecision::Pass
         ));
+    }
+
+    #[test]
+    fn record_disconnected_playtime_rewrites_only_uncontrolled_apps() {
+        let sessions = vec![
+            PlayerPlayHistory {
+                app_id: Some(480),
+                session_time_start: Some(1_700_000_000),
+                seconds: Some(60),
+                offline: Some(false),
+                owner: Some(39734273),
+            },
+            PlayerPlayHistory {
+                app_id: Some(999),
+                session_time_start: Some(1_700_000_100),
+                seconds: Some(120),
+                offline: Some(true),
+                owner: Some(39734273),
+            },
+        ];
+        let body = PlayerRecordDisconnectedPlaytimeRequest {
+            play_sessions: sessions,
+        }
+        .encode_to_vec();
+        let mut config = vapor_forge_config::RuntimeConfig::default();
+        config.apps.inject.push(vapor_forge_config::InjectApp {
+            id: AppId(480),
+            dlc: Vec::new(),
+            ticket: vapor_forge_config::TicketMode::Forge,
+            purchase_time: 0,
+        });
+
+        let SendFrameDecision::Rewrite(packet) =
+            handle_record_disconnected_playtime(K_MSG_HDR_PROTO_FLAG, &[], &body, &body, &config)
+        else {
+            panic!("mixed playtime request was not rewritten");
+        };
+        let (_, _, rewritten_body) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
+        let rewritten = PlayerRecordDisconnectedPlaytimeRequest::decode(rewritten_body).unwrap();
+        assert_eq!(rewritten.play_sessions.len(), 1);
+        assert_eq!(rewritten.play_sessions[0].app_id, Some(999));
     }
 }

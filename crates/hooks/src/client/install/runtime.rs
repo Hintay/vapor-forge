@@ -159,10 +159,7 @@ pub(crate) fn ensure_runtime_services_for_config(config: &RuntimeConfig) {
     if config.local_cloud_configured() || config.cumulus_configured() {
         crate::achievement_worker::ensure_started();
         crate::playtime_worker::ensure_started();
-    }
-    if config.cumulus_configured() {
-        crate::playtime_downlink_worker::ensure_started();
-        crate::stats_wakeup_worker::ensure_started();
+        crate::account_downlink_worker::ensure_started();
     }
     ensure_ipc_server_for_config(config);
 }
