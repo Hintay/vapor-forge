@@ -4,9 +4,9 @@ use std::path::Path;
 
 use crate::{AppId, ConfigError};
 
-/// Root configuration. Lua scripts are the primary configuration method;
-/// this TOML file serves as a simple fallback and for debugging.
+/// Root runtime configuration. Lua scripts extend the app-specific state.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub runtime: RuntimeSection,
@@ -23,8 +23,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub ticket: TicketSection,
     #[serde(default)]
-    pub manifest: ManifestSection,
-    #[serde(default)]
     pub achievements: AchievementsSection,
     #[serde(default)]
     pub app_avatar: AppAvatarSection,
@@ -33,6 +31,7 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSection {
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -44,6 +43,7 @@ pub struct RuntimeSection {
 
 /// Steam internal toast notifications shown through SteamUI WebUI.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToastSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -53,6 +53,7 @@ pub struct ToastSection {
 
 /// Development-only local control API.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebugSection {
     #[serde(default = "default_debug_control_api")]
     pub control_api: bool,
@@ -63,6 +64,7 @@ pub struct DebugSection {
 /// - `inject`: apps the user does NOT own. Full ownership + optional DLC.
 /// - `shared`: family sharing concurrent-play unlock.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppsSection {
     #[serde(default)]
     pub inject: Vec<InjectApp>,
@@ -72,6 +74,7 @@ pub struct AppsSection {
 
 /// An app to inject ownership for, with optional DLC list.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InjectApp {
     pub id: AppId,
     #[serde(default)]
@@ -106,6 +109,7 @@ pub enum TicketMode {
 /// - Neither set = all family-shared apps are unlocked.
 /// - `enabled = false` disables entirely.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -142,6 +146,7 @@ impl Default for SharedSection {
 
 /// Cloud backend selection and settings for controlled apps.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudSection {
     #[serde(default)]
     pub backend: CloudBackendMode,
@@ -171,6 +176,7 @@ pub enum CloudBackendMode {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalCloudSection {
     #[serde(default)]
     pub path: String,
@@ -179,6 +185,7 @@ pub struct LocalCloudSection {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CumulusCloudSection {
     #[serde(default)]
     pub server_url: String,
@@ -213,8 +220,9 @@ impl Default for CumulusCloudSection {
     }
 }
 
-/// Optional Syncthing guard for local cloud garbage collection.
+/// Optional Syncthing integration for the local cloud repository.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncthingSection {
     #[serde(default)]
     pub enabled: bool,
@@ -254,6 +262,7 @@ impl Default for SyncthingSection {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptingSection {
     #[serde(default)]
     pub paths: Vec<String>,
@@ -261,6 +270,7 @@ pub struct ScriptingSection {
 
 /// Achievement/stats schema configuration.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AchievementsSection {
     #[serde(default)]
     pub offline_schema: bool,
@@ -269,7 +279,7 @@ pub struct AchievementsSection {
 /// AppAvatar: map a real AppId to another for networking.
 ///
 /// Integer keys are static mappings. Use 0 as wildcard for all unowned apps.
-/// `rules` is an array of flag-driven rules evaluated at LaunchApp.
+/// `rules` is an array of flag-driven rules evaluated at SpawnProcess.
 ///
 /// ```toml
 /// [app_avatar]
@@ -287,6 +297,7 @@ pub struct AppAvatarSection {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppAvatarRule {
     pub flag: String,
     pub avatar: AppId,
@@ -327,7 +338,10 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
                         let avatar: u32 = map.next_value()?;
                         static_map.insert(AppId(app_id), AppId(avatar));
                     } else {
-                        let _ = map.next_value::<toml::Value>();
+                        return Err(serde::de::Error::unknown_field(
+                            &key,
+                            &["rules", "an unsigned 32-bit AppID"],
+                        ));
                     }
                 }
 
@@ -342,7 +356,7 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
 /// Native .so injection via LD_PRELOAD, applied at BuildSpawnEnvBlock time.
 ///
 /// Each entry lists a library path plus optional app/flag filters, mirroring
-/// the AppAvatar rule shape. Rules are evaluated at LaunchApp; matching paths
+/// the AppAvatar rule shape. Rules are evaluated at SpawnProcess; matching paths
 /// are joined and written into the child process env block.
 ///
 /// ```toml
@@ -352,6 +366,7 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
 /// apps = [480]
 /// ```
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LibraryInjectSection {
     #[serde(default)]
     pub libs: Vec<LibraryInjectEntry>,
@@ -360,6 +375,7 @@ pub struct LibraryInjectSection {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LibraryInjectEntry {
     pub path: String,
     #[serde(default)]
@@ -376,6 +392,7 @@ pub struct LibraryInjectEntry {
 /// - Delegate captured tickets: always persisted to disk.
 /// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TicketSection {
     /// Persistence for non-delegate, non-derived tickets (Lua-provided or
     /// intercepted real tickets). Default: disk.
@@ -397,35 +414,6 @@ pub enum TicketCacheMode {
     /// Persist to disk. Survives restarts.
     #[default]
     Disk,
-}
-
-/// Manifest request code fetch configuration.
-#[derive(Clone, Debug, Deserialize)]
-pub struct ManifestSection {
-    #[serde(default = "default_providers")]
-    pub providers: Vec<String>,
-    #[serde(default = "default_timeout_connect_ms")]
-    pub timeout_connect_ms: u64,
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
-}
-
-impl Default for ManifestSection {
-    fn default() -> Self {
-        Self {
-            providers: default_providers(),
-            timeout_connect_ms: default_timeout_connect_ms(),
-            timeout_ms: default_timeout_ms(),
-        }
-    }
-}
-
-fn default_providers() -> Vec<String> {
-    vec![
-        "opensteamtool".to_owned(),
-        "wudrm".to_owned(),
-        "steamrun".to_owned(),
-    ]
 }
 
 fn default_timeout_connect_ms() -> u64 {

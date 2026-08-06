@@ -14,6 +14,55 @@ fn parses_empty_config() {
 }
 
 #[test]
+fn rejects_unknown_fields_in_every_config_table() {
+    let cases = [
+        ("root", "unknown = true"),
+        ("runtime", "[runtime]\nunknown = true"),
+        ("toast", "[toast]\nunknown = true"),
+        ("debug", "[debug]\nunknown = true"),
+        ("apps", "[apps]\nunknown = true"),
+        ("apps.inject", "[[apps.inject]]\nid = 480\nunknown = true"),
+        ("apps.shared", "[apps.shared]\nunknown = true"),
+        ("cloud", "[cloud]\nunknown = true"),
+        ("cloud.local", "[cloud.local]\nunknown = true"),
+        (
+            "cloud.local.syncthing",
+            "[cloud.local.syncthing]\nunknown = true",
+        ),
+        ("cloud.cumulus", "[cloud.cumulus]\nunknown = true"),
+        ("scripting", "[scripting]\nunknown = true"),
+        ("achievements", "[achievements]\nunknown = true"),
+        (
+            "app_avatar.rules",
+            "[[app_avatar.rules]]\nflag = \"-test\"\navatar = 480\nunknown = true",
+        ),
+        ("library_inject", "[library_inject]\nunknown = true"),
+        (
+            "library_inject.libs",
+            "[[library_inject.libs]]\npath = \"/tmp/test.so\"\nunknown = true",
+        ),
+        ("ticket", "[ticket]\nunknown = true"),
+    ];
+
+    for (name, text) in cases {
+        let error = toml::from_str::<RuntimeConfig>(text)
+            .expect_err(&format!("{name} should reject unknown fields"));
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unexpected {name} error: {error}"
+        );
+    }
+}
+
+#[test]
+fn app_avatar_rejects_non_app_id_keys() {
+    let error = toml::from_str::<RuntimeConfig>("[app_avatar]\nname = 480")
+        .expect_err("app_avatar should reject unknown keys");
+
+    assert!(error.to_string().contains("unknown field `name`"));
+}
+
+#[test]
 fn template_parses_and_keeps_safe_defaults() {
     let config: RuntimeConfig = toml::from_str(CONFIG_TEMPLATE).expect("template should parse");
     assert_eq!(config.runtime.log_level, "info");
@@ -154,9 +203,6 @@ auto_delegate = true
 
 [runtime]
 diagnostics = true
-
-[custom]
-value = 1
 "#,
     )
     .expect("test config should be written");
@@ -171,7 +217,6 @@ value = 1
     assert!(synced.contains(r#"log_level = "info""#));
     assert!(synced.contains("[toast]"));
     assert!(synced.contains("[apps.shared]"));
-    assert!(synced.contains("[custom]"));
     assert!(synced.contains("# [[apps.inject]]"));
     assert!(synced.contains("# [[library_inject.libs]]"));
 
@@ -184,21 +229,16 @@ value = 1
         .expect("apps.shared table should exist");
     let cloud_pos = synced.find("[cloud]").expect("cloud table should exist");
     let ticket_pos = synced.find("[ticket]").expect("ticket table should exist");
-    let manifest_pos = synced
-        .find("[manifest]")
-        .expect("manifest table should exist");
     let achievements_pos = synced
         .find("[achievements]")
         .expect("achievements table should exist");
     let scripting_pos = synced
         .find("[scripting]")
         .expect("scripting table should exist");
-    let custom_pos = synced.find("[custom]").expect("custom table should exist");
     assert!(runtime_pos < toast_pos);
     assert!(toast_pos < apps_pos);
     assert!(apps_pos < cloud_pos);
     assert!(cloud_pos < ticket_pos);
-    assert!(ticket_pos < custom_pos);
 
     let debug_example_pos = synced
         .find("# [debug]")
@@ -212,9 +252,6 @@ value = 1
     let app_example_pos = synced
         .find("# [[apps.inject]]")
         .expect("apps example should exist");
-    let manifest_example_pos = synced
-        .find("# providers")
-        .expect("manifest example should exist");
     let avatar_example_pos = synced
         .find("# [app_avatar]")
         .expect("app_avatar example should exist");
@@ -225,8 +262,7 @@ value = 1
     assert!(runtime_example_pos < toast_pos);
     assert!(apps_pos < shared_example_pos);
     assert!(shared_example_pos < cloud_pos);
-    assert!(manifest_pos < manifest_example_pos);
-    assert!(manifest_example_pos < achievements_pos);
+    assert!(ticket_pos < achievements_pos);
     assert!(scripting_pos < debug_example_pos);
     assert!(debug_example_pos < app_example_pos);
     assert!(app_example_pos < avatar_example_pos);

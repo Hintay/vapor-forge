@@ -46,12 +46,6 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
-# Manifest request-code provider settings.
-[manifest]
-timeout_connect_ms = 5000   # connection timeout per provider
-timeout_ms = 15000          # total request timeout per provider
-# providers = ["provider-name"] # override provider order/list
-
 # Offline achievement schema support.
 [achievements]
 offline_schema = false
