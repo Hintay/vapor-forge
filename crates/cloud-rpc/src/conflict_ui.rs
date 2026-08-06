@@ -82,18 +82,24 @@ struct Choice {
     pending: PendingConflict,
 }
 
+#[derive(Clone)]
+struct PendingAck {
+    context: ConflictUiContext,
+    ack: ConflictUiAck,
+    sent: bool,
+}
+
 #[derive(Default)]
 struct State {
     epoch: u64,
     pending: HashMap<(u64, u32), PendingConflict>,
     presented: HashSet<((u64, u32), ConflictUiContext)>,
     bindings: HashMap<String, Binding>,
-    acks: VecDeque<(ConflictUiContext, ConflictUiAck)>,
+    acks: VecDeque<PendingAck>,
 }
 
 pub(crate) struct LocalConflictCoordinator {
     state: Mutex<State>,
-    revision: AtomicU64,
     ui_ready: std::sync::atomic::AtomicBool,
     choices: mpsc::Sender<Choice>,
 }
@@ -115,7 +121,6 @@ impl LocalConflictCoordinator {
             });
             Self {
                 state: Mutex::new(State::default()),
-                revision: AtomicU64::new(1),
                 ui_ready: std::sync::atomic::AtomicBool::new(false),
                 choices,
             }
@@ -148,7 +153,7 @@ impl LocalConflictCoordinator {
             let removed_pending = state.pending.remove(&key).is_some();
             discard_key_bindings(&mut state, key);
             if removed_pending {
-                self.bump_revision();
+                self.signal_change();
             }
             return;
         }
@@ -175,7 +180,7 @@ impl LocalConflictCoordinator {
         }
         state.pending.insert(key, pending);
         discard_key_bindings(&mut state, key);
-        self.bump_revision();
+        self.signal_change();
     }
 
     pub(crate) fn arm(
@@ -200,7 +205,7 @@ impl LocalConflictCoordinator {
                 pending.minimum_revision = pending.minimum_revision.max(minimum_revision);
                 if !pending.armed {
                     pending.armed = true;
-                    self.bump_revision();
+                    self.signal_change();
                 }
                 return true;
             }
@@ -215,7 +220,7 @@ impl LocalConflictCoordinator {
             return false;
         };
         pending.armed = true;
-        self.bump_revision();
+        self.signal_change();
         true
     }
 
@@ -299,16 +304,16 @@ impl LocalConflictCoordinator {
                 {
                     state.pending.remove(&binding.key);
                     discard_key_bindings(&mut state, binding.key);
-                    self.bump_revision();
+                    self.signal_change();
                 }
                 return ConflictSubmitResult::Stale;
             }
             if binding.head.is_empty() {
                 state.pending.remove(&binding.key);
                 discard_key_bindings(&mut state, binding.key);
-                state.acks.push_back((
+                state.acks.push_back(PendingAck {
                     context,
-                    ConflictUiAck {
+                    ack: ConflictUiAck {
                         token: token.to_owned(),
                         app_id: binding.key.1,
                         accepted: true,
@@ -316,8 +321,9 @@ impl LocalConflictCoordinator {
                         resume_launch: false,
                         cancel_launch: true,
                     },
-                ));
-                self.bump_revision();
+                    sent: false,
+                });
+                self.signal_change();
                 return ConflictSubmitResult::Accepted;
             }
             let Some(pending) = state.pending.get_mut(&binding.key) else {
@@ -345,23 +351,100 @@ impl LocalConflictCoordinator {
         ConflictSubmitResult::Accepted
     }
 
-    pub(crate) fn acks(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
+    #[cfg(test)]
+    fn acks(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .acks
             .iter()
-            .filter_map(|(target, ack)| (*target == context).then_some(ack.clone()))
+            .filter_map(|pending| (pending.context == context).then_some(pending.ack.clone()))
             .collect()
     }
 
-    pub(crate) fn acknowledge_acks(&self, context: ConflictUiContext, tokens: &[String]) {
-        let tokens = tokens.iter().map(String::as_str).collect::<HashSet<_>>();
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    pub(crate) fn ack_deliveries(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut deliveries = Vec::new();
+        for pending in &mut state.acks {
+            if pending.context.window_generation == 0
+                && same_runtime_context(pending.context, context)
+            {
+                pending.context = context;
+            }
+            if pending.context == context && !pending.sent {
+                pending.sent = true;
+                deliveries.push(pending.ack.clone());
+            }
+        }
+        deliveries
+    }
+
+    pub(crate) fn queue_ack(&self, context: ConflictUiContext, ack: ConflictUiAck) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.acks.iter().any(|pending| {
+                same_runtime_context(pending.context, context) && pending.ack.token == ack.token
+            }) {
+                return;
+            }
+            state.acks.push_back(PendingAck {
+                context,
+                ack,
+                sent: false,
+            });
+        }
+        self.signal_change();
+    }
+
+    pub(crate) fn acknowledge_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let before = state.acks.len();
+        state
             .acks
-            .retain(|(target, ack)| *target != context || !tokens.contains(ack.token.as_str()));
+            .retain(|pending| pending.context != context || pending.ack.token != token);
+        state.acks.len() != before
+    }
+
+    pub(crate) fn retry_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        let retry = self.defer_ack(context, token);
+        if retry {
+            self.signal_change();
+        }
+        retry
+    }
+
+    pub(crate) fn retry_dialog(&self, context: ConflictUiContext, token: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(binding) = state
+            .bindings
+            .get(token)
+            .filter(|binding| binding.context == context && binding.head.is_empty())
+            .cloned()
+        else {
+            return false;
+        };
+        let removed = state.presented.remove(&(binding.key, context));
+        state
+            .bindings
+            .retain(|_, current| current.key != binding.key || current.context != context);
+        drop(state);
+        if removed {
+            self.signal_change();
+        }
+        removed
+    }
+
+    pub(crate) fn defer_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(pending) = state
+            .acks
+            .iter_mut()
+            .find(|pending| pending.context == context && pending.ack.token == token)
+        else {
+            return false;
+        };
+        pending.sent = false;
+        true
     }
 
     pub(crate) fn retry_context(&self, context: ConflictUiContext) {
@@ -372,15 +455,23 @@ impl LocalConflictCoordinator {
         state
             .presented
             .retain(|(_, presented)| *presented != context);
-        self.bump_revision();
     }
 
-    pub(crate) fn invalidate_ui_context(&self) {
+    pub(crate) fn retain_ui_windows(&self, generations: &[u64]) {
+        let generations = generations.iter().copied().collect::<HashSet<_>>();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.bindings.clear();
-        state.presented.clear();
-        state.acks.clear();
-        self.bump_revision();
+        state
+            .bindings
+            .retain(|_, binding| generations.contains(&binding.context.window_generation));
+        state
+            .presented
+            .retain(|(_, context)| generations.contains(&context.window_generation));
+        for pending in &mut state.acks {
+            if !generations.contains(&pending.context.window_generation) {
+                pending.context.window_generation = 0;
+                pending.sent = false;
+            }
+        }
     }
 
     pub(crate) fn cancel_pending(&self) -> bool {
@@ -393,13 +484,9 @@ impl LocalConflictCoordinator {
         state.acks.clear();
         drop(state);
         if canceled {
-            self.bump_revision();
+            self.signal_change();
         }
         canceled
-    }
-
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
     }
 
     fn finish_choice(&self, choice: Choice, result: Result<(), String>) {
@@ -417,9 +504,9 @@ impl LocalConflictCoordinator {
                 Ok(()) => {
                     state.pending.remove(&choice.key);
                     discard_key_bindings(&mut state, choice.key);
-                    state.acks.push_back((
-                        choice.context,
-                        ConflictUiAck {
+                    state.acks.push_back(PendingAck {
+                        context: choice.context,
+                        ack: ConflictUiAck {
                             token: choice.token,
                             app_id: choice.key.1,
                             accepted: true,
@@ -427,7 +514,8 @@ impl LocalConflictCoordinator {
                             resume_launch: true,
                             cancel_launch: false,
                         },
-                    ));
+                        sent: false,
+                    });
                 }
                 Err(message) => {
                     tracing::warn!(
@@ -440,9 +528,9 @@ impl LocalConflictCoordinator {
                         pending.resolving = false;
                     }
                     state.presented.retain(|(key, _)| *key != choice.key);
-                    state.acks.push_back((
-                        choice.context,
-                        ConflictUiAck {
+                    state.acks.push_back(PendingAck {
+                        context: choice.context,
+                        ack: ConflictUiAck {
                             token: choice.token,
                             app_id: choice.key.1,
                             accepted: false,
@@ -450,15 +538,16 @@ impl LocalConflictCoordinator {
                             resume_launch: false,
                             cancel_launch: false,
                         },
-                    ));
+                        sent: false,
+                    });
                 }
             }
         }
-        self.bump_revision();
+        self.signal_change();
     }
 
-    fn bump_revision(&self) {
-        self.revision.fetch_add(1, Ordering::AcqRel);
+    fn signal_change(&self) {
+        vapor_forge_features::toast::request_ui_work();
     }
 }
 
@@ -497,6 +586,13 @@ fn apply_choice(choice: &Choice, gc: &LocalGcCoordinator) -> Result<(), String> 
 fn discard_key_bindings(state: &mut State, key: (u64, u32)) {
     state.bindings.retain(|_, binding| binding.key != key);
     state.presented.retain(|(presented, _)| *presented != key);
+}
+
+fn same_runtime_context(left: ConflictUiContext, right: ConflictUiContext) -> bool {
+    left.steam_id64 == right.steam_id64
+        && left.identity_generation == right.identity_generation
+        && left.connection_generation == right.connection_generation
+        && left.cloud_scope == right.cloud_scope
 }
 
 fn next_token(key: (u64, u32), head: &str, context: ConflictUiContext) -> String {
@@ -573,6 +669,17 @@ mod tests {
             connection_generation: 3,
             window_generation: 4,
             cloud_scope: settings.conflict_scope(),
+        }
+    }
+
+    fn ack(token: &str, app_id: u32) -> ConflictUiAck {
+        ConflictUiAck {
+            token: token.to_owned(),
+            app_id,
+            accepted: true,
+            error: String::new(),
+            resume_launch: true,
+            cancel_launch: false,
         }
     }
 
@@ -711,6 +818,51 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_receipts_are_context_bound_and_idempotent() {
+        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let target = context();
+        let token = "a".repeat(64);
+        coordinator.queue_ack(target, ack(&token, 480));
+        coordinator.queue_ack(target, ack(&token, 480));
+
+        assert_eq!(coordinator.acks(target).len(), 1);
+        assert_eq!(coordinator.ack_deliveries(target).len(), 1);
+        assert!(coordinator.ack_deliveries(target).is_empty());
+        assert!(coordinator.retry_ack(target, &token));
+        assert_eq!(coordinator.ack_deliveries(target).len(), 1);
+        assert!(!coordinator.acknowledge_ack(
+            ConflictUiContext {
+                window_generation: target.window_generation + 1,
+                ..target
+            },
+            &token,
+        ));
+        assert_eq!(coordinator.acks(target).len(), 1);
+        assert!(coordinator.acknowledge_ack(target, &token));
+        assert!(!coordinator.acknowledge_ack(target, &token));
+    }
+
+    #[test]
+    fn window_changes_preserve_acknowledgements_for_live_windows() {
+        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let first = context();
+        let second = ConflictUiContext {
+            window_generation: first.window_generation + 1,
+            ..first
+        };
+        coordinator.queue_ack(first, ack(&"a".repeat(64), 480));
+        coordinator.queue_ack(second, ack(&"b".repeat(64), 481));
+
+        coordinator.retain_ui_windows(&[first.window_generation]);
+
+        let deliveries = coordinator.ack_deliveries(first);
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].app_id, 480);
+        assert_eq!(deliveries[1].app_id, 481);
+        assert!(coordinator.acks(second).is_empty());
+    }
+
+    #[test]
     fn registered_conflict_is_presented_only_after_launch_arms_it() {
         let gc = Arc::new(LocalGcCoordinator::new());
         let coordinator = LocalConflictCoordinator::new(gc);
@@ -729,6 +881,30 @@ mod tests {
 
         assert!(coordinator.arm(&settings(), 480, &identity, &view, true, 0));
         assert_eq!(coordinator.dialogs(context()).len(), 1);
+    }
+
+    #[test]
+    fn failed_dialog_delivery_is_rearmed_by_its_cancel_token() {
+        let coordinator = LocalConflictCoordinator::new(Arc::new(LocalGcCoordinator::new()));
+        let view = StoreView {
+            current_change_number: None,
+            max_revision: 9,
+            heads: vec![candidate('a', 7), candidate('b', 8), candidate('c', 9)],
+        };
+        let identity = CommitIdentity {
+            client_id: 7,
+            machine_name: "device-7".into(),
+        };
+        coordinator.arm(&settings(), 480, &identity, &view, true, 0);
+        let first = coordinator.dialogs(context()).remove(0);
+
+        assert!(coordinator.dialogs(context()).is_empty());
+        assert!(!coordinator.retry_dialog(context(), &"0".repeat(64)));
+        assert!(coordinator.retry_dialog(context(), &first.cancel_token));
+
+        let second = coordinator.dialogs(context()).remove(0);
+        assert_ne!(second.cancel_token, first.cancel_token);
+        assert!(!coordinator.retry_dialog(context(), &first.cancel_token));
     }
 
     #[test]

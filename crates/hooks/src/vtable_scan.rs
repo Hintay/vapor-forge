@@ -26,6 +26,7 @@ pub struct Method {
 pub struct Interface {
     pub name: String,
     pub vtable_va: usize,
+    pub candidate_count: usize,
     pub methods: Vec<Method>,
 }
 
@@ -33,6 +34,7 @@ struct ScanResult {
     interfaces: Vec<Interface>,
     by_name: HashMap<String, usize>,
     class_vtables: HashMap<String, Vec<ClassVtable>>,
+    segments: SegmentRanges,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +107,74 @@ pub fn method_address(class: &str, slot: usize) -> Option<usize> {
         .methods
         .get(slot)
         .map(|method| method.func_va)
+}
+
+pub fn config_store_uint64_method_address(
+    method_kind: vapor_forge_patterns::vtable_scan::ConfigStoreUint64Method,
+) -> Result<usize, String> {
+    use vapor_forge_patterns::vtable_scan::{config_store_uint64_wrapper_evidence, ElfClass};
+
+    let result = SCAN_RESULT
+        .get()
+        .ok_or_else(|| "vtable scan is unavailable".to_owned())?;
+    let index = *result
+        .by_name
+        .get("IClientConfigStore")
+        .ok_or_else(|| "IClientConfigStore vtable is unavailable".to_owned())?;
+    let interface = &result.interfaces[index];
+    if interface.candidate_count != 1 {
+        return Err(format!(
+            "IClientConfigStore produced {} RTTI vtables",
+            interface.candidate_count
+        ));
+    }
+    let methods = interface
+        .methods
+        .iter()
+        .filter(|method| method.name == method_kind.name())
+        .collect::<Vec<_>>();
+    if methods.len() != 1 {
+        return Err(format!(
+            "IClientConfigStore::{} produced {} slots",
+            method_kind.name(),
+            methods.len()
+        ));
+    }
+    let method = methods[0];
+    if method.slot != method_kind.slot() {
+        return Err(format!(
+            "IClientConfigStore::{} is slot {}, expected {}",
+            method_kind.name(),
+            method.slot,
+            method_kind.slot()
+        ));
+    }
+    if method.func_hash == 0 {
+        return Err(format!(
+            "IClientConfigStore::{} IPC hash is unavailable",
+            method_kind.name()
+        ));
+    }
+    let bytes = mapped_slice(&result.segments.text, method.func_va, 0x240).ok_or_else(|| {
+        format!(
+            "IClientConfigStore::{} body is unreadable",
+            method_kind.name()
+        )
+    })?;
+    let class = if std::mem::size_of::<usize>() == 8 {
+        ElfClass::Elf64
+    } else {
+        ElfClass::Elf32
+    };
+    let evidence = config_store_uint64_wrapper_evidence(bytes, class, method_kind);
+    if !evidence.is_complete() {
+        return Err(format!(
+            "IClientConfigStore::{} ABI validation failed: {}",
+            method_kind.name(),
+            evidence.describe()
+        ));
+    }
+    Ok(method.func_va)
 }
 
 pub fn interface_slot_count(iface: &str) -> Option<usize> {
@@ -198,11 +268,16 @@ fn do_scan() {
             continue;
         }
 
-        if let Some(&existing_idx) = by_name.get(&iface_name) {
+        let candidate_count = if let Some(&existing_idx) = by_name.get(&iface_name) {
+            let candidate_count = interfaces[existing_idx].candidate_count + 1;
             if interfaces[existing_idx].methods.len() >= candidate.slots.len() {
+                interfaces[existing_idx].candidate_count = candidate_count;
                 continue;
             }
-        }
+            candidate_count
+        } else {
+            1
+        };
 
         let mut methods = Vec::with_capacity(candidate.slots.len());
         for (idx, &slot_va) in candidate.slots.iter().enumerate() {
@@ -218,6 +293,7 @@ fn do_scan() {
         let rec = Interface {
             name: iface_name.clone(),
             vtable_va: candidate.vtable_va,
+            candidate_count,
             methods,
         };
 
@@ -258,6 +334,7 @@ fn do_scan() {
         debug!(
             iface = iface.name.as_str(),
             vtable = format_args!("0x{:x}", iface.vtable_va),
+            candidates = iface.candidate_count,
             slots = iface.methods.len(),
             named = named.len(),
             "vtable-scan: interface found"
@@ -268,6 +345,7 @@ fn do_scan() {
         interfaces,
         by_name,
         class_vtables,
+        segments: segs,
     });
 }
 

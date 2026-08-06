@@ -59,6 +59,8 @@ static STATS_REQUESTS: once_cell::sync::Lazy<Mutex<VecDeque<(u64, u32)>>> =
 static PENDING_LOGIN_DEVICE: once_cell::sync::Lazy<
     Mutex<Option<vapor_forge_steam_protocol::ClientLogOnDevice>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(None));
+static PENDING_CLIENT_ID_LOGIN: once_cell::sync::Lazy<Mutex<Option<LoginCompletion>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 // A protected app without AppAvatar must not upload unscoped Rich Presence.
 static BLOCKED_RICH_PRESENCE_APP: AtomicU32 = AtomicU32::new(0);
@@ -76,33 +78,42 @@ pub enum SendFrameDecision {
 
 fn record_login_device(body: &[u8]) {
     let device = vapor_forge_steam_protocol::client_logon_device(body);
+    clear_pending_client_id_login();
     if let Ok(mut current) = PENDING_LOGIN_DEVICE.lock() {
         *current = device;
     }
 }
 
+pub(super) enum RecvPostAction {
+    LoginCompleted(LoginCompletion),
+}
+
+pub(super) struct LoginCompletion {
+    steam_id: u64,
+    device: Option<vapor_forge_steam_protocol::ClientLogOnDevice>,
+}
+
 struct LoginDeviceCompletion {
     changed: bool,
-    metadata_matched: bool,
+    metadata_present: bool,
     machine_name_present: bool,
     os_type: Option<i64>,
     device_type: Option<i64>,
 }
 
-fn complete_login_device(client_id: u64) -> LoginDeviceCompletion {
-    let pending = PENDING_LOGIN_DEVICE
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.take())
-        .filter(|device| {
-            device
-                .client_instance_id
-                .is_none_or(|request_client_id| request_client_id == client_id)
-        });
-    let Some(device) = pending else {
+fn take_login_device() -> Option<vapor_forge_steam_protocol::ClientLogOnDevice> {
+    let mut pending = PENDING_LOGIN_DEVICE.lock().ok()?;
+    pending.take()
+}
+
+fn complete_login_device(
+    device: Option<vapor_forge_steam_protocol::ClientLogOnDevice>,
+    client_id: u64,
+) -> LoginDeviceCompletion {
+    let Some(device) = device else {
         return LoginDeviceCompletion {
             changed: vapor_forge_cloud_core::record_local_client_id(client_id),
-            metadata_matched: false,
+            metadata_present: false,
             machine_name_present: false,
             os_type: None,
             device_type: None,
@@ -110,7 +121,7 @@ fn complete_login_device(client_id: u64) -> LoginDeviceCompletion {
     };
     let completion = LoginDeviceCompletion {
         changed: false,
-        metadata_matched: true,
+        metadata_present: true,
         machine_name_present: !device.machine_name.trim().is_empty(),
         os_type: device.os_type,
         device_type: device.device_type,
@@ -132,6 +143,94 @@ fn clear_pending_login_device() {
     if let Ok(mut pending) = PENDING_LOGIN_DEVICE.lock() {
         pending.take();
     }
+    clear_pending_client_id_login();
+}
+
+fn clear_pending_client_id_login() {
+    crate::client::client_id::cancel_capture();
+    if let Ok(mut pending) = PENDING_CLIENT_ID_LOGIN.lock() {
+        pending.take();
+    }
+}
+
+pub(super) fn prepare_recv_post_action(buf: &[u8]) -> Option<RecvPostAction> {
+    let emsg_raw = u32::from_le_bytes(buf.get(..4)?.try_into().ok()?);
+    let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
+    if emsg == EMSG_CLIENT_LOGGED_OFF {
+        clear_pending_login_device();
+        crate::client::set_authoritative_steam_id(0);
+        return None;
+    }
+    if emsg != EMSG_CLIENT_LOG_ON_RESPONSE {
+        return None;
+    }
+
+    let (_, header, body) = vapor_forge_steam_protocol::unpack_raw(buf)?;
+    let Some(steam_id) = vapor_forge_steam_protocol::successful_logon_steam_id(header, body) else {
+        clear_pending_login_device();
+        return None;
+    };
+
+    Some(RecvPostAction::LoginCompleted(LoginCompletion {
+        steam_id,
+        device: take_login_device(),
+    }))
+}
+
+pub(super) fn complete_recv_post_action(action: RecvPostAction) {
+    match action {
+        RecvPostAction::LoginCompleted(login) => complete_login_after_recv(login),
+    }
+}
+
+fn complete_login_after_recv(login: LoginCompletion) {
+    crate::client::set_authoritative_steam_id(login.steam_id);
+    let steam_id = login.steam_id;
+    if let Ok(mut pending) = PENDING_CLIENT_ID_LOGIN.lock() {
+        *pending = Some(login);
+    } else {
+        warn!(steam_id, "CM login: device identity state is unavailable");
+        return;
+    }
+    if !crate::client::user_stats::queue_client_id_capture(steam_id) {
+        clear_pending_client_id_login();
+        warn!(steam_id, "CM login: ClientID worker is unavailable");
+    }
+}
+
+pub(crate) fn cancel_client_id_capture() {
+    clear_pending_client_id_login();
+}
+
+pub(crate) fn complete_client_id_capture(client_id: u64) {
+    let Some(login) = PENDING_CLIENT_ID_LOGIN
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+    else {
+        return;
+    };
+    if vapor_forge_features::identity::steam_id() != login.steam_id {
+        warn!(
+            login_steam_id = login.steam_id,
+            active_steam_id = vapor_forge_features::identity::steam_id(),
+            "CM login: discarded ClientID from stale login"
+        );
+        return;
+    }
+    let completion = complete_login_device(login.device, client_id);
+    if completion.changed {
+        notify_device_context_changed();
+    }
+    info!(
+        steam_id = login.steam_id,
+        client_id,
+        metadata_present = completion.metadata_present,
+        machine_name_present = completion.machine_name_present,
+        os_type = ?completion.os_type,
+        device_type = ?completion.device_type,
+        "CM login: device identity captured"
+    );
 }
 
 pub(super) enum RecvFrameDecision {
@@ -296,8 +395,12 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                 header_bytes,
                 body_bytes,
                 data,
-                &runtime.config,
-                &runtime.script_state.stat_steam_ids,
+                stats_proxy::StatsProxyContext::new(
+                    runtime.generation,
+                    crate::client::network::injection_generation(),
+                    &runtime.config,
+                    &runtime.script_state.stat_steam_ids,
+                ),
             ) {
                 return decision;
             }
@@ -315,14 +418,19 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             header_bytes,
             body_bytes,
             data,
-            &runtime.config,
-            &runtime.script_state.stat_steam_ids,
+            stats_proxy::StatsProxyContext::new(
+                runtime.generation,
+                crate::client::network::injection_generation(),
+                &runtime.config,
+                &runtime.script_state.stat_steam_ids,
+            ),
         ) {
             return decision;
         }
     }
 
     if emsg == EMSG_STORE_USERSTATS || emsg == EMSG_STORE_USERSTATS2 {
+        let response_generation = crate::client::network::injection_generation();
         let runtime = crate::client::install::runtime_snapshot();
         match valve_filter::store_stats_action(emsg, header_bytes, body_bytes, &runtime.config) {
             PrivacyAction::Pass => {}
@@ -337,6 +445,10 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
                         app_id,
                         emsg, "netpacket: native response delivery unavailable"
                     );
+                    return SendFrameDecision::Retry;
+                }
+                if crate::client::network::injection_generation() != response_generation {
+                    warn!(app_id, emsg, "netpacket: StoreStats connection changed");
                     return SendFrameDecision::Retry;
                 }
                 let requires_marker = runtime.config.cloud_enabled_for_controlled_apps();
@@ -819,7 +931,7 @@ fn inject_access_tokens(
         }
         app.access_token = Some(token);
         changed = true;
-        debug!(app_id = app_id.0, token, "netpacket: access token injected");
+        debug!(app_id = app_id.0, "netpacket: access token injected");
     }
     if changed {
         Some(req.encode_to_vec())
@@ -895,34 +1007,6 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
         return RecvFrameDecision::Pass;
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
-    if emsg == EMSG_CLIENT_LOG_ON_RESPONSE {
-        if let Some((steam_id, client_id)) =
-            vapor_forge_steam_protocol::successful_logon_identity(hdr_bytes, body_bytes)
-        {
-            crate::client::set_authoritative_steam_id(steam_id);
-            if let Some(client_id) = client_id {
-                let completion = complete_login_device(client_id);
-                if completion.changed {
-                    notify_device_context_changed();
-                }
-                info!(
-                    client_id,
-                    metadata_matched = completion.metadata_matched,
-                    machine_name_present = completion.machine_name_present,
-                    os_type = ?completion.os_type,
-                    device_type = ?completion.device_type,
-                    "CM login: device identity captured"
-                );
-            } else {
-                clear_pending_login_device();
-            }
-        } else {
-            clear_pending_login_device();
-        }
-    } else if emsg == EMSG_CLIENT_LOGGED_OFF {
-        clear_pending_login_device();
-        crate::client::set_authoritative_steam_id(0);
-    }
     let mut change = PacketChange::Unchanged;
     let mut final_len = None;
     let mut replacement = None;
@@ -1025,14 +1109,18 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
 
     // Legacy response (819): keep schema, remove reference-account values.
     if emsg == EMSG_REQUEST_USERSTATS_RESPONSE {
-        if let Some(decision) = stats_proxy::handle_proxy_legacy_stats_response(body_bytes) {
-            crate::packet_capture::capture(
-                PacketDirection::Recv,
-                buf,
-                PacketChange::Dropped,
-                Some(0),
-            );
-            return decision;
+        if let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) {
+            if let Some(decision) =
+                stats_proxy::handle_proxy_legacy_stats_response(&hdr, body_bytes)
+            {
+                crate::packet_capture::capture(
+                    PacketDirection::Recv,
+                    buf,
+                    PacketChange::Dropped,
+                    Some(0),
+                );
+                return decision;
+            }
         }
         let config = crate::client::install::config();
         let original_stats =

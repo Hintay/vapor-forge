@@ -16,13 +16,16 @@ path = "src/bin/vapor-forge-ticket-tool.rs"
 required-features = ["tools"]
 
 [dependencies]
+fs2.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-core = { path = "../runtime-core" }
+vapor-forge-patterns = { path = "../patterns" }
 vapor-forge-tool-support = { path = "../tool-support", optional = true }
 tracing.workspace = true
 ureq.workspace = true

@@ -183,10 +183,6 @@ impl CloudRpcQueue {
         }
     }
 
-    pub fn conflict_ui_revision(&self) -> u64 {
-        self.local_conflicts.revision()
-    }
-
     pub fn set_conflict_ui_ready(&self, ready: bool) {
         self.local_conflicts.set_ui_ready(ready);
     }
@@ -203,30 +199,42 @@ impl CloudRpcQueue {
         self.local_conflicts.submit(token, context)
     }
 
-    pub fn conflict_acks(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
-        self.local_conflicts.acks(context)
+    pub fn conflict_ack_deliveries(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
+        self.local_conflicts.ack_deliveries(context)
     }
 
-    pub fn acknowledge_conflict_acks(&self, context: ConflictUiContext, tokens: &[String]) {
-        self.local_conflicts.acknowledge_acks(context, tokens);
+    pub fn queue_conflict_ack(&self, context: ConflictUiContext, ack: ConflictUiAck) {
+        self.local_conflicts.queue_ack(context, ack);
+    }
+
+    pub fn acknowledge_conflict_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        self.local_conflicts.acknowledge_ack(context, token)
+    }
+
+    pub fn retry_conflict_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        self.local_conflicts.retry_ack(context, token)
+    }
+
+    pub fn retry_conflict_dialog(&self, context: ConflictUiContext, token: &str) -> bool {
+        self.local_conflicts.retry_dialog(context, token)
+    }
+
+    pub fn defer_conflict_ack(&self, context: ConflictUiContext, token: &str) -> bool {
+        self.local_conflicts.defer_ack(context, token)
     }
 
     pub fn retry_conflict_ui_context(&self, context: ConflictUiContext) {
         self.local_conflicts.retry_context(context);
     }
 
-    pub fn invalidate_conflict_ui_context(&self) {
-        self.local_conflicts.invalidate_ui_context();
+    pub fn retain_conflict_ui_windows(&self, generations: &[u64]) {
+        self.local_conflicts.retain_ui_windows(generations);
     }
 
     pub fn cancel_pending_conflicts(&self) {
         self.context_epoch.fetch_add(1, Ordering::AcqRel);
         self.local_gc.invalidate();
-        if self.local_conflicts.cancel_pending() {
-            vapor_forge_features::inject_wake::wake(
-                vapor_forge_features::inject_wake::InjectionSource::Cloud,
-            );
-        }
+        self.local_conflicts.cancel_pending();
     }
 
     pub fn invalidate_local_gc(&self) {

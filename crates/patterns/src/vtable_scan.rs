@@ -13,6 +13,7 @@ const EARLY_SCAN: usize = 0x400;
 pub const DEFAULT_INTERFACES: &[&str] = &[
     "IClientAppManager",
     "IClientApps",
+    "IClientConfigStore",
     "IClientRemoteStorage",
     "IClientUser",
     "IClientUserStats",
@@ -31,6 +32,7 @@ pub struct VtableScanReport {
 pub struct Interface {
     pub name: String,
     pub vtable_va: u64,
+    pub candidate_count: usize,
     pub methods: Vec<Method>,
 }
 
@@ -40,6 +42,84 @@ pub struct Method {
     pub name: String,
     pub func_va: u64,
     pub func_hash: u32,
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigStoreUint64Method {
+    Get,
+    Set,
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+impl ConfigStoreUint64Method {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Get => "GetUint64",
+            Self::Set => "SetUint64",
+        }
+    }
+
+    pub fn slot(self) -> usize {
+        match self {
+            Self::Get => 3,
+            Self::Set => 11,
+        }
+    }
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConfigStoreUint64AbiEvidence {
+    pub this_argument: bool,
+    pub store_argument: bool,
+    pub key_argument: bool,
+    pub value_argument: bool,
+    pub dword_serialization: bool,
+    pub qword_serialization: bool,
+    pub return_value: bool,
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigStoreUint64AbiSummary {
+    pub get_slot: usize,
+    pub set_slot: usize,
+    pub get_hash: u32,
+    pub set_hash: u32,
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+impl ConfigStoreUint64AbiEvidence {
+    pub fn is_complete(self) -> bool {
+        self.this_argument
+            && self.store_argument
+            && self.key_argument
+            && self.value_argument
+            && self.dword_serialization
+            && self.qword_serialization
+            && self.return_value
+    }
+
+    pub fn describe(self) -> String {
+        let missing = [
+            ("this argument", self.this_argument),
+            ("store argument", self.store_argument),
+            ("key argument", self.key_argument),
+            ("uint64 argument", self.value_argument),
+            ("32-bit serialization", self.dword_serialization),
+            ("64-bit serialization", self.qword_serialization),
+            ("return value", self.return_value),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| (!present).then_some(name))
+        .collect::<Vec<_>>();
+        if missing.is_empty() {
+            "complete".to_owned()
+        } else {
+            format!("missing {}", missing.join(", "))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -77,11 +157,16 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
             continue;
         }
 
-        if let Some(&existing) = by_name.get(&name) {
+        let candidate_count = if let Some(&existing) = by_name.get(&name) {
+            let candidate_count = found[existing].candidate_count + 1;
             if found[existing].methods.len() >= candidate.slots.len() {
+                found[existing].candidate_count = candidate_count;
                 continue;
             }
-        }
+            candidate_count
+        } else {
+            1
+        };
 
         let methods = candidate
             .slots
@@ -101,11 +186,16 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
         let interface = Interface {
             name: name.clone(),
             vtable_va: candidate.vtable_va,
+            candidate_count,
             methods,
         };
 
         if let Some(&existing) = by_name.get(&name) {
-            found[existing] = interface;
+            if found[existing].methods.len() < interface.methods.len() {
+                found[existing] = interface;
+            } else {
+                found[existing].candidate_count = candidate_count;
+            }
         } else {
             by_name.insert(name, found.len());
             found.push(interface);
@@ -119,6 +209,222 @@ pub fn scan_file(path: &Path, interfaces: Option<&[String]>) -> Result<VtableSca
         elf_class: image.class,
         candidate_count: candidates.len(),
         interfaces: found,
+    })
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+pub fn config_store_uint64_wrapper_evidence(
+    bytes: &[u8],
+    class: ElfClass,
+    method: ConfigStoreUint64Method,
+) -> ConfigStoreUint64AbiEvidence {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::with_ip(class.bits().into(), bytes, 0, DecoderOptions::NONE);
+    let mut evidence = ConfigStoreUint64AbiEvidence::default();
+    let mut before_first_call = true;
+    let mut x86_value_low = false;
+    let mut x86_value_high = false;
+    let mut x86_return_low = false;
+    let mut x86_return_high = false;
+
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+
+        if class == ElfClass::Elf64 && before_first_call {
+            let source = (instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op1_kind() == OpKind::Register)
+                .then(|| instruction.op1_register());
+            evidence.this_argument |= source == Some(Register::RDI);
+            evidence.store_argument |= source == Some(Register::ESI);
+            evidence.key_argument |= source == Some(Register::RDX);
+            evidence.value_argument |= source == Some(Register::RCX);
+        }
+
+        if class == ElfClass::Elf32 && instruction.memory_base() == Register::EBP {
+            match instruction.memory_displacement64() {
+                0x08 => evidence.this_argument = true,
+                0x0c => evidence.store_argument = true,
+                0x10 => evidence.key_argument = true,
+                0x14 => {
+                    x86_value_low = true;
+                    x86_value_high |= instruction.memory_size().size() == 8;
+                }
+                0x18 => x86_value_high = true,
+                _ => {}
+            }
+        }
+
+        let width = match class {
+            ElfClass::Elf32 if instruction.mnemonic() == Mnemonic::Push => {
+                instruction_immediate(&instruction, 0)
+            }
+            ElfClass::Elf64
+                if instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op0_kind() == OpKind::Register
+                    && instruction.op0_register() == Register::EDX =>
+            {
+                instruction_immediate(&instruction, 1)
+            }
+            _ => None,
+        };
+        evidence.dword_serialization |= width == Some(4);
+        evidence.qword_serialization |= width == Some(8);
+
+        if evidence.qword_serialization {
+            evidence.return_value |= match (class, method) {
+                (ElfClass::Elf64, ConfigStoreUint64Method::Get) => {
+                    instruction.mnemonic() == Mnemonic::Mov
+                        && instruction.op0_kind() == OpKind::Register
+                        && instruction.op0_register() == Register::RAX
+                        && instruction.op1_kind() == OpKind::Register
+                }
+                (ElfClass::Elf64, ConfigStoreUint64Method::Set) => {
+                    instruction.mnemonic() == Mnemonic::Mov
+                        && instruction.op0_kind() == OpKind::Register
+                        && instruction.op0_register() == Register::EAX
+                        && instruction.op1_kind() == OpKind::Register
+                }
+                (ElfClass::Elf32, ConfigStoreUint64Method::Get) => {
+                    let writes_return_register =
+                        matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Movd)
+                            && instruction.op0_kind() == OpKind::Register
+                            && matches!(instruction.op0_register(), Register::EAX | Register::EDX);
+                    if writes_return_register {
+                        x86_return_low |= instruction.op0_register() == Register::EAX;
+                        x86_return_high |= instruction.op0_register() == Register::EDX;
+                    }
+                    x86_return_low && x86_return_high
+                }
+                (ElfClass::Elf32, ConfigStoreUint64Method::Set) => {
+                    instruction.mnemonic() == Mnemonic::Movzx
+                        && instruction.op0_kind() == OpKind::Register
+                        && instruction.op0_register() == Register::EAX
+                        && instruction.op1_kind() == OpKind::Memory
+                }
+            };
+        }
+
+        if matches!(
+            instruction.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            before_first_call = false;
+        }
+        if instruction.flow_control() == FlowControl::Return {
+            break;
+        }
+    }
+
+    if class == ElfClass::Elf32 {
+        evidence.value_argument = x86_value_low && x86_value_high;
+        if method == ConfigStoreUint64Method::Get {
+            evidence.return_value = x86_return_low && x86_return_high;
+        }
+    }
+
+    evidence
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+pub fn validate_config_store_uint64_abi(
+    path: &Path,
+    report: &VtableScanReport,
+) -> Result<ConfigStoreUint64AbiSummary, String> {
+    let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let image = ElfImage::parse(&data)?;
+    let interface = report
+        .interfaces
+        .iter()
+        .find(|interface| interface.name == "IClientConfigStore")
+        .ok_or_else(|| "IClientConfigStore vtable was not found".to_owned())?;
+    if interface.candidate_count != 1 {
+        return Err(format!(
+            "IClientConfigStore produced {} RTTI vtables",
+            interface.candidate_count
+        ));
+    }
+
+    let mut slots = [0usize; 2];
+    let mut hashes = [0u32; 2];
+    for (index, method_kind) in [ConfigStoreUint64Method::Get, ConfigStoreUint64Method::Set]
+        .into_iter()
+        .enumerate()
+    {
+        let methods = interface
+            .methods
+            .iter()
+            .filter(|method| method.name == method_kind.name())
+            .collect::<Vec<_>>();
+        if methods.len() != 1 {
+            return Err(format!(
+                "IClientConfigStore::{} produced {} slots",
+                method_kind.name(),
+                methods.len()
+            ));
+        }
+        let method = methods[0];
+        if method.slot != method_kind.slot() {
+            return Err(format!(
+                "IClientConfigStore::{} is slot {}, expected {}",
+                method_kind.name(),
+                method.slot,
+                method_kind.slot()
+            ));
+        }
+        if method.func_hash == 0 {
+            return Err(format!(
+                "IClientConfigStore::{} IPC hash was not decoded",
+                method_kind.name()
+            ));
+        }
+        let offset = image.va_to_offset(method.func_va).ok_or_else(|| {
+            format!(
+                "IClientConfigStore::{} wrapper is outside the file image",
+                method_kind.name()
+            )
+        })?;
+        let bytes = &data[offset..data.len().min(offset.saturating_add(0x240))];
+        let evidence = config_store_uint64_wrapper_evidence(bytes, image.class, method_kind);
+        if !evidence.is_complete() {
+            return Err(format!(
+                "IClientConfigStore::{} ABI validation failed: {}",
+                method_kind.name(),
+                evidence.describe()
+            ));
+        }
+        slots[index] = method.slot;
+        hashes[index] = method.func_hash;
+    }
+    if hashes[0] == hashes[1] {
+        return Err("GetUint64 and SetUint64 share an IPC hash".to_owned());
+    }
+
+    Ok(ConfigStoreUint64AbiSummary {
+        get_slot: slots[0],
+        set_slot: slots[1],
+        get_hash: hashes[0],
+        set_hash: hashes[1],
+    })
+}
+
+#[cfg(any(feature = "tools", feature = "runtime-semantic"))]
+fn instruction_immediate(instruction: &iced_x86::Instruction, operand: u32) -> Option<u64> {
+    use iced_x86::OpKind;
+
+    Some(match instruction.op_kind(operand) {
+        OpKind::Immediate8 => u64::from(instruction.immediate8()),
+        OpKind::Immediate8to16 => instruction.immediate8to16() as u64,
+        OpKind::Immediate8to32 => instruction.immediate8to32() as u64,
+        OpKind::Immediate8to64 => instruction.immediate8to64() as u64,
+        OpKind::Immediate16 => u64::from(instruction.immediate16()),
+        OpKind::Immediate32 => u64::from(instruction.immediate32()),
+        OpKind::Immediate32to64 => instruction.immediate32to64() as u64,
+        OpKind::Immediate64 => instruction.immediate64(),
+        _ => return None,
     })
 }
 
@@ -443,4 +749,140 @@ fn is_method_shape(text: &str) -> bool {
     text.as_bytes()
         .first()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+}
+
+#[cfg(all(test, any(feature = "tools", feature = "runtime-semantic")))]
+mod tests {
+    use iced_x86::code_asm::*;
+
+    use super::*;
+
+    fn wrapper64(method: ConfigStoreUint64Method, include_key: bool) -> Vec<u8> {
+        let mut asm = CodeAssembler::new(64).unwrap();
+        asm.mov(rbx, rdi).unwrap();
+        asm.mov(r14d, esi).unwrap();
+        if include_key {
+            asm.mov(r13, rdx).unwrap();
+        }
+        asm.mov(r12, rcx).unwrap();
+        asm.mov(edx, 4).unwrap();
+        asm.mov(edx, 8).unwrap();
+        match method {
+            ConfigStoreUint64Method::Get => asm.mov(rax, r12).unwrap(),
+            ConfigStoreUint64Method::Set => asm.mov(eax, r12d).unwrap(),
+        }
+        asm.ret().unwrap();
+        asm.assemble(0).unwrap()
+    }
+
+    fn wrapper32(method: ConfigStoreUint64Method, valid_return: bool) -> Vec<u8> {
+        let mut asm = CodeAssembler::new(32).unwrap();
+        asm.mov(eax, dword_ptr(ebp + 8)).unwrap();
+        asm.mov(ecx, dword_ptr(ebp + 0x0c)).unwrap();
+        asm.push(dword_ptr(ebp + 0x10)).unwrap();
+        asm.mov(eax, dword_ptr(ebp + 0x14)).unwrap();
+        asm.mov(edx, dword_ptr(ebp + 0x18)).unwrap();
+        asm.push(4).unwrap();
+        asm.push(8).unwrap();
+        match method {
+            ConfigStoreUint64Method::Get => {
+                asm.mov(eax, dword_ptr(ebp - 8)).unwrap();
+                asm.mov(edx, dword_ptr(ebp - 4)).unwrap();
+            }
+            ConfigStoreUint64Method::Set if valid_return => {
+                asm.movzx(eax, byte_ptr(ebp - 1)).unwrap();
+            }
+            ConfigStoreUint64Method::Set => {
+                asm.mov(ecx, dword_ptr(ebp - 4)).unwrap();
+            }
+        }
+        asm.ret().unwrap();
+        asm.assemble(0).unwrap()
+    }
+
+    #[test]
+    fn validates_config_store_uint64_abis() {
+        for method in [ConfigStoreUint64Method::Get, ConfigStoreUint64Method::Set] {
+            assert!(config_store_uint64_wrapper_evidence(
+                &wrapper64(method, true),
+                ElfClass::Elf64,
+                method
+            )
+            .is_complete());
+            assert!(config_store_uint64_wrapper_evidence(
+                &wrapper32(method, true),
+                ElfClass::Elf32,
+                method
+            )
+            .is_complete());
+        }
+    }
+
+    #[test]
+    fn validates_x86_packed_uint64_argument_load() {
+        for method in [ConfigStoreUint64Method::Get, ConfigStoreUint64Method::Set] {
+            let mut bytes = wrapper32(method, true);
+            let low_load = asm_bytes32(|asm| asm.mov(eax, dword_ptr(ebp + 0x14))).unwrap();
+            let high_load = asm_bytes32(|asm| asm.mov(edx, dword_ptr(ebp + 0x18))).unwrap();
+            let low_offset = bytes
+                .windows(low_load.len())
+                .position(|window| window == low_load)
+                .unwrap();
+            bytes.drain(low_offset..low_offset + low_load.len());
+            let high_offset = bytes
+                .windows(high_load.len())
+                .position(|window| window == high_load)
+                .unwrap();
+            bytes.splice(
+                high_offset..high_offset + high_load.len(),
+                asm_bytes32(|asm| asm.movq(xmm0, qword_ptr(ebp + 0x14))).unwrap(),
+            );
+
+            assert!(
+                config_store_uint64_wrapper_evidence(&bytes, ElfClass::Elf32, method).is_complete()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_config_store_uint64_abis() {
+        let missing_key = config_store_uint64_wrapper_evidence(
+            &wrapper64(ConfigStoreUint64Method::Get, false),
+            ElfClass::Elf64,
+            ConfigStoreUint64Method::Get,
+        );
+        assert!(!missing_key.is_complete());
+        assert!(!missing_key.key_argument);
+
+        let missing_return = config_store_uint64_wrapper_evidence(
+            &wrapper32(ConfigStoreUint64Method::Set, false),
+            ElfClass::Elf32,
+            ConfigStoreUint64Method::Set,
+        );
+        assert!(!missing_return.is_complete());
+        assert!(!missing_return.return_value);
+
+        let mut missing_high_return = wrapper32(ConfigStoreUint64Method::Get, true);
+        let high_return = asm_bytes32(|asm| asm.mov(edx, dword_ptr(ebp - 4))).unwrap();
+        let offset = missing_high_return
+            .windows(high_return.len())
+            .position(|window| window == high_return)
+            .unwrap();
+        missing_high_return.drain(offset..offset + high_return.len());
+        let missing_high_return = config_store_uint64_wrapper_evidence(
+            &missing_high_return,
+            ElfClass::Elf32,
+            ConfigStoreUint64Method::Get,
+        );
+        assert!(!missing_high_return.is_complete());
+        assert!(!missing_high_return.return_value);
+    }
+
+    fn asm_bytes32(
+        build: impl FnOnce(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>,
+    ) -> Option<Vec<u8>> {
+        let mut asm = CodeAssembler::new(32).ok()?;
+        build(&mut asm).ok()?;
+        asm.assemble(0).ok()
+    }
 }

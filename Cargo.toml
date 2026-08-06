@@ -58,6 +58,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 arc-swap = "1.9"
 base64 = "0.22"
+fs2 = "0.4.3"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "code_asm"] }
 # The `stream` default feature pulls tokio + futures; the watcher only uses the
 # blocking API, and this library is injected into Steam's process.

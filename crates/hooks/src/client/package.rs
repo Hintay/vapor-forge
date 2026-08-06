@@ -265,7 +265,9 @@ fn resolve_raw_address(registry: &PatternRegistry, code: &CodeRegion, name: &str
         }
     };
 
-    crate::pattern_resolver::resolve_pattern_entry(code, name, &entry)
+    let address = crate::pattern_resolver::resolve_pattern_entry(code, name, &entry)?;
+    crate::pattern_resolver::validate_resolved_pattern("steamclient", code, name, address)
+        .then_some(address)
 }
 
 /// Get the resolved GetPackageInfo function address (for hooking).

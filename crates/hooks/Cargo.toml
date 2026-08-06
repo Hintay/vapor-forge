@@ -44,7 +44,7 @@ vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-features = { path = "../features" }
 vapor-forge-memory = { path = "../memory" }
-vapor-forge-patterns = { path = "../patterns" }
+vapor-forge-patterns = { path = "../patterns", features = ["runtime-semantic"] }
 vapor-forge-sync-journal = { path = "../sync-journal" }
 prost.workspace = true
 vapor-forge-scripting = { path = "../scripting" }

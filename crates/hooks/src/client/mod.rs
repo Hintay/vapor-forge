@@ -4,6 +4,7 @@ pub mod package;
 pub(crate) mod achievement;
 pub(crate) mod callback_dispatch;
 pub(crate) mod callback_notify;
+pub(crate) mod client_id;
 pub(crate) mod cloud;
 pub(crate) mod cloud_http;
 pub(crate) mod current_app;
@@ -20,6 +21,9 @@ pub(crate) mod steam_session;
 pub(crate) mod ticket;
 pub(crate) mod user;
 pub(crate) mod user_stats;
+
+#[cfg(test)]
+pub(crate) static ACCOUNT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn reset_account_state() {
     if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
@@ -64,14 +68,10 @@ pub(crate) fn observe_steam_id(steam_id: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use vapor_forge_config::AppId;
     use vapor_forge_features::apps::{self, OwnershipState};
 
     use super::set_authoritative_steam_id;
-
-    static ACCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct AccountStateCleanup;
 
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn account_switch_discards_previous_ownership_and_license_sync() {
-        let _guard = ACCOUNT_TEST_LOCK
+        let _guard = super::ACCOUNT_TEST_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _cleanup = AccountStateCleanup;

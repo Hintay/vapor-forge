@@ -121,8 +121,9 @@ mod linux_audit {
             ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
         };
 
-        if steamclient_seen || steamui_seen {
-            ensure_runtime_initialized();
+        if (steamclient_seen || steamui_seen) && !ensure_runtime_initialized() {
+            log_early("la_activity: runtime initialization rejected; hooks disabled");
+            return;
         }
         if steamclient_seen {
             install_hook_batch(HookBatch::SteamClient);

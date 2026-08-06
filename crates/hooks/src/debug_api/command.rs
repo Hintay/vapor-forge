@@ -381,6 +381,22 @@ fn hooks_response(json_mode: bool) -> String {
                     .collect();
                 map.insert(module.module.to_owned(), serde_json::Value::Array(hooks));
             }
+            let capabilities = crate::capability::statuses()
+                .into_iter()
+                .filter(|status| status.initialized)
+                .map(|status| {
+                    json!({
+                        "name": status.capability.name(),
+                        "ready": status.ready,
+                        "policy": status.capability.failure_policy().name(),
+                        "reason": status.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            map.insert(
+                "capabilities".to_owned(),
+                serde_json::Value::Array(capabilities),
+            );
             return format!("ok {}", serde_json::Value::Object(map));
         }
 
@@ -394,6 +410,31 @@ fn hooks_response(json_mode: bool) -> String {
                     let _ = writeln!(out, "    {:<50} 0x{:x}", h.name, h.addr);
                 } else {
                     let _ = writeln!(out, "    {:<50} MISS", h.name);
+                }
+            }
+        }
+        let capabilities = crate::capability::statuses()
+            .into_iter()
+            .filter(|status| status.initialized)
+            .collect::<Vec<_>>();
+        if !capabilities.is_empty() {
+            let _ = writeln!(out, "  capabilities");
+            for status in capabilities {
+                if status.ready {
+                    let _ = writeln!(
+                        out,
+                        "    {:<50} READY ({})",
+                        status.capability.name(),
+                        status.capability.failure_policy().name()
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    {:<50} DISABLED ({}, {})",
+                        status.capability.name(),
+                        status.capability.failure_policy().name(),
+                        status.reason.as_deref().unwrap_or("unavailable")
+                    );
                 }
             }
         }
@@ -1003,7 +1044,7 @@ fn patterns_response(json_mode: bool) -> String {
 // ---------------------------------------------------------------------------
 
 fn version_response(json_mode: bool) -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = option_env!("VAPOR_FORGE_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     let commit = option_env!("GIT_COMMIT").unwrap_or("dev");
 
     if json_mode {

@@ -7,7 +7,8 @@ use vapor_forge_packet_capture::{PacketChange, PacketDirection};
 use vapor_forge_steam_native_abi::cnet_packet;
 
 use super::router::{
-    process_recv_frame, RecvFrameDecision, CLOUD_PENDING, LOCAL_RESPONSES, PENDING,
+    prepare_recv_post_action, process_recv_frame, RecvFrameDecision, CLOUD_PENDING,
+    LOCAL_RESPONSES, PENDING,
 };
 
 /// Route one source's completed responses to the native injection dispatch. The
@@ -15,7 +16,10 @@ use super::router::{
 pub(crate) fn wake_source(source: InjectionSource) {
     match source {
         InjectionSource::Manifest => drain_manifest(),
-        InjectionSource::Cloud => drain_cloud(),
+        InjectionSource::Cloud => {
+            drain_cloud();
+            crate::ui::toast_bridge::request_pump();
+        }
         InjectionSource::Achievements => drain_achievements(),
         InjectionSource::RichPresence => drain_rich_presence(),
     }
@@ -117,7 +121,7 @@ pub(crate) fn queue_playtime_notification(
 /// dropped before the packet can be released.
 pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> PreparedRecvPacket {
     if packet.is_null() {
-        return PreparedRecvPacket::Pass;
+        return PreparedRecvPacket::pass();
     }
     // SAFETY: packet is the non-null CNetPacket supplied by Steam.
     let p_data = unsafe { cnet_packet::data_slot(packet) };
@@ -128,25 +132,54 @@ pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> PreparedRecvPac
     // SAFETY: both slots point into the live CNetPacket.
     let size = unsafe { *p_size };
     if data.is_null() || size == 0 {
-        return PreparedRecvPacket::Pass;
+        return PreparedRecvPacket::pass();
     }
 
     // SAFETY: Steam's packet supplies a non-null data pointer and byte size.
     let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
-    match process_recv_frame(bytes) {
-        RecvFrameDecision::Pass => PreparedRecvPacket::Pass,
-        RecvFrameDecision::Drop => PreparedRecvPacket::Drop,
+    let post_dispatch = RecvPostDispatch(prepare_recv_post_action(bytes));
+    let decision = match process_recv_frame(bytes) {
+        RecvFrameDecision::Pass => PreparedRecvDecision::Pass,
+        RecvFrameDecision::Drop => PreparedRecvDecision::Drop,
         RecvFrameDecision::Rewrite(replacement) => {
             // SAFETY: caller guarantees packet remains live for the guard lifetime.
-            PreparedRecvPacket::Rewrite(unsafe { PacketSwapGuard::new(packet, replacement) })
+            PreparedRecvDecision::Rewrite(unsafe { PacketSwapGuard::new(packet, replacement) })
+        }
+    };
+    PreparedRecvPacket {
+        decision,
+        post_dispatch,
+    }
+}
+
+pub(crate) struct PreparedRecvPacket {
+    pub(crate) decision: PreparedRecvDecision,
+    pub(crate) post_dispatch: RecvPostDispatch,
+}
+
+impl PreparedRecvPacket {
+    fn pass() -> Self {
+        Self {
+            decision: PreparedRecvDecision::Pass,
+            post_dispatch: RecvPostDispatch(None),
         }
     }
 }
 
-pub(crate) enum PreparedRecvPacket {
+pub(crate) enum PreparedRecvDecision {
     Pass,
     Drop,
     Rewrite(PacketSwapGuard),
+}
+
+pub(crate) struct RecvPostDispatch(Option<super::router::RecvPostAction>);
+
+impl RecvPostDispatch {
+    pub(crate) fn complete(self) {
+        if let Some(action) = self.0 {
+            super::router::complete_recv_post_action(action);
+        }
+    }
 }
 
 pub(crate) struct PacketSwapGuard {

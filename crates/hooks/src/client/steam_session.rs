@@ -225,6 +225,10 @@ impl SteamUserStatsSession {
         super::steam_context::checked_call(self.captured, call)
     }
 
+    pub(super) fn read_client_id_or_arm(&self) -> Result<Option<u64>, &'static str> {
+        super::client_id::read_or_arm(self.captured)
+    }
+
     pub(super) fn playtime_snapshot(&self, app_id: u32) -> Result<PlaytimeSnapshot, &'static str> {
         if app_id == 0 {
             return Err("AppID is invalid");

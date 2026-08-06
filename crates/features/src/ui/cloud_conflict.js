@@ -23,7 +23,7 @@
      * @property {ConflictCandidate[]} candidates
      */
 
-    bridge.registerFeature('cloud-conflict', 1, function(bridge) {
+    bridge.registerFeature('cloud-conflict', 3, function(bridge) {
       const state = {
         jsx: null,
         modal: null,
@@ -36,12 +36,14 @@
         epoch: {},
         promoted: {},
         nativeDialogs: {},
+        acknowledging: {},
         observer: null,
         observerDocument: null,
         language: 'english',
         locale: 'en-US',
         languageReady: false,
-        languagePromise: null
+        languagePromise: null,
+        readyConfirmed: false
       };
 
       const localeByLanguage = {
@@ -77,6 +79,20 @@
         } catch (error) {
           bridge.log('cloud conflict language error: ' + error);
           finishLanguage('english');
+        }
+      }
+
+      function confirmReady() {
+        if (state.readyConfirmed) return true;
+        try {
+          const apps = window.SteamClient && window.SteamClient.Apps;
+          if (!apps || typeof apps.VaporForgeConfirmUIBridge !== 'function') return false;
+          apps.VaporForgeConfirmUIBridge('cloud-conflict:3');
+          state.readyConfirmed = true;
+          return true;
+        } catch (error) {
+          bridge.log('cloud conflict ready confirmation error: ' + error);
+          return false;
         }
       }
 
@@ -476,21 +492,47 @@
 
       function ackCloudConflict(ack) {
         if (!ack || !ack.token) return false;
-        const waiting = state.waiting[ack.token];
-        if (!waiting) return false;
+        if (state.acknowledging[ack.token]) return true;
+        const waiting = state.waiting[ack.token] || {
+          appId: Number(ack.app_id), root: null, closeModal: null
+        };
         delete state.waiting[ack.token];
+        const retry = function() {
+          try {
+            window.SteamClient.Apps.VaporForgeRetryCloudConflict(ack.token);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        };
+        const receipt = function() {
+          delete state.acknowledging[ack.token];
+          try {
+            window.SteamClient.Apps.VaporForgeConfirmCloudConflict(ack.token);
+            return true;
+          } catch (_) {
+            retry();
+            return false;
+          }
+        };
         if (!ack.accepted) {
           const key = ack.error === 'stale_choice' ? 'choice_stale' : 'selection_save_failed';
           setCloudBusy(waiting.root, false, translate(key));
-          return false;
+          return receipt();
         }
+        state.acknowledging[ack.token] = true;
         const finish = function() {
           closeCloudConflict(waiting.appId);
           delete state.dialogs[String(waiting.appId)];
           delete state.promoted[String(waiting.appId)];
           stopCloudObserverIfIdle();
+          receipt();
         };
-        const fail = function(message) { setCloudBusy(waiting.root, false, message); };
+        const fail = function(message) {
+          delete state.acknowledging[ack.token];
+          try { setCloudBusy(waiting.root, false, message); }
+          finally { retry(); }
+        };
         if (ack.cancel_launch) finishGameAction(ack.app_id, true, finish, fail);
         else if (ack.resume_launch) finishGameAction(ack.app_id, false, finish, fail);
         else finish();
@@ -498,13 +540,14 @@
       }
 
       function tryReady() {
-        if (!Object.keys(state.dialogs).length) return true;
+        if (!bridge.isTargetSteamUiContext()) return false;
         ensureLanguage();
         if (!bridge.req || !state.languageReady) return false;
         state.jsx = state.jsx || bridge.findJsx();
         state.modal = state.modal || bridge.findModal();
         state.windowStore = state.windowStore || bridge.findWindowStore();
         if (state.jsx && state.modal && state.windowStore) {
+          if (!confirmReady()) return false;
           Object.keys(state.dialogs).forEach(function(appId) {
             if (!state.handles[appId] && !state.opening[appId]) {
               renderCloudConflict(Number(appId));

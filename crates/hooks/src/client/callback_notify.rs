@@ -2,7 +2,7 @@
 
 use core::ffi::c_void;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use vapor_forge_hook_engine::detour::Detour;
@@ -20,7 +20,6 @@ pub(crate) type SetApiCallResultFn =
 pub(crate) static mut SET_API_CALL_RESULT_DETOUR: Option<Detour<SetApiCallResultFn>> = None;
 
 static WAKE_EPOCH: AtomicU32 = AtomicU32::new(0);
-static HOOKS_READY: AtomicBool = AtomicBool::new(false);
 static API_CALLS: Mutex<ApiCallState> = Mutex::new(ApiCallState::new());
 #[cfg(any(debug_assertions, test))]
 static API_RESULTS: AtomicU32 = AtomicU32::new(0);
@@ -199,14 +198,20 @@ struct PreparedApiResult {
     event: ApiCallResultEvent,
 }
 
-pub(crate) fn set_hooks_ready(ready: bool) {
-    if HOOKS_READY.swap(ready, Ordering::AcqRel) != ready {
+pub(crate) fn set_hooks_ready(requirements: &[(&str, bool)]) {
+    let ready = requirements.iter().all(|(_, ready)| *ready);
+    let changed = hooks_ready() != ready;
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::CallbackEvents,
+        requirements,
+    );
+    if changed {
         notify();
     }
 }
 
 pub(super) fn hooks_ready() -> bool {
-    HOOKS_READY.load(Ordering::Acquire)
+    crate::capability::is_ready(crate::capability::Capability::CallbackEvents)
 }
 
 pub(super) fn activate_session(session: u64) {
@@ -355,9 +360,12 @@ pub(crate) unsafe extern "C" fn hk_set_api_call_result(
     callback: i32,
 ) {
     let api_call = u64::from(api_call_low) | (u64::from(api_call_high) << 32);
-    // SAFETY: Steam owns the result payload during this hook call.
-    let prepared =
-        unsafe { prepare_registered_api_result(api_call, callback, payload, payload_size) };
+    let prepared = hooks_ready()
+        // SAFETY: Steam owns the result payload during this hook call.
+        .then(|| unsafe {
+            prepare_registered_api_result(api_call, callback, payload, payload_size)
+        })
+        .flatten();
     let Some(original) = original_set_api_call_result() else {
         return;
     };
@@ -387,9 +395,12 @@ pub(crate) unsafe extern "C" fn hk_set_api_call_result(
     payload_size: i32,
     callback: i32,
 ) {
-    // SAFETY: Steam owns the result payload during this hook call.
-    let prepared =
-        unsafe { prepare_registered_api_result(api_call, callback, payload, payload_size) };
+    let prepared = hooks_ready()
+        // SAFETY: Steam owns the result payload during this hook call.
+        .then(|| unsafe {
+            prepare_registered_api_result(api_call, callback, payload, payload_size)
+        })
+        .flatten();
     let Some(original) = original_set_api_call_result() else {
         return;
     };

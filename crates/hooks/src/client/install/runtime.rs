@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 
 use tracing::{debug, info, warn};
@@ -11,10 +12,13 @@ use vapor_forge_scripting::{ManifestCodeProvider, RegistryHandle, ScriptRuntime,
 const CONFIG_FILENAME: &str = "config.toml";
 
 static RUNTIME_INIT: Once = Once::new();
+static RUNTIME_READY: AtomicBool = AtomicBool::new(false);
+static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) static IPC_SERVER: OnceLock<Arc<crate::ipc_server::IpcServer>> = OnceLock::new();
 
 pub(crate) struct RuntimeSnapshot {
+    pub generation: u64,
     pub config: Arc<RuntimeConfig>,
     pub script_state: Arc<ScriptState>,
     pub manifest_code_provider: Option<Arc<ManifestCodeProvider>>,
@@ -33,6 +37,7 @@ impl RuntimeSnapshot {
                 .map(|(&app, &avatar)| (app, avatar)),
         );
         Self {
+            generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::AcqRel),
             config: Arc::new(config),
             script_state: Arc::new(script_runtime.state),
             manifest_code_provider: script_runtime.manifest_code_provider.map(Arc::new),
@@ -70,12 +75,18 @@ pub(crate) static TICKET_CACHE: once_cell::sync::Lazy<vapor_forge_features::tick
 /// stores, primes feature state, and starts config watching. It is intentionally
 /// separate from steamclient detour installation so later modules can rely on
 /// the same runtime without depending on steamclient-specific setup.
-pub fn ensure_runtime_initialized() {
+pub fn ensure_runtime_initialized() -> bool {
     RUNTIME_INIT.call_once(|| {
         // Early init so config loading errors can be logged.
         vapor_forge_diagnostics::init("info");
 
-        let (base_config, config_path) = load_config();
+        let (base_config, config_path) = match load_config() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::error!(%error, "hook-install: runtime initialization rejected");
+                return;
+            }
+        };
 
         vapor_forge_diagnostics::init(&base_config.runtime.log_level);
 
@@ -108,7 +119,9 @@ pub fn ensure_runtime_initialized() {
 
         // Force TICKET_CACHE lazy init while config is loaded.
         let _ = &*TICKET_CACHE;
+        RUNTIME_READY.store(true, Ordering::Release);
     });
+    RUNTIME_READY.load(Ordering::Acquire)
 }
 
 pub(crate) fn config() -> Arc<RuntimeConfig> {
@@ -117,6 +130,10 @@ pub(crate) fn config() -> Arc<RuntimeConfig> {
 
 pub(crate) fn runtime_snapshot() -> arc_swap::Guard<Arc<RuntimeSnapshot>> {
     RUNTIME.load()
+}
+
+pub(crate) fn runtime_generation() -> u64 {
+    RUNTIME.load().generation
 }
 
 /// Config ticket mode overlaid with runtime auto-delegate detections.
@@ -176,17 +193,28 @@ pub(crate) fn package_state() -> &'static vapor_forge_features::package::Package
 /// 2. ~/.config/vapor-forge/scripts/: user config directory
 /// 3. config.toml [scripting] paths: user-specified extra dirs (highest priority)
 pub(crate) fn build_script_dirs(config: &RuntimeConfig) -> Vec<String> {
+    let steam_root = steam_install_root();
+    if let Some(root) = &steam_root {
+        debug!(path = %root.display(), "scripting: resolved Steam root");
+    }
+    let home = std::env::var_os("HOME");
+    build_script_dirs_for(config, steam_root.as_deref(), home.as_deref())
+}
+
+fn build_script_dirs_for(
+    config: &RuntimeConfig,
+    steam_root: Option<&Path>,
+    home: Option<&std::ffi::OsStr>,
+) -> Vec<String> {
     let mut dirs = Vec::new();
 
-    // 1. Steam root config/lua + config/scripts
-    if let Some(root) = steam_install_root() {
-        debug!(path = %root.display(), "scripting: resolved Steam root");
+    // 1. Steam root config/lua
+    if let Some(root) = steam_root {
         dirs.push(root.join("config/lua").to_string_lossy().into_owned());
-        dirs.push(root.join("config/scripts").to_string_lossy().into_owned());
     }
 
     // 2. User config directory
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         dirs.push(
             PathBuf::from(home)
                 .join(".config/vapor-forge/scripts")
@@ -245,7 +273,7 @@ fn steam_root_from_executable(executable: &Path) -> Option<PathBuf> {
     let runtime_name = runtime_dir.file_name()?.to_str()?;
     if !matches!(
         runtime_name,
-        "ubuntu12_32" | "ubuntu12_64" | "steamrt32" | "steamrt64"
+        "ubuntu12_32" | "ubuntu12_64" | "linux32" | "linux64" | "steamrt32" | "steamrt64"
     ) {
         return None;
     }
@@ -291,79 +319,51 @@ pub(crate) fn merge_script_apps(
     config
 }
 
-fn config_search_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = vec![std::path::PathBuf::from(CONFIG_FILENAME)];
-    if let Some(path) = user_config_path() {
-        paths.push(path);
-    }
-    paths
-}
-
-fn user_config_path() -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
-        std::path::Path::new(&home)
+fn config_path_for_home(home: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    home.map(|home| {
+        std::path::Path::new(home)
             .join(".config/vapor-forge")
             .join(CONFIG_FILENAME)
     })
 }
 
-fn load_config() -> (RuntimeConfig, Option<std::path::PathBuf>) {
-    let mut saw_config_file = false;
-    for p in config_search_paths() {
-        if p.exists() {
-            saw_config_file = true;
-            match RuntimeConfig::load(&p) {
-                Ok(config) => {
-                    sync_config_template(&p);
-                    info!(path = %p.display(), "hook-install: config loaded");
-                    return (config, Some(p));
-                }
-                Err(e) => {
-                    warn!(path = %p.display(), error = %e, "hook-install: config error");
-                }
-            }
-        }
-    }
-    if !saw_config_file {
-        if let Some(path) = user_config_path() {
-            match RuntimeConfig::write_default_template(&path) {
-                Ok(()) => match RuntimeConfig::load(&path) {
-                    Ok(config) => {
-                        info!(path = %path.display(), "hook-install: config template created");
-                        return (config, Some(path));
-                    }
-                    Err(e) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "hook-install: generated config template failed to load"
-                        );
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "hook-install: config template create failed"
-                    );
-                }
-            }
-        }
-    }
-    info!("hook-install: no config, using defaults");
-    (RuntimeConfig::default(), None)
+fn load_config() -> Result<(RuntimeConfig, std::path::PathBuf), String> {
+    load_config_for_home(std::env::var_os("HOME").as_deref())
 }
 
-pub(crate) fn sync_config_template(path: &std::path::Path) {
-    match RuntimeConfig::sync_default_template(path) {
-        Ok(true) => info!(path = %path.display(), "hook-install: config template synced"),
-        Ok(false) => {}
-        Err(e) => warn!(
-            path = %path.display(),
-            error = %e,
-            "hook-install: config template sync failed"
-        ),
+fn load_config_for_home(
+    home: Option<&std::ffi::OsStr>,
+) -> Result<(RuntimeConfig, std::path::PathBuf), String> {
+    let Some(path) = config_path_for_home(home) else {
+        return Err("HOME is unavailable; configuration path cannot be resolved".to_owned());
+    };
+    if path.exists() {
+        let config =
+            RuntimeConfig::load(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        info!(path = %path.display(), "hook-install: config loaded");
+        return Ok((config, path));
+    }
+
+    match RuntimeConfig::write_default_template(&path) {
+        Ok(()) => match RuntimeConfig::load(&path) {
+            Ok(config) => {
+                info!(path = %path.display(), "hook-install: config template created");
+                Ok((config, path))
+            }
+            Err(error) => Err(format!(
+                "generated config {} failed to load: {error}",
+                path.display()
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let config = RuntimeConfig::load(&path)
+                .map_err(|load_error| format!("{}: {load_error}", path.display()))?;
+            Ok((config, path))
+        }
+        Err(error) => Err(format!(
+            "config template {} could not be created: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -411,6 +411,73 @@ mod tests {
 
         assert_eq!(resolved, Some(install.canonicalize().unwrap()));
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn runtime_config_path_is_canonical_for_the_home_directory() {
+        assert_eq!(
+            config_path_for_home(Some(std::ffi::OsStr::new("/home/user"))),
+            Some(PathBuf::from("/home/user/.config/vapor-forge/config.toml"))
+        );
+        assert_eq!(config_path_for_home(None), None);
+    }
+
+    #[test]
+    fn missing_home_rejects_runtime_initialization() {
+        let error = load_config_for_home(None).unwrap_err();
+        assert!(error.contains("HOME is unavailable"));
+    }
+
+    #[test]
+    fn invalid_existing_config_is_terminal() {
+        let base = temp_dir("invalid-config");
+        let home = base.join("home");
+        let path = config_path_for_home(Some(home.as_os_str())).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "unknown_field = true\n").unwrap();
+
+        let error = load_config_for_home(Some(home.as_os_str())).unwrap_err();
+
+        assert!(error.contains("unknown field"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn absent_config_creates_and_loads_the_default_template() {
+        let base = temp_dir("default-config");
+        let home = base.join("home");
+
+        let (config, path) = load_config_for_home(Some(home.as_os_str())).unwrap();
+
+        assert!(path.is_file());
+        assert!(config.apps.inject.is_empty());
+        assert!(matches!(
+            config.cloud.backend,
+            vapor_forge_config::CloudBackendMode::Disabled
+        ));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn script_directories_exclude_undocumented_steam_paths() {
+        let mut config = RuntimeConfig::default();
+        config.scripting.paths.push("/explicit/scripts".into());
+
+        let dirs = build_script_dirs_for(
+            &config,
+            Some(Path::new("/steam")),
+            Some(std::ffi::OsStr::new("/home/user")),
+        );
+
+        assert_eq!(
+            dirs,
+            [
+                "/steam/config/lua",
+                "/home/user/.config/vapor-forge/scripts",
+                "/explicit/scripts",
+            ]
+        );
+        assert!(!dirs.iter().any(|path| path.ends_with("config/scripts")));
     }
 
     #[test]

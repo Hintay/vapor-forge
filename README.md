@@ -60,7 +60,7 @@ package-store object and calls Steam's token-map lookup with pkg0's known access
 ```
 ~/.config/vapor-forge/
   config.toml               # main configuration
-  patterns.toml             # optional pattern overrides
+  patterns.*.toml           # managed hotfix candidates and active caches
   scripts/                  # user Lua scripts
   cache/                    # ticket and session cache
 ```
@@ -69,9 +69,18 @@ Lua scripts are also loaded from `{Steam}/config/lua/` if the directory exists.
 
 ## Configuration
 
-All configuration lives in `~/.config/vapor-forge/config.toml`. The file is optional. If no config exists, Vapor Forge creates a starter file from `res/config.default.toml` with recommended defaults and commented examples. On later launches, missing recommended fields and commented examples are synced from that template without overwriting existing values. If a commented example is uncommented, it becomes normal user config and is preserved on future syncs. Defaults are applied for every missing field. Changes are picked up automatically through hot-reload.
+All configuration lives in `~/.config/vapor-forge/config.toml`. The file is optional. If no config exists, Vapor Forge creates a starter file from `res/config.default.toml` with recommended defaults and commented examples. Existing files are never rewritten by the runtime. Defaults are applied for every missing field, unknown fields are rejected, and changes are picked up automatically through hot-reload. The `vapor-forge-config-check` tool can preview template updates explicitly.
 
 See `res/config.default.toml` for the full generated template and commented examples.
+
+`runtime.patterns_url` configures an optional HTTPS hotfix source. The URL must
+contain `{arch}` and `{family}` placeholders. A downloaded candidate becomes
+active for a module only after that module validates it against the live Steam
+binary during a later hook installation, normally on the next Steam start.
+Source changes made after SteamClient hooks are installed also take effect on
+the next Steam start.
+Clearing the URL stops downloads and candidate promotion; it does not remove or
+disable an active cache, which is revalidated before every use.
 
 ### Cumulus cloud saves
 

@@ -1,18 +1,5 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WrapperPolicy {
-    ImplementationRequired,
-    WrapperAllowed,
-    NotApplicable,
-}
-
-fn wrapper_policy(name: &str) -> WrapperPolicy {
-    match name {
-        "IClientRemoteStorage::RunIPCFrame"
-        | "IClientAppManager::RunIPCFrame"
-        | "IClientApps::RunIPCFrame" => WrapperPolicy::WrapperAllowed,
-        _ if name.starts_with("IClient") => WrapperPolicy::ImplementationRequired,
-        _ => WrapperPolicy::NotApplicable,
-    }
+fn requires_interface_implementation(name: &str) -> bool {
+    name.starts_with("IClient")
 }
 
 struct SemanticCheck {
@@ -100,21 +87,6 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CUser::GetSubscribedApps",
         label: "CUser::GetSubscribedApps body",
         validate: validate_get_subscribed_apps32,
-    },
-    SemanticCheck {
-        name: "IClientRemoteStorage::RunIPCFrame",
-        label: "IClientRemoteStorage::RunIPCFrame body",
-        validate: validate_ipc_run_frame32,
-    },
-    SemanticCheck {
-        name: "IClientAppManager::RunIPCFrame",
-        label: "IClientAppManager::RunIPCFrame body",
-        validate: validate_ipc_run_frame32,
-    },
-    SemanticCheck {
-        name: "IClientApps::RunIPCFrame",
-        label: "IClientApps::RunIPCFrame body",
-        validate: validate_ipc_run_frame32,
     },
     SemanticCheck {
         name: "LoadDepotDecryptionKey",
@@ -233,21 +205,6 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CUser::GetSubscribedApps",
         label: "CUser::GetSubscribedApps body",
         validate: validate_get_subscribed_apps64,
-    },
-    SemanticCheck {
-        name: "IClientRemoteStorage::RunIPCFrame",
-        label: "IClientRemoteStorage::RunIPCFrame body",
-        validate: validate_ipc_run_frame64,
-    },
-    SemanticCheck {
-        name: "IClientAppManager::RunIPCFrame",
-        label: "IClientAppManager::RunIPCFrame body",
-        validate: validate_ipc_run_frame64,
-    },
-    SemanticCheck {
-        name: "IClientApps::RunIPCFrame",
-        label: "IClientApps::RunIPCFrame body",
-        validate: validate_ipc_run_frame64,
     },
     SemanticCheck {
         name: "LoadDepotDecryptionKey",
@@ -426,18 +383,11 @@ fn scan_semantic_coverage(module: &str, arch: SemanticArch, entries: &[&ScanEntr
     for group in group_variants(&variants) {
         let entry = group[0];
         if !has_semantic_validation(module, arch, entry.name) {
-            if entry.optional {
-                println!(
-                    "  WARN {:<58} optional (no semantic validation registered)",
-                    entry.name
-                );
-            } else {
-                println!(
-                    "  FAIL {:<58} required (no semantic validation registered)",
-                    entry.name
-                );
-                failed = true;
-            }
+            println!(
+                "  FAIL {:<58} required (no semantic validation registered)",
+                entry.name
+            );
+            failed = true;
         }
     }
     failed
@@ -499,6 +449,40 @@ const USER_STATS_WRAPPER_METHODS: &[&str] = &[
     "StoreStats",
     "IndicateAchievementProgress",
 ];
+
+fn scan_config_store_uint64_wrapper_abi(path: &Path) -> bool {
+    let wanted = vec!["IClientConfigStore".to_owned()];
+    let report = match vtable_scan::scan_file(path, Some(&wanted)) {
+        Ok(report) => report,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} required ({error})",
+                "IClientConfigStore uint64 wrapper ABI"
+            );
+            return true;
+        }
+    };
+    let summary = match vtable_scan::validate_config_store_uint64_abi(path, &report) {
+        Ok(summary) => summary,
+        Err(error) => {
+            println!(
+                "  FAIL {:<58} required ({error})",
+                "IClientConfigStore uint64 wrapper ABI"
+            );
+            return true;
+        }
+    };
+
+    println!(
+        "  OK   {:<58} get_slot={} set_slot={} get_hash=0x{:08x} set_hash=0x{:08x}",
+        "IClientConfigStore uint64 wrapper ABI",
+        summary.get_slot,
+        summary.set_slot,
+        summary.get_hash,
+        summary.set_hash
+    );
+    false
+}
 
 fn scan_user_stats_wrapper_abi(path: &Path, data: &[u8]) -> bool {
     let image = match ElfImage::parse(data) {
@@ -1512,12 +1496,6 @@ fn has_seq(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle)
 }
 
-fn has_x86_cmp_eax_any_imm32(bytes: &[u8], values: &[u32]) -> bool {
-    values
-        .iter()
-        .any(|&value| has_x86_cmp_eax_imm32(bytes, value))
-}
-
 fn has_asm32(
     bytes: &[u8],
     build: impl FnOnce(&mut iced_x86::code_asm::CodeAssembler) -> Result<(), iced_x86::IcedError>,
@@ -1838,9 +1816,6 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "CUser::GetSubscribedApps") => {
             get_subscribed_apps64_evidence(code, offset)
         }
-        (SemanticArch::X86, "IClientRemoteStorage::RunIPCFrame")
-        | (SemanticArch::X86, "IClientAppManager::RunIPCFrame")
-        | (SemanticArch::X86, "IClientApps::RunIPCFrame") => ipc_run_frame32_evidence(code, offset),
         (SemanticArch::X86, "CUserStats::SetStat(int32)") => {
             set_stat_adapter32_evidence(code, offset, 0xe4)
         }
@@ -1858,11 +1833,6 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86, "CUserStats::IndicateAchievementProgress") => {
             achievement_progress_adapter32_evidence(code, offset)
-        }
-        (SemanticArch::X86_64, "IClientRemoteStorage::RunIPCFrame")
-        | (SemanticArch::X86_64, "IClientAppManager::RunIPCFrame")
-        | (SemanticArch::X86_64, "IClientApps::RunIPCFrame") => {
-            ipc_run_frame64_evidence(code, offset)
         }
         (SemanticArch::X86_64, "CUserStats::SetStat(int32)") => {
             set_stat_int_adapter64_evidence(code, offset)
@@ -2549,68 +2519,6 @@ fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence
             "package lookup state",
             has_asm64(bytes, |a| a.add(rdi, 0x1018))
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
-        ),
-    ]))
-}
-
-fn validate_ipc_run_frame32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        ipc_run_frame32_evidence(code, offset),
-        "ipc-wrapper mode=4 dispatch",
-    )
-}
-
-fn ipc_run_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x900)?;
-    Some(Evidence::required([
-        ("mode=4 ipc argument", has_asm32(bytes, |a| a.push(4))),
-        (
-            "known ipc dispatch id",
-            has_x86_cmp_eax_any_imm32(
-                bytes,
-                &[
-                    0x872F_E86C,
-                    0x872F_E86D,
-                    0x872F_E86E,
-                    0x8712_DD4B,
-                    0x8712_DD54,
-                    0x7A0A_85B0,
-                    0x7A0A_85B2,
-                    0x7A0A_85B7,
-                    0xA688_9C36,
-                    0xA688_9C37,
-                    0xA688_9C39,
-                ],
-            ),
-        ),
-    ]))
-}
-
-fn validate_ipc_run_frame64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        ipc_run_frame64_evidence(code, offset),
-        "ipc-wrapper mode=4 dispatch",
-    )
-}
-
-fn ipc_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x7000)?;
-    Some(Evidence::required([
-        ("mode=4 ipc argument", has_asm64(bytes, |a| a.mov(edx, 4))),
-        (
-            "known ipc dispatch id",
-            has_x86_cmp_eax_any_imm32(
-                bytes,
-                &[
-                    0x872F_E86C,
-                    0x872F_E86D,
-                    0x8712_DD54,
-                    0x7A0A_85B0,
-                    0x7A0A_85B7,
-                    0xA688_9C36,
-                    0xA688_9C37,
-                ],
-            ),
         ),
     ]))
 }

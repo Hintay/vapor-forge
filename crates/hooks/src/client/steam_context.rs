@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_hook_engine::original::original_detour;
 
-const OWNER_INTERFACE_PREFIX_BYTES: usize = 0x80;
+const OWNER_INTERFACE_SLOTS: usize = 32;
 const MAX_MAPS_LINE_LEN: usize = 4096;
 
 pub(crate) const USER_INTERFACE_INIT_NAME: &str = "CUserInterface::Init";
@@ -26,6 +26,7 @@ static REVISION: AtomicU64 = AtomicU64::new(0);
 static OWNER_PTR: AtomicUsize = AtomicUsize::new(0);
 static USER_PTR: AtomicUsize = AtomicUsize::new(0);
 static STATS_PTR: AtomicUsize = AtomicUsize::new(0);
+static CONFIG_STORE_PTR: AtomicUsize = AtomicUsize::new(0);
 static STEAM_USER: AtomicI32 = AtomicI32::new(0);
 static IDENTITY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static STEAM_ID64: AtomicU64 = AtomicU64::new(0);
@@ -64,6 +65,7 @@ pub(super) struct CapturedInterfaces {
     pub(super) owner: *mut c_void,
     pub(super) user: *mut c_void,
     pub(super) stats: *mut c_void,
+    pub(super) config_store: *mut c_void,
 }
 
 // SAFETY: Steam owns these objects. Every dereference is serialized with owner
@@ -86,11 +88,15 @@ pub(crate) unsafe extern "C" fn hk_user_interface_init(
     };
     // SAFETY: forwards Steam's live owner and unchanged handles.
     unsafe { original(owner, steam_user, steam_pipe) };
-    observe_owner(owner, steam_user);
+    if crate::capability::is_ready(crate::capability::Capability::CallbackEvents) {
+        observe_owner(owner, steam_user);
+    }
 }
 
 pub(crate) unsafe extern "C" fn hk_user_interface_destructor(owner: *mut c_void) {
-    invalidate_owner(owner);
+    if crate::capability::is_ready(crate::capability::Capability::CallbackEvents) {
+        invalidate_owner(owner);
+    }
     // SAFETY: installation initializes the detour before enabling it.
     let Some(original) = (unsafe {
         original_detour(
@@ -161,6 +167,7 @@ pub(super) fn capture() -> Option<CapturedInterfaces> {
             owner: OWNER_PTR.load(Ordering::Acquire) as *mut c_void,
             user: USER_PTR.load(Ordering::Acquire) as *mut c_void,
             stats: STATS_PTR.load(Ordering::Acquire) as *mut c_void,
+            config_store: CONFIG_STORE_PTR.load(Ordering::Acquire) as *mut c_void,
         };
         if REVISION.load(Ordering::Acquire) != revision {
             continue;
@@ -168,6 +175,7 @@ pub(super) fn capture() -> Option<CapturedInterfaces> {
         if captured.owner.is_null()
             || captured.user.is_null()
             || captured.stats.is_null()
+            || captured.config_store.is_null()
             || captured.steam_user == 0
             || captured.steam_id64 == 0
             || captured.identity_generation != vapor_forge_features::identity::generation()
@@ -186,7 +194,17 @@ pub(super) fn is_current(captured: CapturedInterfaces) -> bool {
         && captured.owner as usize == OWNER_PTR.load(Ordering::Acquire)
         && captured.user as usize == USER_PTR.load(Ordering::Acquire)
         && captured.stats as usize == STATS_PTR.load(Ordering::Acquire)
+        && captured.config_store as usize == CONFIG_STORE_PTR.load(Ordering::Acquire)
         && captured.steam_user == STEAM_USER.load(Ordering::Acquire)
+}
+
+pub(super) fn config_store_is_current(revision: u64, config_store: *mut c_void) -> bool {
+    revision != 0
+        && revision == REVISION.load(Ordering::Acquire)
+        && config_store as usize == CONFIG_STORE_PTR.load(Ordering::Acquire)
+        && IDENTITY_GENERATION.load(Ordering::Acquire)
+            == vapor_forge_features::identity::generation()
+        && STEAM_ID64.load(Ordering::Acquire) == vapor_forge_features::identity::steam_id()
 }
 
 pub(super) fn callback_identity(steam_user: i32) -> Option<(u64, u64)> {
@@ -229,6 +247,7 @@ pub(super) fn checked_call<T>(
 }
 
 pub(crate) fn invalidate_identity() {
+    super::client_id::cancel_capture();
     *PACKET_IDENTITY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -243,12 +262,13 @@ pub(crate) fn invalidate_identity() {
 #[cfg(any(debug_assertions, test))]
 pub(crate) fn diagnostic_status() -> String {
     format!(
-        "context_revision={} steam_user={} owner=0x{:x} user_ptr=0x{:x} stats_ptr=0x{:x}",
+        "context_revision={} steam_user={} owner=0x{:x} user_ptr=0x{:x} stats_ptr=0x{:x} config_store_ptr=0x{:x}",
         REVISION.load(Ordering::Relaxed),
         STEAM_USER.load(Ordering::Relaxed),
         OWNER_PTR.load(Ordering::Relaxed),
         USER_PTR.load(Ordering::Relaxed),
         STATS_PTR.load(Ordering::Relaxed),
+        CONFIG_STORE_PTR.load(Ordering::Relaxed),
     )
 }
 
@@ -268,6 +288,12 @@ fn observe_owner(owner: *mut c_void, steam_user: i32) {
         warn!("steam-context: IClientUserStats vtable unavailable");
         return;
     };
+    let Some(config_store_vtable) = crate::vtable_scan::find_interface("IClientConfigStore")
+        .map(|interface| interface.vtable_va)
+    else {
+        warn!("steam-context: IClientConfigStore vtable unavailable");
+        return;
+    };
     let Some(mappings) = readable_mappings() else {
         warn!("steam-context: readable mappings unavailable");
         return;
@@ -280,7 +306,13 @@ fn observe_owner(owner: *mut c_void, steam_user: i32) {
         warn!("steam-context: owner does not contain one IClientUserStats member");
         return;
     };
-    if user == stats {
+    let Some((config_store_offset, config_store)) =
+        find_owner_member(owner, config_store_vtable, &mappings)
+    else {
+        warn!("steam-context: owner does not contain one IClientConfigStore member");
+        return;
+    };
+    if user == stats || user == config_store || stats == config_store {
         warn!("steam-context: owner interface members alias");
         return;
     }
@@ -300,6 +332,7 @@ fn observe_owner(owner: *mut c_void, steam_user: i32) {
             owner: owner as usize,
             user: user as usize,
             stats: stats as usize,
+            config_store: config_store as usize,
             steam_user,
             identity_generation,
             steam_id64,
@@ -311,8 +344,10 @@ fn observe_owner(owner: *mut c_void, steam_user: i32) {
             owner = format_args!("0x{:x}", owner as usize),
             user_offset = format_args!("0x{user_offset:x}"),
             stats_offset = format_args!("0x{stats_offset:x}"),
+            config_store_offset = format_args!("0x{config_store_offset:x}"),
             "steam-context: captured owner interfaces"
         );
+        super::client_id::cancel_capture();
         super::callback_notify::clear_account();
     }
 }
@@ -326,6 +361,7 @@ fn invalidate_owner(owner: *mut c_void) {
             *current = ContextValues::default();
         }
     }) {
+        super::client_id::cancel_capture();
         super::callback_notify::clear_account();
     }
 }
@@ -335,6 +371,7 @@ struct ContextValues {
     owner: usize,
     user: usize,
     stats: usize,
+    config_store: usize,
     steam_user: i32,
     identity_generation: u64,
     steam_id64: u64,
@@ -348,6 +385,7 @@ fn write_context(update: impl FnOnce(&mut ContextValues)) -> bool {
         owner: OWNER_PTR.load(Ordering::Relaxed),
         user: USER_PTR.load(Ordering::Relaxed),
         stats: STATS_PTR.load(Ordering::Relaxed),
+        config_store: CONFIG_STORE_PTR.load(Ordering::Relaxed),
         steam_user: STEAM_USER.load(Ordering::Relaxed),
         identity_generation: IDENTITY_GENERATION.load(Ordering::Relaxed),
         steam_id64: STEAM_ID64.load(Ordering::Relaxed),
@@ -376,6 +414,7 @@ fn write_context(update: impl FnOnce(&mut ContextValues)) -> bool {
     OWNER_PTR.store(values.owner, Ordering::Relaxed);
     USER_PTR.store(values.user, Ordering::Relaxed);
     STATS_PTR.store(values.stats, Ordering::Relaxed);
+    CONFIG_STORE_PTR.store(values.config_store, Ordering::Relaxed);
     STEAM_USER.store(values.steam_user, Ordering::Relaxed);
     IDENTITY_GENERATION.store(values.identity_generation, Ordering::Relaxed);
     STEAM_ID64.store(values.steam_id64, Ordering::Relaxed);
@@ -426,14 +465,15 @@ fn find_owner_member(
     mappings: &[ReadableMapping],
 ) -> Option<(usize, *mut c_void)> {
     let owner = owner as usize;
-    if !is_readable(owner, OWNER_INTERFACE_PREFIX_BYTES, mappings) {
-        return None;
-    }
     let word = std::mem::size_of::<usize>();
     let mut matched = None;
-    for offset in (0..OWNER_INTERFACE_PREFIX_BYTES).step_by(word) {
+    for index in 0..OWNER_INTERFACE_SLOTS {
+        let offset = index.checked_mul(word)?;
         let slot = owner.checked_add(offset)?;
-        // SAFETY: the complete owner scan range is readable.
+        if !is_readable(slot, word, mappings) {
+            continue;
+        }
+        // SAFETY: this owner member slot is readable.
         let candidate = unsafe { (slot as *const usize).read_unaligned() };
         if candidate == 0 || !is_readable(candidate, word, mappings) {
             continue;

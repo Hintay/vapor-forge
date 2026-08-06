@@ -40,6 +40,11 @@ pub(crate) unsafe extern "C" fn hk_get_encrypted_app_ticket(
     cb_max: i32,
     p_cb_used: *mut u32,
 ) -> bool {
+    let original = detour_or_return!("GetEncryptedAppTicket", GET_ENCRYPTED_DETOUR, false);
+    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        // SAFETY: forwards Steam's untouched encrypted-ticket query.
+        return unsafe { original(this, p_ticket, cb_max, p_cb_used) };
+    }
     let app_id = super::current_app::get().unwrap_or(0);
     if app_id != 0 {
         let runtime = runtime_snapshot();
@@ -79,8 +84,7 @@ pub(crate) unsafe extern "C" fn hk_get_encrypted_app_ticket(
         }
     }
 
-    let original = detour_or_return!("GetEncryptedAppTicket", GET_ENCRYPTED_DETOUR, false);
-    /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+    // SAFETY: forwards Steam's untouched encrypted-ticket query.
     unsafe { original(this, p_ticket, cb_max, p_cb_used) }
 }
 

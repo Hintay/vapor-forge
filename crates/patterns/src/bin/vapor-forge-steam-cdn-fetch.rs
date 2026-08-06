@@ -54,7 +54,7 @@ fn run() -> Result<(), String> {
     };
 
     if args.format == OutputFormat::Json {
-        let required_pattern_failures = collect_required_pattern_failures(&scans);
+        let pattern_failures = collect_pattern_failures(&scans);
         let output = JsonOutput {
             manifest_url: manifest_url.to_owned(),
             channel: args.channel.name(),
@@ -64,7 +64,7 @@ fn run() -> Result<(), String> {
             scan_enabled: args.scan,
             scan_unsupported: args.scan_unsupported,
             scans,
-            required_pattern_failures,
+            pattern_failures,
         };
         let json = serde_json::to_string_pretty(&output)
             .map_err(|error| format!("serialize JSON failed: {error}"))?;
@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
     }
 
     if scan_failed {
-        Err("one or more required patterns failed".to_owned())
+        Err("one or more patterns failed".to_owned())
     } else {
         Ok(())
     }
@@ -292,7 +292,7 @@ struct JsonOutput {
     scan_enabled: bool,
     scan_unsupported: bool,
     scans: Vec<JsonPatternScan>,
-    required_pattern_failures: Vec<JsonRequiredPatternFailure>,
+    pattern_failures: Vec<JsonPatternFailure>,
 }
 
 #[derive(Serialize)]
@@ -327,12 +327,12 @@ struct JsonPatternScan {
     text_size: Option<usize>,
     ok_count: usize,
     miss_count: usize,
-    required_failures: Vec<JsonRequiredPatternFailure>,
+    failures: Vec<JsonPatternFailure>,
     entries: Vec<JsonPatternEntry>,
 }
 
 #[derive(Clone, Serialize)]
-struct JsonRequiredPatternFailure {
+struct JsonPatternFailure {
     module: String,
     path: String,
     arch_bits: u8,
@@ -345,7 +345,6 @@ struct JsonRequiredPatternFailure {
 #[derive(Serialize)]
 struct JsonPatternEntry {
     pattern: String,
-    optional: bool,
     status: String,
     hits: usize,
     target_offset: Option<usize>,
@@ -572,7 +571,7 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
                 text_size: None,
                 ok_count: 0,
                 miss_count: 0,
-                required_failures: Vec::new(),
+                failures: Vec::new(),
                 entries: Vec::new(),
             });
             continue;
@@ -583,7 +582,7 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
                 let fail_count = report.failure_count();
                 failed |= fail_count != 0;
                 args.text_print(format_args!(
-                    "scan {} {}-bit: {} ok={} miss={} required_failures={} path={}",
+                    "scan {} {}-bit: {} ok={} miss={} failures={} path={}",
                     report.module,
                     report.elf_class.bits(),
                     if fail_count == 0 { "OK" } else { "MISS" },
@@ -614,7 +613,7 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
                     text_size: None,
                     ok_count: 0,
                     miss_count: 1,
-                    required_failures: Vec::new(),
+                    failures: Vec::new(),
                     entries: Vec::new(),
                 });
             }
@@ -635,8 +634,8 @@ fn module_from_library_path(path: &Path) -> Option<&'static str> {
 fn arch_bits_from_library_path(path: &Path) -> Option<u8> {
     for component in path.components() {
         match component.as_os_str().to_str()? {
-            "ubuntu12_32" | "steamrt32" => return Some(32),
-            "steamrt64" => return Some(64),
+            "ubuntu12_32" | "linux32" | "steamrt32" => return Some(32),
+            "ubuntu12_64" | "linux64" | "steamrt64" => return Some(64),
             _ => {}
         }
     }
@@ -656,9 +655,9 @@ fn json_scan_from_report(report: ModuleScanReport) -> JsonPatternScan {
     let path = report.path.display().to_string();
     let ok_count = report.ok_count();
     let miss_count = report.miss_count();
-    let required_failures = report
-        .required_failures()
-        .map(|entry| json_required_failure(&report, entry))
+    let failures = report
+        .failures()
+        .map(|entry| json_failure(&report, entry))
         .collect();
     let entries = report.entries.iter().map(json_entry).collect();
 
@@ -674,16 +673,13 @@ fn json_scan_from_report(report: ModuleScanReport) -> JsonPatternScan {
         text_size: Some(report.text_size),
         ok_count,
         miss_count,
-        required_failures,
+        failures,
         entries,
     }
 }
 
-fn json_required_failure(
-    report: &ModuleScanReport,
-    entry: &PatternScanEntry,
-) -> JsonRequiredPatternFailure {
-    JsonRequiredPatternFailure {
+fn json_failure(report: &ModuleScanReport, entry: &PatternScanEntry) -> JsonPatternFailure {
+    JsonPatternFailure {
         module: report.module.clone(),
         path: report.path.display().to_string(),
         arch_bits: report.elf_class.bits(),
@@ -697,7 +693,6 @@ fn json_required_failure(
 fn json_entry(entry: &PatternScanEntry) -> JsonPatternEntry {
     JsonPatternEntry {
         pattern: entry.name.to_owned(),
-        optional: entry.optional,
         status: entry.status.label().to_owned(),
         hits: entry.match_count,
         target_offset: entry.target_offset,
@@ -705,10 +700,10 @@ fn json_entry(entry: &PatternScanEntry) -> JsonPatternEntry {
     }
 }
 
-fn collect_required_pattern_failures(scans: &[JsonPatternScan]) -> Vec<JsonRequiredPatternFailure> {
+fn collect_pattern_failures(scans: &[JsonPatternScan]) -> Vec<JsonPatternFailure> {
     scans
         .iter()
-        .flat_map(|scan| scan.required_failures.iter().cloned())
+        .flat_map(|scan| scan.failures.iter().cloned())
         .collect()
 }
 

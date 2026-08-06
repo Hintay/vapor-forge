@@ -3,11 +3,14 @@
 # defaults. Vapor Forge keeps these fields present and sorted.
 # Lines starting with "#" are examples. Uncomment them only when needed.
 
-# Runtime logging, diagnostics, and pattern override source.
+# Runtime logging, diagnostics, and pattern hotfix source.
 [runtime]
 log_level = "info"          # trace, debug, info, warn, error
 diagnostics = false         # write extra hook/module diagnostics to logs
-# patterns_url = "https://example.invalid/patterns.toml" # remote pattern overrides
+# Source changes take effect when SteamClient hooks next install.
+# Downloaded candidates are validated on a later matching module installation.
+# Clearing this URL leaves validated active caches enabled.
+# patterns_url = "https://example.invalid/patterns/{arch}/{family}.toml"
 
 # SteamUI toast notifications.
 [toast]

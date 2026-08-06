@@ -603,6 +603,26 @@ pub(crate) unsafe extern "C" fn hk_ticket_ext_data(
     pi_signature: *mut u32,
     pcb_signature: *mut u32,
 ) -> u32 {
+    let original = detour_or_return!(
+        "GetAppOwnershipTicketExtendedData",
+        TICKET_EXT_DATA_DETOUR,
+        0
+    );
+    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        // SAFETY: forwards Steam's untouched ticket arguments.
+        return unsafe {
+            original(
+                this,
+                app_id,
+                p_ticket,
+                ticket_buf_size,
+                pi_app_id,
+                pi_steam_id,
+                pi_signature,
+                pcb_signature,
+            )
+        };
+    }
     let runtime = runtime_snapshot();
     let authority = vapor_forge_features::apps::classify_app(&runtime.config, AppId(app_id));
     if authority.requires_injected_ownership() {
@@ -619,12 +639,6 @@ pub(crate) unsafe extern "C" fn hk_ticket_ext_data(
         );
     }
 
-    // SAFETY: TICKET_EXT_DATA_DETOUR set before hook enabled, never modified after.
-    let original = detour_or_return!(
-        "GetAppOwnershipTicketExtendedData",
-        TICKET_EXT_DATA_DETOUR,
-        0
-    );
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(
         this,
@@ -947,6 +961,11 @@ pub(crate) unsafe extern "C" fn hk_update_ticket(
     app_id: u32,
     only_update_if_stale: bool,
 ) -> u32 {
+    let original = detour_or_return!("BUpdateAppOwnershipTicket", UPDATE_TICKET_DETOUR, 0);
+    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        // SAFETY: forwards Steam's untouched ticket update request.
+        return unsafe { original(this, app_id, only_update_if_stale) };
+    }
     // Always forward to the trampoline so Steam's internal ticket cache and
     // the appId 7 source ticket both stay warm. For controlled apps that
     // don't have a cached ticket yet, clear `bOnlyUpdateIfStale` so the
@@ -964,8 +983,6 @@ pub(crate) unsafe extern "C" fn hk_update_ticket(
         only_update_if_stale
     };
 
-    // SAFETY: UPDATE_TICKET_DETOUR set before hook enabled, never modified after.
-    let original = detour_or_return!("BUpdateAppOwnershipTicket", UPDATE_TICKET_DETOUR, 0);
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, only_update_if_stale) };
     if controlled {
@@ -993,17 +1010,20 @@ pub(crate) unsafe extern "C" fn hk_is_subscribed_in_ticket(
     game_id_ptr: *const u64,
     app_id: u32,
 ) -> u8 {
-    if is_controlled_unowned_ticket_app(app_id) {
-        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
-        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
-    }
-
-    // SAFETY: IS_SUBSCRIBED_IN_TICKET_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!(
         "IsUserSubscribedAppInTicket",
         IS_SUBSCRIBED_IN_TICKET_DETOUR,
         0
     );
+    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        // SAFETY: forwards Steam's untouched subscription query.
+        return unsafe { original(this, steam_id_low, steam_id_high, game_id_ptr, app_id) };
+    }
+    if is_controlled_unowned_ticket_app(app_id) {
+        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
+        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
+    }
+
     // SAFETY: the typed original and unchanged callback arguments satisfy the
     // validated 32-bit subscription ABI.
     unsafe { original(this, steam_id_low, steam_id_high, game_id_ptr, app_id) }
@@ -1016,17 +1036,20 @@ pub(crate) unsafe extern "C" fn hk_is_subscribed_in_ticket(
     game_id_ptr: *const u64,
     app_id: u32,
 ) -> u8 {
-    if is_controlled_unowned_ticket_app(app_id) {
-        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
-        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
-    }
-
-    // SAFETY: IS_SUBSCRIBED_IN_TICKET_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!(
         "IsUserSubscribedAppInTicket",
         IS_SUBSCRIBED_IN_TICKET_DETOUR,
         0
     );
+    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        // SAFETY: forwards Steam's untouched subscription query.
+        return unsafe { original(this, steam_id, game_id_ptr, app_id) };
+    }
+    if is_controlled_unowned_ticket_app(app_id) {
+        debug!(app_id, "ticket: IsUserSubscribedAppInTicket resolved");
+        return USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE;
+    }
+
     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
     unsafe { original(this, steam_id, game_id_ptr, app_id) }
 }

@@ -36,13 +36,8 @@ struct WatchSet {
 pub(crate) fn start(
     base_config_store: &'static ArcSwap<RuntimeConfig>,
     runtime_store: &'static ArcSwap<RuntimeSnapshot>,
-    config_path: Option<PathBuf>,
+    path: PathBuf,
 ) {
-    let Some(path) = config_path else {
-        debug!("watcher: no config file to watch");
-        return;
-    };
-
     std::thread::Builder::new()
         .name("config-script-watcher".into())
         .spawn(move || watch_loop(path, base_config_store, runtime_store))
@@ -115,7 +110,14 @@ fn watch_loop(
                 }
             }
             if config_changed {
-                if reload_config(&path, base_config_store, runtime_store) {
+                if reload_config(&path, |base_config| {
+                    publish_full_rebuild(
+                        base_config,
+                        base_config_store,
+                        runtime_store,
+                        "config and Lua scripts reloaded",
+                    );
+                }) {
                     refresh_script_watches(&mut inotify, &mut watches, &base_config_store.load());
                 }
             } else {
@@ -353,20 +355,10 @@ fn expand_dir(dir: &str) -> PathBuf {
     PathBuf::from(dir)
 }
 
-fn reload_config(
-    path: &Path,
-    base_config_store: &'static ArcSwap<RuntimeConfig>,
-    runtime_store: &'static ArcSwap<RuntimeSnapshot>,
-) -> bool {
+fn reload_config(path: &Path, publish: impl FnOnce(RuntimeConfig)) -> bool {
     match RuntimeConfig::load(path) {
         Ok(base_config) => {
-            crate::client::install::sync_config_template(path);
-            publish_full_rebuild(
-                base_config,
-                base_config_store,
-                runtime_store,
-                "config and Lua scripts reloaded",
-            );
+            publish(base_config);
             true
         }
         Err(error) => {
@@ -449,14 +441,13 @@ fn finalize_snapshot(
     if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
         queue.invalidate_local_gc();
     }
+    crate::client::install::ensure_runtime_services_for_config(&service_config);
     crate::achievement_worker::notify_context_changed();
     crate::playtime_worker::notify_context_changed();
     crate::playtime_downlink_worker::notify_context_changed();
     crate::stats_wakeup_worker::notify_context_changed();
     crate::client::user_stats::notify_context_changed();
     crate::netpacket::notify_stats_context_changed();
-    crate::client::install::ensure_runtime_services_for_config(&service_config);
-
     crate::client::package::queue_reload(controlled);
 
     info!(inject = inject_count, dlc = dlc_count, message);
@@ -534,6 +525,37 @@ mod tests {
 
         let (_, lua_changed, _) = wait_for_flags(&mut inotify, &watches);
         assert!(lua_changed);
+
+        drop(inotify);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_reload_does_not_write_the_watched_file() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let contents = "[runtime]\ndiagnostics = true\n";
+        fs::write(&path, contents).unwrap();
+
+        let mut inotify = Inotify::init().unwrap();
+        let mut watches = WatchSet::default();
+        register_config_watch(&mut inotify, &mut watches, &path);
+
+        let mut rebuilds = 0;
+        assert!(reload_config(&path, |config| {
+            assert!(config.runtime.diagnostics);
+            rebuilds += 1;
+        }));
+        assert_eq!(rebuilds, 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let (config_changed, lua_changed, script_dirs_changed) =
+            wait_for_flags(&mut inotify, &watches);
+        assert!(!config_changed);
+        assert!(!lua_changed);
+        assert!(!script_dirs_changed);
 
         drop(inotify);
         fs::remove_dir_all(root).unwrap();

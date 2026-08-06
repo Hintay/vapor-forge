@@ -5,7 +5,7 @@ use tracing::warn;
 use vapor_forge_config::RuntimeConfig;
 
 static PENDING_TOASTS: Mutex<Vec<ToastRequest>> = Mutex::new(Vec::new());
-static HAS_WORK: AtomicBool = AtomicBool::new(false);
+static UI_WORK_PENDING: AtomicBool = AtomicBool::new(false);
 static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TITLE: &str = "Vapor Forge";
 const INIT_BODY: &str = "Loaded successfully";
@@ -119,7 +119,8 @@ pub fn show_toast_with_style(
         icon: icon.unwrap_or("").to_owned(),
         duration_ms,
     });
-    HAS_WORK.store(true, Ordering::Release);
+    drop(pending);
+    request_ui_work();
 }
 
 pub fn show_init_toast(config: &RuntimeConfig) {
@@ -129,7 +130,15 @@ pub fn show_init_toast(config: &RuntimeConfig) {
 }
 
 pub fn has_pending_work() -> bool {
-    HAS_WORK.load(Ordering::Acquire)
+    pending_count() != 0
+}
+
+pub fn request_ui_work() {
+    UI_WORK_PENDING.store(true, Ordering::Release);
+}
+
+pub fn take_ui_work() -> bool {
+    UI_WORK_PENDING.swap(false, Ordering::AcqRel)
 }
 
 pub fn pending_count() -> usize {
@@ -158,19 +167,8 @@ pub fn restore_pending(toasts: &[ToastRequest]) {
             let mut restored = toasts.to_vec();
             restored.extend(pending.drain(..));
             *pending = restored;
-            HAS_WORK.store(true, Ordering::Release);
         }
         Err(_) => warn!("toast: pending queue lock poisoned"),
-    }
-}
-
-pub fn mark_idle_if_empty() {
-    let empty = PENDING_TOASTS
-        .lock()
-        .map(|pending| pending.is_empty())
-        .unwrap_or(false);
-    if empty {
-        HAS_WORK.store(false, Ordering::Release);
     }
 }
 
@@ -324,6 +322,12 @@ mod tests {
         let script = bridge_script();
         assert!(script.contains("SteamClient.Apps.GetGameActionForApp"));
         assert!(script.contains("SteamClient.Apps.VaporForgeResolveCloudConflict"));
+        assert!(script.contains("registerFeature('cloud-conflict', 3"));
+        assert!(script.contains("VaporForgeConfirmUIBridge('cloud-conflict:3')"));
+        assert!(script.contains("state.acknowledging[ack.token]"));
+        assert!(script.contains("const receipt = function()"));
+        assert!(script.contains("VaporForgeConfirmCloudConflict(ack.token)"));
+        assert!(script.contains("VaporForgeRetryCloudConflict(ack.token)"));
         assert!(script.contains("'aria-disabled': 'true'"));
         assert!(script.contains("IgnorePendingCloudSessions"));
         assert!(script.contains("SteamClient.Apps.CancelGameAction"));
@@ -341,7 +345,8 @@ mod tests {
         assert!(script.contains("popupWidth: 740"));
         assert!(script.contains("settings.GetCurrentLanguage()"));
         assert!(script.contains("if (state.languageReady || state.languagePromise) return"));
-        assert!(script.contains("if (!Object.keys(state.dialogs).length) return true"));
+        assert!(script.contains("if (!bridge.isTargetSteamUiContext()) return false"));
+        assert!(script.contains("if (!confirmReady()) return false"));
         assert!(script.contains("cloudConflictLocales"));
         assert!(!script.contains("setInterval"));
         assert!(!script.contains("setTimeout"));
@@ -385,7 +390,7 @@ mod tests {
     fn init_toast_respects_config() {
         let _guard = TEST_LOCK.lock().unwrap();
         let _ = take_pending();
-        mark_idle_if_empty();
+        let _ = take_ui_work();
 
         let mut config = RuntimeConfig::default();
         config.toast.enabled = false;
@@ -400,14 +405,14 @@ mod tests {
         assert_eq!(pending[0].title, DEFAULT_TITLE);
         assert_eq!(pending[0].body, INIT_BODY);
 
-        mark_idle_if_empty();
+        let _ = take_ui_work();
     }
 
     #[test]
     fn restore_pending_preserves_retry_order() {
         let _guard = TEST_LOCK.lock().unwrap();
         let _ = take_pending();
-        mark_idle_if_empty();
+        let _ = take_ui_work();
 
         show_toast("a", "b", None, 1000);
         let retry = take_pending();
@@ -421,6 +426,22 @@ mod tests {
         assert_eq!(pending[0].title, "a");
         assert_eq!(pending[1].title, "new");
 
-        mark_idle_if_empty();
+        let _ = take_ui_work();
+    }
+
+    #[test]
+    fn toast_production_publishes_ui_work() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let _ = take_pending();
+        let _ = take_ui_work();
+
+        show_toast("title", "body", None, 1000);
+        assert!(take_ui_work());
+        assert!(!take_ui_work());
+
+        let pending = take_pending();
+        restore_pending(&pending);
+        assert!(!take_ui_work());
+        let _ = take_pending();
     }
 }
