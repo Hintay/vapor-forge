@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use mlua::prelude::*;
 use vapor_forge_core::{AppId, DepotId, ManifestId};
@@ -11,6 +11,73 @@ use crate::{ManifestOverride, ScriptState};
 
 const DEFAULT_HTTP_TIMEOUT_MS: u64 = 10_000;
 const MAX_HTTP_BODY_BYTES: u64 = 256 * 1024;
+const MAX_PROVIDER_HTTP_REQUESTS: u32 = 1;
+
+#[derive(Clone, Default)]
+pub(crate) struct ProviderNetworkBudget {
+    active: Arc<Mutex<Option<ActiveNetworkBudget>>>,
+}
+
+struct ActiveNetworkBudget {
+    requests: u32,
+    deadline: Instant,
+}
+
+pub(crate) struct ProviderNetworkGuard {
+    budget: ProviderNetworkBudget,
+}
+
+impl ProviderNetworkBudget {
+    pub(crate) fn begin(&self, timeout: Duration) -> LuaResult<ProviderNetworkGuard> {
+        let mut active = lock_shared(&self.active);
+        if active.is_some() {
+            return Err(LuaError::RuntimeError(
+                "manifest provider network budget is already active".into(),
+            ));
+        }
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            LuaError::RuntimeError("manifest provider network timeout is too large".into())
+        })?;
+        *active = Some(ActiveNetworkBudget {
+            requests: 0,
+            deadline,
+        });
+        Ok(ProviderNetworkGuard {
+            budget: self.clone(),
+        })
+    }
+
+    fn request_timeout_ms(&self, configured: Option<u64>) -> LuaResult<u64> {
+        let mut active = lock_shared(&self.active);
+        let Some(active) = active.as_mut() else {
+            return Ok(configured.unwrap_or(DEFAULT_HTTP_TIMEOUT_MS));
+        };
+        if active.requests >= MAX_PROVIDER_HTTP_REQUESTS {
+            return Err(LuaError::RuntimeError(
+                "manifest provider HTTP request budget exhausted".into(),
+            ));
+        }
+        let remaining = active
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                LuaError::RuntimeError("manifest provider network deadline expired".into())
+            })?;
+        active.requests += 1;
+        let remaining_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        Ok(configured
+            .unwrap_or(DEFAULT_HTTP_TIMEOUT_MS)
+            .min(remaining_ms))
+    }
+}
+
+impl Drop for ProviderNetworkGuard {
+    fn drop(&mut self) {
+        *lock_shared(&self.budget.active) = None;
+    }
+}
 
 fn file_mtime_unix(path: &Path) -> Option<u32> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -262,6 +329,7 @@ pub(crate) fn install_lua_api(
     state: &Shared<RuntimeState>,
     ctx: &ScriptRunContext,
     options: &ScriptExecutionOptions,
+    provider_network_budget: &ProviderNetworkBudget,
 ) -> Result<(), mlua::Error> {
     let globals = lua.globals();
     let registry = install_case_insensitive_lookup(lua, &globals)?;
@@ -271,7 +339,14 @@ pub(crate) fn install_lua_api(
     install_setstat(lua, &globals, &registry, state, ctx)?;
     install_setavatar(lua, &globals, &registry, state, ctx)?;
     install_addtoken(lua, &globals, &registry, state, ctx)?;
-    install_http_api(lua, &globals, &registry, options, ctx)
+    install_http_api(
+        lua,
+        &globals,
+        &registry,
+        options,
+        ctx,
+        provider_network_budget,
+    )
 }
 
 fn install_case_insensitive_lookup(lua: &Lua, globals: &LuaTable) -> LuaResult<LuaTable> {
@@ -599,9 +674,11 @@ fn install_http_api(
     registry: &LuaTable,
     options: &ScriptExecutionOptions,
     ctx: &ScriptRunContext,
+    provider_network_budget: &ProviderNetworkBudget,
 ) -> Result<(), mlua::Error> {
     let get_options = options.clone();
     let get_ctx = ctx.clone();
+    let get_budget = provider_network_budget.clone();
     register_function(
         globals,
         registry,
@@ -612,7 +689,8 @@ fn install_http_api(
                 format!("url={}", display_url(&url, get_options.redact_network_urls)),
             );
             ensure_network_allowed(&get_options, &url, "http_get")?;
-            let mut request = http_agent(get_options.network_timeout_ms).get(&url);
+            let timeout_ms = get_budget.request_timeout_ms(get_options.network_timeout_ms)?;
+            let mut request = http_agent(Some(timeout_ms)).get(&url);
             for (name, value) in collect_headers(headers)? {
                 request = request.header(name, value);
             }
@@ -635,6 +713,7 @@ fn install_http_api(
 
     let post_options = options.clone();
     let post_ctx = ctx.clone();
+    let post_budget = provider_network_budget.clone();
     register_function(
         globals,
         registry,
@@ -650,7 +729,8 @@ fn install_http_api(
                     ),
                 );
                 ensure_network_allowed(&post_options, &url, "http_post")?;
-                let mut request = http_agent(post_options.network_timeout_ms).post(&url);
+                let timeout_ms = post_budget.request_timeout_ms(post_options.network_timeout_ms)?;
+                let mut request = http_agent(Some(timeout_ms)).post(&url);
                 for (name, value) in collect_headers(headers)? {
                     request = request.header(name, value);
                 }

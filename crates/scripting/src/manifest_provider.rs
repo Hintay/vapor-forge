@@ -95,31 +95,12 @@ impl ManifestCodeProvider {
     }
 
     pub fn fetch(&self, app_id: u32, depot_id: u32, gid: u64) -> Result<Option<u64>, String> {
-        self.fetch_timeout(app_id, depot_id, gid, None)
-    }
-
-    pub fn fetch_with_timeout(
-        &self,
-        app_id: u32,
-        depot_id: u32,
-        gid: u64,
-        _timeout: Duration,
-    ) -> Result<Option<u64>, String> {
-        // Registry calls run synchronously under the shared mutex; the timeout
-        // parameter is preserved for API compatibility with earlier revisions
-        // but is no longer used to bound execution.
-        self.fetch_timeout(app_id, depot_id, gid, None)
-    }
-
-    fn fetch_timeout(
-        &self,
-        app_id: u32,
-        depot_id: u32,
-        gid: u64,
-        _timeout: Option<Duration>,
-    ) -> Result<Option<u64>, String> {
-        if self.has_extended && app_id != 0 && depot_id != 0 {
-            match self.handle.invoke_extended(app_id, depot_id, gid) {
+        let results = self
+            .handle
+            .invoke_manifest_callbacks(app_id, depot_id, gid, self.has_extended, self.has_basic)
+            .map_err(|error| error.to_string())?;
+        if let Some(result) = results.extended {
+            match result {
                 Ok(Some(code)) => {
                     info!(
                         app_id,
@@ -138,8 +119,8 @@ impl ManifestCodeProvider {
                 ),
             }
         }
-        if self.has_basic {
-            match self.handle.invoke_basic(gid) {
+        if let Some(result) = results.basic {
+            match result {
                 Ok(Some(code)) => {
                     info!(
                         gid,
@@ -156,6 +137,16 @@ impl ManifestCodeProvider {
             }
         }
         Ok(None)
+    }
+
+    pub fn fetch_with_timeout(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        gid: u64,
+        _timeout: Duration,
+    ) -> Result<Option<u64>, String> {
+        self.fetch(app_id, depot_id, gid)
     }
 
     pub fn has_basic(&self) -> bool {
