@@ -40,7 +40,7 @@ pub struct LocalGcCoordinator {
 }
 
 impl LocalGcCoordinator {
-    pub fn new() -> Self {
+    pub fn try_new() -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel::<InspectionRequest>();
         let state = Arc::new(Mutex::new(CoordinatorState::default()));
         let worker_state = Arc::clone(&state);
@@ -48,13 +48,12 @@ impl LocalGcCoordinator {
         let worker_epoch = Arc::clone(&epoch);
         std::thread::Builder::new()
             .name("vapor-local-cloud-gc".into())
-            .spawn(move || run_inspections(receiver, worker_state, worker_epoch))
-            .expect("local cloud GC worker must start");
-        Self {
+            .spawn(move || run_inspections(receiver, worker_state, worker_epoch))?;
+        Ok(Self {
             state,
             sender,
             epoch,
-        }
+        })
     }
 
     pub fn queue_inspection(
@@ -97,12 +96,6 @@ impl LocalGcCoordinator {
         if self.sender.send(request).is_err() {
             warn!("local cloud GC worker is unavailable");
         }
-    }
-}
-
-impl Default for LocalGcCoordinator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -290,7 +283,7 @@ mod tests {
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&manifest, b"old manifest").unwrap();
         std::fs::write(&blob, b"old blob").unwrap();
-        let coordinator = LocalGcCoordinator::new();
+        let coordinator = LocalGcCoordinator::try_new().unwrap();
 
         coordinator.queue_inspection(
             store,

@@ -14,5 +14,5 @@ pub(crate) use router::{
 pub(crate) use stats_proxy::notify_context_changed as notify_stats_context_changed;
 
 pub(crate) fn cloud_rpc_queue() -> Option<&'static vapor_forge_cloud_rpc::CloudRpcQueue> {
-    once_cell::sync::Lazy::get(&router::CLOUD_PENDING)
+    router::cloud_rpc_queue()
 }

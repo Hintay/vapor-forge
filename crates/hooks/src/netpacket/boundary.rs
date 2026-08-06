@@ -7,7 +7,7 @@ use vapor_forge_packet_capture::{PacketChange, PacketDirection};
 use vapor_forge_steam_native_abi::cnet_packet;
 
 use super::router::{
-    prepare_recv_post_action, process_recv_frame, RecvFrameDecision, CLOUD_PENDING,
+    cloud_rpc_queue, prepare_recv_post_action, process_recv_frame, RecvFrameDecision,
     LOCAL_RESPONSES, PENDING,
 };
 
@@ -48,7 +48,10 @@ fn drain_manifest() {
 }
 
 fn drain_cloud() {
-    for response in CLOUD_PENDING.drain_completed() {
+    let Some(queue) = cloud_rpc_queue() else {
+        return;
+    };
+    for response in queue.drain_completed() {
         // Cumulus upload responses contain bearer credentials and are not captured.
         crate::client::network::enqueue_cloud_injection(response);
     }

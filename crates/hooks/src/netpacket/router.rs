@@ -43,8 +43,9 @@ use super::stats_proxy;
 
 pub(super) static PENDING: once_cell::sync::Lazy<PendingQueue> =
     once_cell::sync::Lazy::new(PendingQueue::new);
-pub(super) static CLOUD_PENDING: once_cell::sync::Lazy<vapor_forge_cloud_rpc::CloudRpcQueue> =
-    once_cell::sync::Lazy::new(vapor_forge_cloud_rpc::CloudRpcQueue::new);
+static CLOUD_PENDING: once_cell::sync::OnceCell<
+    Result<vapor_forge_cloud_rpc::CloudRpcQueue, std::io::Error>,
+> = once_cell::sync::OnceCell::new();
 const MAX_STATS_REQUESTS: usize = 4096;
 const ERESULT_INVALID_PARAM: i32 = 8;
 pub(super) struct LocalResponse {
@@ -63,6 +64,22 @@ static PENDING_CLIENT_ID_LOGIN: once_cell::sync::Lazy<Mutex<Option<LoginCompleti
 
 // A protected app without AppAvatar must not upload unscoped Rich Presence.
 static BLOCKED_RICH_PRESENCE_APP: AtomicU32 = AtomicU32::new(0);
+
+pub(super) fn cloud_rpc_queue() -> Option<&'static vapor_forge_cloud_rpc::CloudRpcQueue> {
+    CLOUD_PENDING.get()?.as_ref().ok()
+}
+
+fn initialize_cloud_rpc_queue() -> Option<&'static vapor_forge_cloud_rpc::CloudRpcQueue> {
+    CLOUD_PENDING
+        .get_or_init(|| {
+            vapor_forge_cloud_rpc::CloudRpcQueue::try_new().map_err(|error| {
+                warn!(%error, "cloud-rpc: worker initialization failed");
+                error
+            })
+        })
+        .as_ref()
+        .ok()
+}
 
 // ---------------------------------------------------------------------------
 // Outgoing frame handling called from BBuildAndAsyncSendFrame hook
@@ -330,23 +347,30 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
             warn!(method, "netpacket: native response delivery unavailable");
             return SendFrameDecision::Retry;
         }
-        CLOUD_PENDING.set_conflict_ui_ready(crate::ui::conflict_ui_ready());
-        if CLOUD_PENDING.intercept(
-            method,
-            &hdr,
-            header_bytes,
-            body_bytes,
-            &runtime.config,
-            crate::client::network::injection_generation(),
-        ) {
-            info!(method, "netpacket: intercepted client cloud RPC");
-            crate::packet_capture::capture(
-                PacketDirection::Send,
-                data,
-                PacketChange::Dropped,
-                Some(0),
-            );
-            return SendFrameDecision::Drop;
+        let cloud_queue = cloud_rpc_queue().or_else(|| {
+            vapor_forge_cloud_rpc::requires_queue(method, body_bytes, &runtime.config)
+                .then(initialize_cloud_rpc_queue)
+                .flatten()
+        });
+        if let Some(cloud_queue) = cloud_queue {
+            cloud_queue.set_conflict_ui_ready(crate::ui::conflict_ui_ready());
+            if cloud_queue.intercept(
+                method,
+                &hdr,
+                header_bytes,
+                body_bytes,
+                &runtime.config,
+                crate::client::network::injection_generation(),
+            ) {
+                info!(method, "netpacket: intercepted client cloud RPC");
+                crate::packet_capture::capture(
+                    PacketDirection::Send,
+                    data,
+                    PacketChange::Dropped,
+                    Some(0),
+                );
+                return SendFrameDecision::Drop;
+            }
         }
 
         if let Some((app_id, expects_response)) =
