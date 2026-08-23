@@ -49,6 +49,12 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
+# Manifest request-code providers for controlled apps.
+[manifest]
+providers = ["opensteamtool", "wudrm", "steamrun"]
+timeout_connect_ms = 5000
+timeout_ms = 15000
+
 # Offline achievement schema support.
 [achievements]
 offline_schema = false

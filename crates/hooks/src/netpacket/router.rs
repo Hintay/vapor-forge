@@ -311,22 +311,18 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         let response_delivery_ready = crate::client::network::response_delivery_ready();
 
         if method == request_code::TARGET_JOB_NAME {
-            if response_delivery_ready && handle_manifest_send(&hdr, header_bytes, body_bytes) {
-                decision = SendFrameDecision::Drop;
-                crate::packet_capture::capture(
+            decision =
+                handle_manifest_send(&hdr, header_bytes, body_bytes, response_delivery_ready);
+            match &decision {
+                SendFrameDecision::Drop => capture_dropped(data),
+                SendFrameDecision::Pass => crate::packet_capture::capture(
                     PacketDirection::Send,
                     data,
-                    PacketChange::Dropped,
-                    Some(0),
-                );
-                return decision;
+                    PacketChange::Unchanged,
+                    None,
+                ),
+                SendFrameDecision::Retry | SendFrameDecision::Rewrite(_) => {}
             }
-            crate::packet_capture::capture(
-                PacketDirection::Send,
-                data,
-                PacketChange::Unchanged,
-                None,
-            );
             return decision;
         }
 
@@ -921,16 +917,21 @@ fn inject_access_tokens(
     }
 }
 
-fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_bytes: &[u8]) -> bool {
+fn handle_manifest_send(
+    hdr: &CMsgProtoBufHeader,
+    header_bytes: &[u8],
+    body_bytes: &[u8],
+    response_delivery_ready: bool,
+) -> SendFrameDecision {
     let fetch = match request_code::plan_fetch(hdr, header_bytes, body_bytes) {
         Ok(fetch) => fetch,
         Err(request_code::ManifestFetchError::Decode(error)) => {
             warn!(%error, "netpacket: failed to decode manifest request");
-            return false;
+            return SendFrameDecision::Pass;
         }
         Err(request_code::ManifestFetchError::MissingJobId) => {
             debug!("netpacket: missing or zero jobid_source, passing through");
-            return false;
+            return SendFrameDecision::Pass;
         }
     };
     let request_code::ManifestCodeFetch {
@@ -943,26 +944,40 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
 
     let runtime = crate::client::install::runtime_snapshot();
     let cfg = &runtime.config;
-    if !request_code::should_intercept(AppId(app_id), cfg, runtime.manifest_code_provider.is_some())
-    {
-        return false;
+    if !request_code::should_intercept(AppId(app_id), cfg) {
+        return SendFrameDecision::Pass;
     }
-    let Some(provider) = runtime.manifest_code_provider.clone() else {
-        debug!(
+    if !response_delivery_ready {
+        warn!(
             app_id,
-            depot_id, gid, "netpacket: manifest request has no script provider, passing through"
+            depot_id, gid, "netpacket: manifest response delivery unavailable"
         );
-        return false;
-    };
+        return SendFrameDecision::Retry;
+    }
 
+    let response_generation = crate::client::network::injection_generation();
     info!(
         app_id,
         depot_id, gid, job_id, "netpacket: intercepted manifest request code"
     );
-    let callback =
+    let script_callback = runtime.manifest_code_provider.clone().map(|provider| {
         std::sync::Arc::new(move |app_id, depot_id, gid| provider.fetch(app_id, depot_id, gid))
-            as request_code::ManifestCodeCallback;
-    PENDING.queue_fetch(
+            as request_code::ManifestCodeCallback
+    });
+    if script_callback.is_none() && cfg.manifest.providers.is_empty() {
+        warn!(
+            app_id,
+            depot_id, gid, "netpacket: manifest request has no provider"
+        );
+        queue_local_response_for_generation(
+            request_code::build_response_packet(&req_hdr_bytes, job_id, gid, 0),
+            response_generation,
+        );
+        return SendFrameDecision::Drop;
+    }
+
+    let offline_response = request_code::build_response_packet(&req_hdr_bytes, job_id, gid, 0);
+    if PENDING.queue_fetch(
         request_code::ManifestCodeFetch {
             job_id,
             app_id,
@@ -970,9 +985,15 @@ fn handle_manifest_send(hdr: &CMsgProtoBufHeader, header_bytes: &[u8], body_byte
             gid,
             req_hdr_bytes,
         },
-        callback,
-        crate::client::network::injection_generation(),
-    )
+        &cfg.manifest,
+        script_callback,
+        response_generation,
+    ) {
+        SendFrameDecision::Drop
+    } else {
+        queue_local_response_for_generation(offline_response, response_generation);
+        SendFrameDecision::Drop
+    }
 }
 
 /// Process an incoming frame before Steam handles the real packet.

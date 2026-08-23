@@ -1,6 +1,7 @@
 use crate::template::{parse_commented_section_header, CommentedSectionHeader, TEMPLATE_EXAMPLES};
 use crate::{
-    AppCategory, AppId, CloudBackendMode, RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE,
+    AppCategory, AppId, CloudBackendMode, ManifestProvider, RuntimeConfig, TicketCacheMode,
+    CONFIG_TEMPLATE,
 };
 
 #[test]
@@ -42,6 +43,7 @@ fn rejects_unknown_fields_in_every_config_table() {
             "[[library_inject.libs]]\npath = \"/tmp/test.so\"\nunknown = true",
         ),
         ("ticket", "[ticket]\nunknown = true"),
+        ("manifest", "[manifest]\nunknown = true"),
     ];
 
     for (name, text) in cases {
@@ -79,6 +81,25 @@ fn template_parses_and_keeps_safe_defaults() {
     assert!(config.cloud.local.syncthing.folder_id.is_empty());
     assert_eq!(config.ticket.cache, TicketCacheMode::Disk);
     assert!(!config.ticket.auto_delegate);
+    assert_eq!(
+        config.manifest.providers,
+        vec![
+            ManifestProvider::OpenSteamTool,
+            ManifestProvider::Wudrm,
+            ManifestProvider::SteamRun,
+        ]
+    );
+    assert_eq!(config.manifest.timeout_connect_ms, 5000);
+    assert_eq!(config.manifest.timeout_ms, 15000);
+}
+
+#[test]
+fn manifest_rejects_unknown_providers() {
+    let error =
+        toml::from_str::<RuntimeConfig>("[manifest]\nproviders = [\"opensteamtool\", \"unknown\"]")
+            .expect_err("unknown manifest provider should be rejected");
+
+    assert!(error.to_string().contains("unknown variant `unknown`"));
 }
 
 #[test]
@@ -229,6 +250,9 @@ diagnostics = true
         .expect("apps.shared table should exist");
     let cloud_pos = synced.find("[cloud]").expect("cloud table should exist");
     let ticket_pos = synced.find("[ticket]").expect("ticket table should exist");
+    let manifest_pos = synced
+        .find("[manifest]")
+        .expect("manifest table should exist");
     let achievements_pos = synced
         .find("[achievements]")
         .expect("achievements table should exist");
@@ -239,6 +263,7 @@ diagnostics = true
     assert!(toast_pos < apps_pos);
     assert!(apps_pos < cloud_pos);
     assert!(cloud_pos < ticket_pos);
+    assert!(ticket_pos < manifest_pos);
 
     let debug_example_pos = synced
         .find("# [debug]")
@@ -262,7 +287,7 @@ diagnostics = true
     assert!(runtime_example_pos < toast_pos);
     assert!(apps_pos < shared_example_pos);
     assert!(shared_example_pos < cloud_pos);
-    assert!(ticket_pos < achievements_pos);
+    assert!(manifest_pos < achievements_pos);
     assert!(scripting_pos < debug_example_pos);
     assert!(debug_example_pos < app_example_pos);
     assert!(app_example_pos < avatar_example_pos);

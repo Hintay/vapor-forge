@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prost::Message;
-use tracing::{debug, warn};
-use vapor_forge_config::{AppId, RuntimeConfig};
+use tracing::{debug, info, warn};
+use vapor_forge_config::{AppId, ManifestProvider, ManifestSection, RuntimeConfig};
 use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
-    K_MSG_HDR_PROTO_FLAG,
+    ERESULT_NO_CONNECTION, K_MSG_HDR_PROTO_FLAG,
 };
 
 pub type ManifestCodeCallback =
@@ -97,11 +97,12 @@ impl PendingQueue {
     }
 
     /// Queue a new manifest code fetch. Spawns a background thread to call
-    /// the configured script callback and stores the result for later draining.
+    /// the configured providers and stores the result for later draining.
     pub fn queue_fetch(
         &self,
         request: ManifestCodeFetch,
-        callback: ManifestCodeCallback,
+        manifest: &ManifestSection,
+        script_callback: Option<ManifestCodeCallback>,
         response_generation: u64,
     ) -> bool {
         let ManifestCodeFetch {
@@ -126,10 +127,7 @@ impl PendingQueue {
         {
             let mut list = self.list.lock().unwrap();
             if list.len() >= MAX_PENDING_FETCHES {
-                warn!(
-                    job_id,
-                    gid, "request_code: pending queue full, passing request through"
-                );
+                warn!(job_id, gid, "request_code: pending queue full");
                 return false;
             }
             list.push(pending);
@@ -137,21 +135,28 @@ impl PendingQueue {
 
         let result_clone = Arc::clone(&result);
         let done_clone = Arc::clone(&done);
+        let providers = manifest.providers.clone();
+        let timeout_connect_ms = manifest.timeout_connect_ms;
+        let timeout_ms = manifest.timeout_ms;
         let spawn_result = std::thread::Builder::new()
             .name("manifest-code-fetch".to_owned())
             .spawn(move || {
-                let code = match catch_unwind(AssertUnwindSafe(|| callback(app_id, depot_id, gid)))
-                {
-                    Ok(Ok(code)) => code,
-                    Ok(Err(error)) => {
-                        warn!(gid, %error, "request_code: script provider unavailable");
-                        None
+                let script_code = script_callback.and_then(|callback| {
+                    match catch_unwind(AssertUnwindSafe(|| callback(app_id, depot_id, gid))) {
+                        Ok(Ok(code)) => code.filter(|code| *code > 0),
+                        Ok(Err(error)) => {
+                            warn!(gid, %error, "request_code: script provider unavailable");
+                            None
+                        }
+                        Err(_) => {
+                            warn!(gid, "request_code: script provider panicked");
+                            None
+                        }
                     }
-                    Err(_) => {
-                        warn!(gid, "request_code: script provider panicked");
-                        None
-                    }
-                };
+                });
+                let code = script_code.or_else(|| {
+                    fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms)
+                });
                 {
                     let mut lock = result_clone.lock().unwrap();
                     // Some(0) = failed, Some(n) = success
@@ -215,25 +220,110 @@ impl Default for PendingQueue {
 // Interception check
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if this app requires an injected manifest request code.
-pub fn should_intercept(app_id: AppId, config: &RuntimeConfig, provider_available: bool) -> bool {
-    should_intercept_with_ownership(
-        app_id,
-        config,
-        provider_available,
-        crate::apps::actual_ownership,
-    )
+/// Returns `true` if this app requires a local manifest request-code response.
+pub fn should_intercept(app_id: AppId, config: &RuntimeConfig) -> bool {
+    should_intercept_with_ownership(app_id, config, crate::apps::actual_ownership)
 }
 
 pub fn should_intercept_with_ownership(
     app_id: AppId,
     config: &RuntimeConfig,
-    provider_available: bool,
     ownership: impl FnOnce(AppId) -> crate::apps::OwnershipState,
 ) -> bool {
-    provider_available
-        && crate::apps::classify_app_with_ownership(config, app_id, ownership)
-            .requires_injected_ownership()
+    crate::apps::classify_app_with_ownership(config, app_id, ownership)
+        .requires_injected_ownership()
+}
+
+// ---------------------------------------------------------------------------
+// Built-in providers
+// ---------------------------------------------------------------------------
+
+const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
+const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4096;
+
+fn fetch_manifest_code(
+    gid: u64,
+    providers: &[ManifestProvider],
+    timeout_connect_ms: u64,
+    timeout_ms: u64,
+) -> Option<u64> {
+    for &provider in providers {
+        let (name, url_template) = provider_endpoint(provider);
+        let url = url_template.replace("{gid}", &gid.to_string());
+        debug!(
+            provider = name,
+            gid, "request_code: trying built-in provider"
+        );
+
+        match fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms) {
+            Ok(code) if code > 0 => {
+                info!(
+                    provider = name,
+                    gid, code, "request_code: manifest code obtained"
+                );
+                return Some(code);
+            }
+            Ok(_) => warn!(provider = name, gid, "request_code: provider returned zero"),
+            Err(error) => {
+                warn!(provider = name, gid, %error, "request_code: provider failed");
+            }
+        }
+    }
+
+    None
+}
+
+fn provider_endpoint(provider: ManifestProvider) -> (&'static str, &'static str) {
+    match provider {
+        ManifestProvider::OpenSteamTool => {
+            ("opensteamtool", "https://manifest.opensteamtool.com/{gid}")
+        }
+        ManifestProvider::Wudrm => ("wudrm", "http://gmrc.wudrm.com/manifest/{gid}"),
+        ManifestProvider::SteamRun => ("steamrun", "https://manifest.steam.run/api/manifest/{gid}"),
+    }
+}
+
+fn fetch_from_provider(
+    provider: ManifestProvider,
+    url: &str,
+    timeout_connect_ms: u64,
+    timeout_ms: u64,
+) -> Result<u64, String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_millis(timeout_connect_ms)))
+        .timeout_global(Some(std::time::Duration::from_millis(timeout_ms)))
+        .build()
+        .new_agent();
+
+    let mut request = agent.get(url);
+    if provider == ManifestProvider::OpenSteamTool {
+        request = request.header("User-Agent", OPENSTEAMTOOL_USER_AGENT);
+    }
+
+    let mut response = request.call().map_err(|error| error.to_string())?;
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_PROVIDER_RESPONSE_BYTES)
+        .read_to_string()
+        .map_err(|error| error.to_string())?;
+    parse_provider_response(provider, body.trim())
+}
+
+fn parse_provider_response(provider: ManifestProvider, body: &str) -> Result<u64, String> {
+    let body = body.trim();
+    if provider == ManifestProvider::SteamRun {
+        let value: serde_json::Value =
+            serde_json::from_str(body).map_err(|error| error.to_string())?;
+        return value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "missing string content field".to_owned())?
+            .parse::<u64>()
+            .map_err(|error| error.to_string());
+    }
+
+    body.parse::<u64>().map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +338,10 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
     // Parse the original request header to copy fields
     let req_hdr = CMsgProtoBufHeader::decode(req_hdr_bytes).unwrap_or_default();
 
-    let (eresult, transport_error, seq_num) = if code > 0 {
-        (Some(1_i32), None, None) // EResult::OK
+    let eresult = if code > 0 {
+        Some(1_i32)
     } else {
-        (Some(15_i32), Some(1_i32), Some(1_i32)) // EResult::AccessDenied
+        Some(ERESULT_NO_CONNECTION)
     };
 
     let resp_hdr = CMsgProtoBufHeader {
@@ -260,8 +350,8 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
         jobid_target: req_hdr.jobid_source, // route response to the original caller
         target_job_name: req_hdr.target_job_name.clone(),
         eresult,
-        transport_error,
-        seq_num,
+        transport_error: None,
+        seq_num: None,
         ..Default::default()
     };
 
@@ -291,6 +381,13 @@ mod tests {
         .encode_to_vec()
     }
 
+    fn script_only_manifest() -> ManifestSection {
+        ManifestSection {
+            providers: Vec::new(),
+            ..ManifestSection::default()
+        }
+    }
+
     #[test]
     fn build_response_routes_to_caller() {
         let req_hdr = make_req_header(42, TARGET_JOB_NAME);
@@ -308,13 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn build_response_failure_returns_access_denied() {
+    fn build_response_failure_returns_no_connection() {
         let req_hdr = make_req_header(7, TARGET_JOB_NAME);
         let packet = build_response_packet(&req_hdr, 7, 123, 0);
         let (_, hdr_bytes, body_bytes) = vapor_forge_steam_protocol::unpack_raw(&packet).unwrap();
 
         let resp_hdr = CMsgProtoBufHeader::decode(hdr_bytes).unwrap();
-        assert_eq!(resp_hdr.eresult, Some(15));
+        assert_eq!(resp_hdr.eresult, Some(ERESULT_NO_CONNECTION));
+        assert_eq!(resp_hdr.transport_error, None);
+        assert_eq!(resp_hdr.seq_num, None);
 
         let resp_body = GetManifestRequestCodeResponse::decode(body_bytes).unwrap();
         assert_eq!(resp_body.manifest_request_code, None);
@@ -362,9 +461,14 @@ mod tests {
             },
             ..Default::default()
         };
-        assert!(should_intercept(AppId(480), &config, true));
-        assert!(!should_intercept(AppId(480), &config, false));
-        assert!(!should_intercept(AppId(999), &config, true));
+        assert!(should_intercept(AppId(480), &config));
+        assert!(!should_intercept(AppId(999), &config));
+
+        let without_provider = RuntimeConfig {
+            manifest: script_only_manifest(),
+            ..config.clone()
+        };
+        assert!(should_intercept(AppId(480), &without_provider));
 
         let owned_app = AppId(246_813_583);
         let owned_config = RuntimeConfig {
@@ -380,7 +484,7 @@ mod tests {
             ..Default::default()
         };
         crate::apps::record_actual_ownership(owned_app, true);
-        assert!(!should_intercept(owned_app, &owned_config, true));
+        assert!(!should_intercept(owned_app, &owned_config));
     }
 
     #[test]
@@ -401,7 +505,8 @@ mod tests {
                 gid: 1234,
                 req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
             },
-            callback,
+            &script_only_manifest(),
+            Some(callback),
             7,
         ));
 
@@ -442,7 +547,8 @@ mod tests {
                     gid: job_id + 100,
                     req_hdr_bytes: Vec::new(),
                 },
-                Arc::clone(&callback),
+                &script_only_manifest(),
+                Some(Arc::clone(&callback)),
                 7,
             ));
         }
@@ -454,7 +560,8 @@ mod tests {
                 gid: 999,
                 req_hdr_bytes: Vec::new(),
             },
-            callback,
+            &script_only_manifest(),
+            Some(callback),
             7,
         ));
         barrier.wait();
@@ -472,7 +579,8 @@ mod tests {
                 gid: 1234,
                 req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
             },
-            callback,
+            &script_only_manifest(),
+            Some(callback),
             7,
         ));
 
@@ -504,7 +612,8 @@ mod tests {
                 gid: 1234,
                 req_hdr_bytes: make_req_header(99, TARGET_JOB_NAME),
             },
-            callback,
+            &script_only_manifest(),
+            Some(callback),
             7,
         ));
 
@@ -522,5 +631,23 @@ mod tests {
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].job_id, 99);
         assert_eq!(completed[0].code, 0);
+    }
+
+    #[test]
+    fn parses_built_in_provider_responses() {
+        assert_eq!(
+            parse_provider_response(ManifestProvider::OpenSteamTool, "123456").unwrap(),
+            123456
+        );
+        assert_eq!(
+            parse_provider_response(ManifestProvider::Wudrm, " 654321 ").unwrap(),
+            654321
+        );
+        assert_eq!(
+            parse_provider_response(ManifestProvider::SteamRun, r#"{"content":"9999999999"}"#,)
+                .unwrap(),
+            9_999_999_999
+        );
+        assert!(parse_provider_response(ManifestProvider::SteamRun, r#"{"other":"1"}"#).is_err());
     }
 }

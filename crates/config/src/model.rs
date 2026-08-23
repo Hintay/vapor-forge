@@ -23,6 +23,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub ticket: TicketSection,
     #[serde(default)]
+    pub manifest: ManifestSection,
+    #[serde(default)]
     pub achievements: AchievementsSection,
     #[serde(default)]
     pub app_avatar: AppAvatarSection,
@@ -414,6 +416,46 @@ pub enum TicketCacheMode {
     /// Persist to disk. Survives restarts.
     #[default]
     Disk,
+}
+
+/// Manifest request-code provider configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestSection {
+    #[serde(default = "default_manifest_providers")]
+    pub providers: Vec<ManifestProvider>,
+    #[serde(default = "default_timeout_connect_ms")]
+    pub timeout_connect_ms: u64,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for ManifestSection {
+    fn default() -> Self {
+        Self {
+            providers: default_manifest_providers(),
+            timeout_connect_ms: default_timeout_connect_ms(),
+            timeout_ms: default_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum ManifestProvider {
+    #[serde(rename = "opensteamtool")]
+    OpenSteamTool,
+    #[serde(rename = "wudrm")]
+    Wudrm,
+    #[serde(rename = "steamrun")]
+    SteamRun,
+}
+
+fn default_manifest_providers() -> Vec<ManifestProvider> {
+    vec![
+        ManifestProvider::OpenSteamTool,
+        ManifestProvider::Wudrm,
+        ManifestProvider::SteamRun,
+    ]
 }
 
 fn default_timeout_connect_ms() -> u64 {
