@@ -16,6 +16,7 @@ pub(crate) mod internal_callbacks;
 pub(crate) mod network;
 pub(crate) mod ownership;
 pub(crate) mod playtime_downlink;
+pub(crate) mod shader;
 pub(crate) mod steam_context;
 pub(crate) mod steam_session;
 pub(crate) mod ticket;

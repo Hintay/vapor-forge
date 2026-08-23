@@ -66,6 +66,11 @@ pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 2C 02 00 00 8B 45 08
 [[steamclient."BuildDepotDependency".variants]]
 pattern = "E8 ? ? ? ? 81 C2 ? ? ? ? 55 89 E5 57 56 53 83 EC 6C 8B 45 08 8B 5D 10 89 55 A0 8B 75 0C 89 45 9C 89 5D A4"
 
+# Reads game/shadercachedepot from the local app-info cache.
+[steamclient."CShaderCacheManager::GetShaderCacheDepot"]
+follow = "none"
+pattern = "57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 8B 83 ? ? ? ? 8B 40 44 85 C0 75 ?"
+
 [steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame"]
 follow = "none"
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC AC 00 00 00 8B 45 10"
