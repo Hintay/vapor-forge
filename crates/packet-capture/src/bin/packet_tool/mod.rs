@@ -192,15 +192,12 @@ mod tests {
         assert_eq!(result.final_len, None);
         assert_eq!(
             result.required_runtime_state,
-            vec![
-                "actual ownership snapshot",
-                "manifest provider availability"
-            ]
+            vec!["actual ownership snapshot"]
         );
     }
 
     #[test]
-    fn simulate_manifest_request_passes_without_a_provider() {
+    fn simulate_manifest_request_stays_local_without_a_provider() {
         let app_id = AppId(480);
         let header = CMsgProtoBufHeader {
             jobid_source: Some(42),
@@ -220,16 +217,20 @@ mod tests {
             &header.encode_to_vec(),
             &body.encode_to_vec(),
         );
-        let config = controlled_config(app_id.0);
+        let mut config = controlled_config(app_id.0);
+        config.manifest.providers.clear();
         let ownership = HashMap::from([(app_id, OwnershipState::Unowned)]);
         let avatars = HashMap::new();
         let donors = HashMap::new();
-        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors, false);
+        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors);
 
         let result = simulate_send_with_context(&packet, &context);
-        assert_eq!(result.decision, SimDecision::Pass);
+        assert_eq!(result.decision, SimDecision::NeedsRuntimeState);
         assert_eq!(result.handler, "manifest-request-code");
-        assert!(result.required_runtime_state.is_empty());
+        assert_eq!(
+            result.required_runtime_state,
+            vec!["native response delivery state"]
+        );
     }
 
     #[test]
@@ -284,7 +285,7 @@ mod tests {
         let ownership = HashMap::from([(app_id, OwnershipState::Unowned)]);
         let avatars = HashMap::new();
         let donors = HashMap::new();
-        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors, true);
+        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors);
         let body = LegacyStoreUserStatsRequestFixture {
             game_id: Some(u64::from(app_id.0)),
         };
@@ -307,7 +308,7 @@ mod tests {
         let ownership = HashMap::from([(app_id, OwnershipState::Unowned)]);
         let avatars = HashMap::new();
         let donors = HashMap::new();
-        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors, true);
+        let context = SimulationContext::complete(&config, &ownership, &avatars, &donors);
         let body = CMsgClientGamesPlayed {
             games_played: vec![vapor_forge_steam_protocol::GamePlayed {
                 game_id: Some(u64::from(app_id.0)),
