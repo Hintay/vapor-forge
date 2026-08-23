@@ -4,12 +4,13 @@
     const bridge = window.VaporForgeUIBridge;
     if (!bridge || typeof bridge.registerFeature !== 'function') return;
 
-    bridge.registerFeature('toast', 1, function(bridge) {
+    bridge.registerFeature('toast', 3, function(bridge) {
       const state = {
         store: null,
         css: null,
         jsx: null,
         focusable: null,
+        navigation: null,
         nextId: 10000,
         pending: [],
         seen: {},
@@ -46,19 +47,48 @@
         return found;
       }
 
-      function findFocusable() {
+      function isGamepadUiReady() {
+        try {
+          return String(window.location && window.location.href || '').indexOf('/routes/') !== -1;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function findFocusable(allowFactoryLoad) {
         var found = null;
         bridge.eachExport(function(exp) {
           try {
-            if (exp && exp.render && typeof exp.render === 'function' &&
-                String(exp.render).indexOf('flow-children') !== -1) {
+            var render = typeof exp === 'function'
+              ? exp
+              : exp && typeof exp.render === 'function' ? exp.render : null;
+            if (render && bridge.hasAll(String(render), [
+              'flow-children',
+              'focusClassName',
+              'focusWithinClassName',
+              'onOKButton'
+            ])) {
               found = exp;
               return true;
             }
           } catch (_) {}
           return false;
-        });
+        }, allowFactoryLoad ? function(text) {
+          return bridge.hasAll(text, [
+            'flow-children',
+            'focusClassName',
+            'focusWithinClassName',
+            'onOKButton'
+          ]);
+        } : null);
         return found;
+      }
+
+      function activateQamToast() {
+        var navigation = state.navigation;
+        if (navigation && typeof navigation.CloseSideMenus === 'function') {
+          navigation.CloseSideMenus();
+        }
       }
 
       function allocateNotificationId(toast) {
@@ -252,11 +282,9 @@
               })
             })
             : null;
-          var content = jsx.jsx('div', {
-            className: (css.StandardTemplateContainer || '') +
-              ' VaporForgeQAMToast VaporForgeToast-' + kind + ' VaporForgeToastStyle-' + style,
-            style: qamRootStyle(kind, style),
-            children: jsx.jsxs('div', { className: css.StandardTemplate || '', children: [
+          var content = jsx.jsxs('div', {
+            className: css.StandardTemplate || '',
+            children: [
               logo,
               jsx.jsxs('div', { className: css.Content || '', children: [
                 jsx.jsxs('div', { className: css.Header || '', children: [
@@ -273,11 +301,17 @@
                   children: body
                 }) : null
               ]})
-            ]})
+            ]
           });
           var Focusable = state.focusable;
-          if (Focusable) return jsx.jsx(Focusable, { onActivate: function() {}, children: content });
-          return content;
+          if (!Focusable) return renderFallback(jsx, title, body);
+          return jsx.jsx(Focusable, {
+            onActivate: activateQamToast,
+            className: (css.StandardTemplateContainer || '') +
+              ' VaporForgeQAMToast VaporForgeToast-' + kind + ' VaporForgeToastStyle-' + style,
+            style: qamRootStyle(kind, style),
+            children: content
+          });
         } catch (error) {
           bridge.log('qam render error: ' + error);
           return renderFallback(jsx, data.title, data.body);
@@ -340,6 +374,11 @@
       }
 
       function patchJsxRenderer() {
+        var gamepadUiReady = isGamepadUiReady();
+        state.focusable = state.focusable || findFocusable(gamepadUiReady);
+        if (gamepadUiReady) {
+          state.navigation = state.navigation || bridge.findWindowStore();
+        }
         if (state.renderPatched) return true;
         const jsx = state.jsx || bridge.findJsx();
         const css = state.css || findCss();
@@ -347,7 +386,6 @@
         state.jsx = jsx;
         state.css = css;
         const jsxPatched = patchJsxRuntime(jsx);
-        state.focusable = state.focusable || findFocusable();
         if (jsxPatched) return true;
         var patched = false;
         bridge.eachExport(function(exp, id, mod, parent, key) {
@@ -385,6 +423,7 @@
       function flush() {
         if (!bridge.isTargetSteamUiContext()) return false;
         if (!state.store || !state.renderPatched) return false;
+        if (isGamepadUiReady() && !state.focusable) return false;
         while (state.pending.length) {
           var toast = state.pending.shift();
           if (toast.id != null && state.seen['flushed:' + toast.id]) continue;
@@ -434,8 +473,10 @@
         if (!bridge.req) return false;
         state.store = state.store || findStore();
         patchJsxRenderer();
-        if (state.store && state.renderPatched) flush();
-        return !!(state.store && state.renderPatched);
+        var ready = !!(state.store && state.renderPatched &&
+          (!isGamepadUiReady() || state.focusable));
+        if (ready) flush();
+        return ready;
       }
 
       bridge.showToast = showToast;
