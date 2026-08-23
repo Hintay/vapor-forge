@@ -5,6 +5,7 @@ use super::*;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::warn;
 use vapor_forge_cloud_core::{CloudFileStore, FileEntry, FileMetadata};
 use vapor_forge_cloud_local::{
     commit_upload, issue_download, issue_upload, CommitIdentity, FolderStore, StoreView,
@@ -21,9 +22,21 @@ pub(super) fn execute_local_rpc(
         .steam_id64
         .filter(|steam_id64| *steam_id64 != 0)
         .ok_or_else(|| AdapterError::Protocol("local cloud account is unavailable".into()))?;
-    let store = FolderStore::open_account(&settings.local_path, steam_id64)?;
+    let store = match state.local_store.as_ref() {
+        Some(store) => store.clone(),
+        None => {
+            let store = FolderStore::open_account(&settings.local_path, steam_id64)?;
+            state.local_store = Some(store.clone());
+            store
+        }
+    };
     match method {
-        GET_CHANGELIST => changelist(state, settings, &store, body),
+        GET_CHANGELIST => {
+            let request = CloudGetAppFileChangelistRequest::decode(body)?;
+            let app_id = local_app_id(request.app_id)?;
+            ensure_syncthing_ready(settings, &store, app_id)?;
+            changelist(state, settings, &store, body)
+        }
         BEGIN_BATCH => begin_batch(state, settings, &store, body),
         BEGIN_FILE_UPLOAD => begin_file_upload(state, store, body),
         COMMIT_FILE_UPLOAD => commit_file_upload(state, body),
@@ -31,7 +44,12 @@ pub(super) fn execute_local_rpc(
         FILE_DOWNLOAD => file_download(store, body),
         DELETE_FILE => delete_file(state, &store, body),
         QUOTA_USAGE => quota(&store, body),
-        LAUNCH_INTENT => launch(state, settings, &store, body),
+        LAUNCH_INTENT => {
+            let request = CloudAppLaunchIntentRequest::decode(body)?;
+            let app_id = local_app_id(request.app_id)?;
+            ensure_syncthing_ready(settings, &store, app_id)?;
+            launch(state, settings, &store, body)
+        }
         SUSPEND_SESSION => suspend(state, settings, &store, body),
         RESUME_SESSION => resume(state, settings, &store, body),
         CONFLICT_RESOLUTION => conflict_resolution(state, settings, &store, body),
@@ -41,6 +59,17 @@ pub(super) fn execute_local_rpc(
             "unsupported local cloud method".into(),
         )),
     }
+}
+
+fn ensure_syncthing_ready(
+    settings: &CloudSettings,
+    store: &FolderStore,
+    app_id: u32,
+) -> Result<(), AdapterError> {
+    if let Some(syncthing) = &settings.syncthing {
+        syncthing.ensure_ready_for_app(store.root(), &store.manifest_scope(app_id))?;
+    }
+    Ok(())
 }
 
 fn conflict_resolution(
@@ -381,49 +410,60 @@ fn complete_batch(
     let batch_id = super::adapter::find_batch_id(state, app_id, request.batch_id)?;
     let committed = request.batch_eresult.unwrap_or_default() == super::ERESULT_OK as u32;
     if committed {
-        let batch = state
-            .batches
-            .get(&batch_id)
-            .ok_or_else(|| AdapterError::Protocol("unknown upload batch".into()))?;
-        if let Some(path) = batch
-            .upload_paths
-            .iter()
-            .find(|path| !batch.local_files.contains_key(*path))
-        {
-            return Err(AdapterError::Protocol(format!(
-                "upload batch completed before file was committed: {path}"
-            )));
-        }
-        let staged = batch.local_files.values().cloned().collect::<Vec<_>>();
-        let identity = batch.local_identity.as_ref().ok_or_else(|| {
-            AdapterError::Protocol("local upload batch has no bound identity".into())
-        })?;
-        let operation = batch.local_operation.as_ref().ok_or_else(|| {
-            AdapterError::Protocol("local upload batch has no storage operation".into())
-        })?;
-        let change_number =
-            store.commit_operation(operation, &staged, &batch.delete_paths, identity)?;
+        let (staged, deleted, identity, operation) = {
+            let batch = state
+                .batches
+                .get(&batch_id)
+                .ok_or_else(|| AdapterError::Protocol("unknown upload batch".into()))?;
+            if let Some(path) = batch
+                .upload_paths
+                .iter()
+                .find(|path| !batch.local_files.contains_key(*path))
+            {
+                return Err(AdapterError::Protocol(format!(
+                    "upload batch completed before file was committed: {path}"
+                )));
+            }
+            (
+                batch.local_files.values().cloned().collect::<Vec<_>>(),
+                batch.delete_paths.clone(),
+                batch.local_identity.clone().ok_or_else(|| {
+                    AdapterError::Protocol("local upload batch has no bound identity".into())
+                })?,
+                batch.local_operation.clone().ok_or_else(|| {
+                    AdapterError::Protocol("local upload batch has no storage operation".into())
+                })?,
+            )
+        };
+        let change_number = store.commit_operation(&operation, &staged, &deleted, &identity)?;
         state.current_change_numbers.insert(app_id, change_number);
-        let view = store.view(app_id)?;
-        let app = state.local_apps.get_mut(&app_id).ok_or_else(|| {
-            AdapterError::Protocol("local upload batch lost its verified app state".into())
-        })?;
-        app.identity = identity.clone();
-        app.verified_heads = view.head_ids();
-        app.conflict = None;
-        app.pending_keep_local = None;
-    }
-    state.active_batches.remove(&app_id);
-    if let Some(batch) = state.batches.remove(&batch_id) {
-        if !committed {
+        state.active_batches.remove(&app_id);
+        state.batches.remove(&batch_id);
+        match store.view(app_id) {
+            Ok(view) => {
+                if let Some(app) = state.local_apps.get_mut(&app_id) {
+                    let conflict = conflict_from_view(&view, identity.client_id);
+                    app.identity = identity;
+                    app.verified_heads = view.head_ids();
+                    app.conflict = conflict;
+                    app.pending_keep_local = None;
+                }
+            }
+            Err(error) => {
+                warn!(%error, app_id, "local cloud committed before the refreshed view was available");
+            }
+        }
+        state
+            .local_gc
+            .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
+    } else {
+        state.active_batches.remove(&app_id);
+        if let Some(batch) = state.batches.remove(&batch_id) {
             if let Some(operation) = batch.local_operation {
                 operation.abort()?;
             }
         }
     }
-    state
-        .local_gc
-        .queue_inspection(store.clone(), app_id, settings.syncthing.clone());
     Ok(RpcReply::ok(
         CloudCompleteAppUploadBatchResponse {}.encode_to_vec(),
     ))
@@ -456,23 +496,17 @@ fn file_download(store: FolderStore, body: &[u8]) -> Result<RpcReply, AdapterErr
     let request = CloudClientFileDownloadRequest::decode(body)?;
     let app_id = required(request.app_id, "appid")?;
     let path = required(request.filename, "filename")?;
-    let file = store
-        .changes_since(app_id, 0)?
-        .files
-        .into_iter()
-        .find(|file| file.path == path)
-        .ok_or_else(|| AdapterError::Protocol("download file is not in the manifest".into()))?;
-    let target = issue_download(store, app_id, path)?;
-    let size = u32::try_from(file.metadata.raw_size)
+    let (metadata, target) = issue_download(store, app_id, path)?;
+    let size = u32::try_from(metadata.raw_size)
         .map_err(|_| AdapterError::Protocol("local cloud file exceeds Steam size range".into()))?;
     Ok(RpcReply::ok(
         CloudClientFileDownloadResponse {
             app_id: Some(app_id),
             file_size: Some(size),
             raw_file_size: Some(size),
-            sha_file: Some(hex_to_bytes(&file.metadata.sha1)?),
+            sha_file: Some(hex_to_bytes(&metadata.sha1)?),
             timestamp: Some(
-                u64::try_from(file.metadata.mtime).map_err(|_| {
+                u64::try_from(metadata.mtime).map_err(|_| {
                     AdapterError::Protocol("local cloud timestamp is negative".into())
                 })?,
             ),

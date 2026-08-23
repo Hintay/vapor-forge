@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 use vapor_forge_cloud_core::{device_descriptor, CloudBackend};
-use vapor_forge_cloud_local::LocalGcCoordinator;
+use vapor_forge_cloud_local::{FolderStore, LocalGcCoordinator};
 use vapor_forge_core::unix_now;
 use vapor_forge_steam_protocol::*;
 use vapor_forge_sync_journal::{
@@ -32,6 +32,7 @@ pub(super) struct AdapterState {
     pub(super) principal_scope: Option<String>,
     pub(super) local_gc: Arc<LocalGcCoordinator>,
     pub(super) local_conflicts: Arc<LocalConflictCoordinator>,
+    pub(super) local_store: Option<FolderStore>,
 }
 
 #[cfg(test)]
@@ -96,6 +97,7 @@ impl AdapterState {
             principal_scope: None,
             local_gc,
             local_conflicts,
+            local_store: None,
         }
     }
 
@@ -113,6 +115,7 @@ impl AdapterState {
         self.active_batches.clear();
         self.batches.clear();
         self.local_apps.clear();
+        self.local_store = None;
         self.files.clear();
         self.principal_scope = None;
         self.scope = Some(scope);
