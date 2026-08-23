@@ -14,7 +14,7 @@ use vapor_forge_cloud_core::{
 use crate::client::playtime_downlink::{self, RuntimeKey};
 use crate::context_signal::ContextChangeSignal;
 
-static STARTED: OnceLock<()> = OnceLock::new();
+static WORKER_STATE: Mutex<WorkerState> = Mutex::new(WorkerState::Stopped);
 static CONTEXT_CHANGE: OnceLock<ContextChangeSignal> = OnceLock::new();
 static ACTIVE_STREAM: Mutex<Option<ActiveStreamState>> = Mutex::new(None);
 const RETRY_INITIAL: Duration = Duration::from_secs(2);
@@ -22,6 +22,21 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 
 struct RetryBackoff {
     next: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerState {
+    Stopped,
+    Starting,
+    Running,
+}
+
+struct WorkerLifetime;
+
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        *worker_state() = WorkerState::Stopped;
+    }
 }
 
 impl RetryBackoff {
@@ -43,21 +58,38 @@ impl RetryBackoff {
 }
 
 pub(crate) fn ensure_started() {
-    if STARTED.set(()).is_err() {
+    let mut state = worker_state();
+    if *state != WorkerState::Stopped {
         return;
     }
-    if std::thread::Builder::new()
+    *state = WorkerState::Starting;
+    match std::thread::Builder::new()
         .name("account-downlink".into())
-        .spawn(run)
-        .is_err()
-    {
-        warn!("account-downlink: failed to start event worker");
+        .spawn(|| {
+            let _lifetime = WorkerLifetime;
+            run();
+        }) {
+        Ok(_) => *state = WorkerState::Running,
+        Err(error) => {
+            *state = WorkerState::Stopped;
+            warn!(%error, "account-downlink: failed to start event worker");
+        }
     }
 }
 
 pub(crate) fn notify_context_changed() {
+    let config = crate::client::install::config();
+    if config.local_cloud_configured() || config.cumulus_configured() {
+        ensure_started();
+    }
     cancel_active_stream_if_stale();
     context_change_signal().notify();
+}
+
+fn worker_state() -> std::sync::MutexGuard<'static, WorkerState> {
+    WORKER_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn run() {
