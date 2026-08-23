@@ -383,6 +383,44 @@ fn scripts_without_manifest_callbacks_do_not_create_provider() {
 }
 
 #[test]
+fn incremental_reload_removes_file_apps_after_the_last_reference() {
+    let dir = std::env::temp_dir().join(format!(
+        "lua-incremental-app-removal-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let first = dir.join("00-first.lua");
+    let second = dir.join("10-second.lua");
+    std::fs::write(&first, "addappid(480)\n").unwrap();
+    std::fs::write(&second, "addappid(480)\n").unwrap();
+
+    let runtime = execute_scripts_runtime(&[dir.to_string_lossy().into_owned()]);
+    let registry = runtime.registry.unwrap();
+    assert_eq!(
+        registry.snapshot_state().apps,
+        [AppId(480)].into_iter().collect()
+    );
+
+    registry.unload_file(&first);
+    assert_eq!(
+        registry.snapshot_state().apps,
+        [AppId(480)].into_iter().collect()
+    );
+
+    let errors = registry.parse_file(&second, "addappid(730)\n");
+    assert!(errors.is_empty());
+    assert_eq!(
+        registry.snapshot_state().apps,
+        [AppId(730)].into_iter().collect()
+    );
+
+    registry.unload_file(&second);
+    assert!(registry.snapshot_state().apps.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn http_helpers_accept_headers_and_return_failure_status() {
     let dir = std::env::temp_dir().join(format!("lua-http-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);

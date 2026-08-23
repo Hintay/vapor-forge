@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::{AppId, ConfigError};
 
@@ -69,9 +70,11 @@ pub struct DebugSection {
 #[serde(deny_unknown_fields)]
 pub struct AppsSection {
     #[serde(default)]
-    pub inject: Vec<InjectApp>,
+    inject: Vec<InjectApp>,
     #[serde(default)]
     pub shared: SharedSection,
+    #[serde(skip)]
+    app_index: OnceLock<HashMap<AppId, AppCategory>>,
 }
 
 /// An app to inject ownership for, with optional DLC list.
@@ -519,22 +522,83 @@ pub enum AppCategory {
     InjectDlc { parent: AppId },
 }
 
+impl AppsSection {
+    pub fn with_inject(inject: Vec<InjectApp>) -> Self {
+        let apps = Self {
+            inject,
+            ..Self::default()
+        };
+        apps.app_index();
+        apps
+    }
+
+    pub fn inject(&self) -> &[InjectApp] {
+        &self.inject
+    }
+
+    pub fn push_inject(&mut self, app: InjectApp) {
+        if let Some(index) = self.app_index.get_mut() {
+            index.reserve(1 + app.dlc.len());
+            Self::index_app(index, &app);
+        }
+        self.inject.push(app);
+    }
+
+    pub fn extend_inject(&mut self, apps: Vec<InjectApp>) {
+        if apps.is_empty() {
+            return;
+        }
+
+        self.inject.reserve(apps.len());
+        if let Some(index) = self.app_index.get_mut() {
+            let additional_entries = apps.iter().map(|app| 1 + app.dlc.len()).sum();
+            index.reserve(additional_entries);
+            for app in &apps {
+                Self::index_app(index, app);
+            }
+        }
+        self.inject.extend(apps);
+    }
+
+    fn app_category(&self, app_id: AppId) -> Option<AppCategory> {
+        self.app_index().get(&app_id).copied()
+    }
+
+    fn is_controlled_app(&self, app_id: AppId) -> bool {
+        self.app_index().contains_key(&app_id)
+    }
+
+    fn app_index(&self) -> &HashMap<AppId, AppCategory> {
+        self.app_index.get_or_init(|| {
+            let entry_count = self.inject.iter().map(|app| 1 + app.dlc.len()).sum();
+            let mut index = HashMap::with_capacity(entry_count);
+            for app in &self.inject {
+                Self::index_app(&mut index, app);
+            }
+            index
+        })
+    }
+
+    fn index_app(index: &mut HashMap<AppId, AppCategory>, app: &InjectApp) {
+        index.entry(app.id).or_insert(AppCategory::Inject);
+        for &dlc in &app.dlc {
+            index
+                .entry(dlc)
+                .or_insert(AppCategory::InjectDlc { parent: app.id });
+        }
+    }
+}
+
 impl RuntimeConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&text)?)
+        let config: Self = toml::from_str(&text)?;
+        config.apps.app_index();
+        Ok(config)
     }
 
     pub fn app_category(&self, app_id: AppId) -> Option<AppCategory> {
-        for app in &self.apps.inject {
-            if app.id == app_id {
-                return Some(AppCategory::Inject);
-            }
-            if app.dlc.contains(&app_id) {
-                return Some(AppCategory::InjectDlc { parent: app.id });
-            }
-        }
-        None
+        self.apps.app_category(app_id)
     }
 
     /// Returns whether this AppId is managed by the effective runtime config.
@@ -543,12 +607,12 @@ impl RuntimeConfig {
     /// config is published, so this remains the single source of truth for
     /// both configured and scripted apps.
     pub fn is_controlled_app(&self, app_id: AppId) -> bool {
-        self.app_category(app_id).is_some()
+        self.apps.is_controlled_app(app_id)
     }
 
     pub fn purchase_time(&self, app_id: AppId) -> u32 {
         self.apps
-            .inject
+            .inject()
             .iter()
             .find(|a| a.id == app_id)
             .map(|a| a.purchase_time)
@@ -557,7 +621,7 @@ impl RuntimeConfig {
 
     pub fn ticket_mode(&self, app_id: AppId) -> TicketMode {
         self.apps
-            .inject
+            .inject()
             .iter()
             .find(|a| a.id == app_id)
             .map(|a| a.ticket)
@@ -570,7 +634,7 @@ impl RuntimeConfig {
 
     pub fn inject_app_ids(&self) -> HashSet<AppId> {
         let mut ids = HashSet::new();
-        for app in &self.apps.inject {
+        for app in self.apps.inject() {
             ids.insert(app.id);
             ids.extend(&app.dlc);
         }
@@ -579,7 +643,7 @@ impl RuntimeConfig {
 
     pub fn inject_dlc_map(&self) -> HashMap<AppId, Vec<AppId>> {
         self.apps
-            .inject
+            .inject()
             .iter()
             .filter(|app| !app.dlc.is_empty())
             .map(|app| (app.id, app.dlc.clone()))
@@ -587,7 +651,7 @@ impl RuntimeConfig {
     }
 
     pub fn has_any_inject_apps(&self) -> bool {
-        !self.apps.inject.is_empty()
+        !self.apps.inject().is_empty()
     }
 
     pub fn cloud_enabled_for_controlled_apps(&self) -> bool {

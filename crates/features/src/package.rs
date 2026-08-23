@@ -120,7 +120,7 @@ impl Default for PackageState {
 pub fn controlled_app_ids(config: &RuntimeConfig, script_apps: &HashSet<AppId>) -> Vec<AppId> {
     let mut seen: HashSet<AppId> = HashSet::new();
     let mut ids: Vec<AppId> = Vec::new();
-    for app in &config.apps.inject {
+    for app in config.apps.inject() {
         if seen.insert(app.id) {
             ids.push(app.id);
         }
@@ -153,10 +153,7 @@ mod tests {
             })
             .collect();
         RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject,
-                ..Default::default()
-            },
+            apps: vapor_forge_config::AppsSection::with_inject(inject),
             ..Default::default()
         }
     }

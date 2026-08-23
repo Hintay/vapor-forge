@@ -762,15 +762,12 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
 fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
     let app_id = AppId(246_813_579);
     let config = RuntimeConfig {
-        apps: AppsSection {
-            inject: vec![InjectApp {
-                id: app_id,
-                dlc: Vec::new(),
-                ticket: Default::default(),
-                purchase_time: 0,
-            }],
-            ..Default::default()
-        },
+        apps: AppsSection::with_inject(vec![InjectApp {
+            id: app_id,
+            dlc: Vec::new(),
+            ticket: Default::default(),
+            purchase_time: 0,
+        }]),
         cloud: CloudSection {
             backend: CloudBackendMode::Cumulus,
             cumulus: CumulusCloudSection {
@@ -824,15 +821,12 @@ fn unknown_ownership_declines_cumulus_but_requires_privacy_fallback() {
 fn confirmed_unowned_cloud_request_requires_queue() {
     let app_id = AppId(246_813_581);
     let config = RuntimeConfig {
-        apps: AppsSection {
-            inject: vec![InjectApp {
-                id: app_id,
-                dlc: Vec::new(),
-                ticket: Default::default(),
-                purchase_time: 0,
-            }],
-            ..Default::default()
-        },
+        apps: AppsSection::with_inject(vec![InjectApp {
+            id: app_id,
+            dlc: Vec::new(),
+            ticket: Default::default(),
+            purchase_time: 0,
+        }]),
         cloud: CloudSection {
             backend: CloudBackendMode::Cumulus,
             cumulus: CumulusCloudSection {
@@ -863,15 +857,12 @@ fn confirmed_unowned_cloud_request_requires_queue() {
 fn actually_owned_apps_stay_on_steam() {
     let app_id = AppId(246_813_580);
     let config = RuntimeConfig {
-        apps: AppsSection {
-            inject: vec![InjectApp {
-                id: app_id,
-                dlc: Vec::new(),
-                ticket: Default::default(),
-                purchase_time: 0,
-            }],
-            ..Default::default()
-        },
+        apps: AppsSection::with_inject(vec![InjectApp {
+            id: app_id,
+            dlc: Vec::new(),
+            ticket: Default::default(),
+            purchase_time: 0,
+        }]),
         cloud: CloudSection {
             backend: CloudBackendMode::Cumulus,
             cumulus: CumulusCloudSection {

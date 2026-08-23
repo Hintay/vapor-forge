@@ -213,7 +213,7 @@ pub fn on_get_subscribed_apps(
     // deferred ownership spoofing can start.
     mark_license_sync_complete();
 
-    let inject_ids: Vec<AppId> = config.apps.inject.iter().map(|a| a.id).collect();
+    let inject_ids: Vec<AppId> = config.apps.inject().iter().map(|a| a.id).collect();
     if inject_ids.is_empty() {
         return original_count;
     }
@@ -232,7 +232,7 @@ pub fn on_get_subscribed_apps(
 }
 
 pub fn get_subscribed_count_adjustment(config: &RuntimeConfig) -> u32 {
-    config.apps.inject.len() as u32
+    config.apps.inject().len() as u32
 }
 
 #[cfg(test)]
@@ -242,9 +242,8 @@ mod tests {
 
     fn config_with_inject(ids: &[u32]) -> RuntimeConfig {
         RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: ids
-                    .iter()
+            apps: vapor_forge_config::AppsSection::with_inject(
+                ids.iter()
                     .map(|&id| InjectApp {
                         id: AppId(id),
                         dlc: Vec::new(),
@@ -252,8 +251,7 @@ mod tests {
                         purchase_time: 0,
                     })
                     .collect(),
-                ..Default::default()
-            },
+            ),
             ..Default::default()
         }
     }

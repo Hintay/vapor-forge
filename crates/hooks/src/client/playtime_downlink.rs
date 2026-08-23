@@ -403,8 +403,8 @@ mod tests {
 
     fn config_with(app_ids: &[u32]) -> RuntimeConfig {
         RuntimeConfig {
-            apps: AppsSection {
-                inject: app_ids
+            apps: AppsSection::with_inject(
+                app_ids
                     .iter()
                     .copied()
                     .map(|app_id| InjectApp {
@@ -414,8 +414,7 @@ mod tests {
                         purchase_time: 0,
                     })
                     .collect(),
-                ..Default::default()
-            },
+            ),
             ..Default::default()
         }
     }

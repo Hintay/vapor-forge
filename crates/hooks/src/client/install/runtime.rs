@@ -94,8 +94,8 @@ pub fn ensure_runtime_initialized() -> bool {
         let (config, script_runtime) = build_runtime(&base_config);
         let script_state = &script_runtime.state;
 
-        let inject_count = config.apps.inject.len();
-        let dlc_count: usize = config.apps.inject.iter().map(|a| a.dlc.len()).sum();
+        let inject_count = config.apps.inject().len();
+        let dlc_count: usize = config.apps.inject().iter().map(|a| a.dlc.len()).sum();
         info!(
             inject = inject_count,
             dlc = dlc_count,
@@ -300,18 +300,25 @@ pub(crate) fn merge_script_apps(
     apps: &std::collections::HashSet<AppId>,
 ) -> RuntimeConfig {
     let mut existing_ids: std::collections::HashSet<AppId> =
-        config.apps.inject.iter().map(|a| a.id).collect();
+        config.apps.inject().iter().map(|a| a.id).collect();
 
-    for &app_id in apps {
-        if existing_ids.insert(app_id) {
-            config.apps.inject.push(vapor_forge_config::InjectApp {
-                id: app_id,
-                dlc: Vec::new(),
-                ticket: Default::default(),
-                purchase_time: 0,
-            });
-        }
-    }
+    let additions = apps
+        .iter()
+        .copied()
+        .filter_map(|app_id| {
+            if existing_ids.insert(app_id) {
+                Some(vapor_forge_config::InjectApp {
+                    id: app_id,
+                    dlc: Vec::new(),
+                    ticket: Default::default(),
+                    purchase_time: 0,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    config.apps.extend_inject(additions);
 
     config
 }
@@ -447,7 +454,7 @@ mod tests {
         let (config, path) = load_config_for_home(Some(home.as_os_str())).unwrap();
 
         assert!(path.is_file());
-        assert!(config.apps.inject.is_empty());
+        assert!(config.apps.inject().is_empty());
         assert!(matches!(
             config.cloud.backend,
             vapor_forge_config::CloudBackendMode::Disabled
@@ -483,13 +490,15 @@ mod tests {
         let scripts: std::collections::HashSet<AppId> = [AppId(480)].into_iter().collect();
         let effective = merge_script_apps(base.clone(), &scripts);
 
-        assert!(base.apps.inject.is_empty());
-        assert_eq!(effective.apps.inject.len(), 1);
-        assert_eq!(effective.apps.inject[0].id, AppId(480));
+        assert!(base.apps.inject().is_empty());
+        assert_eq!(effective.apps.inject().len(), 1);
+        assert_eq!(effective.apps.inject()[0].id, AppId(480));
+        assert!(effective.is_controlled_app(AppId(480)));
 
         let empty = std::collections::HashSet::new();
         let after_script_removal = merge_script_apps(base.clone(), &empty);
-        assert!(after_script_removal.apps.inject.is_empty());
+        assert!(after_script_removal.apps.inject().is_empty());
+        assert!(!after_script_removal.is_controlled_app(AppId(480)));
     }
 
     #[test]

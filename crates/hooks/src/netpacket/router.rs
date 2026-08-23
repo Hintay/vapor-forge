@@ -875,7 +875,7 @@ fn reset_stopped_delegate_windows(
     now_playing: &[AppId],
     config: &vapor_forge_config::RuntimeConfig,
 ) {
-    for app in &config.apps.inject {
+    for app in config.apps.inject() {
         if app.ticket != vapor_forge_config::TicketMode::Delegate {
             continue;
         }
@@ -1438,7 +1438,7 @@ mod tests {
         }
         .encode_to_vec();
         let mut config = vapor_forge_config::RuntimeConfig::default();
-        config.apps.inject.push(vapor_forge_config::InjectApp {
+        config.apps.push_inject(vapor_forge_config::InjectApp {
             id: AppId(480),
             dlc: Vec::new(),
             ticket: vapor_forge_config::TicketMode::Forge,

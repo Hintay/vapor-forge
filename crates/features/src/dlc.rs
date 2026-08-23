@@ -58,7 +58,7 @@ pub fn get_injected_dlc_at(
 fn is_controlled_dlc(config: &RuntimeConfig, app_id: AppId, dlc_id: AppId) -> bool {
     config
         .apps
-        .inject
+        .inject()
         .iter()
         .any(|a| a.id == app_id && a.dlc.contains(&dlc_id))
 }
@@ -66,7 +66,7 @@ fn is_controlled_dlc(config: &RuntimeConfig, app_id: AppId, dlc_id: AppId) -> bo
 fn controlled_dlcs_for(config: &RuntimeConfig, app_id: AppId) -> Vec<AppId> {
     config
         .apps
-        .inject
+        .inject()
         .iter()
         .find(|a| a.id == app_id)
         .map(|a| a.dlc.clone())
@@ -80,15 +80,12 @@ mod tests {
 
     fn config_with_dlc() -> RuntimeConfig {
         RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: vec![InjectApp {
-                    id: AppId(480),
-                    dlc: vec![AppId(505730), AppId(505740)],
-                    ticket: Default::default(),
-                    purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+            apps: vapor_forge_config::AppsSection::with_inject(vec![InjectApp {
+                id: AppId(480),
+                dlc: vec![AppId(505730), AppId(505740)],
+                ticket: Default::default(),
+                purchase_time: 0,
+            }]),
             ..Default::default()
         }
     }
