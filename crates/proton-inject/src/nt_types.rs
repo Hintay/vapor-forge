@@ -27,7 +27,3 @@ pub type LdrLoadDllFn = unsafe extern "win64" fn(
     dll_name: *mut UnicodeString,
     base_address: *mut *mut core::ffi::c_void,
 ) -> i32;
-
-pub type LdrLockLoaderLockFn =
-    unsafe extern "win64" fn(flags: u32, disposition: *mut u32, cookie: *mut usize) -> i32;
-pub type LdrUnlockLoaderLockFn = unsafe extern "win64" fn(flags: u32, cookie: usize) -> i32;

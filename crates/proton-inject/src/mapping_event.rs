@@ -1,17 +1,16 @@
 use core::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::loader;
 
 const LA_FLG_BINDTO: u32 = 0x01;
 const LA_FLG_BINDFROM: u32 = 0x02;
-const FUTEX_WAIT_PRIVATE: libc::c_int = 128;
-const FUTEX_WAKE_PRIVATE: libc::c_int = 129;
-
 static MMAP_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static MMAP64_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
-static EVENT_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-static WORKER_ARMED: AtomicBool = AtomicBool::new(false);
+static MPROTECT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static OBSERVER_ARMED: AtomicBool = AtomicBool::new(false);
+static NTDLL_MAPPED: AtomicBool = AtomicBool::new(false);
+static NTDLL_EXECUTABLE_MAPPING_SEEN: AtomicBool = AtomicBool::new(false);
 
 type MmapFn = unsafe extern "C" fn(
     *mut c_void,
@@ -21,6 +20,8 @@ type MmapFn = unsafe extern "C" fn(
     libc::c_int,
     libc::off64_t,
 ) -> *mut c_void;
+
+type MprotectFn = unsafe extern "C" fn(*mut c_void, usize, libc::c_int) -> libc::c_int;
 
 #[repr(C)]
 pub struct Elf64Symbol {
@@ -85,50 +86,18 @@ pub unsafe fn bind_symbol(symbol: *const Elf64Symbol, symbol_name: *const c_char
             MMAP64_ORIGINAL.store(value, Ordering::Release);
             mmap64_hook as *const () as usize
         }
+        b"mprotect" => {
+            MPROTECT_ORIGINAL.store(value, Ordering::Release);
+            mprotect_hook as *const () as usize
+        }
         _ => value,
     }
 }
 
-pub fn spawn_install_worker() {
-    if WORKER_ARMED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if std::thread::Builder::new()
-        .name("vapor-forge-proton-inject-map".into())
-        .spawn(install_worker)
-        .is_err()
-    {
-        WORKER_ARMED.store(false, Ordering::Release);
-        loader::log("failed to start PE mapping worker");
-    }
-}
-
-fn install_worker() {
-    let mut observed = EVENT_SEQUENCE.load(Ordering::Acquire);
-    loop {
-        if loader::install_trigger() {
-            WORKER_ARMED.store(false, Ordering::Release);
-            return;
-        }
-
-        let current = EVENT_SEQUENCE.load(Ordering::Acquire);
-        if current != observed {
-            observed = current;
-            continue;
-        }
-
-        // SAFETY: EVENT_SEQUENCE has a stable process-lifetime address and the
-        // expected value closes the check-to-wait race.
-        let _ = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                EVENT_SEQUENCE.as_ptr(),
-                FUTEX_WAIT_PRIVATE,
-                current,
-                std::ptr::null::<libc::timespec>(),
-            )
-        };
-    }
+pub fn arm_observer() {
+    NTDLL_MAPPED.store(false, Ordering::Release);
+    NTDLL_EXECUTABLE_MAPPING_SEEN.store(false, Ordering::Release);
+    OBSERVER_ARMED.store(true, Ordering::Release);
 }
 
 unsafe extern "C" fn mmap_hook(
@@ -152,7 +121,7 @@ unsafe extern "C" fn mmap_hook(
             offset,
         )
     };
-    observe_mapping(result, fd);
+    observe_mapping(result, length, protection, fd, offset);
     result
 }
 
@@ -177,7 +146,31 @@ unsafe extern "C" fn mmap64_hook(
             offset,
         )
     };
-    observe_mapping(result, fd);
+    observe_mapping(result, length, protection, fd, offset);
+    result
+}
+
+unsafe extern "C" fn mprotect_hook(
+    address: *mut c_void,
+    length: usize,
+    protection: libc::c_int,
+) -> libc::c_int {
+    let address_value = MPROTECT_ORIGINAL.load(Ordering::Acquire);
+    if address_value == 0 {
+        return -1;
+    }
+    // SAFETY: la_symbind64 stored the address of libc's matching mprotect ABI.
+    let function: MprotectFn = unsafe { std::mem::transmute(address_value) };
+    // SAFETY: the hook forwards the arguments from the original call unchanged.
+    let result = unsafe { function(address, length, protection) };
+    if result == 0
+        && protection & libc::PROT_EXEC != 0
+        && OBSERVER_ARMED.load(Ordering::Acquire)
+        && NTDLL_MAPPED.load(Ordering::Acquire)
+        && loader::install_trigger()
+    {
+        OBSERVER_ARMED.store(false, Ordering::Release);
+    }
     result
 }
 
@@ -201,22 +194,76 @@ unsafe fn call_mmap(
     unsafe { function(address, length, protection, flags, fd, offset) }
 }
 
-fn observe_mapping(result: *mut c_void, fd: libc::c_int) {
-    if !WORKER_ARMED.load(Ordering::Acquire) || result == libc::MAP_FAILED || fd < 0 {
+fn observe_mapping(
+    result: *mut c_void,
+    length: usize,
+    protection: libc::c_int,
+    fd: libc::c_int,
+    offset: libc::off64_t,
+) {
+    if !OBSERVER_ARMED.load(Ordering::Acquire) || result == libc::MAP_FAILED || fd < 0 || offset < 0
+    {
         return;
     }
-    if fd_targets_pe_ntdll(fd) {
-        EVENT_SEQUENCE.fetch_add(1, Ordering::Release);
-        // SAFETY: waking a futex requires only the stable atomic address.
-        let _ = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                EVENT_SEQUENCE.as_ptr(),
-                FUTEX_WAKE_PRIVATE,
-                1,
-            )
-        };
+    if !fd_targets_pe_ntdll(fd) {
+        return;
     }
+    if protection & libc::PROT_EXEC != 0 {
+        NTDLL_EXECUTABLE_MAPPING_SEEN.store(true, Ordering::Release);
+    }
+    if mapping_reaches_image_end(fd, length, offset as u64) {
+        NTDLL_MAPPED.store(true, Ordering::Release);
+        if NTDLL_EXECUTABLE_MAPPING_SEEN.load(Ordering::Acquire) && loader::install_trigger() {
+            OBSERVER_ARMED.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn mapping_reaches_image_end(fd: libc::c_int, length: usize, offset: u64) -> bool {
+    let Some(image_size) = pe_image_size(fd) else {
+        return false;
+    };
+    offset
+        .checked_add(length as u64)
+        .is_some_and(|end| end >= image_size as u64)
+}
+
+fn pe_image_size(fd: libc::c_int) -> Option<u32> {
+    let mut header = [0u8; 4096];
+    // SAFETY: header is writable for its declared length and pread does not
+    // modify the descriptor offset.
+    let read = unsafe { libc::pread(fd, header.as_mut_ptr().cast::<c_void>(), header.len(), 0) };
+    if read < 0x40 {
+        return None;
+    }
+    parse_pe_image_size(&header[..read as usize])
+}
+
+fn parse_pe_image_size(header: &[u8]) -> Option<u32> {
+    if read_u16(header, 0)? != 0x5a4d {
+        return None;
+    }
+    let pe_offset = read_u32(header, 0x3c)? as usize;
+    if read_u32(header, pe_offset)? != 0x0000_4550 {
+        return None;
+    }
+    let optional_header = pe_offset.checked_add(24)?;
+    match read_u16(header, optional_header)? {
+        0x10b | 0x20b => read_u32(header, optional_header.checked_add(56)?),
+        _ => None,
+    }
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 fn fd_targets_pe_ntdll(fd: libc::c_int) -> bool {
@@ -311,5 +358,20 @@ mod tests {
             b"/compat/ntdll.so",
             b"/ntdll.dll"
         ));
+    }
+
+    #[test]
+    fn reads_pe_image_size() {
+        let mut header = [0u8; 256];
+        header[0..2].copy_from_slice(&0x5a4d_u16.to_le_bytes());
+        header[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        header[0x80..0x84].copy_from_slice(&0x0000_4550_u32.to_le_bytes());
+        header[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        header[0xd0..0xd4].copy_from_slice(&0xb8000_u32.to_le_bytes());
+
+        assert_eq!(parse_pe_image_size(&header), Some(0xb8000));
+        assert_eq!(parse_pe_image_size(&header[..0xd2]), None);
+        header[0] = 0;
+        assert_eq!(parse_pe_image_size(&header), None);
     }
 }
