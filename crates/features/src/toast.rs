@@ -297,6 +297,28 @@ mod tests {
     }
 
     #[test]
+    fn bridge_requires_the_gamepad_focus_component() {
+        let script = bridge_script();
+        assert!(script.contains("registerFeature('toast', 3"));
+        assert!(script.contains("typeof exp === 'function'"));
+        assert!(script.contains("typeof exp.render === 'function'"));
+        assert!(script.contains("'focusClassName'"));
+        assert!(script.contains("'focusWithinClassName'"));
+        assert!(script.contains("'onOKButton'"));
+        assert!(script.contains("isGamepadUiReady() && !state.focusable"));
+        assert!(script.contains("indexOf('/routes/')"));
+        assert!(script.contains("findFocusable(gamepadUiReady)"));
+    }
+
+    #[test]
+    fn bridge_uses_a_focusable_notification_root() {
+        let script = bridge_script();
+        assert!(script.contains("onActivate: activateQamToast"));
+        assert!(script.contains("navigation.CloseSideMenus()"));
+        assert!(script.contains("className: (css.StandardTemplateContainer || '')"));
+    }
+
+    #[test]
     fn bridge_keeps_steam_toast_manager_selection() {
         let script = bridge_script();
         assert!(!script.contains("findToastStackManager"));
