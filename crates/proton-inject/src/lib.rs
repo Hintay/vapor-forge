@@ -63,7 +63,7 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
         return;
     }
     if current_executable_is_wine() {
-        mapping_event::spawn_install_worker();
+        mapping_event::arm_observer();
     }
 }
 

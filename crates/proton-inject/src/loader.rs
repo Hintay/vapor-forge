@@ -5,9 +5,7 @@ use std::sync::Mutex;
 
 use crate::detour::PreparedDetour;
 use crate::maps;
-use crate::nt_types::{
-    LdrLoadDllFn, LdrLockLoaderLockFn, LdrUnlockLoaderLockFn, UnicodeString, STATUS_SUCCESS,
-};
+use crate::nt_types::{LdrLoadDllFn, UnicodeString, STATUS_SUCCESS};
 use crate::pe;
 use crate::trigger;
 
@@ -46,24 +44,7 @@ pub fn install_trigger() -> bool {
             return false;
         }
     };
-    let Some(lock_rva) = pe::find_export_rva(&pe_bytes, "LdrLockLoaderLock") else {
-        log("no LdrLockLoaderLock export in PE ntdll");
-        return false;
-    };
-    let Some(unlock_rva) = pe::find_export_rva(&pe_bytes, "LdrUnlockLoaderLock") else {
-        log("no LdrUnlockLoaderLock export in PE ntdll");
-        return false;
-    };
-
     let target = pe_base + load_rva as usize;
-    // SAFETY: all three addresses are exports from the same mapped PE ntdll.
-    let Some(_loader_guard) = (unsafe {
-        WineLoaderGuard::acquire(pe_base + lock_rva as usize, pe_base + unlock_rva as usize)
-    }) else {
-        log("failed to acquire Wine loader lock");
-        return false;
-    };
-
     // SAFETY: target is LdrLoadDll's address in the mapped PE ntdll.
     let prepared =
         match unsafe { PreparedDetour::prepare(target, hook_ldr_load_dll as *const () as usize) } {
@@ -97,34 +78,6 @@ pub fn install_trigger() -> bool {
         log("trigger already loaded, pending pickup armed");
     }
     true
-}
-
-struct WineLoaderGuard {
-    unlock: LdrUnlockLoaderLockFn,
-    cookie: usize,
-}
-
-impl WineLoaderGuard {
-    /// # Safety
-    /// Both addresses must be matching exports from the live PE ntdll image.
-    unsafe fn acquire(lock_addr: usize, unlock_addr: usize) -> Option<Self> {
-        // SAFETY: caller validated both addresses as matching ntdll exports.
-        let lock: LdrLockLoaderLockFn = unsafe { std::mem::transmute(lock_addr) };
-        // SAFETY: caller validated both addresses as matching ntdll exports.
-        let unlock: LdrUnlockLoaderLockFn = unsafe { std::mem::transmute(unlock_addr) };
-        let mut disposition = 0u32;
-        let mut cookie = 0usize;
-        // SAFETY: output pointers are valid for the duration of the call.
-        let status = unsafe { lock(0, &mut disposition, &mut cookie) };
-        (status == STATUS_SUCCESS && cookie != 0).then_some(Self { unlock, cookie })
-    }
-}
-
-impl Drop for WineLoaderGuard {
-    fn drop(&mut self) {
-        // SAFETY: cookie was returned by the matching successful lock call.
-        let _ = unsafe { (self.unlock)(0, self.cookie) };
-    }
 }
 
 pub fn mark_pending() {
