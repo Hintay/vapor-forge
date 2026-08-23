@@ -71,29 +71,35 @@ pub(crate) unsafe extern "C" fn hk_build_spawn_env_block(
     env_map: *mut c_void,
     context: *mut c_void,
 ) -> i32 {
-    // Call original first so Steam has already populated the env block.
     // SAFETY: BUILD_SPAWN_ENV_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("BuildSpawnEnvBlock", BUILD_SPAWN_ENV_DETOUR, 0);
-    let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
-unsafe { original(
-        game_id,
-        exe_path,
-        working_dir,
-        launch_ctx,
-        flags,
-        something,
-        env_map,
-        context,
-    ) };
 
-    if !crate::capability::is_ready(crate::capability::Capability::LaunchEnvironment) {
-        return result;
+    if crate::capability::is_ready(crate::capability::Capability::LaunchEnvironment)
+        && !game_id.is_null()
+        && !env_map.is_null()
+    {
+        // BuildSpawnEnvBlock forks and executes the child while the original call
+        // is active. Update its input map before Steam snapshots the environment.
+        // SAFETY: both pointers were validated above and belong to this invocation.
+        unsafe { inject_spawn_environment(game_id, env_map) };
     }
 
-    if game_id.is_null() || env_map.is_null() {
-        return result;
+    // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+    unsafe {
+        original(
+            game_id,
+            exe_path,
+            working_dir,
+            launch_ctx,
+            flags,
+            something,
+            env_map,
+            context,
+        )
     }
+}
 
+unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
     // CGameID low 24 bits = AppId.
     // SAFETY: game_id is a valid CGameID* from Steam's caller.
     let raw = unsafe { *(game_id as *const u32) };
@@ -104,13 +110,13 @@ unsafe { original(
     let ipc_server = IPC_SERVER.get();
 
     if injection.is_none() && ipc_server.is_none() {
-        return result;
+        return;
     }
 
     // SAFETY: SET_ENV_STRING_FN resolved once at install time, never modified after.
     let Some(set_env) = (unsafe { *std::ptr::addr_of!(SET_ENV_STRING_FN) }) else {
         warn!(app = app_id.0, "library_inject: SetEnvString unresolved");
-        return result;
+        return;
     };
 
     // Native .so injection via LD_PRELOAD
@@ -196,8 +202,6 @@ unsafe { original(
             }
         }
     }
-
-    result
 }
 
 // ---------------------------------------------------------------------------
