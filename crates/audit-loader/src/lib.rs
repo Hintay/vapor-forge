@@ -95,6 +95,7 @@ mod linux_audit {
     pub extern "C" fn la_preinit(_cookie: *mut usize) {
         LIFECYCLE.mark_ready_for_heavy_init();
         log_early("la_preinit: ready for heavy init");
+        clear_audit_env_for_steam();
         // Do not install hooks here. Even if steamclient is already mapped,
         // relocations may not be complete. la_activity(LA_ACT_CONSISTENT)
         // is the reliable signal that all pending relocations are done.
@@ -140,6 +141,30 @@ mod linux_audit {
         }
     }
 
+    fn clear_audit_env_for_steam() {
+        // SAFETY: AT_EXECFN points to a loader-owned NUL-terminated string for
+        // the lifetime of the process.
+        let executable = unsafe {
+            bounded_cstr_to_string(libc::getauxval(libc::AT_EXECFN) as *const c_char, 4096)
+        };
+        if !executable.as_deref().is_some_and(is_steam_executable_path) {
+            return;
+        }
+
+        // SAFETY: la_preinit runs before the executable's main function. The
+        // audit module is already loaded, so removing the variable only stops
+        // child processes from inheriting it.
+        if unsafe { libc::unsetenv(c"LD_AUDIT".as_ptr()) } == 0 {
+            log_early("la_preinit: cleared inherited LD_AUDIT");
+        } else {
+            log_early("la_preinit: failed to clear inherited LD_AUDIT");
+        }
+    }
+
+    fn is_steam_executable_path(path: &str) -> bool {
+        path.rsplit('/').next() == Some("steam")
+    }
+
     unsafe fn bounded_cstr_to_string(ptr: *const c_char, max_len: usize) -> Option<String> {
         if ptr.is_null() {
             return None;
@@ -163,6 +188,21 @@ mod linux_audit {
         // SAFETY: The byte range was checked above up to the first NUL byte.
         let bytes = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) };
         Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_steam_executable_path;
+
+        #[test]
+        fn identifies_the_steam_client_executable() {
+            assert!(is_steam_executable_path(
+                "/home/deck/.local/share/Steam/ubuntu12_32/steam"
+            ));
+            assert!(is_steam_executable_path("steam"));
+            assert!(!is_steam_executable_path("/usr/bin/steam.sh"));
+            assert!(!is_steam_executable_path("/usr/bin/steamwebhelper"));
+        }
     }
 }
 
