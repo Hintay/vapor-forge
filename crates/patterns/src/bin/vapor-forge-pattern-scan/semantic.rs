@@ -4128,6 +4128,12 @@ fn set_env_string32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
     Some(Evidence::required([
         (
+            "three cdecl arguments",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
+                && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
+                && has_asm32(bytes, |a| a.test(eax, eax)),
+        ),
+        (
             "environment map load",
             has_x86_mov_from_any_disp8(bytes, 0x78),
         ),
@@ -4142,12 +4148,31 @@ fn validate_set_env_string64(code: &[u8], offset: usize) -> Option<&'static str>
 
 fn set_env_string64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
-    let old_shape = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4)))
-        && has_asm64(bytes, |a| a.lea(r14, qword_ptr(r15 + 0x80)));
-    let current_shape = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0xA4)))
-        && has_asm64(bytes, |a| a.lea(r14, qword_ptr(r13 + 0x80)));
+    let ordinary_arguments = has_asm64(bytes, |a| a.mov(r12, rsi))
+        && has_asm64(bytes, |a| a.mov(rbp, rdi))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp + 0x08), rdx))
+        && has_asm64(bytes, |a| a.test(rsi, rsi))
+        && has_asm64(bytes, |a| a.test(rdx, rdx));
+    let steamrt_arguments = has_asm64(bytes, |a| a.mov(r15, rdi))
+        && has_asm64(bytes, |a| a.mov(rbx, rsi))
+        && has_asm64(bytes, |a| a.mov(r13, rdx))
+        && has_asm64(bytes, |a| a.test(rsi, rsi))
+        && has_asm64(bytes, |a| a.test(r13, r13));
+    let ordinary_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbp + 0xA4)));
+    let steamrt_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4)));
     Some(Evidence::required([
-        ("known environment map layout", old_shape || current_shape),
+        (
+            "three SysV arguments",
+            ordinary_arguments || steamrt_arguments,
+        ),
+        (
+            "environment map load",
+            ordinary_map || steamrt_map,
+        ),
+        (
+            "setenv key hash",
+            has_asm64(bytes, |a| a.mov(edx, 0x417)),
+        ),
         ("insert mode argument", has_asm64(bytes, |a| a.mov(ecx, 1))),
     ]))
 }
