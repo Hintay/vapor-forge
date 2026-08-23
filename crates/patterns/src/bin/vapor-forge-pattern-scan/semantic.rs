@@ -99,6 +99,11 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_build_depot_dependency32,
     },
     SemanticCheck {
+        name: "CShaderCacheManager::GetShaderCacheDepot",
+        label: "CShaderCacheManager::GetShaderCacheDepot accessor",
+        validate: validate_get_shader_cache_depot32,
+    },
+    SemanticCheck {
         name: "CWebSocketConnection::BBuildAndAsyncSendFrame",
         label: "CWebSocketConnection::BBuildAndAsyncSendFrame body",
         validate: validate_websocket_send_frame32,
@@ -215,6 +220,11 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "BuildDepotDependency",
         label: "BuildDepotDependency body",
         validate: validate_build_depot_dependency64,
+    },
+    SemanticCheck {
+        name: "CShaderCacheManager::GetShaderCacheDepot",
+        label: "CShaderCacheManager::GetShaderCacheDepot accessor",
+        validate: validate_get_shader_cache_depot64,
     },
     SemanticCheck {
         name: "CWebSocketConnection::BBuildAndAsyncSendFrame",
@@ -1860,6 +1870,12 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "BuildDepotDependency") => {
             build_depot_dependency64_evidence(code, offset)
         }
+        (SemanticArch::X86, "CShaderCacheManager::GetShaderCacheDepot") => {
+            get_shader_cache_depot32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CShaderCacheManager::GetShaderCacheDepot") => {
+            get_shader_cache_depot64_evidence(code, offset)
+        }
         (SemanticArch::X86, "CWebSocketConnection::BBuildAndAsyncSendFrame") => {
             websocket_send_frame32_evidence(code, offset)
         }
@@ -2821,6 +2837,63 @@ fn load_depot_key64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     Some(Evidence::required([
         ("key size 128", has_asm64(bytes, |a| a.mov(esi, 0x80))),
         ("key buffer argument", has_asm64(bytes, |a| a.mov(rdi, rdx))),
+    ]))
+}
+
+fn validate_get_shader_cache_depot32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        get_shader_cache_depot32_evidence(code, offset),
+        "local app-info shader depot accessor",
+    )
+}
+
+fn get_shader_cache_depot32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x120)?;
+    Some(Evidence::required([
+        (
+            "shader manager readiness",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x44)))
+                && has_asm32(bytes, |a| a.test(eax, eax)),
+        ),
+        (
+            "app-info AppID",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x08))),
+        ),
+        (
+            "game type lookup",
+            has_seq(bytes, &[0x6A, 0x02]) && has_seq(bytes, &[0x83, 0xF8, 0x01]),
+        ),
+        ("shader depot lookup", has_seq(bytes, &[0x6A, 0x07])),
+    ]))
+}
+
+fn validate_get_shader_cache_depot64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        get_shader_cache_depot64_evidence(code, offset),
+        "local app-info shader depot accessor",
+    )
+}
+
+fn get_shader_cache_depot64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x120)?;
+    let app_id = has_asm64(bytes, |a| a.mov(esi, dword_ptr(rbx + 0x0C)))
+        || has_asm64(bytes, |a| a.mov(esi, dword_ptr(rbp + 0x0C)));
+    Some(Evidence::required([
+        (
+            "shader manager readiness",
+            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rax + 0x7C)))
+                && has_asm64(bytes, |a| a.test(eax, eax)),
+        ),
+        ("app-info AppID", app_id),
+        (
+            "game type lookup",
+            has_seq(bytes, &[0xBA, 0x02, 0x00, 0x00, 0x00])
+                && has_seq(bytes, &[0x83, 0xF8, 0x01]),
+        ),
+        (
+            "shader depot lookup",
+            has_seq(bytes, &[0xBA, 0x07, 0x00, 0x00, 0x00]),
+        ),
     ]))
 }
 

@@ -18,6 +18,7 @@ pub(crate) enum Capability {
     PackageInjection,
     TicketOverrides,
     DepotInjection,
+    ShaderCacheControl,
     DlcOverrides,
     CmInterception,
     NativeResponseDelivery,
@@ -31,12 +32,13 @@ pub(crate) enum Capability {
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::CallbackEvents,
         Self::Ownership,
         Self::PackageInjection,
         Self::TicketOverrides,
         Self::DepotInjection,
+        Self::ShaderCacheControl,
         Self::DlcOverrides,
         Self::CmInterception,
         Self::NativeResponseDelivery,
@@ -56,6 +58,7 @@ impl Capability {
             Self::PackageInjection => "package-injection",
             Self::TicketOverrides => "ticket-overrides",
             Self::DepotInjection => "depot-injection",
+            Self::ShaderCacheControl => "shader-cache-control",
             Self::DlcOverrides => "dlc-overrides",
             Self::CmInterception => "cm-interception",
             Self::NativeResponseDelivery => "native-response-delivery",

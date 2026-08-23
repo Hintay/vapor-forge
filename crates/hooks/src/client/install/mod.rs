@@ -73,6 +73,7 @@ const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
     crate::capability::Capability::PackageInjection,
     crate::capability::Capability::TicketOverrides,
     crate::capability::Capability::DepotInjection,
+    crate::capability::Capability::ShaderCacheControl,
     crate::capability::Capability::DlcOverrides,
     crate::capability::Capability::CmInterception,
     crate::capability::Capability::NativeResponseDelivery,
@@ -801,6 +802,12 @@ fn do_install() {
         "LoadDepotDecryptionKey",
         super::depot::hk_load_depot_decryption_key as super::depot::LoadDepotDecryptionKeyFn,
     );
+    let d_shader_cache_depot = resolve_from_registry(
+        &registry,
+        &code,
+        super::shader::GET_SHADER_CACHE_DEPOT_NAME,
+        super::shader::hk_get_shader_cache_depot as super::shader::GetShaderCacheDepotFn,
+    );
     let mut d_send_frame = resolve_from_registry(
         &registry,
         &code,
@@ -978,6 +985,10 @@ fn do_install() {
         hr!("CConfigStore::WriteVdfFile", d_write_vdf),
         hr!("CUser::BuildSpawnEnvBlock", d_build_spawn_env),
         hr!("CUser::SpawnProcess", d_spawn_process),
+        hr!(
+            super::shader::GET_SHADER_CACHE_DEPOT_NAME,
+            d_shader_cache_depot
+        ),
     ];
 
     macro_rules! finalize {
@@ -1133,6 +1144,12 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::env::SPAWN_PROCESS_DETOUR),
         d_spawn_process
     );
+    finalize!(
+        24,
+        super::shader::GET_SHADER_CACHE_DEPOT_NAME,
+        std::ptr::addr_of_mut!(super::shader::GET_SHADER_CACHE_DEPOT_DETOUR),
+        d_shader_cache_depot
+    );
 
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
@@ -1195,6 +1212,10 @@ fn do_install() {
             (hook_results[16].name, hook_results[16].installed),
             (hook_results[17].name, hook_results[17].installed),
         ],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::ShaderCacheControl,
+        &[(hook_results[24].name, hook_results[24].installed)],
     );
     crate::capability::set_from_requirements(
         crate::capability::Capability::DlcOverrides,
