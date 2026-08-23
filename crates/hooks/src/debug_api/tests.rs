@@ -161,6 +161,37 @@ fn toast_command_accepts_flag_options() {
 }
 
 #[test]
+fn toast_command_accepts_steam_url_action() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = vapor_forge_features::toast::take_pending();
+    let _ = vapor_forge_features::toast::take_ui_work();
+
+    let response =
+        dispatch("steamui toast body=Downloads --steam-url steam://open/downloads duration=60000");
+    assert!(response.contains("queued toast"));
+    let pending = vapor_forge_features::toast::take_pending();
+    assert_eq!(pending.len(), 1);
+    let script = vapor_forge_features::toast::toast_script(&pending[0]);
+    assert!(script.contains("action:{kind:\"steam-url\",target:\"steam://open/downloads\"}"));
+
+    let _ = vapor_forge_features::toast::take_ui_work();
+}
+
+#[test]
+fn toast_command_rejects_non_steam_url_action() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = vapor_forge_features::toast::take_pending();
+    let _ = vapor_forge_features::toast::take_ui_work();
+
+    let response = dispatch("steamui toast --steam-url https://example.invalid/");
+    assert_eq!(
+        response,
+        "err invalid steam URL: \"https://example.invalid/\""
+    );
+    assert_eq!(vapor_forge_features::toast::pending_count(), 0);
+}
+
+#[test]
 fn toast_is_steamui_only() {
     let _guard = TEST_LOCK.lock().unwrap();
     let _ = vapor_forge_features::toast::take_pending();

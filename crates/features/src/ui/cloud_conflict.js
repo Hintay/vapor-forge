@@ -2,7 +2,7 @@
 (function() {
   try {
     const bridge = window.VaporForgeUIBridge;
-    if (!bridge || typeof bridge.registerFeature !== 'function') return;
+    if (!bridge || typeof bridge.registerFeatureOnce !== 'function') return;
 
     /**
      * @typedef {Object} ConflictCandidate
@@ -23,7 +23,7 @@
      * @property {ConflictCandidate[]} candidates
      */
 
-    bridge.registerFeature('cloud-conflict', 3, function(bridge) {
+    bridge.registerFeatureOnce('cloud-conflict', function(bridge) {
       const state = {
         jsx: null,
         modal: null,
@@ -87,7 +87,7 @@
         try {
           const apps = window.SteamClient && window.SteamClient.Apps;
           if (!apps || typeof apps.VaporForgeConfirmUIBridge !== 'function') return false;
-          apps.VaporForgeConfirmUIBridge('cloud-conflict:3');
+          apps.VaporForgeConfirmUIBridge('cloud-conflict-ready');
           state.readyConfirmed = true;
           return true;
         } catch (error) {
@@ -558,19 +558,10 @@
         return false;
       }
 
-      function dispose() {
-        if (state.observer) state.observer.disconnect();
-        Object.keys(state.dialogs).forEach(function(appId) {
-          restoreNativeCloudDialog(Number(appId));
-          closeCloudConflict(Number(appId));
-        });
-      }
-
       bridge.showCloudConflict = showCloudConflict;
       bridge.ackCloudConflict = ackCloudConflict;
       return {
         tryReady: tryReady,
-        dispose: dispose,
         showCloudConflict: showCloudConflict,
         ackCloudConflict: ackCloudConflict
       };

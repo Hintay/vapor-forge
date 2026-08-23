@@ -16,7 +16,7 @@ const RESOLVE_METHOD: &[u8] = b"Apps.VaporForgeResolveCloudConflict\0";
 const CONFIRM_METHOD: &[u8] = b"Apps.VaporForgeConfirmCloudConflict\0";
 const RETRY_METHOD: &[u8] = b"Apps.VaporForgeRetryCloudConflict\0";
 const READY_METHOD: &[u8] = b"Apps.VaporForgeConfirmUIBridge\0";
-const READY_SIGNAL: &[u8] = b"cloud-conflict:3";
+const READY_SIGNAL: &[u8] = b"cloud-conflict-ready";
 const URL_METHOD: &[u8] = b"URL.ExecuteSteamURL";
 const CONTINUE_METHOD: &[u8] = b"Apps.ContinueGameAction";
 const TOKEN_LENGTH: usize = 64;
@@ -584,8 +584,8 @@ mod tests {
         let first = register_test_window(0x1000);
         let second = register_test_window(0x1000);
         set_runtime_ready(true);
-        let ready = std::ffi::CString::new("cloud-conflict:3").unwrap();
-        let wrong = std::ffi::CString::new("cloud-conflict:2").unwrap();
+        let ready = std::ffi::CString::new("cloud-conflict-ready").unwrap();
+        let wrong = std::ffi::CString::new("cloud-conflict").unwrap();
 
         // SAFETY: both strings are live NUL-terminated test inputs.
         unsafe { receive_ready(first as usize as *mut c_void, ready.as_ptr()) };

@@ -190,33 +190,23 @@ fn queue_toast_command(target: DebugTarget, args: ToastArgs<'_>) -> String {
 fn queue_toast_fields(args: &str) -> Result<String, String> {
     let parsed = parse_toast_args(args)?;
 
-    if let Some(style) = parsed.style {
-        vapor_forge_features::toast::show_toast_with_style(
-            parsed.kind,
-            style,
-            &parsed.title,
-            &parsed.body,
-            parsed.icon.as_deref(),
-            parsed.duration_ms,
-        );
-    } else {
-        vapor_forge_features::toast::show_toast_with_kind(
-            parsed.kind,
-            &parsed.title,
-            &parsed.body,
-            parsed.icon.as_deref(),
-            parsed.duration_ms,
-        );
-    }
+    let style = parsed
+        .style
+        .unwrap_or_else(|| default_toast_style(parsed.kind));
+    vapor_forge_features::toast::show_toast_with_style_and_action(
+        parsed.kind,
+        style,
+        &parsed.title,
+        &parsed.body,
+        parsed.icon.as_deref(),
+        parsed.duration_ms,
+        parsed.action,
+    );
     request_target_pump(DebugTarget::SteamUi);
     Ok(format!(
         "ok queued toast kind={} style={} title={} body={} duration_ms={}",
         toast_kind_name(parsed.kind),
-        toast_style_name(
-            parsed
-                .style
-                .unwrap_or_else(|| default_toast_style(parsed.kind))
-        ),
+        toast_style_name(style),
         quote_text(&parsed.title),
         quote_text(&parsed.body),
         parsed.duration_ms
@@ -253,7 +243,9 @@ fn help_response() -> String {
     out.push_str("  native-inject         arm a native dispatch self-test\n");
     out.push_str("  native-inject-self    dispatch a captured packet from our own thread\n");
     out.push_str("  dump/status           toast subsystem status\n");
-    out.push_str("  toast [args]          queue a toast notification\n");
+    out.push_str(
+        "  toast [args]          queue a toast notification, optionally with --steam-url\n",
+    );
     out.push('\n');
     out.push_str("  Add --json to any command for machine-readable output.\n");
     out.push_str("  Prefix with steamui/steamclient to select target.");

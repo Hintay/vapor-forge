@@ -4,6 +4,7 @@ use super::{DEFAULT_DURATION_MS, DEFAULT_TOAST_BODY};
 pub(crate) struct ParsedToast {
     pub kind: vapor_forge_features::toast::ToastKind,
     pub style: Option<vapor_forge_features::toast::ToastStyle>,
+    pub action: vapor_forge_features::toast::ToastAction,
     pub title: String,
     pub body: String,
     pub duration_ms: u32,
@@ -17,6 +18,7 @@ struct ToastOptions {
     body: Option<String>,
     duration_ms: u32,
     icon: Option<String>,
+    action: vapor_forge_features::toast::ToastAction,
 }
 
 pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
@@ -28,6 +30,7 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
         body: None,
         duration_ms: DEFAULT_DURATION_MS,
         icon: None,
+        action: vapor_forge_features::toast::ToastAction::Dismiss,
     };
     let mut body_words = Vec::new();
     let mut index = 0;
@@ -64,6 +67,7 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
     Ok(ParsedToast {
         kind: options.kind,
         style: options.style,
+        action: options.action,
         title: non_empty(options.title.as_deref().unwrap_or(""), "Vapor Forge").to_owned(),
         body: non_empty(options.body.as_deref().unwrap_or(""), DEFAULT_TOAST_BODY).to_owned(),
         duration_ms: options.duration_ms,
@@ -120,6 +124,16 @@ fn apply_toast_option(key: &str, value: &str, options: &mut ToastOptions) -> Res
         "body" | "message" | "text" => options.body = Some(value.to_owned()),
         "duration" | "duration_ms" | "ms" => options.duration_ms = parse_duration(value)?,
         "icon" => options.icon = Some(value.to_owned()),
+        "steam-url" | "steam_url" => {
+            if !value.starts_with("steam://") {
+                return Err(format!(
+                    "err invalid steam URL: {}",
+                    super::command::quote_text(value)
+                ));
+            }
+            options.action =
+                vapor_forge_features::toast::ToastAction::OpenSteamUrl(value.to_owned());
+        }
         _ => {
             return Err(format!(
                 "err unknown toast option: {}",

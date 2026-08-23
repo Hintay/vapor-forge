@@ -12,6 +12,7 @@ const INIT_BODY: &str = "Loaded successfully";
 const DEFAULT_DURATION_MS: u32 = 5000;
 const STEAMUI_BRIDGE_JS: &str = include_str!("ui/steamui_bridge.js");
 const TOAST_JS: &str = include_str!("ui/toast.js");
+const TOAST_I18N: &str = include_str!("ui/toast_i18n.json");
 const CLOUD_CONFLICT_JS: &str = include_str!("ui/cloud_conflict.js");
 const CLOUD_CONFLICT_I18N: &str = include_str!("ui/cloud_conflict_i18n.json");
 
@@ -20,6 +21,8 @@ pub struct ToastRequest {
     id: u64,
     kind: ToastKind,
     style: ToastStyle,
+    action: ToastAction,
+    message_key: String,
     title: String,
     body: String,
     icon: String,
@@ -37,6 +40,45 @@ pub enum ToastKind {
 pub enum ToastStyle {
     Accent,
     Banner,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToastAction {
+    Dismiss,
+    OpenSteamUrl(String),
+}
+
+impl ToastRequest {
+    fn new(
+        kind: ToastKind,
+        style: ToastStyle,
+        title: &str,
+        body: &str,
+        icon: Option<&str>,
+        duration_ms: u32,
+        action: ToastAction,
+    ) -> Self {
+        Self {
+            id: NEXT_TOAST_ID.fetch_add(1, Ordering::Relaxed),
+            kind,
+            style,
+            action,
+            message_key: String::new(),
+            title: if title.is_empty() {
+                DEFAULT_TITLE.to_owned()
+            } else {
+                title.to_owned()
+            },
+            body: body.to_owned(),
+            icon: icon.unwrap_or("").to_owned(),
+            duration_ms,
+        }
+    }
+
+    fn with_message_key(mut self, message_key: &str) -> Self {
+        self.message_key = message_key.to_owned();
+        self
+    }
 }
 
 impl ToastKind {
@@ -77,6 +119,22 @@ impl ToastStyle {
     }
 }
 
+impl ToastAction {
+    fn as_js_kind(&self) -> &'static str {
+        match self {
+            Self::Dismiss => "dismiss",
+            Self::OpenSteamUrl(_) => "steam-url",
+        }
+    }
+
+    fn target(&self) -> &str {
+        match self {
+            Self::Dismiss => "",
+            Self::OpenSteamUrl(target) => target,
+        }
+    }
+}
+
 pub fn show_toast(title: &str, body: &str, icon: Option<&str>, duration_ms: u32) {
     show_toast_with_kind(ToastKind::Info, title, body, icon, duration_ms);
 }
@@ -99,6 +157,38 @@ pub fn show_toast_with_style(
     icon: Option<&str>,
     duration_ms: u32,
 ) {
+    show_toast_with_style_and_action(
+        kind,
+        style,
+        title,
+        body,
+        icon,
+        duration_ms,
+        ToastAction::Dismiss,
+    );
+}
+
+pub fn show_toast_with_style_and_action(
+    kind: ToastKind,
+    style: ToastStyle,
+    title: &str,
+    body: &str,
+    icon: Option<&str>,
+    duration_ms: u32,
+    action: ToastAction,
+) {
+    enqueue_toast(ToastRequest::new(
+        kind,
+        style,
+        title,
+        body,
+        icon,
+        duration_ms,
+        action,
+    ));
+}
+
+fn enqueue_toast(toast: ToastRequest) {
     let mut pending = match PENDING_TOASTS.lock() {
         Ok(p) => p,
         Err(_) => {
@@ -106,26 +196,25 @@ pub fn show_toast_with_style(
             return;
         }
     };
-    pending.push(ToastRequest {
-        id: NEXT_TOAST_ID.fetch_add(1, Ordering::Relaxed),
-        kind,
-        style,
-        title: if title.is_empty() {
-            DEFAULT_TITLE.to_owned()
-        } else {
-            title.to_owned()
-        },
-        body: body.to_owned(),
-        icon: icon.unwrap_or("").to_owned(),
-        duration_ms,
-    });
+    pending.push(toast);
     drop(pending);
     request_ui_work();
 }
 
 pub fn show_init_toast(config: &RuntimeConfig) {
     if config.toast.enabled && config.toast.init {
-        show_toast(DEFAULT_TITLE, INIT_BODY, None, DEFAULT_DURATION_MS);
+        enqueue_toast(
+            ToastRequest::new(
+                ToastKind::Info,
+                ToastStyle::Accent,
+                DEFAULT_TITLE,
+                INIT_BODY,
+                None,
+                DEFAULT_DURATION_MS,
+                ToastAction::Dismiss,
+            )
+            .with_message_key("loaded"),
+        );
     }
 }
 
@@ -179,17 +268,20 @@ pub fn toast_script(toast: &ToastRequest) -> String {
         toast.duration_ms
     };
     format!(
-        "(function(){{try{{if(!window.VaporForgeToastBridge||!window.VaporForgeToastBridge.showToast){{return false;}}window.VaporForgeToastBridge.showToast({{id:{},kind:\"{}\",style:\"{}\",title:\"{}\",body:\"{}\",icon:\"{}\",duration:{},playSound:true,sound:{},eType:{},critical:{}}});return true;}}catch(e){{try{{console.log('[VaporForgeToast] show error: '+e);}}catch(_){{}}}}}})();",
+        "(function(){{try{{if(!window.VaporForgeToastBridge||!window.VaporForgeToastBridge.showToast){{return false;}}window.VaporForgeToastBridge.showToast({{id:{},kind:\"{}\",style:\"{}\",messageKey:\"{}\",title:\"{}\",body:\"{}\",icon:\"{}\",duration:{},playSound:true,sound:{},eType:{},critical:{},action:{{kind:\"{}\",target:\"{}\"}}}});return true;}}catch(e){{try{{console.log('[VaporForgeToast] show error: '+e);}}catch(_){{}}}}}})();",
         toast.id,
         toast.kind.as_js_str(),
         toast.style.as_js_str(),
+        js_escape(&toast.message_key),
         js_escape(&toast.title),
         js_escape(&toast.body),
         js_escape(&toast.icon),
         duration,
         toast.kind.sound(),
         toast.kind.e_type(),
-        toast.kind.critical()
+        toast.kind.critical(),
+        toast.action.as_js_kind(),
+        js_escape(toast.action.target())
     )
 }
 
@@ -219,13 +311,16 @@ pub fn bridge_script() -> &'static str {
     SCRIPT.get_or_init(|| {
         let capacity = STEAMUI_BRIDGE_JS.len()
             + TOAST_JS.len()
+            + TOAST_I18N.len()
             + CLOUD_CONFLICT_JS.len()
             + CLOUD_CONFLICT_I18N.len()
             + 256;
         let mut script = String::with_capacity(capacity);
         script.push_str(STEAMUI_BRIDGE_JS);
         script.push_str("\n(function(){try{var bridge=window.VaporForgeUIBridge;");
-        script.push_str("if(bridge){bridge.resources.cloudConflictLocales=");
+        script.push_str("if(bridge){bridge.resources.toastLocales=");
+        script.push_str(TOAST_I18N);
+        script.push_str(";bridge.resources.cloudConflictLocales=");
         script.push_str(CLOUD_CONFLICT_I18N);
         script.push_str(
             ";}}catch(error){try{console.log('[VaporForgeUI] locale install error: '+error);}",
@@ -259,6 +354,8 @@ mod tests {
             id: 42,
             kind: ToastKind::Info,
             style: ToastStyle::Accent,
+            action: ToastAction::Dismiss,
+            message_key: String::new(),
             title: "t".to_owned(),
             body: "b".to_owned(),
             icon: String::new(),
@@ -269,6 +366,7 @@ mod tests {
         assert!(script.contains("kind:\"info\""));
         assert!(script.contains("style:\"accent\""));
         assert!(script.contains("critical:false"));
+        assert!(script.contains("action:{kind:\"dismiss\",target:\"\"}"));
         assert!(!script.contains("SLS"));
     }
 
@@ -279,6 +377,8 @@ mod tests {
             id: 43,
             kind: ToastKind::Error,
             style: ToastStyle::Banner,
+            action: ToastAction::Dismiss,
+            message_key: String::new(),
             title: "t".to_owned(),
             body: "b".to_owned(),
             icon: String::new(),
@@ -287,6 +387,23 @@ mod tests {
         let script = toast_script(&toast);
         assert!(script.contains("kind:\"error\""));
         assert!(script.contains("critical:true"));
+    }
+
+    #[test]
+    fn toast_script_serializes_steam_url_action() {
+        let toast = ToastRequest {
+            id: 44,
+            kind: ToastKind::Info,
+            style: ToastStyle::Accent,
+            action: ToastAction::OpenSteamUrl("steam://open/downloads".to_owned()),
+            message_key: String::new(),
+            title: "t".to_owned(),
+            body: "b".to_owned(),
+            icon: String::new(),
+            duration_ms: 5000,
+        };
+        let script = toast_script(&toast);
+        assert!(script.contains("action:{kind:\"steam-url\",target:\"steam://open/downloads\"}"));
     }
 
     #[test]
@@ -299,7 +416,7 @@ mod tests {
     #[test]
     fn bridge_requires_the_gamepad_focus_component() {
         let script = bridge_script();
-        assert!(script.contains("registerFeature('toast', 3"));
+        assert!(script.contains("registerFeatureOnce('toast'"));
         assert!(script.contains("typeof exp === 'function'"));
         assert!(script.contains("typeof exp.render === 'function'"));
         assert!(script.contains("'focusClassName'"));
@@ -311,11 +428,34 @@ mod tests {
     }
 
     #[test]
+    fn bridge_registers_features_once_without_feature_versions() {
+        let script = bridge_script();
+        assert!(script.contains("bridge.registerFeatureOnce = function(name, install)"));
+        assert!(script.contains("if (current)"));
+        assert!(script.contains("bridge.features[name] = { api: api }"));
+        assert!(!script.contains("current.version"));
+        assert!(!script.contains("version: version"));
+        assert!(!script.contains("current.api.dispose"));
+    }
+
+    #[test]
     fn bridge_uses_a_focusable_notification_root() {
         let script = bridge_script();
-        assert!(script.contains("onActivate: activateQamToast"));
+        assert!(script.contains("onActivate: function() { activateQamToast(data, notification); }"));
         assert!(script.contains("navigation.CloseSideMenus()"));
         assert!(script.contains("className: (css.StandardTemplateContainer || '')"));
+    }
+
+    #[test]
+    fn bridge_dismisses_or_opens_clicked_notifications() {
+        let script = bridge_script();
+        assert!(script.contains("function dismissTrayNotification(notification)"));
+        assert!(script.contains("store.GetNotificationsInTray()"));
+        assert!(script.contains("store.RemoveGroupFromTray(group)"));
+        assert!(script.contains("function runToastAction(data)"));
+        assert!(script.contains("target.indexOf('steam://') !== 0"));
+        assert!(script.contains("client.URL.ExecuteSteamURL(target)"));
+        assert!(!script.contains("setInterval"));
     }
 
     #[test]
@@ -330,9 +470,6 @@ mod tests {
     #[test]
     fn bridge_uses_general_notification_type_by_default() {
         let script = bridge_script();
-        assert!(script.contains("version === BRIDGE_VERSION"));
-        assert!(script.contains("version: BRIDGE_VERSION"));
-        assert!(script.contains("const BRIDGE_VERSION = 12"));
         assert!(script.contains("eType: toast.eType || 31"));
         assert!(script.contains("function allocateNotificationId(toast)"));
         assert!(script.contains("notificationID: id"));
@@ -340,12 +477,22 @@ mod tests {
     }
 
     #[test]
+    fn bridge_installs_once_without_a_bridge_version() {
+        let script = bridge_script();
+        assert!(script.contains("if (existing)"));
+        assert!(script.contains("array.__vaporForgeBridgeWrapped"));
+        assert!(!script.contains("BRIDGE_VERSION"));
+        assert!(!script.contains("__vaporForgeBridgeVersion"));
+    }
+
+    #[test]
     fn cloud_conflict_bridge_resumes_the_public_game_action() {
         let script = bridge_script();
         assert!(script.contains("SteamClient.Apps.GetGameActionForApp"));
         assert!(script.contains("SteamClient.Apps.VaporForgeResolveCloudConflict"));
-        assert!(script.contains("registerFeature('cloud-conflict', 3"));
-        assert!(script.contains("VaporForgeConfirmUIBridge('cloud-conflict:3')"));
+        assert!(script.contains("registerFeatureOnce('cloud-conflict'"));
+        assert!(script.contains("VaporForgeConfirmUIBridge('cloud-conflict-ready')"));
+        assert!(!script.contains("cloud-conflict:3"));
         assert!(script.contains("state.acknowledging[ack.token]"));
         assert!(script.contains("const receipt = function()"));
         assert!(script.contains("VaporForgeConfirmCloudConflict(ack.token)"));
@@ -397,6 +544,44 @@ mod tests {
     }
 
     #[test]
+    fn toast_locales_match_english_keys() {
+        let locales: serde_json::Value = serde_json::from_str(TOAST_I18N).unwrap();
+        let locales = locales.as_object().unwrap();
+        assert_eq!(
+            locales.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["english", "japanese", "schinese", "tchinese"])
+        );
+        let english = locales["english"].as_object().unwrap();
+        for locale in locales.values() {
+            let messages = locale.as_object().unwrap();
+            assert_eq!(messages.len(), english.len());
+            for key in english.keys() {
+                let message = messages.get(key).and_then(serde_json::Value::as_object);
+                assert!(message
+                    .and_then(|value| value.get("title"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty()));
+                assert!(message
+                    .and_then(|value| value.get("body"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn toast_bridge_localizes_stable_message_keys() {
+        let script = bridge_script();
+        assert!(script.contains("settings.GetCurrentLanguage()"));
+        assert!(script.contains("toastLocales"));
+        assert!(script.contains("function pendingNeedsLanguage()"));
+        assert!(script.contains("function localizeToast(toast)"));
+        assert!(script.contains("var toast = localizeToast(state.pending.shift())"));
+        assert!(!script.contains("setInterval"));
+        assert!(!script.contains("setTimeout"));
+    }
+
+    #[test]
     fn bridge_styles_warning_and_error_toasts() {
         let script = bridge_script();
         assert!(script.contains("function toastKind(data)"));
@@ -426,6 +611,8 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].title, DEFAULT_TITLE);
         assert_eq!(pending[0].body, INIT_BODY);
+        assert_eq!(pending[0].action, ToastAction::Dismiss);
+        assert_eq!(pending[0].message_key, "loaded");
 
         let _ = take_ui_work();
     }

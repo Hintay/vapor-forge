@@ -1,16 +1,14 @@
 // @ts-check
 (function() {
   try {
-    const BRIDGE_VERSION = 12;
     const existing = window.VaporForgeUIBridge;
-    if (existing && existing.version === BRIDGE_VERSION) {
+    if (existing) {
       window.VaporForgeToastBridge = existing;
       existing.tryReady && existing.tryReady();
       return;
     }
 
     const bridge = window.VaporForgeUIBridge = {
-      version: BRIDGE_VERSION,
       req: null,
       features: {},
       resources: {},
@@ -183,17 +181,14 @@
     bridge.findModal = findModal;
     bridge.findWindowStore = findWindowStore;
 
-    bridge.registerFeature = function(name, version, install) {
+    bridge.registerFeatureOnce = function(name, install) {
       const current = bridge.features[name];
-      if (current && current.version === version) {
+      if (current) {
         current.api.tryReady && current.api.tryReady();
         return current.api;
       }
-      if (current && current.api.dispose) {
-        try { current.api.dispose(); } catch (_) {}
-      }
       const api = install(bridge) || {};
-      bridge.features[name] = { version: version, api: api };
+      bridge.features[name] = { api: api };
       api.tryReady && api.tryReady();
       return api;
     };
@@ -224,7 +219,7 @@
     }
 
     function wrapChunkArray(array) {
-      if (!array || array.__vaporForgeBridgeVersion === BRIDGE_VERSION) return;
+      if (!array || array.__vaporForgeBridgeWrapped) return;
       const oldPush = array.push;
       array.push = function(chunk) {
         try {
@@ -240,7 +235,7 @@
         bridge.tryReady();
         return result;
       };
-      array.__vaporForgeBridgeVersion = BRIDGE_VERSION;
+      array.__vaporForgeBridgeWrapped = true;
     }
 
     let chunkArray = window.webpackChunksteamui || [];
