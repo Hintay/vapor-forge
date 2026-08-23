@@ -1,0 +1,26 @@
+{
+  "english": {
+    "loaded": {
+      "title": "Vapor Forge",
+      "body": "Loaded successfully"
+    }
+  },
+  "schinese": {
+    "loaded": {
+      "title": "Vapor Forge",
+      "body": "已成功加载"
+    }
+  },
+  "tchinese": {
+    "loaded": {
+      "title": "Vapor Forge",
+      "body": "已成功載入"
+    }
+  },
+  "japanese": {
+    "loaded": {
+      "title": "Vapor Forge",
+      "body": "正常に読み込まれました"
+    }
+  }
+}

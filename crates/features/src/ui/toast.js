@@ -2,15 +2,18 @@
 (function() {
   try {
     const bridge = window.VaporForgeUIBridge;
-    if (!bridge || typeof bridge.registerFeature !== 'function') return;
+    if (!bridge || typeof bridge.registerFeatureOnce !== 'function') return;
 
-    bridge.registerFeature('toast', 3, function(bridge) {
+    bridge.registerFeatureOnce('toast', function(bridge) {
       const state = {
         store: null,
         css: null,
         jsx: null,
         focusable: null,
         navigation: null,
+        language: 'english',
+        languageReady: false,
+        languagePromise: null,
         nextId: 10000,
         pending: [],
         seen: {},
@@ -19,16 +22,76 @@
         jsxPatched: false
       };
 
+      const supportedLanguages = {
+        english: true,
+        schinese: true,
+        tchinese: true,
+        japanese: true
+      };
+
+      function finishLanguage(language) {
+        if (language === 'sc_schinese') language = 'schinese';
+        if (!supportedLanguages[language]) language = 'english';
+        state.language = language;
+        state.languageReady = true;
+        bridge.tryReady();
+      }
+
+      function ensureLanguage() {
+        if (state.languageReady || state.languagePromise) return;
+        try {
+          var settings = window.SteamClient && window.SteamClient.Settings;
+          if (!settings || typeof settings.GetCurrentLanguage !== 'function') {
+            finishLanguage('english');
+            return;
+          }
+          state.languagePromise = Promise.resolve(settings.GetCurrentLanguage()).then(function(language) {
+            finishLanguage(String(language || 'english').toLowerCase());
+          }).catch(function(error) {
+            bridge.log('toast language error: ' + error);
+            finishLanguage('english');
+          });
+        } catch (error) {
+          bridge.log('toast language error: ' + error);
+          finishLanguage('english');
+        }
+      }
+
+      function pendingNeedsLanguage() {
+        return state.pending.some(function(toast) { return !!toast.messageKey; });
+      }
+
+      function localizeToast(toast) {
+        var key = String(toast && toast.messageKey || '');
+        if (!key) return toast;
+        var locales = bridge.resources.toastLocales || {};
+        var english = locales.english || {};
+        var messages = locales[state.language] || english;
+        var translated = messages[key] || english[key];
+        if (!translated) return toast;
+        return Object.assign({}, toast, {
+          title: translated.title || toast.title,
+          body: translated.body || toast.body
+        });
+      }
+
       function findStore() {
         var found = null;
         bridge.eachExport(function(exp) {
-          if (exp && typeof exp.ProcessNotification === 'function') {
+          if (exp && typeof exp.ProcessNotification === 'function' &&
+              typeof exp.GetNotificationsInTray === 'function' &&
+              typeof exp.RemoveGroupFromTray === 'function') {
             found = exp;
             return true;
           }
           return false;
         }, function(text) {
-          return bridge.hasAll(text, ['ProcessNotification', 'm_nNextTestNotificationID']);
+          return bridge.hasAll(text, [
+            'ProcessNotification',
+            'm_nNextTestNotificationID',
+            'GetNotificationsInTray',
+            'RemoveGroupFromTray'
+          ]);
         });
         return found;
       }
@@ -84,7 +147,53 @@
         return found;
       }
 
-      function activateQamToast() {
+      function dismissTrayNotification(notification) {
+        var store = state.store;
+        if (!store || !notification ||
+            typeof store.GetNotificationsInTray !== 'function' ||
+            typeof store.RemoveGroupFromTray !== 'function') return false;
+        try {
+          var result = store.GetNotificationsInTray();
+          var tray = Array.isArray(result) ? result[0] : null;
+          if (!Array.isArray(tray)) return false;
+          var id = notification.notificationID;
+          var group = tray.find(function(entry) {
+            var notifications = entry && entry.notifications || [];
+            return notifications.some(function(item) {
+              return item && item.notificationID === id;
+            });
+          });
+          if (!group) return false;
+          store.RemoveGroupFromTray(group);
+          return true;
+        } catch (error) {
+          bridge.log('notification dismiss error: ' + error);
+          return false;
+        }
+      }
+
+      function runToastAction(data) {
+        var action = data && data.action;
+        if (!action || action.kind === 'dismiss') return true;
+        if (action.kind !== 'steam-url') return false;
+        var target = String(action.target || '');
+        if (target.indexOf('steam://') !== 0) return false;
+        try {
+          var client = window.SteamClient;
+          if (!client || !client.URL || typeof client.URL.ExecuteSteamURL !== 'function') {
+            return false;
+          }
+          client.URL.ExecuteSteamURL(target);
+          return true;
+        } catch (error) {
+          bridge.log('notification action error: ' + error);
+          return false;
+        }
+      }
+
+      function activateQamToast(data, notification) {
+        dismissTrayNotification(notification);
+        if (!runToastAction(data)) bridge.log('notification action rejected');
         var navigation = state.navigation;
         if (navigation && typeof navigation.CloseSideMenus === 'function') {
           navigation.CloseSideMenus();
@@ -306,7 +415,7 @@
           var Focusable = state.focusable;
           if (!Focusable) return renderFallback(jsx, title, body);
           return jsx.jsx(Focusable, {
-            onActivate: activateQamToast,
+            onActivate: function() { activateQamToast(data, notification); },
             className: (css.StandardTemplateContainer || '') +
               ' VaporForgeQAMToast VaporForgeToast-' + kind + ' VaporForgeToastStyle-' + style,
             style: qamRootStyle(kind, style),
@@ -424,8 +533,9 @@
         if (!bridge.isTargetSteamUiContext()) return false;
         if (!state.store || !state.renderPatched) return false;
         if (isGamepadUiReady() && !state.focusable) return false;
+        if (pendingNeedsLanguage() && !state.languageReady) return false;
         while (state.pending.length) {
-          var toast = state.pending.shift();
+          var toast = localizeToast(state.pending.shift());
           if (toast.id != null && state.seen['flushed:' + toast.id]) continue;
           if (toast.id != null) state.seen['flushed:' + toast.id] = true;
           var id = allocateNotificationId(toast);
@@ -471,10 +581,12 @@
 
       function tryReady() {
         if (!bridge.req) return false;
+        ensureLanguage();
         state.store = state.store || findStore();
         patchJsxRenderer();
         var ready = !!(state.store && state.renderPatched &&
-          (!isGamepadUiReady() || state.focusable));
+          (!isGamepadUiReady() || state.focusable) &&
+          (!pendingNeedsLanguage() || state.languageReady));
         if (ready) flush();
         return ready;
       }
