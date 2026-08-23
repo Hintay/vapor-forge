@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use vapor_forge_cloud_core::{BackendError, ByteStore, FileMetadata, HttpTarget};
+use vapor_forge_cloud_core::{BackendError, FileMetadata, HttpTarget};
 
+use crate::store::BoundDownload;
 use crate::{FolderStore, SaveOperation, StagedFile};
 
 pub const LOCAL_TRANSFER_AUTHORITY: &str = "vapor-forge.local";
@@ -34,11 +35,7 @@ struct UploadTransfer {
 
 enum TransferOperation {
     Upload(Arc<UploadTransfer>),
-    Download {
-        store: FolderStore,
-        app_id: u32,
-        path: String,
-    },
+    Download { download: BoundDownload },
 }
 
 struct IssuedTransfer {
@@ -80,18 +77,15 @@ pub fn issue_download(
     store: FolderStore,
     app_id: u32,
     path: String,
-) -> Result<HttpTarget, BackendError> {
+) -> Result<(FileMetadata, HttpTarget), BackendError> {
+    let (entry, download) = store.bind_download(app_id, &path)?;
     let token = next_token();
     insert(IssuedTransfer {
         token: token.clone(),
         expires_at: Instant::now() + TRANSFER_TTL,
-        operation: TransferOperation::Download {
-            store,
-            app_id,
-            path,
-        },
+        operation: TransferOperation::Download { download },
     })?;
-    Ok(target("download", &token))
+    Ok((entry.metadata, target("download", &token)))
 }
 
 pub fn intercept_transfer(
@@ -132,11 +126,7 @@ pub fn intercept_transfer(
             }
             LocalTransferOutcome::Upload(result.map(|_| ()))
         }
-        TransferOperation::Download {
-            store,
-            app_id,
-            path,
-        } => LocalTransferOutcome::Download(store.read(app_id, &path)),
+        TransferOperation::Download { download } => LocalTransferOutcome::Download(download.read()),
     })
 }
 
@@ -188,14 +178,19 @@ fn complete_upload_body(upload: &UploadTransfer, body: &[u8]) -> Result<StagedFi
             "local upload transfer size does not match declaration",
         ));
     }
-    let raw = if upload.transfer_size == upload.metadata.raw_size {
-        body.to_vec()
+    if upload.metadata.raw_size > crate::store::MAX_SAVE_FILE_BYTES {
+        return Err(permanent("local cloud file exceeds the supported size"));
+    }
+    if upload.transfer_size == upload.metadata.raw_size {
+        upload
+            .store
+            .stage_file(&upload.operation, &upload.path, body, &upload.metadata)
     } else {
-        decode_steam_zip(body, upload.metadata.raw_size)?
-    };
-    upload
-        .store
-        .stage_file(&upload.operation, &upload.path, &raw, &upload.metadata)
+        let raw = decode_steam_zip(body, upload.metadata.raw_size)?;
+        upload
+            .store
+            .stage_file(&upload.operation, &upload.path, &raw, &upload.metadata)
+    }
 }
 
 fn decode_steam_zip(body: &[u8], raw_size: u64) -> Result<Vec<u8>, BackendError> {
@@ -214,7 +209,9 @@ fn decode_steam_zip(body: &[u8], raw_size: u64) -> Result<Vec<u8>, BackendError>
     }
     let capacity = usize::try_from(raw_size)
         .map_err(|_| permanent("local cloud file is too large for this process"))?;
-    let mut raw = Vec::with_capacity(capacity);
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(capacity)
+        .map_err(|_| permanent("local cloud file is too large for this process"))?;
     entry
         .take(raw_size.saturating_add(1))
         .read_to_end(&mut raw)
@@ -352,11 +349,31 @@ mod tests {
             )
             .unwrap();
 
-        let target = issue_download(store.clone(), 480, "save.dat".into()).unwrap();
+        let (_, target) = issue_download(store.clone(), 480, "save.dat".into()).unwrap();
         assert_eq!(
             transfer_contract(&target.host, &target.path),
             Some(LocalTransferContract::Download)
         );
+
+        let replacement = b"new save";
+        let heads = store.view(480).unwrap().head_ids();
+        let operation = store.begin_operation(480, &heads, None).unwrap();
+        let staged = store
+            .stage_file(&operation, "save.dat", replacement, &metadata(replacement))
+            .unwrap();
+        store
+            .commit_operation(
+                &operation,
+                &[staged],
+                &std::collections::BTreeSet::new(),
+                &identity,
+            )
+            .unwrap();
+        let report = store.inspect_gc(480).unwrap();
+        let plan = store.prepare_gc_sweep(&report).unwrap().unwrap();
+        let sweep = store.apply_gc_sweep(plan).unwrap().unwrap();
+        store.finalize_gc_sweep(sweep).unwrap();
+
         let Some(LocalTransferOutcome::Download(result)) =
             intercept_transfer(&target.host, &target.path, &[])
         else {

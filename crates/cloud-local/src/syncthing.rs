@@ -6,7 +6,12 @@ use std::path::Path;
 use std::time::Duration;
 use vapor_forge_cloud_core::BackendError;
 
-#[derive(Clone, Eq, PartialEq)]
+const MAX_SYNCTHING_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const EVENT_LONG_POLL_SECONDS: u64 = 60;
+const EVENT_TRANSPORT_MARGIN: Duration = Duration::from_secs(5);
+const GC_EVENT_TYPES: &str = "StateChanged,LocalIndexUpdated,ConfigSaved";
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SyncthingGcConfig {
     pub url: String,
     pub api_key: String,
@@ -17,11 +22,42 @@ pub struct SyncthingGcConfig {
 pub(crate) struct SyncthingBoundary {
     sequence: u64,
     relative_app: String,
+    deleted_files: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SyncthingEventBatch {
+    pub(crate) last_id: Option<u64>,
+    pub(crate) wakes_gc: bool,
 }
 
 impl SyncthingGcConfig {
     pub fn validate_for_gc(&self) -> Result<(), BackendError> {
         self.endpoint().map(|_| ())
+    }
+
+    pub fn ensure_ready_for_app(
+        &self,
+        repository: &Path,
+        relative_app: &str,
+    ) -> Result<(), BackendError> {
+        let endpoint = self.endpoint()?;
+        let agent = self.agent();
+        self.validate_folder(&agent, &endpoint, repository)?;
+        let relative = repository
+            .join(relative_app)
+            .exists()
+            .then_some(relative_app);
+        self.scan(&agent, &endpoint, relative)?;
+        let before = self.folder_status(&agent, &endpoint)?;
+        if !before.ready() {
+            return Err(retryable("Syncthing folder is not locally settled"));
+        }
+        let after = self.folder_status(&agent, &endpoint)?;
+        if !after.ready() || after.sequence != before.sequence {
+            return Err(retryable("Syncthing folder changed during readiness check"));
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_for_gc(
@@ -32,36 +68,81 @@ impl SyncthingGcConfig {
         let endpoint = self.endpoint()?;
         let agent = self.agent();
         self.validate_folder(&agent, &endpoint, repository)?;
-        self.scan(&agent, &endpoint, &report.manifest_scope)?;
+        self.scan(&agent, &endpoint, Some(&report.manifest_scope))?;
         let status = self.folder_status(&agent, &endpoint)?;
         if !status.ready() {
             return Err(retryable("Syncthing folder is not locally settled"));
         }
-        for manifest_id in report
-            .retained_manifests
-            .iter()
-            .chain(&report.candidate_manifests)
-        {
+        for manifest_id in &report.retained_manifests {
             let directory = repository.join(&report.manifest_scope).join(manifest_id);
             self.verify_indexed_tree(&agent, &endpoint, repository, &directory)?;
         }
+        let mut deleted_files = Vec::new();
+        for manifest_id in &report.candidate_manifests {
+            let directory = repository.join(&report.manifest_scope).join(manifest_id);
+            deleted_files
+                .extend(self.verify_indexed_tree(&agent, &endpoint, repository, &directory)?);
+        }
+        deleted_files.sort();
+        deleted_files.dedup();
         Ok(SyncthingBoundary {
             sequence: status.sequence,
             relative_app: report.manifest_scope.clone(),
+            deleted_files,
         })
     }
 
     pub(crate) fn publish_gc(&self, boundary: SyncthingBoundary) -> Result<(), BackendError> {
         let endpoint = self.endpoint()?;
         let agent = self.agent();
-        self.scan(&agent, &endpoint, &boundary.relative_app)?;
+        self.scan(&agent, &endpoint, Some(&boundary.relative_app))?;
         let status = self.folder_status(&agent, &endpoint)?;
         if !status.ready() || status.sequence <= boundary.sequence {
             return Err(retryable(
                 "Syncthing did not index the local cloud deletion",
             ));
         }
+        for relative in &boundary.deleted_files {
+            let indexed: FileRecord = self.get_json(
+                &agent,
+                format!("{endpoint}/rest/db/file"),
+                &[("folder", self.folder_id.trim()), ("file", relative)],
+            )?;
+            if !indexed.local.is_some_and(|local| local.deleted) {
+                return Err(retryable(
+                    "Syncthing did not index the local cloud deletion",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn wait_for_gc_events(
+        &self,
+        since: Option<u64>,
+    ) -> Result<SyncthingEventBatch, BackendError> {
+        let endpoint = self.endpoint()?;
+        let agent = self.event_agent();
+        let mut request = agent
+            .get(format!("{endpoint}/rest/events"))
+            .header("X-API-Key", self.api_key.trim())
+            .query("events", GC_EVENT_TYPES)
+            .query("since", since.unwrap_or_default().to_string())
+            .query("timeout", EVENT_LONG_POLL_SECONDS.to_string());
+        if since.is_none() {
+            request = request.query("limit", "1");
+        }
+        let events: Vec<SyncthingEvent> = self.read_json_response(request.call(), false)?;
+        let last_id = events.iter().map(|event| event.id).max().or(since);
+        if since.is_some_and(|since| events.iter().any(|event| event.id <= since)) {
+            return Err(retryable("Syncthing event cursor did not advance"));
+        }
+        Ok(SyncthingEventBatch {
+            last_id,
+            wakes_gc: events
+                .iter()
+                .any(|event| event.wakes_gc(self.folder_id.trim())),
+        })
     }
 
     fn endpoint(&self) -> Result<String, BackendError> {
@@ -96,6 +177,17 @@ impl SyncthingGcConfig {
             .new_agent()
     }
 
+    fn event_agent(&self) -> ureq::Agent {
+        let long_poll = Duration::from_secs(EVENT_LONG_POLL_SECONDS) + EVENT_TRANSPORT_MARGIN;
+        ureq::Agent::config_builder()
+            .timeout_global(Some(
+                Duration::from_millis(self.timeout_ms.max(1)).max(long_poll),
+            ))
+            .http_status_as_error(false)
+            .build()
+            .new_agent()
+    }
+
     fn validate_folder(
         &self,
         agent: &ureq::Agent,
@@ -121,6 +213,11 @@ impl SyncthingGcConfig {
         }
         if folder.ignore_delete {
             return Err(permanent("Syncthing folder must propagate deletions"));
+        }
+        if !folder.versioning.kind.trim().is_empty() {
+            return Err(permanent(
+                "Syncthing file versioning must be disabled for local cloud",
+            ));
         }
         let folder_root = Path::new(&folder.path)
             .canonicalize()
@@ -152,11 +249,31 @@ impl SyncthingGcConfig {
         endpoint: &str,
         repository: &Path,
         directory: &Path,
-    ) -> Result<(), BackendError> {
+    ) -> Result<Vec<String>, BackendError> {
         if !directory.is_dir() {
             return Err(retryable("local cloud manifest is unavailable"));
         }
         let mut pending = vec![directory.to_owned()];
+        let mut indexed_files = Vec::new();
+        let relative_directory = directory
+            .strip_prefix(repository)
+            .map_err(|_| permanent("local cloud manifest escaped the repository"))?;
+        let relative_directory = path_to_syncthing(relative_directory)?;
+        let indexed: FileRecord = self.get_json(
+            agent,
+            format!("{endpoint}/rest/db/file"),
+            &[
+                ("folder", self.folder_id.trim()),
+                ("file", relative_directory.as_str()),
+            ],
+        )?;
+        let local = indexed
+            .local
+            .ok_or_else(|| retryable("Syncthing local index is incomplete"))?;
+        if local.deleted || local.invalid || local.ignored {
+            return Err(retryable("Syncthing local index is incomplete"));
+        }
+        indexed_files.push(relative_directory);
         while let Some(current) = pending.pop() {
             for entry in std::fs::read_dir(&current).map_err(io_error)? {
                 let entry = entry.map_err(io_error)?;
@@ -190,22 +307,26 @@ impl SyncthingGcConfig {
                 if local.deleted || local.invalid || local.ignored || local.size != size {
                     return Err(retryable("Syncthing local index is incomplete"));
                 }
+                indexed_files.push(relative);
             }
         }
-        Ok(())
+        Ok(indexed_files)
     }
 
     fn scan(
         &self,
         agent: &ureq::Agent,
         endpoint: &str,
-        relative: &str,
+        relative: Option<&str>,
     ) -> Result<(), BackendError> {
-        let response = agent
+        let mut request = agent
             .post(format!("{endpoint}/rest/db/scan"))
             .header("X-API-Key", self.api_key.trim())
-            .query("folder", self.folder_id.trim())
-            .query("sub", relative)
+            .query("folder", self.folder_id.trim());
+        if let Some(relative) = relative {
+            request = request.query("sub", relative);
+        }
+        let response = request
             .send_empty()
             .map_err(|error| retryable(format!("Syncthing request failed: {error}")))?;
         if !response.status().is_success() {
@@ -239,17 +360,29 @@ impl SyncthingGcConfig {
         for (key, value) in query {
             request = request.query(*key, *value);
         }
-        let mut response = request
-            .call()
-            .map_err(|error| retryable(format!("Syncthing request failed: {error}")))?;
+        self.read_json_response(request.call(), true)
+    }
+
+    fn read_json_response<T: DeserializeOwned>(
+        &self,
+        response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+        client_errors_retryable: bool,
+    ) -> Result<T, BackendError> {
+        let mut response =
+            response.map_err(|error| retryable(format!("Syncthing request failed: {error}")))?;
         if !response.status().is_success() {
-            return Err(retryable(format!(
-                "Syncthing request returned HTTP {}",
-                response.status().as_u16()
-            )));
+            let status = response.status().as_u16();
+            let retryable_status =
+                client_errors_retryable || status == 408 || status == 429 || status >= 500;
+            return Err(BackendError::new(
+                format!("Syncthing request returned HTTP {status}"),
+                retryable_status,
+            ));
         }
         let body = response
             .body_mut()
+            .with_config()
+            .limit(MAX_SYNCTHING_RESPONSE_BYTES)
             .read_to_string()
             .map_err(|error| retryable(format!("invalid Syncthing response: {error}")))?;
         serde_json::from_str(&body)
@@ -302,6 +435,14 @@ struct FolderConfig {
     folder_type: String,
     #[serde(default, rename = "ignoreDelete")]
     ignore_delete: bool,
+    #[serde(default)]
+    versioning: VersioningConfig,
+}
+
+#[derive(Default, Deserialize)]
+struct VersioningConfig {
+    #[serde(default, rename = "type")]
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +472,35 @@ struct ConfigSync {
 #[derive(Deserialize)]
 struct FileRecord {
     local: Option<LocalFileRecord>,
+}
+
+#[derive(Deserialize)]
+struct SyncthingEvent {
+    id: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    data: SyncthingEventData,
+}
+
+impl SyncthingEvent {
+    fn wakes_gc(&self, folder_id: &str) -> bool {
+        match self.kind.as_str() {
+            "ConfigSaved" => true,
+            "LocalIndexUpdated" => self.data.folder.as_deref() == Some(folder_id),
+            "StateChanged" => {
+                self.data.folder.as_deref() == Some(folder_id)
+                    && self.data.to.as_deref() == Some("idle")
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct SyncthingEventData {
+    folder: Option<String>,
+    to: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -396,6 +566,10 @@ mod tests {
         r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":4}}"#;
     const INDEXED_THREE_BYTES: &str =
         r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":3}}"#;
+    const INDEXED_DIRECTORY: &str =
+        r#"{"local":{"deleted":false,"invalid":false,"ignored":false,"size":0}}"#;
+    const INDEXED_DELETION: &str =
+        r#"{"local":{"deleted":true,"invalid":false,"ignored":false,"size":0}}"#;
 
     #[test]
     fn remote_plaintext_api_is_rejected() {
@@ -420,6 +594,52 @@ mod tests {
     }
 
     #[test]
+    fn readiness_scans_and_requires_a_settled_folder() {
+        let repository = tempfile::tempdir().unwrap();
+        let server = MockServer::start(vec![
+            ok(CONFIG_SYNC),
+            ok(&folder_config(repository.path())),
+            ok(IGNORES),
+            ok("{}"),
+            ok(IDLE_SEQUENCE_7),
+            ok(IDLE_SEQUENCE_7),
+        ]);
+
+        settings(&server.url)
+            .ensure_ready_for_app(repository.path(), "76561198000000000/480")
+            .unwrap();
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 6);
+        assert_root_scan(&requests[3]);
+        assert_request(&requests[4], "GET", "/rest/db/status?folder=cloud");
+        assert_request(&requests[5], "GET", "/rest/db/status?folder=cloud");
+    }
+
+    #[test]
+    fn file_versioning_is_rejected() {
+        let repository = tempfile::tempdir().unwrap();
+        let config = serde_json::json!([{
+            "id": "cloud",
+            "path": repository.path().canonicalize().unwrap(),
+            "paused": false,
+            "type": "sendreceive",
+            "ignoreDelete": false,
+            "versioning": { "type": "simple" }
+        }])
+        .to_string();
+        let server = MockServer::start(vec![ok(CONFIG_SYNC), ok(&config), ok(IGNORES)]);
+
+        let error = settings(&server.url)
+            .ensure_ready_for_app(repository.path(), "76561198000000000/480")
+            .unwrap_err();
+        assert!(!error.is_retryable());
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
     fn include_directives_are_effective_ignore_rules() {
         assert!(!IgnorePatterns {
             ignore: vec!["// comment".into(), String::new()],
@@ -434,6 +654,68 @@ mod tests {
     }
 
     #[test]
+    fn event_subscription_uses_a_cursor_and_filters_the_target_folder() {
+        let server = MockServer::start(vec![ok(r#"[
+                {"id":42,"type":"LocalIndexUpdated","data":{"folder":"other"}},
+                {"id":43,"type":"StateChanged","data":{"folder":"cloud","to":"idle"}}
+            ]"#)]);
+
+        let batch = settings(&server.url).wait_for_gc_events(Some(41)).unwrap();
+
+        assert_eq!(batch.last_id, Some(43));
+        assert!(batch.wakes_gc);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_query_request(&requests[0], "GET", "/rest/events");
+        let line = request_line(&requests[0]);
+        assert!(line.contains("since=41"));
+        assert!(line.contains("timeout=60"));
+        assert!(!line.contains("limit="));
+        assert!(line.contains("StateChanged"));
+        assert!(line.contains("LocalIndexUpdated"));
+        assert!(line.contains("ConfigSaved"));
+    }
+
+    #[test]
+    fn event_subscription_baselines_without_waking_for_another_folder() {
+        let server = MockServer::start(vec![ok(
+            r#"[{"id":7,"type":"StateChanged","data":{"folder":"other","to":"idle"}}]"#,
+        )]);
+
+        let batch = settings(&server.url).wait_for_gc_events(None).unwrap();
+
+        assert_eq!(batch.last_id, Some(7));
+        assert!(!batch.wakes_gc);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        let line = request_line(&requests[0]);
+        assert!(line.contains("since=0"));
+        assert!(line.contains("limit=1"));
+    }
+
+    #[test]
+    fn event_subscription_rejects_a_nonadvancing_cursor() {
+        let server = MockServer::start(vec![ok(r#"[{"id":41,"type":"ConfigSaved","data":{}}]"#)]);
+
+        let error = settings(&server.url)
+            .wait_for_gc_events(Some(41))
+            .unwrap_err();
+
+        assert!(error.is_retryable());
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn event_subscription_treats_authentication_failure_as_permanent() {
+        let server = MockServer::start(vec![(401, "{}".into())]);
+
+        let error = settings(&server.url).wait_for_gc_events(None).unwrap_err();
+
+        assert!(!error.is_retryable());
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
     fn gc_boundary_scans_verifies_and_publishes_in_order() {
         let (repository, report) = repository_fixture();
         let server = MockServer::start(vec![
@@ -442,10 +724,14 @@ mod tests {
             ok(IGNORES),
             ok("{}"),
             ok(IDLE_SEQUENCE_7),
+            ok(INDEXED_DIRECTORY),
             ok(INDEXED_FOUR_BYTES),
+            ok(INDEXED_DIRECTORY),
             ok(INDEXED_THREE_BYTES),
             ok("{}"),
             ok(IDLE_SEQUENCE_8),
+            ok(INDEXED_DELETION),
+            ok(INDEXED_DELETION),
         ]);
         let settings = settings(&server.url);
 
@@ -455,22 +741,35 @@ mod tests {
         settings.publish_gc(boundary).unwrap();
 
         let requests = server.finish();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 13);
         assert_request(&requests[0], "GET", "/rest/system/config/insync");
         assert_request(&requests[1], "GET", "/rest/config/folders");
         assert_request(&requests[2], "GET", "/rest/db/ignores?folder=cloud");
         assert_scan(&requests[3], &report.manifest_scope);
         assert_request(&requests[4], "GET", "/rest/db/status?folder=cloud");
+        assert_file_lookup(&requests[5], &format!("{}/retained", report.manifest_scope));
         assert_file_lookup(
-            &requests[5],
+            &requests[6],
             &format!("{}/retained/manifest.json", report.manifest_scope),
         );
         assert_file_lookup(
-            &requests[6],
+            &requests[7],
+            &format!("{}/candidate", report.manifest_scope),
+        );
+        assert_file_lookup(
+            &requests[8],
             &format!("{}/candidate/files/save.bin", report.manifest_scope),
         );
-        assert_scan(&requests[7], &report.manifest_scope);
-        assert_request(&requests[8], "GET", "/rest/db/status?folder=cloud");
+        assert_scan(&requests[9], &report.manifest_scope);
+        assert_request(&requests[10], "GET", "/rest/db/status?folder=cloud");
+        assert_file_lookup(
+            &requests[11],
+            &format!("{}/candidate", report.manifest_scope),
+        );
+        assert_file_lookup(
+            &requests[12],
+            &format!("{}/candidate/files/save.bin", report.manifest_scope),
+        );
         assert!(requests.iter().all(|request| request
             .to_ascii_lowercase()
             .contains("x-api-key: secret\r\n")));
@@ -547,6 +846,7 @@ mod tests {
                 ok(IGNORES),
                 ok("{}"),
                 ok(IDLE_SEQUENCE_7),
+                ok(INDEXED_DIRECTORY),
                 (status, index_record.into()),
                 ok(INDEXED_THREE_BYTES),
             ]);
@@ -558,9 +858,9 @@ mod tests {
             assert!(error.is_retryable());
 
             let requests = server.finish();
-            assert_eq!(requests.len(), 6);
+            assert_eq!(requests.len(), 7);
             assert_file_lookup(
-                &requests[5],
+                &requests[6],
                 &format!("{}/retained/manifest.json", report.manifest_scope),
             );
         }
@@ -577,6 +877,7 @@ mod tests {
             let boundary = SyncthingBoundary {
                 sequence: 7,
                 relative_app: "76561198000000000/480".into(),
+                deleted_files: Vec::new(),
             };
 
             let error = settings(&server.url).publish_gc(boundary).err().unwrap();
@@ -647,6 +948,12 @@ mod tests {
         assert_query_request(request, "POST", "/rest/db/scan");
         assert!(request_line(request).contains("folder=cloud"));
         assert_query_path(request, "sub", relative);
+    }
+
+    fn assert_root_scan(request: &str) {
+        assert_query_request(request, "POST", "/rest/db/scan");
+        assert!(request_line(request).contains("folder=cloud"));
+        assert!(!request_line(request).contains("sub="));
     }
 
     fn assert_file_lookup(request: &str, relative: &str) {

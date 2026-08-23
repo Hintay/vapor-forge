@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use vapor_forge_cloud_core::{
     AccountSyncState, AchievementSchema, AchievementSyncState, AppStatsQuery, AppStatsResult,
@@ -11,13 +12,13 @@ use vapor_forge_cloud_core::{
 
 use crate::store::atomic_replace;
 
-const RECORD_VERSION: u32 = 1;
-
 const STATS_DIR: &str = "stats";
 const PLAYTIME_DIR: &str = "playtime";
 const MAX_STATS_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STATS_ENTRIES: usize = 100_000;
 const MAX_PLAYTIME_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_DEVICE_RECORDS: usize = 4096;
+const MAX_ACCOUNT_APPS: usize = 100_000;
 
 pub struct LocalBackend {
     root: PathBuf,
@@ -27,7 +28,6 @@ pub struct LocalBackend {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PlaytimeRecord {
-    version: u32,
     steam_id64: String,
     client_id: u64,
     entry: PlaytimeEntry,
@@ -36,7 +36,6 @@ struct PlaytimeRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SteamAppStateRecord {
-    version: u32,
     steam_id64: String,
     client_id: u64,
     app_id: u32,
@@ -101,6 +100,9 @@ impl LocalBackend {
             else {
                 continue;
             };
+            if apps.len() >= MAX_ACCOUNT_APPS {
+                return Err(permanent("too many local account App directories"));
+            }
             apps.push((app_id, entry.path()));
         }
         apps.sort_by_key(|(app_id, _)| *app_id);
@@ -124,14 +126,10 @@ impl LocalBackend {
             if !entry.file_type().map_err(io_error)?.is_file() {
                 return Err(permanent("invalid local playtime state file"));
             }
-            let metadata = entry.metadata().map_err(io_error)?;
-            if metadata.len() > MAX_PLAYTIME_RECORD_BYTES {
-                return Err(permanent("invalid local playtime state file"));
+            if records.len() >= MAX_DEVICE_RECORDS {
+                return Err(permanent("too many local playtime state files"));
             }
-            let bytes = std::fs::read(&path).map_err(io_error)?;
-            if bytes.len() as u64 > MAX_PLAYTIME_RECORD_BYTES {
-                return Err(permanent("invalid local playtime state file"));
-            }
+            let bytes = read_bounded_json_file(&path, MAX_PLAYTIME_RECORD_BYTES, "playtime state")?;
             let value = serde_json::from_slice(&bytes).map_err(json_error)?;
             records.push((path, value));
         }
@@ -154,6 +152,7 @@ impl LocalBackend {
             if !directory.exists() {
                 continue;
             }
+            let mut app_records = 0usize;
             for entry in std::fs::read_dir(directory).map_err(io_error)? {
                 let entry = entry.map_err(io_error)?;
                 if !entry.file_type().map_err(io_error)?.is_file() {
@@ -163,11 +162,15 @@ impl LocalBackend {
                 if path.extension().and_then(|value| value.to_str()) != Some("json") {
                     continue;
                 }
+                if app_records >= MAX_DEVICE_RECORDS {
+                    return Err(permanent("too many local Steam app state files"));
+                }
                 let bytes = read_stats_record_bytes(&path)?;
                 let record =
                     serde_json::from_slice::<SteamAppStateRecord>(&bytes).map_err(json_error)?;
                 validate_stats_record(&record, steam_id64, app_id, Some(&path))?;
                 all_records.push(record);
+                app_records += 1;
             }
         }
         Ok(all_records)
@@ -235,18 +238,7 @@ impl LocalBackend {
         for (app_id, app_root) in self.account_app_roots(steam_id64)? {
             let records = self.read_playtime_records_with_paths(&app_root.join(PLAYTIME_DIR))?;
             for (path, record) in records {
-                if record.version != RECORD_VERSION || record.steam_id64 != steam_id64 {
-                    return Err(permanent("invalid local playtime record"));
-                }
-                if record_client_id(&path)? != record.client_id
-                    || record.entry.app_id != app_id
-                    || record.entry.observed_at <= 0
-                    || record.entry.last_played_at.is_some_and(|value| value < 0)
-                    || (!record.entry.owner_steam_id64.is_empty()
-                        && record.entry.owner_steam_id64 != steam_id64)
-                {
-                    return Err(permanent("invalid local playtime observation"));
-                }
+                validate_playtime_record(&record, steam_id64, app_id, Some(&path))?;
                 let tie = serde_json::to_vec(&record).map_err(json_error)?;
                 observations.push((
                     (record.entry.observed_at, record.client_id, digest(&tie)),
@@ -335,8 +327,7 @@ impl CloudBackend for LocalBackend {
             }
         }
         for entry in entries {
-            let record = PlaytimeRecord {
-                version: RECORD_VERSION,
+            let incoming = PlaytimeRecord {
                 steam_id64: steam_id64.to_owned(),
                 client_id,
                 entry: entry.clone(),
@@ -346,7 +337,20 @@ impl CloudBackend for LocalBackend {
                 .app_root(steam_id64, entry.app_id)?
                 .join(PLAYTIME_DIR)
                 .join(format!("{client_id}.json"));
+            let record = if path.exists() {
+                let bytes =
+                    read_bounded_json_file(&path, MAX_PLAYTIME_RECORD_BYTES, "playtime state")?;
+                let existing =
+                    serde_json::from_slice::<PlaytimeRecord>(&bytes).map_err(json_error)?;
+                validate_playtime_record(&existing, steam_id64, entry.app_id, Some(&path))?;
+                fold_playtime_records(existing, incoming)?
+            } else {
+                incoming
+            };
             let bytes = serde_json::to_vec(&record).map_err(json_error)?;
+            if bytes.len() as u64 > MAX_PLAYTIME_RECORD_BYTES {
+                return Err(permanent("local playtime state file is too large"));
+            }
             atomic_replace(&path, &bytes)?;
         }
         Ok(())
@@ -369,7 +373,6 @@ impl CloudBackend for LocalBackend {
             .join(STATS_DIR)
             .join(format!("{}.json", identity.client_id));
         let incoming = SteamAppStateRecord {
-            version: RECORD_VERSION,
             steam_id64: identity.steam_id64.clone(),
             client_id: identity.client_id,
             app_id: snapshot.app_id,
@@ -572,7 +575,6 @@ fn fold_device_records(
     let commit_id = latest.commit_id.clone();
     let observed_at = latest.observed_at;
     SteamAppStateRecord {
-        version: RECORD_VERSION,
         steam_id64: incoming.steam_id64,
         client_id: incoming.client_id,
         app_id: incoming.app_id,
@@ -583,12 +585,72 @@ fn fold_device_records(
     }
 }
 
-fn read_stats_record_bytes(path: &Path) -> Result<Vec<u8>, BackendError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_STATS_RECORD_BYTES {
-        return Err(permanent("invalid local Steam app state file"));
+fn fold_playtime_records(
+    existing: PlaytimeRecord,
+    incoming: PlaytimeRecord,
+) -> Result<PlaytimeRecord, BackendError> {
+    let existing_tie = serde_json::to_vec(&existing).map_err(json_error)?;
+    let incoming_tie = serde_json::to_vec(&incoming).map_err(json_error)?;
+    let incoming_is_newer = (incoming.entry.observed_at, digest(&incoming_tie))
+        >= (existing.entry.observed_at, digest(&existing_tie));
+    let mut record = if incoming_is_newer {
+        incoming.clone()
+    } else {
+        existing.clone()
+    };
+    record.entry.playtime_minutes = existing
+        .entry
+        .playtime_minutes
+        .max(incoming.entry.playtime_minutes);
+    record.entry.last_played_at =
+        max_option(existing.entry.last_played_at, incoming.entry.last_played_at);
+    Ok(record)
+}
+
+fn validate_playtime_record(
+    record: &PlaytimeRecord,
+    steam_id64: &str,
+    app_id: u32,
+    path: Option<&Path>,
+) -> Result<(), BackendError> {
+    if record.steam_id64 != steam_id64
+        || record.client_id == 0
+        || record.entry.app_id != app_id
+        || record.entry.observed_at <= 0
+        || record.entry.last_played_at.is_some_and(|value| value < 0)
+        || (!record.entry.owner_steam_id64.is_empty()
+            && record.entry.owner_steam_id64 != steam_id64)
+        || path.is_some_and(|path| record_client_id(path).ok() != Some(record.client_id))
+    {
+        return Err(permanent("invalid local playtime observation"));
     }
-    std::fs::read(path).map_err(io_error)
+    Ok(())
+}
+
+fn read_bounded_json_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, BackendError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.file_type().is_file() || metadata.len() > maximum {
+        return Err(permanent(format!("invalid local {label} file")));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| permanent(format!("local {label} file is too large")))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| permanent(format!("local {label} file is too large")))?;
+    std::fs::File::open(path)
+        .map_err(io_error)?
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() as u64 > maximum {
+        return Err(permanent(format!("invalid local {label} file")));
+    }
+    Ok(bytes)
+}
+
+fn read_stats_record_bytes(path: &Path) -> Result<Vec<u8>, BackendError> {
+    read_bounded_json_file(path, MAX_STATS_RECORD_BYTES, "Steam app state")
 }
 
 fn validate_stats_record(
@@ -597,8 +659,7 @@ fn validate_stats_record(
     app_id: u32,
     path: Option<&Path>,
 ) -> Result<(), BackendError> {
-    if record.version != RECORD_VERSION
-        || record.steam_id64 != steam_id64
+    if record.steam_id64 != steam_id64
         || record.client_id == 0
         || record.app_id != app_id
         || record.commit_id.is_empty()
@@ -888,6 +949,37 @@ mod tests {
         assert_eq!(reduced.len(), 1);
         assert_eq!(reduced[0].app_id, 480);
         assert_eq!(reduced[0].playtime_minutes, 240);
+    }
+
+    #[test]
+    fn one_device_playtime_does_not_regress_on_delayed_observations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::open(temporary.path()).unwrap();
+        let steam_id64 = "76561198000000001";
+
+        let mut newer = playtime_entry(steam_id64, 480, 240);
+        newer.playtime_2weeks_minutes = 30;
+        newer.last_played_at = Some(300);
+        newer.observed_at = 300;
+        backend.upload_playtime(7, steam_id64, &[newer]).unwrap();
+
+        let mut delayed = playtime_entry(steam_id64, 480, 120);
+        delayed.playtime_2weeks_minutes = 10;
+        delayed.last_played_at = Some(400);
+        delayed.observed_at = 200;
+        backend.upload_playtime(7, steam_id64, &[delayed]).unwrap();
+
+        let mut latest = playtime_entry(steam_id64, 480, 180);
+        latest.playtime_2weeks_minutes = 20;
+        latest.last_played_at = Some(350);
+        latest.observed_at = 500;
+        backend.upload_playtime(7, steam_id64, &[latest]).unwrap();
+
+        let reduced = backend.pull_playtime(steam_id64).unwrap();
+        assert_eq!(reduced[0].playtime_minutes, 240);
+        assert_eq!(reduced[0].playtime_2weeks_minutes, 20);
+        assert_eq!(reduced[0].last_played_at, Some(400));
+        assert_eq!(reduced[0].observed_at, 500);
     }
 
     #[test]

@@ -1524,6 +1524,32 @@ fn syncthing_integration_does_not_disable_local_cloud() {
     let quota = CloudClientGetAppQuotaUsageResponse::decode(reply.body.as_slice()).unwrap();
 
     assert_eq!(quota.existing_files, Some(0));
+    assert!(state.local_store.is_some());
+}
+
+#[test]
+fn syncthing_enabled_changelist_fails_closed_when_configuration_is_incomplete() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = local_settings(directory.path(), 7);
+    settings.syncthing = Some(vapor_forge_cloud_local::SyncthingGcConfig {
+        url: "http://127.0.0.1:8384".into(),
+        api_key: String::new(),
+        folder_id: "cloud".into(),
+        timeout_ms: 1_000,
+    });
+    let mut state = AdapterState::default();
+    let request = CloudGetAppFileChangelistRequest {
+        app_id: Some(480),
+        synced_change_number: Some(0),
+    };
+
+    assert!(execute_rpc(
+        &mut state,
+        &settings,
+        GET_CHANGELIST,
+        &request.encode_to_vec(),
+    )
+    .is_err());
 }
 
 fn create_local_manifest_heads(
