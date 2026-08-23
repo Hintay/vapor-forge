@@ -430,8 +430,13 @@ fn finalize_snapshot(
     message: &'static str,
 ) {
     let new_script_state = &new_script_runtime.state;
-    let inject_count = new_config.apps.inject.len();
-    let dlc_count: usize = new_config.apps.inject.iter().map(|app| app.dlc.len()).sum();
+    let inject_count = new_config.apps.inject().len();
+    let dlc_count: usize = new_config
+        .apps
+        .inject()
+        .iter()
+        .map(|app| app.dlc.len())
+        .sum();
     let controlled =
         vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
     base_config_store.store(Arc::new(base_config));

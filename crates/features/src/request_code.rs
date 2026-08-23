@@ -450,15 +450,14 @@ mod tests {
     #[test]
     fn should_intercept_only_when_injected_ownership_is_required() {
         let config = RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: vec![vapor_forge_config::InjectApp {
+            apps: vapor_forge_config::AppsSection::with_inject(vec![
+                vapor_forge_config::InjectApp {
                     id: AppId(480),
                     dlc: Vec::new(),
                     ticket: Default::default(),
                     purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+                },
+            ]),
             ..Default::default()
         };
         assert!(should_intercept(AppId(480), &config));
@@ -472,15 +471,14 @@ mod tests {
 
         let owned_app = AppId(246_813_583);
         let owned_config = RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: vec![vapor_forge_config::InjectApp {
+            apps: vapor_forge_config::AppsSection::with_inject(vec![
+                vapor_forge_config::InjectApp {
                     id: owned_app,
                     dlc: Vec::new(),
                     ticket: Default::default(),
                     purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+                },
+            ]),
             ..Default::default()
         };
         crate::apps::record_actual_ownership(owned_app, true);

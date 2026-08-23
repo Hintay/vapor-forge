@@ -317,15 +317,12 @@ mod tests {
 
     fn config(app_id: u32) -> RuntimeConfig {
         RuntimeConfig {
-            apps: AppsSection {
-                inject: vec![InjectApp {
-                    id: AppId(app_id),
-                    dlc: Vec::new(),
-                    ticket: Default::default(),
-                    purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+            apps: AppsSection::with_inject(vec![InjectApp {
+                id: AppId(app_id),
+                dlc: Vec::new(),
+                ticket: Default::default(),
+                purchase_time: 0,
+            }]),
             ..Default::default()
         }
     }

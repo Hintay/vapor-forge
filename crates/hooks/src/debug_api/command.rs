@@ -289,7 +289,7 @@ fn config_response(json_mode: bool) -> String {
     #[cfg(not(target_os = "linux"))]
     let cfg = vapor_forge_config::RuntimeConfig::default();
 
-    let inject_ids: Vec<u32> = cfg.apps.inject.iter().map(|a| a.id.0).collect();
+    let inject_ids: Vec<u32> = cfg.apps.inject().iter().map(|a| a.id.0).collect();
     let ticket_cache = match cfg.ticket.cache {
         vapor_forge_config::TicketCacheMode::Session => "session",
         vapor_forge_config::TicketCacheMode::Disk => "disk",
@@ -300,7 +300,7 @@ fn config_response(json_mode: bool) -> String {
             "ok {}",
             json!({
                 "runtime": {"log_level": cfg.runtime.log_level, "diagnostics": cfg.runtime.diagnostics},
-                "apps": {"inject_count": cfg.apps.inject.len(), "inject_ids": inject_ids, "shared_enabled": cfg.apps.shared.enabled},
+                "apps": {"inject_count": cfg.apps.inject().len(), "inject_ids": inject_ids, "shared_enabled": cfg.apps.shared.enabled},
                 "cloud": {
                     "backend": cloud_backend_name(cfg.cloud.backend),
                 },
@@ -320,7 +320,7 @@ fn config_response(json_mode: bool) -> String {
     let _ = writeln!(
         out,
         "    inject:         {} apps {:?}",
-        cfg.apps.inject.len(),
+        cfg.apps.inject().len(),
         inject_ids
     );
     let _ = writeln!(out, "    shared:         {}", cfg.apps.shared.enabled);
@@ -460,7 +460,7 @@ fn apps_response(json_mode: bool) -> String {
     if json_mode {
         let controlled: Vec<_> = cfg
             .apps
-            .inject
+            .inject()
             .iter()
             .map(|app| {
                 let ownership =
@@ -483,13 +483,13 @@ fn apps_response(json_mode: bool) -> String {
         return format!("ok {}", json!({"controlled": controlled}));
     }
 
-    if cfg.apps.inject.is_empty() {
+    if cfg.apps.inject().is_empty() {
         return "ok no controlled apps".to_owned();
     }
 
     let mut out = String::new();
-    let _ = writeln!(out, "ok Controlled Apps ({}):", cfg.apps.inject.len());
-    for app in &cfg.apps.inject {
+    let _ = writeln!(out, "ok Controlled Apps ({}):", cfg.apps.inject().len());
+    for app in cfg.apps.inject() {
         let ownership = ownership_label(vapor_forge_features::apps::actual_ownership(app.id));
         let injected = injected_into_pkg0(app.id);
         let ticket = match app.ticket {
@@ -656,7 +656,7 @@ fn pkg0_response(json_mode: bool) -> String {
     let cfg = crate::client::install::config();
     #[cfg(not(target_os = "linux"))]
     let cfg = vapor_forge_config::RuntimeConfig::default();
-    let inject_count = cfg.apps.inject.len();
+    let inject_count = cfg.apps.inject().len();
 
     if json_mode {
         return format!(

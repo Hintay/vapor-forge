@@ -430,15 +430,14 @@ mod tests {
 
     fn controlled_config(app_id: u32) -> RuntimeConfig {
         RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: vec![vapor_forge_config::InjectApp {
+            apps: vapor_forge_config::AppsSection::with_inject(vec![
+                vapor_forge_config::InjectApp {
                     id: AppId(app_id),
                     dlc: Vec::new(),
                     ticket: Default::default(),
                     purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+                },
+            ]),
             ..Default::default()
         }
     }

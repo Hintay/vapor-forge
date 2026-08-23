@@ -281,15 +281,12 @@ mod tests {
 
     fn controlled_config(cloud: CloudSection) -> RuntimeConfig {
         RuntimeConfig {
-            apps: vapor_forge_config::AppsSection {
-                inject: vec![InjectApp {
-                    id: TEST_APP_ID,
-                    dlc: Vec::new(),
-                    ticket: Default::default(),
-                    purchase_time: 0,
-                }],
-                ..Default::default()
-            },
+            apps: vapor_forge_config::AppsSection::with_inject(vec![InjectApp {
+                id: TEST_APP_ID,
+                dlc: Vec::new(),
+                ticket: Default::default(),
+                purchase_time: 0,
+            }]),
             cloud,
             ..Default::default()
         }

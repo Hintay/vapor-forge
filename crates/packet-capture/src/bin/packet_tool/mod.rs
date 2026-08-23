@@ -88,7 +88,7 @@ mod tests {
 
     fn controlled_config(app_id: u32) -> RuntimeConfig {
         let mut config = RuntimeConfig::default();
-        config.apps.inject.push(vapor_forge_config::InjectApp {
+        config.apps.push_inject(vapor_forge_config::InjectApp {
             id: AppId(app_id),
             dlc: Vec::new(),
             ticket: vapor_forge_config::TicketMode::Forge,

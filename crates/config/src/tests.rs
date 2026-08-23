@@ -500,6 +500,38 @@ fn parses_inject_with_dlc() {
 }
 
 #[test]
+fn controlled_app_index_is_updated_after_inject_mutation() {
+    let mut config = RuntimeConfig::default();
+    assert!(!config.is_controlled_app(AppId(480)));
+
+    config.apps.push_inject(crate::InjectApp {
+        id: AppId(480),
+        dlc: vec![AppId(505730)],
+        ticket: Default::default(),
+        purchase_time: 0,
+    });
+
+    assert_eq!(config.app_category(AppId(480)), Some(AppCategory::Inject));
+    assert_eq!(
+        config.app_category(AppId(505730)),
+        Some(AppCategory::InjectDlc { parent: AppId(480) })
+    );
+
+    config.apps.extend_inject(vec![crate::InjectApp {
+        id: AppId(730),
+        dlc: vec![AppId(731), AppId(732)],
+        ticket: Default::default(),
+        purchase_time: 0,
+    }]);
+
+    assert!(config.is_controlled_app(AppId(730)));
+    assert_eq!(
+        config.app_category(AppId(732)),
+        Some(AppCategory::InjectDlc { parent: AppId(730) })
+    );
+}
+
+#[test]
 fn cloud_defaults_to_disabled() {
     let config: RuntimeConfig = toml::from_str("").expect("parse");
     assert_eq!(config.cloud.backend, CloudBackendMode::Disabled);
