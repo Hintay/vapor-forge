@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use vapor_forge_config::AppId;
 use vapor_forge_features::apps::{OwnershipDecision, OwnershipObservation};
 use vapor_forge_hook_engine::detour::Detour;
+use vapor_forge_hook_engine::original::original_detour;
 use vapor_forge_steam_native_abi::CAppOwnershipInfo;
 
 use vapor_forge_hook_engine::original::detour_or_return;
@@ -87,13 +88,8 @@ unsafe { original(this, app_id, out) };
                 let injected = access.inject(&plan.app_ids);
                 pkg_state.record_injected(&injected);
                 pkg_state.set_active();
+                super::package::try_post_reload();
             }
-        }
-
-        if let Some(access) = package_access.as_mut() {
-            super::package::pump_reload(access, |app_ids| {
-                snapshot_with_original(original, this, app_ids)
-            });
         }
     }
 
@@ -139,6 +135,18 @@ unsafe { original(this, app_id.0, &mut info) };
         );
         vapor_forge_features::apps::record_actual_ownership(app_id, genuine);
     }
+}
+
+pub(crate) fn snapshot_actual_ownership(this: *mut c_void, app_ids: &[AppId]) -> bool {
+    // SAFETY: installation initializes the process-lifetime detour before any
+    // package work item can be posted.
+    let Some(original) =
+        (unsafe { original_detour("CheckAppOwnership", std::ptr::addr_of!(OWNERSHIP_DETOUR)) })
+    else {
+        return false;
+    };
+    snapshot_with_original(original, this, app_ids);
+    true
 }
 
 // ---------------------------------------------------------------------------

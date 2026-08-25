@@ -1374,6 +1374,7 @@ dependencies = [
  "iced-x86",
  "inotify",
  "libc",
+ "memchr",
  "once_cell",
  "prost",
  "serde_json",

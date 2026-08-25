@@ -20,6 +20,9 @@ pub(crate) mod context_signal;
 #[cfg_attr(all(not(target_os = "linux"), test), allow(dead_code))]
 pub(crate) mod debug_api;
 #[cfg(any(target_os = "linux", test))]
+#[cfg_attr(all(not(target_os = "linux"), test), allow(dead_code))]
+pub(crate) mod engine_work_item_site;
+#[cfg(any(target_os = "linux", test))]
 pub(crate) mod hook_report;
 #[cfg(target_os = "linux")]
 pub(crate) mod ipc_server;

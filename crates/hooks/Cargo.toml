@@ -8,6 +8,7 @@ rust-version.workspace = true
 # The debug API and packet-capture adapter also compile under `cfg(test)` on
 # other hosts; everything else is Linux-only and lives in the target table.
 [dependencies]
+memchr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 vapor-forge-packet-capture = { path = "../packet-capture", features = ["json"] }
