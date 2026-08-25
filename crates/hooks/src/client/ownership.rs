@@ -9,14 +9,14 @@ use vapor_forge_steam_native_abi::CAppOwnershipInfo;
 
 use vapor_forge_hook_engine::original::detour_or_return;
 
-use super::install::{config, package_state, runtime_snapshot, PKG0_INJECTED};
+use super::install::{config, runtime_snapshot, PKG0_INJECTED};
 
 // ---------------------------------------------------------------------------
 // Function type alias
 // ---------------------------------------------------------------------------
 
 pub(crate) type CheckAppOwnershipFn =
-    unsafe extern "C" fn(*mut c_void, u32, *mut CAppOwnershipInfo) -> u32;
+    unsafe extern "C" fn(*mut c_void, u32, *mut CAppOwnershipInfo) -> bool;
 pub(crate) type GetSubscribedAppsFn = unsafe extern "C" fn(*mut c_void, *mut u32, u32, u8) -> u32;
 
 // ---------------------------------------------------------------------------
@@ -34,9 +34,9 @@ pub(crate) unsafe extern "C" fn hk_check_app_ownership(
     this: *mut c_void,
     app_id: u32,
     out: *mut CAppOwnershipInfo,
-) -> u32 {
+) -> bool {
     // SAFETY: OWNERSHIP_DETOUR set before hook enabled, never modified after.
-    let original = detour_or_return!("CheckAppOwnership", OWNERSHIP_DETOUR, 0);
+    let original = detour_or_return!("CheckAppOwnership", OWNERSHIP_DETOUR, false);
     let pkg0_was_injected = PKG0_INJECTED.load(Ordering::Acquire);
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id, out) };
@@ -56,7 +56,6 @@ unsafe { original(this, app_id, out) };
 
     if !pkg0_was_injected && !out.is_null() {
         // SAFETY: the original call populated `out` and it remains valid for this callback.
-        // SAFETY: the original call populated `out` and it remains valid for this callback.
         let genuine = vapor_forge_features::apps::original_result_is_genuinely_owned(
             ownership_observation(result, unsafe { &*out }),
         );
@@ -67,55 +66,38 @@ unsafe { original(this, app_id, out) };
         return result;
     }
 
-    if crate::capability::is_ready(crate::capability::Capability::PackageInjection) {
-        // SAFETY: this scope exists only for the dynamic extent of this callback.
-        let mut package_scope = unsafe { super::package::SteamPackageHookScope::enter() };
-        let mut package_access = super::package::SteamPackageAccess::from_hook(&mut package_scope);
-
-        // pkg0 injection begins after GetPackageInfo captures CPackageInfo and pkg0.
-        if let Some(access) = package_access.as_mut() {
-            if !PKG0_INJECTED.swap(true, Ordering::AcqRel) {
-                let runtime = runtime_snapshot();
-                let controlled = vapor_forge_features::package::controlled_app_ids(
-                    &runtime.config,
-                    &runtime.script_state.apps,
-                );
-                let pkg_state = package_state();
-                let plan = pkg_state.compute_injection(&controlled);
-
-                snapshot_with_original(original, this, &plan.app_ids);
-
-                let injected = access.inject(&plan.app_ids);
-                pkg_state.record_injected(&injected);
-                pkg_state.set_active();
-                super::package::try_post_reload();
-            }
-        }
-    }
-
-    let cfg = config();
+    let runtime = runtime_snapshot();
+    let cfg = &runtime.config;
+    let app_id = AppId(app_id);
     // SAFETY: out is a valid pointer provided by Steam's caller, filled by original.
     let info = unsafe { &mut *out };
 
-    // If pkg0 injection is active, Steam's original already sees ownership
-    // from pkg0. Still run the spoof as fallback for edge cases.
+    // A pkg0 lookup can succeed without setting the native owns-license bit.
+    // Normalize the returned ownership record before Steam composes app flags.
     let decision = vapor_forge_features::apps::decide_check_ownership(
-        &cfg,
-        AppId(app_id),
+        cfg,
+        app_id,
         ownership_observation(result, info),
     );
-    apply_ownership_decision(info, decision)
+    let result = apply_ownership_decision(info, decision);
+    if vapor_forge_features::apps::classify_app(cfg, app_id).requires_injected_ownership() {
+        let purchase_time = runtime.purchase_time(app_id);
+        if purchase_time != 0 {
+            info.purchase_time = purchase_time;
+        }
+    }
+    result
 }
 
-fn ownership_observation(result: u32, info: &CAppOwnershipInfo) -> OwnershipObservation {
+fn ownership_observation(result: bool, info: &CAppOwnershipInfo) -> OwnershipObservation {
     OwnershipObservation {
         original_result: result,
-        package_associations: info.exist_in_package_nums,
+        owns_license: info.owns_license() != 0,
         family_shared: info.is_family_shared(),
     }
 }
 
-fn apply_ownership_decision(info: &mut CAppOwnershipInfo, decision: OwnershipDecision) -> u32 {
+fn apply_ownership_decision(info: &mut CAppOwnershipInfo, decision: OwnershipDecision) -> bool {
     if decision.grant_spoofed_ownership {
         info.grant_spoofed_ownership();
     }

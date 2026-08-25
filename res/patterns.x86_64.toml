@@ -111,7 +111,11 @@ pattern = "41 57 48 8D 05 ? ? ? ? 41 56 41 55 41 54 55 48 89 F5 53 48 89 FB 48 8
 
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"
-pattern = "41 ? 41 ? 41 ? 49 89 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 8D ? ? ? ? 00 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 0F 84 ? ? 00 00 ? ? ? ? ? ? ? ? ? ? ? ? 00 00 ? ?"
+pattern = "41 57 41 56 41 55 4C 8D ? ? ? 00 00 41 54 55 53 48 83 EC ? 88 54 24 ? 8B 97 ? ? 00 00 89 74 24 ? 85 D2"
+
+# steamrt preserves the package ID before saving the change map base.
+[[steamclient."CUser::MarkLicenseAsChanged".variants]]
+pattern = "41 57 48 8D 87 ? ? 00 00 41 89 F7 41 56 41 55 41 54 55 53 48 83 EC ? 88 54 24 ? 8B 97 ? ? 00 00 89 74 24 ? 48 89 44 24 ? 85 D2"
 
 [steamclient."CUser::ProcessPendingLicenseUpdates"]
 follow = "none"
@@ -156,6 +160,10 @@ pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 64 48 8B 1C 2
 follow = "upward"
 prologue = "53 55 54 41 55 41 56 41 57 41"
 pattern = "48 8B 45 00 48 89 EF 48 8D 0D ? ? ? ? 48 8B 90 B0 00 00 00 48 39 CA 0F 85 ? ? ? ? FF 50 68 83 E0 01 84 C0 74 ? 81 4B 10 00 00 10 00 C6 83 ED 00 00 00 01"
+
+[steamui."CSteamApp::IsVisibleInGamesList"]
+follow = "none"
+pattern = "41 57 41 56 41 55 41 54 55 53 48 83 EC 18 48 8B 05 ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 5C 24 08 48 89 FB 8B 00 85 C0 0F 85 ? ? ? ? 8B 43 3C 48 C7 04 24 00 00 00 00 83 E8 20 83 E0 DF"
 
 [steamui."CSteamUIAppController::BuildCompleteAppOverviewChange"]
 follow = "none"

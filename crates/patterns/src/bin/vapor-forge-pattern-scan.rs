@@ -903,6 +903,42 @@ mod tests {
     }
 
     #[test]
+    fn validates_mark_license_changed64_added_state_shape() {
+        let mut code = vec![0x90; 0x300];
+        let start = 0x20;
+        place_asm64(&mut code, start + 0x10, |a| {
+            a.mov(byte_ptr(rsp + 0x18), dl)?;
+            a.mov(dword_ptr(rsp + 0x1c), esi)?;
+            a.mov(edx, dword_ptr(rdi + 0x2394))?;
+            a.imul_3(ebx, ebx, 0x85EBCA6Bu32)?;
+            a.imul_3(ebx, ebx, 0xC2B2AE35u32)?;
+            a.cmp(byte_ptr(rax + 4), 0)?;
+            a.mov(byte_ptr(rsp + 0x18), 1)
+        });
+
+        assert_eq!(
+            validate_mark_license_changed64(&code, start),
+            Some("license change map update")
+        );
+    }
+
+    #[test]
+    fn rejects_cd_key_body_as_mark_license_changed64() {
+        let mut code = vec![0x90; 0x300];
+        let start = 0x20;
+        place_asm64(&mut code, start + 0x10, |a| {
+            a.mov(ebp, esi)?;
+            a.lea(r12, qword_ptr(rax + 0xF20))?;
+            a.mov(ecx, 7)?;
+            a.mov(dword_ptr(rsp), -1)?;
+            a.mov(rdi, r13)?;
+            a.test(al, al)
+        });
+
+        assert!(validate_mark_license_changed64(&code, start).is_none());
+    }
+
+    #[test]
     fn recognizes_x86_cgameid_reference_abi() {
         let code = asm_bytes32(|a| {
             a.push(ebp)?;

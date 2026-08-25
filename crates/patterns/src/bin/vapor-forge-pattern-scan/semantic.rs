@@ -315,6 +315,11 @@ const STEAMUI32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_fill_in_app_overview32,
     },
     SemanticCheck {
+        name: "CSteamApp::IsVisibleInGamesList",
+        label: "CSteamApp::IsVisibleInGamesList body",
+        validate: validate_is_visible_in_games_list32,
+    },
+    SemanticCheck {
         name: "CSteamUIAppController::BuildCompleteAppOverviewChange",
         label: "CSteamUIAppController::BuildCompleteAppOverviewChange body",
         validate: validate_build_complete_app_overview_change32,
@@ -346,6 +351,11 @@ const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CSteamUIAppController::FillInAppOverview",
         label: "CSteamUIAppController::FillInAppOverview body",
         validate: validate_fill_in_app_overview64,
+    },
+    SemanticCheck {
+        name: "CSteamApp::IsVisibleInGamesList",
+        label: "CSteamApp::IsVisibleInGamesList body",
+        validate: validate_is_visible_in_games_list64,
     },
     SemanticCheck {
         name: "CSteamUIAppController::BuildCompleteAppOverviewChange",
@@ -1952,6 +1962,12 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "CSteamUIAppController::FillInAppOverview") => {
             fill_in_app_overview64_evidence(code, offset)
         }
+        (SemanticArch::X86, "CSteamApp::IsVisibleInGamesList") => {
+            is_visible_in_games_list32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "CSteamApp::IsVisibleInGamesList") => {
+            is_visible_in_games_list64_evidence(code, offset)
+        }
         (SemanticArch::X86, "CSteamUIAppController::BuildCompleteAppOverviewChange") => {
             build_complete_app_overview_change32_evidence(code, offset)
         }
@@ -2401,7 +2417,7 @@ fn set_api_call_result64_evidence(code: &[u8], offset: usize) -> Option<Evidence
 }
 
 fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x360)?;
+    let bytes = bounded_tail(code, offset, 0x600)?;
     let has_result_frame = has_asm32(bytes, |a| a.sub(esp, 0xACu32))
         && (has_asm32(bytes, |a| a.mov(ecx, 8)) || has_asm32(bytes, |a| a.mov(ecx, 0x0D)))
         && (has_asm32(bytes, |a| a.mov(dword_ptr(eax), -1))
@@ -2409,12 +2425,15 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let has_license_state = (has_x86_rm32_disp32_load(bytes, 0x1bd4)
         && has_x86_rm32_disp32_load(bytes, 0x1bf0))
         || (has_x86_rm32_disp32_load(bytes, 0x1bd0) && has_x86_rm32_disp32_load(bytes, 0x1bec));
-    let has_success_flags = (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x28), 1))
+    let has_license_accumulators = (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x28), 1))
         || has_asm32(bytes, |a| a.mov(byte_ptr(esi + 0x28), 1)))
         && (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x30), 1))
             || has_asm32(bytes, |a| a.mov(byte_ptr(esi + 0x30), 1)))
         && (has_asm32(bytes, |a| a.mov(word_ptr(eax + 0x33), bx))
             || has_asm32(bytes, |a| a.mov(word_ptr(esi + 0x33), di)));
+    let has_ownership_fields = has_byte_disp8_access(bytes, 0x24)
+        && has_byte_disp8_access(bytes, 0x26)
+        && has_byte_disp8_access(bytes, 0x35);
     let has_owned_app_iteration = (has_asm32(bytes, |a| a.mov(ecx, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x0C))))
@@ -2425,7 +2444,8 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let mut evidence = Evidence::default();
     evidence.require("ownership result frame", has_result_frame);
     evidence.require("license state offsets", has_license_state);
-    evidence.require("success result writes", has_success_flags);
+    evidence.require("ownership result fields", has_ownership_fields);
+    evidence.require("license accumulator fields", has_license_accumulators);
     evidence.require("owned app vector iteration", has_owned_app_iteration);
     Some(evidence)
 }
@@ -2437,7 +2457,7 @@ fn validate_check_app_ownership64(code: &[u8], offset: usize) -> Option<&'static
 }
 
 fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x360)?;
+    let bytes = bounded_tail(code, offset, 0x600)?;
     let old_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
         && has_asm64(bytes, |a| a.mov(ecx, 6))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x70), -1));
@@ -2446,12 +2466,15 @@ fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence
         && has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax));
     let has_license_state =
         has_x64_rm32_disp32_load(bytes, 0x2498) && has_x64_rm32_disp32_load(bytes, 0x24bc);
-    let old_success_flags = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
+    let old_license_accumulators = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
         && has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x30), 1))
         && has_asm64(bytes, |a| a.mov(word_ptr(r14 + 0x33), r8w));
-    let current_success_flags = has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x28), 1))
+    let current_license_accumulators = has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x28), 1))
         && has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x30), 1))
         && has_asm64(bytes, |a| a.mov(word_ptr(rbx + 0x33), r8w));
+    let has_ownership_fields = has_byte_disp8_access(bytes, 0x24)
+        && has_byte_disp8_access(bytes, 0x26)
+        && has_byte_disp8_access(bytes, 0x35);
     let old_owned_app_iteration = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rax + 0x10)))
         && has_asm64(bytes, |a| a.movsxd(rdx, dword_ptr(rdx + r13 * 4)));
     let current_owned_app_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(rax + 0x10)))
@@ -2464,14 +2487,28 @@ fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence
     );
     evidence.require("license state offsets", has_license_state);
     evidence.require(
-        "success result writes",
-        old_success_flags || current_success_flags,
+        "license accumulator fields",
+        old_license_accumulators || current_license_accumulators,
     );
+    evidence.require("ownership result fields", has_ownership_fields);
     evidence.require(
         "owned app vector iteration",
         old_owned_app_iteration || current_owned_app_iteration,
     );
     Some(evidence)
+}
+
+fn has_byte_disp8_access(bytes: &[u8], displacement: u8) -> bool {
+    bytes.windows(3).any(|window| {
+        matches!(window[0], 0x80 | 0x88 | 0x8A | 0xC6)
+            && window[1] & 0xC0 == 0x40
+            && window[2] == displacement
+    }) || bytes.windows(4).any(|window| {
+        window[0] == 0x0F
+            && matches!(window[1], 0xB6 | 0xBE)
+            && window[2] & 0xC0 == 0x40
+            && window[3] == displacement
+    })
 }
 
 fn validate_get_subscribed_apps32(code: &[u8], offset: usize) -> Option<&'static str> {
@@ -3737,7 +3774,7 @@ fn http_download_consumer64_from(code: &[u8], start: usize) -> bool {
 fn validate_mark_license_changed32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         mark_license_changed32_evidence(code, offset),
-        "license-vector dirty mark",
+        "license change map update",
     )
 }
 
@@ -3774,29 +3811,51 @@ fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
 fn validate_mark_license_changed64(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         mark_license_changed64_evidence(code, offset),
-        "license-vector dirty mark",
+        "license change map update",
     )
 }
 
 fn mark_license_changed64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    let old_shape = has_asm64(bytes, |a| a.mov(ebx, esi))
-        && has_asm64(bytes, |a| a.lea(rbp, qword_ptr(rax + 0xF20)))
-        && has_asm64_call_after(bytes, |a| a.mov(esi, ebx), 0x20)
-        && has_asm64(bytes, |a| a.mov(ecx, 6))
-        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x40), -1))
-        && has_asm64(bytes, |a| a.mov(rdi, r12));
-    let current_shape = has_asm64(bytes, |a| a.mov(ebp, esi))
-        && has_asm64(bytes, |a| a.lea(r12, qword_ptr(rax + 0xF20)))
-        && has_asm64_call_after(bytes, |a| a.mov(esi, ebp), 0x20)
-        && has_asm64(bytes, |a| a.mov(ecx, 7))
-        && has_asm64(bytes, |a| a.mov(dword_ptr(rsp), -1))
-        && has_asm64(bytes, |a| a.mov(rdi, r13));
+    let bytes = bounded_tail(code, offset, 0x260)?;
     Some(Evidence::required([
-        ("known license-change layout", old_shape || current_shape),
         (
-            "ownership recheck call",
-            has_asm64(bytes, |a| a.test(al, al)),
+            "added-state argument spill",
+            bytes
+                .windows(4)
+                .any(|window| window[0..3] == [0x88, 0x54, 0x24]),
+        ),
+        (
+            "package ID argument spill",
+            bytes
+                .windows(4)
+                .any(|window| window[0..3] == [0x89, 0x74, 0x24]),
+        ),
+        (
+            "changed-license count load",
+            bytes.windows(6).any(|window| {
+                window[0] == 0x8b
+                    && window[1] == 0x97
+                    && window[4] == 0
+                    && window[5] == 0
+            }),
+        ),
+        (
+            "license ID hash",
+            has_seq(bytes, &[0x6b, 0xca, 0xeb, 0x85])
+                && has_seq(bytes, &[0x35, 0xae, 0xb2, 0xc2]),
+        ),
+        (
+            "existing added-state lookup",
+            has_seq(bytes, &[0x80, 0x78, 0x04, 0x00]),
+        ),
+        (
+            "added-state promotion",
+            bytes.windows(5).any(|window| {
+                window[0] == 0xc6
+                    && window[1] == 0x44
+                    && window[2] == 0x24
+                    && window[4] == 1
+            }),
         ),
     ]))
 }
@@ -4336,6 +4395,77 @@ fn fill_in_app_overview64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         );
     }
     Some(evidence)
+}
+
+fn validate_is_visible_in_games_list32(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        is_visible_in_games_list32_evidence(code, offset),
+        "Steam library visibility predicate",
+    )
+}
+
+fn is_visible_in_games_list32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x520)?;
+    Some(Evidence::required([
+        (
+            "CSteamApp argument",
+            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
+        ),
+        (
+            "app type filter",
+            has_seq(bytes, &[0x8B, 0x46, 0x38])
+                && has_seq(bytes, &[0x83, 0xE8, 0x20, 0x83, 0xE0, 0xDF]),
+        ),
+        (
+            "app ID filter",
+            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi + 0x0C))),
+        ),
+        (
+            "legacy free sub predicate",
+            has_asm32(bytes, |a| a.call(dword_ptr(eax + 0x60))),
+        ),
+        (
+            "final native visibility predicate",
+            has_asm32(bytes, |a| a.call(dword_ptr(eax + 0xE4))),
+        ),
+    ]))
+}
+
+fn validate_is_visible_in_games_list64(
+    code: &[u8],
+    offset: usize,
+) -> Option<&'static str> {
+    evidence_result(
+        is_visible_in_games_list64_evidence(code, offset),
+        "Steam library visibility predicate",
+    )
+}
+
+fn is_visible_in_games_list64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x520)?;
+    Some(Evidence::required([
+        ("CSteamApp argument", has_asm64(bytes, |a| a.mov(rbx, rdi))),
+        (
+            "app type filter",
+            has_seq(bytes, &[0x8B, 0x43, 0x3C])
+                && has_seq(bytes, &[0x83, 0xE8, 0x20, 0x83, 0xE0, 0xDF]),
+        ),
+        (
+            "app ID filter",
+            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0x10))),
+        ),
+        (
+            "legacy free sub predicate",
+            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0xC0))),
+        ),
+        (
+            "final native visibility predicate",
+            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x1C8))),
+        ),
+    ]))
 }
 
 fn validate_build_complete_app_overview_change32(

@@ -441,6 +441,12 @@ fn finalize_snapshot(
         vapor_forge_features::package::controlled_app_ids(&new_config, &new_script_state.apps);
     base_config_store.store(Arc::new(base_config));
     let snapshot = RuntimeSnapshot::new(new_config, new_script_runtime);
+    let previous = runtime_store.load();
+    let metadata_refreshes: Vec<_> = snapshot
+        .purchase_time_app_ids()
+        .into_iter()
+        .filter(|&app_id| previous.purchase_time(app_id) != snapshot.purchase_time(app_id))
+        .collect();
     let service_config = Arc::clone(&snapshot.config);
     runtime_store.store(Arc::new(snapshot));
     if let Some(queue) = crate::netpacket::cloud_rpc_queue() {
@@ -453,6 +459,7 @@ fn finalize_snapshot(
     crate::client::user_stats::notify_context_changed();
     crate::netpacket::notify_stats_context_changed();
     crate::client::package::queue_reload(controlled);
+    crate::ui::install::queue_metadata_refreshes(metadata_refreshes);
 
     info!(inject = inject_count, dlc = dlc_count, message);
 }
