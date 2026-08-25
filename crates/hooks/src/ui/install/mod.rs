@@ -22,6 +22,7 @@ use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTarg
 #[cfg(target_pointer_width = "64")]
 use vapor_forge_patterns::Pattern;
 
+pub(crate) use super::library::queue_metadata_refreshes;
 pub use super::library::queue_removal;
 use super::state::{
     GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, GET_APP_BY_ID_DETOUR,
@@ -31,6 +32,7 @@ use super::state::{
 type RunFrameFn = unsafe extern "C" fn(*mut c_void);
 type FillInAppOverviewFn =
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type IsVisibleInGamesListFn = unsafe extern "C" fn(*mut c_void) -> bool;
 type BuildCompleteChangeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 #[cfg(target_pointer_width = "64")]
 const MAX_REPEATED_FIELD_CANDIDATES: usize = 256;
@@ -38,6 +40,7 @@ const MAX_REPEATED_FIELD_CANDIDATES: usize = 256;
 static mut REPEATED_FIELD_ADD: Option<RepeatedFieldAddFn> = None;
 static mut RUN_FRAME_DETOUR: Option<Detour<RunFrameFn>> = None;
 static mut FILL_IN_OVERVIEW_DETOUR: Option<Detour<FillInAppOverviewFn>> = None;
+static mut IS_VISIBLE_IN_GAMES_LIST_DETOUR: Option<Detour<IsVisibleInGamesListFn>> = None;
 static mut BUILD_COMPLETE_DETOUR: Option<Detour<BuildCompleteChangeFn>> = None;
 
 unsafe extern "C" fn hk_run_frame(controller: *mut c_void) {
@@ -53,6 +56,7 @@ unsafe extern "C" fn hk_run_frame(controller: *mut c_void) {
 }
 
 fn drain_ui_work(controller: *mut c_void) {
+    super::library::drain_pending_metadata_refreshes(controller);
     super::library::drain_pending_removals(controller);
     crate::ui::toast_bridge::drain();
 }
@@ -71,38 +75,76 @@ unsafe extern "C" fn hk_fill_in_app_overview(
         // SAFETY: forwards Steam's untouched overview arguments.
         return unsafe { original(this, app_overview, app) };
     }
-    if !app.is_null() {
-        // SAFETY: app is a CSteamApp* passed by SteamUI.
-        let steam_app = app.cast::<CSteamApp>();
-        // SAFETY: steam_app points to the CSteamApp passed by SteamUI; this is a by-value read.
-        let app_id_raw = unsafe { (*steam_app).app_id };
-        let cfg = crate::client::install::config();
-        if vapor_forge_features::apps::classify_app(&cfg, AppId(app_id_raw))
-            .requires_injected_ownership()
-        {
-            // Precedence: explicit config → max mtime across the .lua files
-            // that contribute this app's depots (mirrors OpenSteamTool's
-            // `LuaConfig::GetPurchaseTime`). If neither is available, leave
-            // the field untouched so the original `FillInAppOverview` still
-            // writes whatever Steam had.
-            let mut t = cfg.purchase_time(AppId(app_id_raw));
-            if t == 0 {
-                let script_state = crate::client::install::script_state();
-                t = script_state
-                    .app_purchase_times
-                    .get(&AppId(app_id_raw))
-                    .copied()
-                    .unwrap_or(0);
-            }
-            if t != 0 {
-                // Stamp BEFORE the original copies the field into the overview.
-                // SAFETY: steam_app points to the CSteamApp passed by SteamUI.
-                unsafe { (*steam_app).purchased_time = t };
-            }
-        }
-    }
+    // SAFETY: app is the direct CSteamApp pointer for this ABI.
+    unsafe { stamp_purchase_time(app) };
     // SAFETY: forwards Steam's overview arguments after applying configured metadata.
     unsafe { original(this, app_overview, app) }
+}
+
+pub(super) unsafe fn stamp_purchase_time(app: *mut c_void) {
+    if app.is_null() {
+        return;
+    }
+    let steam_app = app.cast::<CSteamApp>();
+    // SAFETY: steam_app is the live CSteamApp supplied by SteamUI.
+    let app_id = AppId(unsafe { (*steam_app).app_id });
+    let runtime = crate::client::install::runtime_snapshot();
+    if !vapor_forge_features::apps::classify_app(&runtime.config, app_id)
+        .requires_injected_ownership()
+    {
+        return;
+    }
+    let purchase_time = runtime.purchase_time(app_id);
+    if purchase_time != 0 {
+        // SAFETY: steam_app remains valid for the synchronous overview call.
+        unsafe { (*steam_app).purchased_time = purchase_time };
+    }
+}
+
+unsafe extern "C" fn hk_is_visible_in_games_list(app: *mut c_void) -> bool {
+    let original = detour_or_return!(
+        "CSteamApp::IsVisibleInGamesList",
+        IS_VISIBLE_IN_GAMES_LIST_DETOUR,
+        false
+    );
+    if app.is_null() {
+        // SAFETY: forwards Steam's original argument unchanged.
+        return unsafe { original(app) };
+    }
+
+    let steam_app = app.cast::<CSteamApp>();
+    // SAFETY: Steam supplied a live CSteamApp for this synchronous predicate.
+    let app_id = AppId(unsafe { (*steam_app).app_id });
+    let should_override = {
+        let runtime = crate::client::install::runtime_snapshot();
+        vapor_forge_features::apps::classify_app(&runtime.config, app_id)
+            .requires_injected_library_visibility()
+            && crate::client::install::package_state().is_injected_into_pkg0(app_id)
+    };
+    if !should_override {
+        // SAFETY: forwards Steam's original argument unchanged.
+        return unsafe { original(app) };
+    }
+
+    // SAFETY: ownership_flags belongs to the live CSteamApp and is restored
+    // before returning from this synchronous call.
+    let flags = unsafe { std::ptr::addr_of_mut!((*steam_app).ownership_flags) };
+    // SAFETY: CSteamApp is packed, so the field may be unaligned.
+    let original_flags = unsafe { flags.read_unaligned() };
+    if original_flags & super::state::EAPP_OWNERSHIP_FLAG_LEGACY_FREE_SUB == 0 {
+        // SAFETY: forwards Steam's original argument unchanged.
+        return unsafe { original(app) };
+    }
+
+    // SAFETY: the temporary value only affects the original visibility predicate.
+    unsafe {
+        flags.write_unaligned(original_flags & !super::state::EAPP_OWNERSHIP_FLAG_LEGACY_FREE_SUB)
+    };
+    // SAFETY: the trampoline preserves the one-argument CSteamApp ABI.
+    let visible = unsafe { original(app) };
+    // SAFETY: restore the exact ownership flags observed before the call.
+    unsafe { flags.write_unaligned(original_flags) };
+    visible
 }
 
 unsafe extern "C" fn hk_build_complete_change(
@@ -168,11 +210,12 @@ pub fn install(
         "CSteamUIAppController::BuildCompleteAppOverviewChange",
         "CSteamUIAppController::GetAppByID",
         "CUpdateManager::MarkAppChange",
+        "CSteamApp::IsVisibleInGamesList",
         "google::protobuf::RepeatedField<uint32>::Add",
     ];
-    let mut addrs = [0usize; 6];
+    let mut addrs = [0usize; 7];
     let mut all_found = true;
-    for (i, name) in names[..5].iter().enumerate() {
+    for (i, name) in names[..6].iter().enumerate() {
         let entry = match registry.get(name) {
             Some(e) => e,
             None => {
@@ -264,6 +307,11 @@ pub fn install(
             installed: false,
             addr: addrs[5],
         },
+        HookResult {
+            name: names[6],
+            installed: false,
+            addr: addrs[6],
+        },
     ];
 
     hook_results[0].installed = try_detour!(
@@ -301,12 +349,19 @@ pub fn install(
         MarkAppChangeFn,
         MARK_APP_CHANGE_DETOUR
     );
+    hook_results[5].installed = try_detour!(
+        "IsVisibleInGamesList",
+        addrs[5],
+        hk_is_visible_in_games_list as IsVisibleInGamesListFn,
+        IsVisibleInGamesListFn,
+        IS_VISIBLE_IN_GAMES_LIST_DETOUR
+    );
 
     // Resolve RepeatedField<uint32>::Add for BuildComplete protobuf mutation.
     if let Some(addr) = resolve_repeated_field_add(steamui_code, registry) {
-        addrs[5] = addr;
-        hook_results[5].addr = addr;
-        hook_results[5].installed = true;
+        addrs[6] = addr;
+        hook_results[6].addr = addr;
+        hook_results[6].installed = true;
     }
 
     let reverse_bridge = super::reverse_bridge::install(steamui_code);
@@ -322,6 +377,7 @@ pub fn install(
             (hook_results[3].name, hook_results[3].installed),
             (hook_results[4].name, hook_results[4].installed),
             (hook_results[5].name, hook_results[5].installed),
+            (hook_results[6].name, hook_results[6].installed),
         ],
     );
     crate::capability::set_from_requirements(
@@ -332,9 +388,13 @@ pub fn install(
         crate::capability::Capability::LibrarySnapshot,
         &[
             (hook_results[2].name, hook_results[2].installed),
-            (hook_results[5].name, hook_results[5].installed),
+            (hook_results[6].name, hook_results[6].installed),
         ],
     );
+    if library_ready {
+        let runtime = crate::client::install::runtime_snapshot();
+        queue_metadata_refreshes(runtime.purchase_time_app_ids());
+    }
     super::reverse_bridge::set_runtime_ready(conflict_bridge_installed);
     let conflict_ui_ready = crate::ui::conflict_ui_ready();
     if conflict_bridge_installed {
@@ -359,6 +419,7 @@ pub fn install(
         build_complete = format_args!("{:#x}", addrs[2]),
         get_app = format_args!("{:#x}", addrs[3]),
         mark = format_args!("{:#x}", addrs[4]),
+        is_visible = format_args!("{:#x}", addrs[5]),
         repeated_field_add = rfa,
         library_ready,
         conflict_bridge_installed,

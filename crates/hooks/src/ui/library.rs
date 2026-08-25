@@ -17,6 +17,10 @@ use super::state::{
 // UI thread inside hk_run_frame.
 static PENDING_REMOVALS: Mutex<Vec<AppId>> = Mutex::new(Vec::new());
 
+// App metadata changes queued outside the SteamUI thread.
+static PENDING_METADATA_REFRESHES: Mutex<Vec<AppId>> = Mutex::new(Vec::new());
+const MAX_METADATA_REFRESHES_PER_DRAIN: usize = 64;
+
 // Apps confirmed removed. Appended to CAppOverview_Change.removed_appid
 // during full rebuilds to prevent removed apps from reappearing.
 static REMOVED_APP_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -70,6 +74,79 @@ pub fn queue_removal(app_id: AppId) {
     drop(pending);
     vapor_forge_features::toast::request_ui_work();
     debug!(app = app_id.0, "steamui: removal queued");
+}
+
+pub(crate) fn queue_metadata_refreshes(app_ids: impl IntoIterator<Item = AppId>) {
+    if !crate::capability::is_ready(crate::capability::Capability::LibraryUi) {
+        return;
+    }
+    let Ok(mut pending) = PENDING_METADATA_REFRESHES.lock() else {
+        error!("steamui: pending metadata refresh lock poisoned");
+        return;
+    };
+    for app_id in app_ids {
+        if !pending.contains(&app_id) {
+            pending.push(app_id);
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    drop(pending);
+    vapor_forge_features::toast::request_ui_work();
+}
+
+pub(crate) fn drain_pending_metadata_refreshes(controller: *mut c_void) {
+    if !crate::capability::is_ready(crate::capability::Capability::LibraryUi) {
+        return;
+    }
+    let src = APP_CHANGE_SOURCE.load(Ordering::Acquire);
+    if src == 0 {
+        return;
+    }
+
+    let (draining, has_more): (Vec<AppId>, bool) = {
+        let Ok(mut pending) = PENDING_METADATA_REFRESHES.lock() else {
+            error!("steamui: pending metadata refresh lock poisoned");
+            return;
+        };
+        let count = pending.len().min(MAX_METADATA_REFRESHES_PER_DRAIN);
+        let batch = pending.drain(..count).collect();
+        (batch, !pending.is_empty())
+    };
+
+    for app_id in draining {
+        do_refresh_metadata(controller, src, app_id);
+    }
+    if has_more {
+        vapor_forge_features::toast::request_ui_work();
+    }
+}
+
+fn do_refresh_metadata(controller: *mut c_void, src: usize, app_id: AppId) {
+    let runtime = crate::client::install::runtime_snapshot();
+    if !vapor_forge_features::apps::classify_app(&runtime.config, app_id)
+        .requires_injected_ownership()
+        || runtime.purchase_time(app_id) == 0
+    {
+        return;
+    }
+    drop(runtime);
+
+    let get_app_by_id =
+        detour_or_return!("CSteamUIAppController::GetAppByID", GET_APP_BY_ID_DETOUR);
+    // SAFETY: controller is the live UI receiver and the trampoline preserves Steam's ABI.
+    let app_ptr = unsafe { get_app_by_id(controller, app_id.0, false) };
+    if app_ptr.is_null() {
+        return;
+    }
+    // SAFETY: app_ptr is a live CSteamApp returned by GetAppByID.
+    unsafe { super::install::stamp_purchase_time(app_ptr) };
+
+    let mark_app_change =
+        detour_or_return!("CUpdateManager::MarkAppChange", MARK_APP_CHANGE_DETOUR);
+    // SAFETY: src is captured from Steam's live update manager callback.
+    unsafe { mark_app_change(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED) };
 }
 
 pub(crate) fn drain_pending_removals(controller: *mut c_void) {

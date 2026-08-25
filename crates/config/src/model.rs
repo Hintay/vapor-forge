@@ -87,7 +87,7 @@ pub struct InjectApp {
     #[serde(default)]
     pub ticket: TicketMode,
     /// Unix timestamp shown as purchase date in the Steam library UI.
-    /// 0 = auto (current time at first FillInAppOverview call).
+    /// Script-provided apps use the Lua source mtime when this is zero.
     #[serde(default)]
     pub purchase_time: u32,
 }

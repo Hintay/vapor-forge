@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tracing::info;
+use tracing::{debug, info};
 use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
 struct AccountState {
@@ -59,14 +59,14 @@ pub enum OwnershipState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OwnershipObservation {
-    pub original_result: u32,
-    pub package_associations: i32,
+    pub original_result: bool,
+    pub owns_license: bool,
     pub family_shared: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OwnershipDecision {
-    pub result: u32,
+    pub result: bool,
     pub grant_spoofed_ownership: bool,
     pub clear_family_shared: bool,
 }
@@ -88,6 +88,18 @@ impl AppAuthority {
             Self::Controlled {
                 ownership: OwnershipState::Unknown | OwnershipState::Unowned,
                 ..
+            }
+        )
+    }
+
+    /// Injected top-level apps need the library visibility exception until
+    /// genuine ownership is confirmed. DLC keeps Steam's native filtering.
+    pub fn requires_injected_library_visibility(self) -> bool {
+        matches!(
+            self,
+            Self::Controlled {
+                category: AppCategory::Inject,
+                ownership: OwnershipState::Unknown | OwnershipState::Unowned,
             }
         )
     }
@@ -144,10 +156,10 @@ pub fn classify_app_with_ownership(
 
 /// Interpret a result returned by Steam's original ownership path.
 ///
-/// A non-zero return alone is insufficient after package injection. Genuine
-/// ownership also has more than the injected package association.
+/// A successful lookup alone is insufficient because pkg0 also produces a
+/// successful result. Steam's license bit distinguishes a real entitlement.
 pub fn original_result_is_genuinely_owned(observation: OwnershipObservation) -> bool {
-    observation.original_result != 0 && observation.package_associations > 1
+    observation.original_result && observation.owns_license
 }
 
 /// Record an ownership result obtained before the app is added to pkg0.
@@ -165,7 +177,9 @@ pub fn decide_check_ownership(
     app_id: AppId,
     observation: OwnershipObservation,
 ) -> OwnershipDecision {
-    if config.is_controlled_app(app_id) && observation.original_result == 0 {
+    if config.is_controlled_app(app_id)
+        && (!observation.original_result || !observation.owns_license)
+    {
         // Don't grant spoofed ownership until Steam has finished its initial
         // license sync — otherwise a DRM racing us to `CheckAppOwnership`
         // during startup latches a fake positive into the ownership cache
@@ -182,16 +196,16 @@ pub fn decide_check_ownership(
                 clear_family_shared: false,
             };
         }
-        info!(app_id = app_id.0, "feat: ownership granted");
+        debug!(app_id = app_id.0, "feat: ownership granted");
         return OwnershipDecision {
-            result: 1,
+            result: true,
             grant_spoofed_ownership: true,
             clear_family_shared: false,
         };
     }
 
     let clear_family_shared = config.should_bypass_sharing(app_id)
-        && observation.original_result != 0
+        && observation.original_result
         && observation.family_shared;
     if clear_family_shared {
         info!(app_id = app_id.0, "feat: sharing unlocked");
@@ -256,10 +270,10 @@ mod tests {
         }
     }
 
-    fn observation(original_result: u32) -> OwnershipObservation {
+    fn observation(original_result: bool) -> OwnershipObservation {
         OwnershipObservation {
             original_result,
-            package_associations: 0,
+            owns_license: original_result,
             family_shared: false,
         }
     }
@@ -275,8 +289,8 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         mark_license_sync_complete();
         let config = config_with_inject(&[480]);
-        let decision = decide_check_ownership(&config, AppId(480), observation(0));
-        assert_eq!(decision.result, 1);
+        let decision = decide_check_ownership(&config, AppId(480), observation(false));
+        assert!(decision.result);
         assert!(decision.grant_spoofed_ownership);
         assert!(!decision.clear_family_shared);
     }
@@ -291,9 +305,9 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner())
             .license_sync_complete = false;
         let config = config_with_inject(&[912_345]);
-        let decision = decide_check_ownership(&config, AppId(912_345), observation(0));
+        let decision = decide_check_ownership(&config, AppId(912_345), observation(false));
         // No spoof while license sync is pending.
-        assert_eq!(decision.result, 0);
+        assert!(!decision.result);
         assert!(!decision.grant_spoofed_ownership);
 
         // Simulate Steam returning the first subscribed-apps list.
@@ -302,16 +316,33 @@ mod tests {
         assert!(license_sync_complete());
 
         assert!(
-            decide_check_ownership(&config, AppId(912_345), observation(0)).grant_spoofed_ownership
+            decide_check_ownership(&config, AppId(912_345), observation(false))
+                .grant_spoofed_ownership
         );
     }
 
     #[test]
     fn no_inject_when_already_owned() {
         let config = config_with_inject(&[480]);
-        let decision = decide_check_ownership(&config, AppId(480), observation(1));
-        assert_eq!(decision.result, 1);
+        let decision = decide_check_ownership(&config, AppId(480), observation(true));
+        assert!(decision.result);
         assert!(!decision.grant_spoofed_ownership);
+    }
+
+    #[test]
+    fn pkg0_result_without_license_is_normalized() {
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        mark_license_sync_complete();
+        let config = config_with_inject(&[480]);
+        let mut observed = observation(true);
+        observed.owns_license = false;
+
+        let decision = decide_check_ownership(&config, AppId(480), observed);
+
+        assert!(decision.result);
+        assert!(decision.grant_spoofed_ownership);
     }
 
     #[test]
@@ -320,10 +351,7 @@ mod tests {
         let config = config_with_inject(&[app_id.0]);
         record_actual_ownership(app_id, false);
 
-        assert_eq!(
-            decide_check_ownership(&config, app_id, observation(1)).result,
-            1
-        );
+        assert!(decide_check_ownership(&config, app_id, observation(true)).result);
         assert_eq!(actual_ownership(app_id), OwnershipState::Unowned);
         assert!(classify_app(&config, app_id).requires_injected_ownership());
 
@@ -333,14 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn package_association_alone_is_not_genuine_ownership() {
-        let mut observed = observation(1);
-        observed.package_associations = 1;
+    fn successful_lookup_without_license_is_not_genuine_ownership() {
+        let mut observed = observation(true);
+        observed.owns_license = false;
         assert!(!original_result_is_genuinely_owned(observed));
 
-        observed.package_associations = 2;
+        observed.owns_license = true;
         assert!(original_result_is_genuinely_owned(observed));
-        observed.original_result = 0;
+        observed.original_result = false;
         assert!(!original_result_is_genuinely_owned(observed));
     }
 
@@ -358,7 +386,26 @@ mod tests {
             }
         );
         assert!(classify_app(&config, app_id).requires_injected_ownership());
+        assert!(classify_app(&config, app_id).requires_injected_library_visibility());
         assert!(!classify_app(&config, app_id).is_confirmed_unowned());
+    }
+
+    #[test]
+    fn dlc_does_not_receive_library_visibility_exception() {
+        let app_id = AppId(246_813_585);
+        let dlc_id = AppId(246_813_586);
+        let config = RuntimeConfig {
+            apps: vapor_forge_config::AppsSection::with_inject(vec![InjectApp {
+                id: app_id,
+                dlc: vec![dlc_id],
+                ticket: Default::default(),
+                purchase_time: 0,
+            }]),
+            ..Default::default()
+        };
+
+        assert!(classify_app(&config, app_id).requires_injected_library_visibility());
+        assert!(!classify_app(&config, dlc_id).requires_injected_library_visibility());
     }
 
     #[test]
@@ -381,26 +428,26 @@ mod tests {
     #[test]
     fn non_controlled_app_passes_through() {
         let config = config_with_inject(&[480]);
-        let decision = decide_check_ownership(&config, AppId(999), observation(0));
-        assert_eq!(decision.result, 0);
+        let decision = decide_check_ownership(&config, AppId(999), observation(false));
+        assert!(!decision.result);
         assert!(!decision.grant_spoofed_ownership);
     }
 
     #[test]
     fn sharing_bypass_clears_family_shared() {
         let config = RuntimeConfig::default(); // shared.enabled = true by default
-        let mut observed = observation(1);
+        let mut observed = observation(true);
         observed.family_shared = true;
         let decision = decide_check_ownership(&config, AppId(570), observed);
-        assert_eq!(decision.result, 1);
+        assert!(decision.result);
         assert!(decision.clear_family_shared);
     }
 
     #[test]
     fn sharing_bypass_noop_when_not_shared() {
         let config = RuntimeConfig::default();
-        let decision = decide_check_ownership(&config, AppId(570), observation(1));
-        assert_eq!(decision.result, 1);
+        let decision = decide_check_ownership(&config, AppId(570), observation(true));
+        assert!(decision.result);
         assert!(!decision.clear_family_shared);
     }
 

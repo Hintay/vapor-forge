@@ -1150,7 +1150,6 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::shader::GET_SHADER_CACHE_DEPOT_DETOUR),
         d_shader_cache_depot
     );
-
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
         (hook_results[1].name, hook_results[1].installed),

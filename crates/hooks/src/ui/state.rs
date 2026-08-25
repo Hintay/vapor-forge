@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use vapor_forge_hook_engine::detour::Detour;
 
 pub(crate) const EAPP_OWNERSHIP_FLAGS_NONE: u32 = 0;
+pub(crate) const EAPP_OWNERSHIP_FLAG_LEGACY_FREE_SUB: u32 = 1 << 19;
 pub(crate) const EAPP_STATE_UNINSTALLED: u32 = 1;
 pub(crate) const EAPPCHANGE_ADDED_OR_CREATED: u32 = 1;
 

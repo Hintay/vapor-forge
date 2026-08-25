@@ -486,17 +486,26 @@ pub struct CAppOwnershipInfo {
     pub purchase_country_code: [u8; 4],
     pub purchase_time: u32,
     pub license_expiration_time: u32,
-    pub _unknown_24: [u8; 4],
     pub owns_license: u8,
     pub license_expired: u8,
-    pub _unknown_2a: [u8; 2],
+    pub is_permanent: u8,
+    pub low_violence: u8,
     pub free_license: u8,
-    pub _unknown_2d: [u8; 3],
+    pub region_restricted: u8,
+    pub from_free_weekend: u8,
+    pub license_locked: u8,
+    pub license_pending: u8,
+    pub retail_license: u8,
+    pub auto_grant: u8,
     pub license_permanent: u8,
-    pub _unknown_31: [u8; 2],
-    pub license_flags_pair: [u8; 2],
+    pub guest_pass: u8,
+    pub borrowed: u8,
+    pub any_site_license: u8,
+    pub all_site_licenses: u8,
+    pub all_activation_required: u8,
     pub family_shared: u8,
-    pub _pad_36: [u8; 2],
+    pub _unknown_36: u8,
+    pub _unknown_37: u8,
 }
 
 impl CAppOwnershipInfo {
@@ -512,13 +521,13 @@ impl CAppOwnershipInfo {
 
     pub const LICENSE_EXPIRED_OFFSET: usize = core::mem::offset_of!(Self, license_expired);
 
+    pub const IS_PERMANENT_OFFSET: usize = core::mem::offset_of!(Self, is_permanent);
+
     pub const FREE_LICENSE_OFFSET: usize = core::mem::offset_of!(Self, free_license);
 
     pub const LICENSE_PERMANENT_OFFSET: usize = core::mem::offset_of!(Self, license_permanent);
 
     pub const FAMILY_SHARED_OFFSET: usize = core::mem::offset_of!(Self, family_shared);
-
-    pub const LICENSE_FLAGS_OFFSET: usize = core::mem::offset_of!(Self, license_flags_pair);
 
     pub fn zeroed() -> Self {
         Self::default()
@@ -531,12 +540,8 @@ impl CAppOwnershipInfo {
     /// downstream code and DRM see a consistent package association.
     pub const INJECTED_PACKAGE_ID: i32 = 0;
 
-    /// Fill in the flags/fields Steam checks when deciding whether the caller
-    /// owns an app. Deliberately leaves `purchase_time` alone (matches
-    /// OpenSteamTool's `Hooks_Package::CheckAppOwnership`, which touches only
-    /// `PackageId`, `ReleaseState`, `bOwnsLicense` and `bFreeLicense`); the
-    /// library-UI purchase date is stamped separately in
-    /// `hk_fill_in_app_overview`.
+    /// Fill in the fields Steam checks when deciding whether the caller owns
+    /// an app. Purchase metadata remains unchanged.
     pub fn grant_spoofed_ownership(&mut self) {
         self.package_id = Self::INJECTED_PACKAGE_ID;
         self.release_state = EAppReleaseState::Released as i32;
@@ -544,9 +549,8 @@ impl CAppOwnershipInfo {
         self.exist_in_package_nums = 2;
         self.owns_license = 1;
         self.license_expired = 0;
+        self.is_permanent = 1;
         self.free_license = 0;
-        self.license_permanent = 1;
-        self.license_flags_pair = [1, 1];
         self.family_shared = 0;
     }
 
@@ -562,8 +566,8 @@ impl CAppOwnershipInfo {
         self.owns_license
     }
 
-    pub fn license_permanent(&self) -> u8 {
-        self.license_permanent
+    pub fn is_permanent_license(&self) -> u8 {
+        self.is_permanent
     }
 
     pub fn is_family_shared(&self) -> bool {
@@ -580,7 +584,7 @@ impl CAppOwnershipInfo {
 }
 
 pub type CheckAppOwnershipFn =
-    unsafe extern "C" fn(this: *mut c_void, app_id: u32, out: *mut CAppOwnershipInfo) -> u32;
+    unsafe extern "C" fn(this: *mut c_void, app_id: u32, out: *mut CAppOwnershipInfo) -> bool;
 
 #[cfg(test)]
 mod tests {
@@ -698,9 +702,10 @@ mod tests {
         assert_eq!(CAppOwnershipInfo::SIZE, 0x38);
         assert_eq!(CAppOwnershipInfo::EXIST_IN_PACKAGE_NUMS_OFFSET, 0x14);
         assert_eq!(CAppOwnershipInfo::PURCHASE_TIME_OFFSET, 0x1c);
-        assert_eq!(CAppOwnershipInfo::OWNS_LICENSE_OFFSET, 0x28);
-        assert_eq!(CAppOwnershipInfo::LICENSE_PERMANENT_OFFSET, 0x30);
-        assert_eq!(CAppOwnershipInfo::LICENSE_FLAGS_OFFSET, 0x33);
+        assert_eq!(CAppOwnershipInfo::OWNS_LICENSE_OFFSET, 0x24);
+        assert_eq!(CAppOwnershipInfo::IS_PERMANENT_OFFSET, 0x26);
+        assert_eq!(CAppOwnershipInfo::FREE_LICENSE_OFFSET, 0x28);
+        assert_eq!(CAppOwnershipInfo::LICENSE_PERMANENT_OFFSET, 0x2f);
         assert_eq!(CAppOwnershipInfo::FAMILY_SHARED_OFFSET, 0x35);
 
         let mut info = CAppOwnershipInfo::zeroed();
@@ -708,7 +713,8 @@ mod tests {
         info.grant_spoofed_ownership();
         assert_eq!(info.owner(), 1);
         assert_eq!(info.owns_license(), 1);
-        assert_eq!(info.license_permanent(), 1);
+        assert_eq!(info.is_permanent_license(), 1);
+        assert_eq!(info.license_permanent, 0);
         assert!(!info.is_family_shared());
         let release_state = { info.release_state };
         assert_eq!(release_state, EAppReleaseState::Released as i32);

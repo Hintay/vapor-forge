@@ -30,7 +30,7 @@ const PKG_STATUS_AVAILABLE: u32 = 0;
 
 const MAX_MAPS_ENTRIES: usize = 4096;
 
-static WORK_ITEM_NAME: &[u8] = b"VaporPackageReload\0";
+static WORK_ITEM_NAME: &[u8] = b"VaporPackageUpdate\0";
 
 // ---------------------------------------------------------------------------
 // Static state for raw function pointers resolved via pattern matching
@@ -54,19 +54,19 @@ static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 /// Captured pkg0 PackageInfo pointer.
 static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
 
-struct PendingReload {
+struct PendingUpdate {
     controlled: Vec<AppId>,
     generation: u64,
 }
 
-struct ReloadDispatch {
-    pending: Option<PendingReload>,
+struct UpdateDispatch {
+    pending: Option<PendingUpdate>,
     posted_generation: Option<u64>,
 }
 
-impl ReloadDispatch {
+impl UpdateDispatch {
     fn replace_pending(&mut self, controlled: Vec<AppId>, generation: u64) {
-        self.pending = Some(PendingReload {
+        self.pending = Some(PendingUpdate {
             controlled,
             generation,
         });
@@ -117,24 +117,14 @@ impl ReloadDispatch {
     }
 }
 
-static RELOAD_DISPATCH: Mutex<ReloadDispatch> = Mutex::new(ReloadDispatch {
+static UPDATE_DISPATCH: Mutex<UpdateDispatch> = Mutex::new(UpdateDispatch {
     pending: None,
     posted_generation: None,
 });
 
-/// Proof that package operations are executing inside the live
-/// `CheckAppOwnership` callback on Steam's thread.
-pub(crate) struct SteamPackageHookScope {
-    _private: (),
-}
-
-impl SteamPackageHookScope {
-    /// # Safety
-    /// Must only be called for the dynamic extent of Steam's
-    /// `CheckAppOwnership` callback.
-    pub(crate) unsafe fn enter() -> Self {
-        Self { _private: () }
-    }
+struct InjectionResult {
+    appended: Vec<AppId>,
+    complete: bool,
 }
 
 pub(crate) struct SteamPackageAccess {
@@ -146,10 +136,6 @@ pub(crate) struct SteamPackageAccess {
 }
 
 impl SteamPackageAccess {
-    pub(crate) fn from_hook(_scope: &mut SteamPackageHookScope) -> Option<Self> {
-        Self::from_current(CUSER_PTR.load(Ordering::Acquire) as *mut c_void)
-    }
-
     fn from_current(cuser: *mut c_void) -> Option<Self> {
         let pkg0 = NonNull::new(PKG0_PTR.load(Ordering::Acquire) as *mut u8)?;
         let cuser = NonNull::new(cuser)?;
@@ -180,22 +166,26 @@ impl SteamPackageAccess {
         unsafe { &mut *package_info::app_id_vec(self.pkg0.as_ptr()) }
     }
 
-    fn mark_and_process(&self) {
-        // SAFETY: the capability holds the live callback's CUser and the
-        // architecture-matched functions resolved before hook activation.
+    fn publish_package_change(&self) {
+        // SAFETY: the capability holds the current CUser and the
+        // architecture-matched functions resolved before work is posted.
         unsafe {
-            (self.mark_license)(self.cuser.as_ptr(), 0, false);
+            (self.mark_license)(self.cuser.as_ptr(), 0, true);
             (self.process_updates)(self.cuser.as_ptr());
         }
     }
 
-    pub(crate) fn inject(&mut self, app_ids: &[AppId]) -> Vec<AppId> {
+    fn inject(&mut self, app_ids: &[AppId]) -> InjectionResult {
         if app_ids.is_empty() {
             debug!("package: no apps to inject");
-            return Vec::new();
+            return InjectionResult {
+                appended: Vec::new(),
+                complete: true,
+            };
         }
 
-        let mut injected = Vec::new();
+        let mut appended = Vec::new();
+        let mut complete = true;
         for &app_id in app_ids {
             let raw_id = app_id.0;
             // SAFETY: `app_ids` returns the validated pkg0 vector for this capability.
@@ -203,21 +193,22 @@ impl SteamPackageAccess {
                 continue;
             }
             if self.append(raw_id) {
-                injected.push(app_id);
+                appended.push(app_id);
             } else {
+                complete = false;
                 error!(app_id = raw_id, "package: failed to append (grow failed)");
             }
         }
 
-        if !injected.is_empty() {
-            self.mark_and_process();
+        if !appended.is_empty() {
+            self.publish_package_change();
             info!(
-                injected = injected.len(),
+                injected = appended.len(),
                 total = app_ids.len(),
-                "package: pkg0 injection complete"
+                "package: app IDs appended to pkg0"
             );
         }
-        injected
+        InjectionResult { appended, complete }
     }
 
     fn append(&mut self, value: u32) -> bool {
@@ -277,7 +268,7 @@ impl SteamPackageAccess {
                 removals = applied.removals.len(),
                 "package: reload mutation applied on Steam engine thread"
             );
-            self.mark_and_process();
+            self.publish_package_change();
         }
         applied
     }
@@ -483,7 +474,7 @@ pub(crate) unsafe fn capture_cuser(this: *mut c_void) {
             debug!("package: updated CUser at 0x{:x}", this as usize);
         }
     }
-    try_post_reload();
+    queue_initial_injection();
 }
 
 pub(crate) fn reset_account_state() {
@@ -496,7 +487,7 @@ pub(crate) fn reset_account_state() {
     }
     CPKG_INFO_PTR.store(0, Ordering::Release);
     PKG0_PTR.store(0, Ordering::Release);
-    let mut dispatch = RELOAD_DISPATCH
+    let mut dispatch = UPDATE_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     dispatch.pending = None;
@@ -509,7 +500,7 @@ pub(crate) fn seed_account_state_for_test() {
     CUSER_GENERATION.store(1, Ordering::Release);
     CPKG_INFO_PTR.store(2, Ordering::Release);
     PKG0_PTR.store(3, Ordering::Release);
-    let mut dispatch = RELOAD_DISPATCH
+    let mut dispatch = UPDATE_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     dispatch.replace_pending(vec![AppId(4)], 1);
@@ -523,7 +514,7 @@ pub(crate) fn account_state_is_clear_for_test() -> bool {
         && CPKG_INFO_PTR.load(Ordering::Acquire) == 0
         && PKG0_PTR.load(Ordering::Acquire) == 0
         && {
-            let dispatch = RELOAD_DISPATCH
+            let dispatch = UPDATE_DISPATCH
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             dispatch.pending.is_none() && dispatch.posted_generation.is_none()
@@ -539,16 +530,41 @@ pub fn queue_reload(controlled: Vec<AppId>) {
     if generation == 0 {
         return;
     }
-    RELOAD_DISPATCH
+    UPDATE_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .replace_pending(controlled, generation);
-    try_post_reload();
+    try_post_update();
 }
 
-pub(crate) fn try_post_reload() {
+fn queue_initial_injection() {
+    if crate::client::install::PKG0_INJECTED.load(Ordering::Acquire) {
+        try_post_update();
+        return;
+    }
     let generation = vapor_forge_features::identity::generation();
-    if !crate::client::install::package_state().is_active()
+    if generation == 0
+        || CUSER_PTR.load(Ordering::Acquire) == 0
+        || CUSER_GENERATION.load(Ordering::Acquire) != generation
+        || PKG0_PTR.load(Ordering::Acquire) == 0
+    {
+        return;
+    }
+    let runtime = crate::client::install::runtime_snapshot();
+    let controlled = vapor_forge_features::package::controlled_app_ids(
+        &runtime.config,
+        &runtime.script_state.apps,
+    );
+    UPDATE_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace_pending(controlled, generation);
+    try_post_update();
+}
+
+fn try_post_update() {
+    let generation = vapor_forge_features::identity::generation();
+    if !crate::capability::is_ready(crate::capability::Capability::PackageInjection)
         || CUSER_PTR.load(Ordering::Acquire) == 0
         || CUSER_GENERATION.load(Ordering::Acquire) != generation
         || PKG0_PTR.load(Ordering::Acquire) == 0
@@ -557,7 +573,7 @@ pub(crate) fn try_post_reload() {
         return;
     }
     let should_post = {
-        let mut dispatch = RELOAD_DISPATCH
+        let mut dispatch = UPDATE_DISPATCH
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         dispatch.arm(generation)
@@ -566,44 +582,44 @@ pub(crate) fn try_post_reload() {
         return;
     }
     if post_engine_work_item(generation) {
-        debug!(generation, "package: reload work item posted");
+        debug!(generation, "package: update work item posted");
         return;
     }
 
-    let mut dispatch = RELOAD_DISPATCH
+    let mut dispatch = UPDATE_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     dispatch.reject_post(generation);
-    warn!(generation, "package: reload work item could not be posted");
+    warn!(generation, "package: update work item could not be posted");
 }
 
-fn run_reload_work_item(generation: u64) {
+fn run_update_work_item(generation: u64) {
     let controlled = {
-        let mut dispatch = RELOAD_DISPATCH
+        let mut dispatch = UPDATE_DISPATCH
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         dispatch.take_for(generation)
     };
     let Some(controlled) = controlled else {
-        complete_reload_work_item(generation);
+        complete_update_work_item(generation);
         return;
     };
 
     if generation != vapor_forge_features::identity::generation() {
-        complete_reload_work_item(generation);
+        complete_update_work_item(generation);
         return;
     }
     let Some(captured) = super::steam_context::capture() else {
         warn!(
             generation,
-            "package: reload work item has no current Steam context"
+            "package: update work item has no current Steam context"
         );
-        complete_reload_work_item(generation);
+        complete_update_work_item(generation);
         return;
     };
     if captured.identity_generation != generation {
-        warn!(generation, "package: reload work item context changed");
-        complete_reload_work_item(generation);
+        warn!(generation, "package: update work item context changed");
+        complete_update_work_item(generation);
         return;
     }
 
@@ -619,6 +635,25 @@ fn run_reload_work_item(generation: u64) {
             return false;
         };
         let package_state = crate::client::install::package_state();
+        if !crate::client::install::PKG0_INJECTED.load(Ordering::Acquire) {
+            if !super::ownership::snapshot_actual_ownership(cuser, &controlled) {
+                return false;
+            }
+            let plan = package_state.compute_injection(&controlled);
+            let injection = access.inject(&plan.app_ids);
+            package_state.record_injected(&injection.appended);
+            if !injection.complete {
+                return false;
+            }
+            package_state.set_active();
+            crate::client::install::PKG0_INJECTED.store(true, Ordering::Release);
+            info!(
+                controlled = controlled.len(),
+                injected = injection.appended.len(),
+                "package: initial injection completed"
+            );
+            return true;
+        }
         if !package_state.is_active() {
             return false;
         }
@@ -636,24 +671,21 @@ fn run_reload_work_item(generation: u64) {
         true
     });
     if !matches!(result, Ok(true)) {
-        warn!(
-            generation,
-            "package: reload work item was rejected as stale"
-        );
+        warn!(generation, "package: update work item did not complete");
     }
-    complete_reload_work_item(generation);
+    complete_update_work_item(generation);
 }
 
-fn complete_reload_work_item(generation: u64) {
+fn complete_update_work_item(generation: u64) {
     {
-        let mut dispatch = RELOAD_DISPATCH
+        let mut dispatch = UPDATE_DISPATCH
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !dispatch.complete(generation) {
             return;
         }
     }
-    try_post_reload();
+    try_post_update();
 }
 
 fn post_engine_work_item(generation: u64) -> bool {
@@ -689,10 +721,10 @@ unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: 
             .write_unaligned(generation);
         item.add(pointer_size * 3)
             .cast::<usize>()
-            .write(package_reload_manager as *const () as usize);
+            .write(package_update_manager as *const () as usize);
         item.add(pointer_size * 4)
             .cast::<usize>()
-            .write(package_reload_invoker as *const () as usize);
+            .write(package_update_invoker as *const () as usize);
     }
 
     // SAFETY: offsets and the mutex relationship were proved by the native
@@ -774,16 +806,16 @@ unsafe fn append_engine_work_item(
     true
 }
 
-unsafe extern "C" fn package_reload_invoker(storage: *const c_void) {
+unsafe extern "C" fn package_update_invoker(storage: *const c_void) {
     if storage.is_null() {
         return;
     }
     // SAFETY: Steam passes the two-word callable storage beginning at item + 1 pointer.
     let generation = unsafe { storage.cast::<u64>().read_unaligned() };
-    run_reload_work_item(generation);
+    run_update_work_item(generation);
 }
 
-unsafe extern "C" fn package_reload_manager(
+unsafe extern "C" fn package_update_manager(
     _destination: *mut c_void,
     _source: *const c_void,
     _operation: i32,
@@ -838,15 +870,15 @@ pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
 
     PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
     info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
-    try_post_reload();
+    queue_initial_injection();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dispatch() -> ReloadDispatch {
-        ReloadDispatch {
+    fn dispatch() -> UpdateDispatch {
+        UpdateDispatch {
             pending: None,
             posted_generation: None,
         }

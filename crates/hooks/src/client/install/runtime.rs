@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
@@ -44,6 +44,31 @@ impl RuntimeSnapshot {
             script_registry: script_runtime.registry,
             avatar_map: Arc::new(avatar_map),
         }
+    }
+
+    pub(crate) fn purchase_time(&self, app_id: AppId) -> u32 {
+        let configured = self.config.purchase_time(app_id);
+        if configured != 0 {
+            return configured;
+        }
+        self.script_state
+            .app_purchase_times
+            .get(&app_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn purchase_time_app_ids(&self) -> Vec<AppId> {
+        let mut app_ids: HashSet<AppId> = self
+            .config
+            .apps
+            .inject()
+            .iter()
+            .filter(|app| app.purchase_time != 0)
+            .map(|app| app.id)
+            .collect();
+        app_ids.extend(self.script_state.app_purchase_times.keys().copied());
+        app_ids.into_iter().collect()
     }
 }
 
@@ -513,6 +538,28 @@ mod tests {
 
         assert_eq!(snapshot.avatar_map.get(&AppId(480)), Some(&AppId(20)));
         assert_eq!(snapshot.avatar_map.get(&AppId(481)), Some(&AppId(11)));
+    }
+
+    #[test]
+    fn runtime_snapshot_resolves_purchase_time_sources() {
+        let mut config = RuntimeConfig::default();
+        config.apps =
+            vapor_forge_config::AppsSection::with_inject(vec![vapor_forge_config::InjectApp {
+                id: AppId(480),
+                dlc: Vec::new(),
+                ticket: vapor_forge_config::TicketMode::Forge,
+                purchase_time: 123,
+            }]);
+        let mut scripts = ScriptRuntime::default();
+        scripts.state.app_purchase_times.insert(AppId(480), 456);
+        scripts.state.app_purchase_times.insert(AppId(481), 789);
+
+        let snapshot = RuntimeSnapshot::new(config, scripts);
+
+        assert_eq!(snapshot.purchase_time(AppId(480)), 123);
+        assert_eq!(snapshot.purchase_time(AppId(481)), 789);
+        let app_ids: HashSet<_> = snapshot.purchase_time_app_ids().into_iter().collect();
+        assert_eq!(app_ids, [AppId(480), AppId(481)].into_iter().collect());
     }
 
     #[test]
