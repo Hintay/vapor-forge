@@ -1,8 +1,7 @@
 use core::ffi::c_void;
-use core::marker::PhantomData;
 use core::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use tracing::{debug, error, info, warn};
 use vapor_forge_config::AppId;
@@ -13,6 +12,7 @@ use vapor_forge_steam_native_abi::{
     ProcessPendingLicenseUpdatesFn,
 };
 
+use crate::engine_work_item_site::EngineWorkItemSite;
 use crate::pattern_resolver::CodeRegion;
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,10 @@ const GROW_BATCH: i32 = 16;
 /// PackageInfo::status value for Available.
 const PKG_STATUS_AVAILABLE: u32 = 0;
 
+const MAX_MAPS_ENTRIES: usize = 4096;
+
+static WORK_ITEM_NAME: &[u8] = b"VaporPackageReload\0";
+
 // ---------------------------------------------------------------------------
 // Static state for raw function pointers resolved via pattern matching
 // ---------------------------------------------------------------------------
@@ -37,8 +41,12 @@ static mut FN_PROCESS_UPDATES: Option<ProcessPendingLicenseUpdatesFn> = None;
 static mut FN_GROW: Option<CUtlMemoryGrowFn> = None;
 static mut FN_GET_PKG_INFO: Option<GetPackageInfoArchFn> = None;
 
+static ENGINE_WORK_ITEM_SITE: OnceLock<EngineWorkItemSite> = OnceLock::new();
+
 /// Captured IClientUser `this` pointer from CheckAppOwnership.
 static CUSER_PTR: AtomicUsize = AtomicUsize::new(0);
+static CUSER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CUSER_GUARD: RwLock<()> = RwLock::new(());
 
 /// Captured package helper `this` pointer.
 static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -46,9 +54,73 @@ static CPKG_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
 /// Captured pkg0 PackageInfo pointer.
 static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
 
-/// Latest desired controlled-app set. The watcher only replaces this queue;
-/// Steam-owned memory is mutated by `pump_reload` on a Steam hook thread.
-static PENDING_RELOAD: Mutex<Option<Vec<AppId>>> = Mutex::new(None);
+struct PendingReload {
+    controlled: Vec<AppId>,
+    generation: u64,
+}
+
+struct ReloadDispatch {
+    pending: Option<PendingReload>,
+    posted_generation: Option<u64>,
+}
+
+impl ReloadDispatch {
+    fn replace_pending(&mut self, controlled: Vec<AppId>, generation: u64) {
+        self.pending = Some(PendingReload {
+            controlled,
+            generation,
+        });
+    }
+
+    fn arm(&mut self, generation: u64) -> bool {
+        if self.posted_generation.is_some()
+            || self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.generation != generation)
+        {
+            return false;
+        }
+        self.posted_generation = Some(generation);
+        true
+    }
+
+    fn take_for(&mut self, generation: u64) -> Option<Vec<AppId>> {
+        if self.posted_generation != Some(generation) {
+            return None;
+        }
+        self.pending
+            .take()
+            .filter(|pending| pending.generation == generation)
+            .map(|pending| pending.controlled)
+    }
+
+    fn complete(&mut self, generation: u64) -> bool {
+        if self.posted_generation != Some(generation) {
+            return false;
+        }
+        self.posted_generation = None;
+        true
+    }
+
+    fn reject_post(&mut self, generation: u64) {
+        if !self.complete(generation) {
+            return;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.pending = None;
+        }
+    }
+}
+
+static RELOAD_DISPATCH: Mutex<ReloadDispatch> = Mutex::new(ReloadDispatch {
+    pending: None,
+    posted_generation: None,
+});
 
 /// Proof that package operations are executing inside the live
 /// `CheckAppOwnership` callback on Steam's thread.
@@ -65,19 +137,25 @@ impl SteamPackageHookScope {
     }
 }
 
-pub(crate) struct SteamPackageAccess<'hook> {
+pub(crate) struct SteamPackageAccess {
     pkg0: NonNull<u8>,
     cuser: NonNull<c_void>,
     mark_license: MarkLicenseAsChangedFn,
     process_updates: ProcessPendingLicenseUpdatesFn,
     grow: CUtlMemoryGrowFn,
-    _scope: PhantomData<&'hook mut SteamPackageHookScope>,
 }
 
-impl<'hook> SteamPackageAccess<'hook> {
-    pub(crate) fn from_hook(_scope: &'hook mut SteamPackageHookScope) -> Option<Self> {
+impl SteamPackageAccess {
+    pub(crate) fn from_hook(_scope: &mut SteamPackageHookScope) -> Option<Self> {
+        Self::from_current(CUSER_PTR.load(Ordering::Acquire) as *mut c_void)
+    }
+
+    fn from_current(cuser: *mut c_void) -> Option<Self> {
         let pkg0 = NonNull::new(PKG0_PTR.load(Ordering::Acquire) as *mut u8)?;
-        let cuser = NonNull::new(CUSER_PTR.load(Ordering::Acquire) as *mut c_void)?;
+        let cuser = NonNull::new(cuser)?;
+        if cuser.as_ptr() as usize != CUSER_PTR.load(Ordering::Acquire) {
+            return None;
+        }
         // SAFETY: initialization writes each slot before hooks are enabled and
         // never mutates it afterward.
         let (mark_license, process_updates, grow) = unsafe {
@@ -93,7 +171,6 @@ impl<'hook> SteamPackageAccess<'hook> {
             mark_license,
             process_updates,
             grow,
-            _scope: PhantomData,
         })
     }
 
@@ -198,7 +275,7 @@ impl<'hook> SteamPackageAccess<'hook> {
             info!(
                 additions = applied.additions.len(),
                 removals = applied.removals.len(),
-                "package: reload mutation applied on Steam thread"
+                "package: reload mutation applied on Steam engine thread"
             );
             self.mark_and_process();
         }
@@ -210,8 +287,7 @@ impl<'hook> SteamPackageAccess<'hook> {
 // Resolution called from install::do_install
 // ---------------------------------------------------------------------------
 
-/// Resolve all 4 function addresses needed for pkg0 injection.
-/// Not hooks. These are just address resolutions via pattern matching and are called directly.
+/// Resolve the callables and engine queue layout needed for pkg0 mutation.
 /// # Safety
 /// The registry must have been validated against `code` from the live
 /// steamclient executable mapping.
@@ -254,6 +330,50 @@ pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
                 )));
         }
     }
+    resolve_engine_work_item_site(code);
+}
+
+fn resolve_engine_work_item_site(code: &CodeRegion) {
+    let discovered =
+        match crate::engine_work_item_site::discover(usize::BITS, code.base, code.bytes) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                warn!(error, "package: engine work-item queue was not discovered");
+                return;
+            }
+        };
+    let code_end = code.base.saturating_add(code.bytes.len());
+    if !(code.base..code_end).contains(&discovered.site.grow) {
+        warn!(
+            grow = format_args!("0x{:x}", discovered.site.grow),
+            "package: decoded queue grow function is outside steamclient code"
+        );
+        return;
+    }
+    let data = vapor_forge_memory::find_proc_self_module_data("steamclient.so", MAX_MAPS_ENTRIES)
+        .unwrap_or_default();
+    let engine_slot = discovered.site.engine_slot;
+    if engine_slot % std::mem::align_of::<usize>() != 0
+        || !data
+            .iter()
+            .any(|range| (range.base.0..range.end.0).contains(&engine_slot))
+    {
+        warn!(
+            engine_slot = format_args!("0x{engine_slot:x}"),
+            "package: decoded engine slot is outside steamclient data"
+        );
+        return;
+    }
+    info!(
+        engine_slot = format_args!("0x{engine_slot:x}"),
+        mutex_offset = format_args!("0x{:x}", discovered.site.mutex_offset),
+        queue_offset = format_args!("0x{:x}", discovered.site.queue_offset),
+        grow = format_args!("0x{:x}", discovered.site.grow),
+        item_size = discovered.site.item_size,
+        producers = discovered.agreeing_producers,
+        "package: engine work-item queue discovered"
+    );
+    let _ = ENGINE_WORK_ITEM_SITE.set(discovered.site);
 }
 
 fn resolve_raw_address(registry: &PatternRegistry, code: &CodeRegion, name: &str) -> Option<usize> {
@@ -329,7 +449,8 @@ pub fn all_functions_resolved() -> bool {
     unsafe {
         let common = (*std::ptr::addr_of!(FN_MARK_LICENSE)).is_some()
             && (*std::ptr::addr_of!(FN_PROCESS_UPDATES)).is_some()
-            && (*std::ptr::addr_of!(FN_GROW)).is_some();
+            && (*std::ptr::addr_of!(FN_GROW)).is_some()
+            && ENGINE_WORK_ITEM_SITE.get().is_some();
 
         common && (*std::ptr::addr_of!(FN_GET_PKG_INFO)).is_some()
     }
@@ -347,71 +468,327 @@ pub(crate) fn cuser_captured() -> bool {
 /// # Safety
 /// `this` must be the live CUser receiver for the active Steam callback.
 pub(crate) unsafe fn capture_cuser(this: *mut c_void) {
-    let previous = CUSER_PTR.swap(this as usize, Ordering::AcqRel);
-    if previous != this as usize {
-        debug!("package: updated CUser at 0x{:x}", this as usize);
+    let generation = vapor_forge_features::identity::generation();
+    if CUSER_PTR.load(Ordering::Acquire) != this as usize
+        || CUSER_GENERATION.load(Ordering::Acquire) != generation
+    {
+        let _guard = CUSER_GUARD
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = CUSER_PTR.load(Ordering::Acquire);
+        let previous_generation = CUSER_GENERATION.load(Ordering::Acquire);
+        if previous != this as usize || previous_generation != generation {
+            CUSER_PTR.store(this as usize, Ordering::Release);
+            CUSER_GENERATION.store(generation, Ordering::Release);
+            debug!("package: updated CUser at 0x{:x}", this as usize);
+        }
     }
+    try_post_reload();
 }
 
 pub(crate) fn reset_account_state() {
-    CUSER_PTR.store(0, Ordering::Release);
+    {
+        let _guard = CUSER_GUARD
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CUSER_PTR.store(0, Ordering::Release);
+        CUSER_GENERATION.store(0, Ordering::Release);
+    }
     CPKG_INFO_PTR.store(0, Ordering::Release);
     PKG0_PTR.store(0, Ordering::Release);
-    *PENDING_RELOAD
+    let mut dispatch = RELOAD_DISPATCH
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    dispatch.pending = None;
+    dispatch.posted_generation = None;
 }
 
 #[cfg(test)]
 pub(crate) fn seed_account_state_for_test() {
     CUSER_PTR.store(1, Ordering::Release);
+    CUSER_GENERATION.store(1, Ordering::Release);
     CPKG_INFO_PTR.store(2, Ordering::Release);
     PKG0_PTR.store(3, Ordering::Release);
-    queue_reload(vec![AppId(4)]);
+    let mut dispatch = RELOAD_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    dispatch.replace_pending(vec![AppId(4)], 1);
+    dispatch.posted_generation = Some(1);
 }
 
 #[cfg(test)]
 pub(crate) fn account_state_is_clear_for_test() -> bool {
     CUSER_PTR.load(Ordering::Acquire) == 0
+        && CUSER_GENERATION.load(Ordering::Acquire) == 0
         && CPKG_INFO_PTR.load(Ordering::Acquire) == 0
         && PKG0_PTR.load(Ordering::Acquire) == 0
-        && PENDING_RELOAD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none()
+        && {
+            let dispatch = RELOAD_DISPATCH
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            dispatch.pending.is_none() && dispatch.posted_generation.is_none()
+        }
 }
 
 // ---------------------------------------------------------------------------
-// Pump called from Steam thread (CheckAppOwnership hook)
+// One-shot engine work item
 // ---------------------------------------------------------------------------
 
 pub fn queue_reload(controlled: Vec<AppId>) {
-    *PENDING_RELOAD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(controlled);
-}
-
-/// Apply the latest queued runtime state from a Steam-thread hook callback.
-pub fn pump_reload(
-    access: &mut SteamPackageAccess<'_>,
-    snapshot_actual_ownership: impl FnOnce(&[AppId]),
-) {
-    let controlled = PENDING_RELOAD
+    let generation = vapor_forge_features::identity::generation();
+    if generation == 0 {
+        return;
+    }
+    RELOAD_DISPATCH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
+        .replace_pending(controlled, generation);
+    try_post_reload();
+}
+
+pub(crate) fn try_post_reload() {
+    let generation = vapor_forge_features::identity::generation();
+    if !crate::client::install::package_state().is_active()
+        || CUSER_PTR.load(Ordering::Acquire) == 0
+        || CUSER_GENERATION.load(Ordering::Acquire) != generation
+        || PKG0_PTR.load(Ordering::Acquire) == 0
+        || ENGINE_WORK_ITEM_SITE.get().is_none()
+    {
+        return;
+    }
+    let should_post = {
+        let mut dispatch = RELOAD_DISPATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dispatch.arm(generation)
+    };
+    if !should_post {
+        return;
+    }
+    if post_engine_work_item(generation) {
+        debug!(generation, "package: reload work item posted");
+        return;
+    }
+
+    let mut dispatch = RELOAD_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    dispatch.reject_post(generation);
+    warn!(generation, "package: reload work item could not be posted");
+}
+
+fn run_reload_work_item(generation: u64) {
+    let controlled = {
+        let mut dispatch = RELOAD_DISPATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dispatch.take_for(generation)
+    };
     let Some(controlled) = controlled else {
+        complete_reload_work_item(generation);
         return;
     };
 
-    let package_state = crate::client::install::package_state();
-    let diff = package_state.compute_hot_reload_diff(&controlled);
-    snapshot_actual_ownership(&diff.additions);
-    let applied = access.apply_reload_diff(&diff);
-    package_state.apply_diff(&applied);
-    if !applied.additions.is_empty() || !applied.removals.is_empty() {
-        info!("package: hot reload completed on Steam thread");
+    if generation != vapor_forge_features::identity::generation() {
+        complete_reload_work_item(generation);
+        return;
     }
+    let Some(captured) = super::steam_context::capture() else {
+        warn!(
+            generation,
+            "package: reload work item has no current Steam context"
+        );
+        complete_reload_work_item(generation);
+        return;
+    };
+    if captured.identity_generation != generation {
+        warn!(generation, "package: reload work item context changed");
+        complete_reload_work_item(generation);
+        return;
+    }
+
+    let result = super::steam_context::checked_call(captured, || {
+        let _cuser_guard = CUSER_GUARD
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if CUSER_GENERATION.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let cuser = CUSER_PTR.load(Ordering::Acquire) as *mut c_void;
+        let Some(mut access) = SteamPackageAccess::from_current(cuser) else {
+            return false;
+        };
+        let package_state = crate::client::install::package_state();
+        if !package_state.is_active() {
+            return false;
+        }
+        let diff = package_state.compute_hot_reload_diff(&controlled);
+        if !super::ownership::snapshot_actual_ownership(cuser, &diff.additions) {
+            return false;
+        }
+        let applied = access.apply_reload_diff(&diff);
+        package_state.apply_diff(&applied);
+        info!(
+            additions = applied.additions.len(),
+            removals = applied.removals.len(),
+            "package: hot reload work item completed"
+        );
+        true
+    });
+    if !matches!(result, Ok(true)) {
+        warn!(
+            generation,
+            "package: reload work item was rejected as stale"
+        );
+    }
+    complete_reload_work_item(generation);
+}
+
+fn complete_reload_work_item(generation: u64) {
+    {
+        let mut dispatch = RELOAD_DISPATCH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !dispatch.complete(generation) {
+            return;
+        }
+    }
+    try_post_reload();
+}
+
+fn post_engine_work_item(generation: u64) -> bool {
+    let Some(site) = ENGINE_WORK_ITEM_SITE.get().copied() else {
+        return false;
+    };
+    // SAFETY: the discovered site was validated against multiple native
+    // producers and its global slot was checked against steamclient data.
+    unsafe { post_engine_work_item_unchecked(site, generation) }
+}
+
+unsafe fn post_engine_work_item_unchecked(site: EngineWorkItemSite, generation: u64) -> bool {
+    let pointer_size = std::mem::size_of::<usize>();
+    if site.item_size != pointer_size * 5 {
+        return false;
+    }
+    // SAFETY: the slot is aligned, mapped steamclient data admitted at install.
+    let engine = unsafe { (site.engine_slot as *const *mut u8).read_volatile() };
+    if engine.is_null() {
+        return false;
+    }
+    // SAFETY: libc malloc returns storage aligned for any pointer field.
+    let item = unsafe { libc::malloc(site.item_size) as *mut u8 };
+    if item.is_null() {
+        return false;
+    }
+    // SAFETY: item owns site.item_size writable bytes.
+    unsafe {
+        item.write_bytes(0, site.item_size);
+        item.cast::<usize>().write(WORK_ITEM_NAME.as_ptr() as usize);
+        item.add(pointer_size)
+            .cast::<u64>()
+            .write_unaligned(generation);
+        item.add(pointer_size * 3)
+            .cast::<usize>()
+            .write(package_reload_manager as *const () as usize);
+        item.add(pointer_size * 4)
+            .cast::<usize>()
+            .write(package_reload_invoker as *const () as usize);
+    }
+
+    // SAFETY: offsets and the mutex relationship were proved by the native
+    // producer decoder. The engine owns this mutex for the queue's lifetime.
+    let mutex = unsafe {
+        engine
+            .add(site.mutex_offset)
+            .cast::<libc::pthread_mutex_t>()
+    };
+    // SAFETY: mutex points to Steam's live queue mutex.
+    if unsafe { libc::pthread_mutex_lock(mutex) } != 0 {
+        // SAFETY: Steam did not take ownership of item.
+        unsafe { libc::free(item.cast()) };
+        return false;
+    }
+    // SAFETY: the mutex remains locked and engine_slot remains mapped.
+    let current_engine = unsafe { (site.engine_slot as *const *mut u8).read_volatile() };
+    let inserted = if current_engine != engine {
+        false
+    } else {
+        // SAFETY: queue_offset identifies the native CUtlVector<void *> header.
+        unsafe { append_engine_work_item(site, engine, item.cast()) }
+    };
+    // SAFETY: this call balances the successful lock above.
+    let unlock_result = unsafe { libc::pthread_mutex_unlock(mutex) };
+    if !inserted || unlock_result != 0 {
+        if !inserted {
+            // SAFETY: Steam did not take ownership of item.
+            unsafe { libc::free(item.cast()) };
+        }
+        return false;
+    }
+    true
+}
+
+unsafe fn append_engine_work_item(
+    site: EngineWorkItemSite,
+    engine: *mut u8,
+    item: *mut c_void,
+) -> bool {
+    let pointer_size = std::mem::size_of::<usize>();
+    // SAFETY: caller holds the decoded queue mutex and engine is current.
+    let queue = unsafe { engine.add(site.queue_offset) };
+    let allocation_offset = pointer_size;
+    let count_offset = if pointer_size == 8 {
+        pointer_size * 2
+    } else {
+        pointer_size * 3
+    };
+    // SAFETY: the decoded CUtlVector header contains these live fields.
+    let mut capacity = unsafe { queue.add(allocation_offset).cast::<i32>().read() };
+    // SAFETY: the decoded CUtlVector header contains these live fields.
+    let count = unsafe { queue.add(count_offset).cast::<i32>().read() };
+    if count < 0 || capacity < 0 || count > capacity {
+        return false;
+    }
+    if count == capacity {
+        type GrowFn = unsafe extern "C" fn(*mut c_void, i32);
+        // SAFETY: discovery followed this exact queue producer's typed Grow call.
+        let grow = unsafe { std::mem::transmute::<usize, GrowFn>(site.grow) };
+        // SAFETY: queue is the matching CUtlMemory<void *> prefix.
+        unsafe { grow(queue.cast(), 1) };
+        // SAFETY: Grow updates the live allocation field in place.
+        capacity = unsafe { queue.add(allocation_offset).cast::<i32>().read() };
+        if capacity <= count {
+            return false;
+        }
+    }
+    // SAFETY: the queue pointer is the first field of the decoded vector header.
+    let storage = unsafe { queue.cast::<*mut *mut c_void>().read() };
+    if storage.is_null() || !storage.is_aligned() {
+        return false;
+    }
+    // SAFETY: capacity exceeds count and caller holds the native queue mutex.
+    unsafe {
+        storage.add(count as usize).write(item);
+        queue.add(count_offset).cast::<i32>().write(count + 1);
+    }
+    true
+}
+
+unsafe extern "C" fn package_reload_invoker(storage: *const c_void) {
+    if storage.is_null() {
+        return;
+    }
+    // SAFETY: Steam passes the two-word callable storage beginning at item + 1 pointer.
+    let generation = unsafe { storage.cast::<u64>().read_unaligned() };
+    run_reload_work_item(generation);
+}
+
+unsafe extern "C" fn package_reload_manager(
+    _destination: *mut c_void,
+    _source: *const c_void,
+    _operation: i32,
+) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -461,4 +838,65 @@ pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
 
     PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
     info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
+    try_post_reload();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dispatch() -> ReloadDispatch {
+        ReloadDispatch {
+            pending: None,
+            posted_generation: None,
+        }
+    }
+
+    #[test]
+    fn reload_dispatch_keeps_only_the_latest_state() {
+        let mut dispatch = dispatch();
+        dispatch.replace_pending(vec![AppId(1)], 7);
+        dispatch.replace_pending(vec![AppId(2), AppId(3)], 7);
+        assert!(dispatch.arm(7));
+        assert_eq!(dispatch.take_for(7), Some(vec![AppId(2), AppId(3)]));
+    }
+
+    #[test]
+    fn reload_arriving_during_execution_arms_a_second_item() {
+        let mut dispatch = dispatch();
+        dispatch.replace_pending(vec![AppId(1)], 7);
+        assert!(dispatch.arm(7));
+        assert_eq!(dispatch.take_for(7), Some(vec![AppId(1)]));
+
+        dispatch.replace_pending(vec![AppId(2)], 7);
+        assert!(!dispatch.arm(7));
+        assert!(dispatch.complete(7));
+        assert!(dispatch.arm(7));
+        assert_eq!(dispatch.take_for(7), Some(vec![AppId(2)]));
+    }
+
+    #[test]
+    fn stale_item_cannot_disarm_a_new_generation() {
+        let mut dispatch = dispatch();
+        dispatch.replace_pending(vec![AppId(1)], 7);
+        assert!(dispatch.arm(7));
+        dispatch.pending = None;
+        dispatch.posted_generation = None;
+
+        dispatch.replace_pending(vec![AppId(2)], 8);
+        assert!(dispatch.arm(8));
+        assert!(!dispatch.complete(7));
+        assert_eq!(dispatch.posted_generation, Some(8));
+        assert_eq!(dispatch.take_for(8), Some(vec![AppId(2)]));
+    }
+
+    #[test]
+    fn rejected_post_is_terminal_for_its_generation() {
+        let mut dispatch = dispatch();
+        dispatch.replace_pending(vec![AppId(1)], 7);
+        assert!(dispatch.arm(7));
+        dispatch.reject_post(7);
+        assert!(dispatch.pending.is_none());
+        assert!(dispatch.posted_generation.is_none());
+    }
 }
