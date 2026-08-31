@@ -70,7 +70,11 @@ unsafe extern "C" fn hk_get_package_info(
 }
 
 #[cfg(target_pointer_width = "64")]
-unsafe extern "C" fn hk_get_package_info64(this: *mut c_void, key: *const u64) -> *mut u8 {
+unsafe extern "C" fn hk_get_package_info64(
+    this: *mut c_void,
+    package_id: u32,
+    access_token: u64,
+) -> *mut u8 {
     // SAFETY: GET_PKG_INFO_DETOUR set before enabled.
     let original = vapor_forge_hook_engine::original::detour_or_return!(
         "GetPackageInfo",
@@ -78,17 +82,13 @@ unsafe extern "C" fn hk_get_package_info64(this: *mut c_void, key: *const u64) -
         std::ptr::null_mut()
     );
     let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
-unsafe { original(this, key) };
+unsafe { original(this, package_id, access_token) };
 
     if !crate::capability::is_ready(crate::capability::Capability::PackageInjection) {
         return result;
     }
 
-    // Linux x86_64 receives the CPackageInfo package-store subobject plus a
-    // package-token key pointer. The function walks the token map discovered by
-    // the scanner and returns the inline PackageInfo value from the matched node.
-    // Once the store object is captured, ask Steam's original lookup for pkg0's
-    // known token rather than relying on a fixed map offset in the hook.
+    // Capture the package store and use the same package-id/token lookup for pkg0.
     if !CPKG_INFO_CAPTURED.swap(true, Ordering::AcqRel) {
         // SAFETY: `this` is the live CPackageInfo receiver for this hook callback.
         unsafe { super::super::package::capture_pkg_info_this(this) };
@@ -104,7 +104,7 @@ unsafe { original(this, key) };
             result
         } else {
             /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-            unsafe { original(this, &pkg0_token) }
+            unsafe { original(this, 0, pkg0_token) }
         };
 
         if !pkg0.is_null() {

@@ -23,7 +23,7 @@ impl UnicodeString {
 // LdrLoadDll uses the Microsoft x64 calling convention (win64/ms_abi).
 pub type LdrLoadDllFn = unsafe extern "win64" fn(
     search_path: *mut u16,
-    flags: u32,
+    dll_characteristics: *mut u32,
     dll_name: *mut UnicodeString,
     base_address: *mut *mut core::ffi::c_void,
 ) -> i32;

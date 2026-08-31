@@ -30,8 +30,7 @@ use super::state::{
 };
 
 type RunFrameFn = unsafe extern "C" fn(*mut c_void);
-type FillInAppOverviewFn =
-    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type FillInAppOverviewFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 type IsVisibleInGamesListFn = unsafe extern "C" fn(*mut c_void) -> bool;
 type BuildCompleteChangeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 #[cfg(target_pointer_width = "64")]
@@ -65,20 +64,20 @@ unsafe extern "C" fn hk_fill_in_app_overview(
     this: *mut c_void,
     app_overview: *mut c_void,
     app: *mut c_void,
-) -> *mut c_void {
+) {
     let original = detour_or_return!(
         "CSteamUIAppController::FillInAppOverview",
-        FILL_IN_OVERVIEW_DETOUR,
-        std::ptr::null_mut()
+        FILL_IN_OVERVIEW_DETOUR
     );
     if !crate::capability::is_ready(crate::capability::Capability::OverviewMetadata) {
         // SAFETY: forwards Steam's untouched overview arguments.
-        return unsafe { original(this, app_overview, app) };
+        unsafe { original(this, app_overview, app) };
+        return;
     }
     // SAFETY: app is the direct CSteamApp pointer for this ABI.
     unsafe { stamp_purchase_time(app) };
     // SAFETY: forwards Steam's overview arguments after applying configured metadata.
-    unsafe { original(this, app_overview, app) }
+    unsafe { original(this, app_overview, app) };
 }
 
 pub(super) unsafe fn stamp_purchase_time(app: *mut c_void) {

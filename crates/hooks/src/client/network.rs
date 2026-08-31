@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::ffi::{c_char, c_void};
 use std::alloc::Layout;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -296,11 +296,11 @@ struct NativeProbeWorkItemVtable {
     destroy: unsafe extern "C" fn(*mut c_void),
     deleting_destroy: unsafe extern "C" fn(*mut c_void),
     pre_destroy: unsafe extern "C" fn(*mut c_void) -> bool,
-    slot_3: unsafe extern "C" fn(*mut c_void) -> bool,
-    slot_4: unsafe extern "C" fn(*mut c_void) -> bool,
-    aux: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
-    execute: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
-    slot_7: unsafe extern "C" fn(*mut c_void) -> bool,
+    work_item_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    thread_process_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    aux: unsafe extern "C" fn(*mut c_void) -> bool,
+    execute: unsafe extern "C" fn(*mut c_void) -> bool,
+    slot_7: unsafe extern "C" fn(*mut c_void),
     slot_8: unsafe extern "C" fn(*mut c_void) -> bool,
 }
 
@@ -980,13 +980,16 @@ static NATIVE_INJECT_VTABLE: NativeProbeWorkItemVtable = NativeProbeWorkItemVtab
     destroy: native_inject_noop,
     deleting_destroy: native_inject_deleting_destroy,
     pre_destroy: native_inject_true,
-    slot_3: native_inject_true,
-    slot_4: native_inject_true,
-    aux: native_inject_slot_14,
+    work_item_name: native_inject_work_item_name,
+    thread_process_name: native_inject_thread_process_name,
+    aux: native_inject_true,
     execute: native_inject_execute,
-    slot_7: native_inject_true,
+    slot_7: native_inject_noop,
     slot_8: native_inject_true,
 };
+
+static NATIVE_INJECT_WORK_ITEM_NAME: &[u8] = b"VaporNativeInjectionWorkItem\0";
+static NATIVE_INJECT_THREAD_PROCESS_NAME: &[u8] = b"VaporNativeInjectionWorkItem::ThreadProcess\0";
 
 unsafe extern "C" fn native_inject_true(_item: *mut c_void) -> bool {
     true
@@ -1084,9 +1087,12 @@ fn release_inject_caller_ref(item: *mut c_void) {
 
 unsafe extern "C" fn native_inject_noop(_item: *mut c_void) {}
 
-unsafe extern "C" fn native_inject_slot_14(_item: *mut c_void, _arg: *mut c_void) -> bool {
-    // Runs on a pool worker thread; never dispatch packets here.
-    true
+unsafe extern "C" fn native_inject_work_item_name(_item: *mut c_void) -> *const c_char {
+    NATIVE_INJECT_WORK_ITEM_NAME.as_ptr().cast()
+}
+
+unsafe extern "C" fn native_inject_thread_process_name(_item: *mut c_void) -> *const c_char {
+    NATIVE_INJECT_THREAD_PROCESS_NAME.as_ptr().cast()
 }
 
 unsafe extern "C" fn native_inject_deleting_destroy(item: *mut c_void) {
@@ -1100,7 +1106,7 @@ unsafe extern "C" fn native_inject_deleting_destroy(item: *mut c_void) {
 /// on the same frame thread as `CNet::BFrameFuncPollConnections`, which is where
 /// Steam delivers inbound packets. Returning true suppresses Steam's "job no
 /// longer existed to notify" warning.
-unsafe extern "C" fn native_inject_execute(item: *mut c_void, _arg: *mut c_void) -> bool {
+unsafe extern "C" fn native_inject_execute(item: *mut c_void) -> bool {
     // SAFETY: Steam invokes this slot only for an item allocated above.
     let generation = unsafe { NativeWorkItem::generation(item) };
     let pthread = current_pthread();

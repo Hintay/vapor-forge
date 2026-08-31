@@ -1014,6 +1014,11 @@ mod tests {
         place_asm32(&mut code, start + 0xb0, |a| {
             a.lea(edx, dword_ptr(eax + eax * 8))
         });
+        place_asm32(&mut code, start + 0xc0, |a| {
+            a.mov(byte_ptr(eax + 0x24), 1)?;
+            a.mov(byte_ptr(eax + 0x26), 1)?;
+            a.mov(byte_ptr(eax + 0x35), 1)
+        });
 
         assert_eq!(
             validate_check_app_ownership32(&code, start),
@@ -1045,6 +1050,11 @@ mod tests {
         });
         place_asm32(&mut code, start + 0xb0, |a| {
             a.lea(ecx, dword_ptr(edx + edx * 8))
+        });
+        place_asm32(&mut code, start + 0xc0, |a| {
+            a.mov(byte_ptr(esi + 0x24), 1)?;
+            a.mov(byte_ptr(esi + 0x26), 1)?;
+            a.mov(byte_ptr(esi + 0x35), 1)
         });
 
         assert_eq!(
@@ -1078,6 +1088,11 @@ mod tests {
         });
         place_asm64(&mut code, start + 0xa0, |a| {
             a.movsxd(rdx, dword_ptr(rdx + r13 * 4))
+        });
+        place_asm64(&mut code, start + 0xb0, |a| {
+            a.mov(byte_ptr(r14 + 0x24), 1)?;
+            a.mov(byte_ptr(r14 + 0x26), 1)?;
+            a.mov(byte_ptr(r14 + 0x35), 1)
         });
 
         assert_eq!(
@@ -1203,6 +1218,7 @@ mod tests {
         place_asm32(&mut code, start + 0x70, |a| {
             a.movq(xmm0, qword_ptr(edi + 0x08))
         });
+        place_asm32(&mut code, start + 0x80, |a| a.push(0x78));
 
         let layout = discover_package_info32_layout(&code, start).unwrap();
         assert_eq!(layout.count_off, 0x18);
@@ -1214,6 +1230,39 @@ mod tests {
 
     #[test]
     fn discovers_package_info64_layout_from_lookup_shape() {
+        let mut code = vec![0x90; 0x300];
+        let start = 0x30;
+        place_asm64(&mut code, start, |a| {
+            a.mov(r12, rdx)?;
+            a.mov(ebx, esi)
+        });
+        place_asm64(&mut code, start + 0x10, |a| {
+            a.movsxd(rax, dword_ptr(rdi + 0x20))?;
+            a.mov(rsi, qword_ptr(rdi + 0x38))
+        });
+        place_asm64(&mut code, start + 0x30, |a| {
+            a.shl(rax, 5)?;
+            a.lea(rdx, qword_ptr(rsi + rax))?;
+            a.mov(ecx, dword_ptr(rdx + 0x10))?;
+            a.cmp(ebx, ecx)
+        });
+        place_asm64(&mut code, start + 0x50, |a| {
+            a.mov(r13, qword_ptr(rsi + rax + 0x18))?;
+            a.cmp(qword_ptr(r13 + 0x08), r12)?;
+            a.mov(qword_ptr(r13 + 0x08), r12)
+        });
+        place_asm64(&mut code, start + 0x70, |a| a.mov(edi, 0xa0));
+
+        let layout = discover_package_info64_layout(&code, start).unwrap();
+        assert_eq!(layout.count_off, 0x20);
+        assert_eq!(layout.elements_off, 0x38);
+        assert_eq!(layout.node_size, 0x20);
+        assert_eq!(layout.node_key_off, 0x10);
+        assert_eq!(layout.node_value_off, 0x18);
+    }
+
+    #[test]
+    fn rejects_unrelated_x64_token_map_lookup() {
         let mut code = vec![0x90; 0x200];
         let start = 0x30;
         place_asm64(&mut code, start, |a| a.movsxd(rax, dword_ptr(rdi + 0x570)));
@@ -1229,37 +1278,35 @@ mod tests {
             a.ret()
         });
 
-        let layout = discover_package_info64_layout(&code, start).unwrap();
-        assert_eq!(layout.count_off, 0x570);
-        assert_eq!(layout.elements_off, 0x588);
-        assert_eq!(layout.node_size, 0x78);
-        assert_eq!(layout.node_key_off, 0x10);
-        assert_eq!(layout.node_value_off, 0x18);
+        assert!(discover_package_info64_layout(&code, start).is_none());
     }
 
     #[test]
-    fn discovers_current_package_info64_layout_from_lookup_shape() {
-        let mut code = vec![0x90; 0x200];
+    fn rejects_package_info64_lookup_with_wrong_map_layout() {
+        let mut code = vec![0x90; 0x300];
         let start = 0x30;
-        place_asm64(&mut code, start, |a| a.movsxd(rax, dword_ptr(rdi + 0x570)));
+        place_asm64(&mut code, start, |a| {
+            a.mov(r12, rdx)?;
+            a.mov(ebx, esi)
+        });
         place_asm64(&mut code, start + 0x10, |a| {
-            a.mov(rcx, qword_ptr(rdi + 0x588))
+            a.movsxd(rax, dword_ptr(rdi + 0x24))?;
+            a.mov(rsi, qword_ptr(rdi + 0x40))
         });
-        place_asm64(&mut code, start + 0x20, |a| a.imul_3(rax, rax, 0x78));
         place_asm64(&mut code, start + 0x30, |a| {
-            a.cmp(rdx, qword_ptr(rax + 0x10))
+            a.shl(rax, 5)?;
+            a.lea(rdx, qword_ptr(rsi + rax))?;
+            a.mov(ecx, dword_ptr(rdx + 0x10))?;
+            a.cmp(ebx, ecx)
         });
-        place_asm64(&mut code, start + 0x40, |a| {
-            a.add(rax, 0x18)?;
-            a.ret()
+        place_asm64(&mut code, start + 0x50, |a| {
+            a.mov(r13, qword_ptr(rsi + rax + 0x18))?;
+            a.cmp(qword_ptr(r13 + 0x08), r12)?;
+            a.mov(qword_ptr(r13 + 0x08), r12)
         });
+        place_asm64(&mut code, start + 0x70, |a| a.mov(edi, 0xa0));
 
-        let layout = discover_package_info64_layout(&code, start).unwrap();
-        assert_eq!(layout.count_off, 0x570);
-        assert_eq!(layout.elements_off, 0x588);
-        assert_eq!(layout.node_size, 0x78);
-        assert_eq!(layout.node_key_off, 0x10);
-        assert_eq!(layout.node_value_off, 0x18);
+        assert!(discover_package_info64_layout(&code, start).is_none());
     }
 
     #[test]

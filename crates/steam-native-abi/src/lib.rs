@@ -112,12 +112,12 @@ impl<T> CUtlVector<T> {
     }
 }
 
-// Native PackageInfo returned by CPackageInfo::GetPackageInfo.
+// Prefix of the native PackageInfo returned by CPackageInfo::GetPackageInfo.
 pub mod package_info {
     use super::{c_void, CUtlVector};
 
     #[repr(C)]
-    pub struct PackageInfo {
+    pub struct PackageInfoPrefix {
         pub package_id: u32,
         pub change_number: i32,
         pub pics_token: u64,
@@ -134,7 +134,7 @@ pub mod package_info {
     /// # Safety
     /// pkg must point to a valid PackageInfo struct in Steam memory.
     pub unsafe fn package_id(pkg: *const u8) -> u32 {
-        let pkg = pkg.cast::<PackageInfo>();
+        let pkg = pkg.cast::<PackageInfoPrefix>();
         // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { core::ptr::addr_of!((*pkg).package_id).read() }
     }
@@ -142,7 +142,7 @@ pub mod package_info {
     /// # Safety
     /// pkg must point to a valid PackageInfo struct in Steam memory.
     pub unsafe fn status(pkg: *const u8) -> u32 {
-        let pkg = pkg.cast::<PackageInfo>();
+        let pkg = pkg.cast::<PackageInfoPrefix>();
         // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { core::ptr::addr_of!((*pkg).status).read() as u32 }
     }
@@ -150,7 +150,7 @@ pub mod package_info {
     /// # Safety
     /// pkg must point to a valid PackageInfo struct in Steam memory.
     pub unsafe fn app_id_vec(pkg: *mut u8) -> *mut CUtlVector<u32> {
-        let pkg = pkg.cast::<PackageInfo>();
+        let pkg = pkg.cast::<PackageInfoPrefix>();
         // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { core::ptr::addr_of_mut!((*pkg).app_id_vec) }
     }
@@ -453,14 +453,10 @@ pub struct DepotEntry {
 
 // Function signatures for pkg0 injection
 pub type GetPackageInfoFn = unsafe extern "C" fn(*mut c_void, u32, u64) -> *mut u8;
-pub type GetPackageInfo64Fn = unsafe extern "C" fn(*mut c_void, *const u64) -> *mut u8;
-#[cfg(target_pointer_width = "32")]
 pub type GetPackageInfoArchFn = GetPackageInfoFn;
-#[cfg(target_pointer_width = "64")]
-pub type GetPackageInfoArchFn = GetPackageInfo64Fn;
-pub type MarkLicenseAsChangedFn = unsafe extern "C" fn(*mut c_void, u32, bool) -> i64;
+pub type MarkLicenseAsChangedFn = unsafe extern "C" fn(*mut c_void, u32, bool);
 pub type ProcessPendingLicenseUpdatesFn = unsafe extern "C" fn(*mut c_void) -> bool;
-pub type CUtlMemoryGrowFn = unsafe extern "C" fn(*mut c_void, i32) -> *mut c_void;
+pub type CUtlMemoryGrowFn = unsafe extern "C" fn(*mut c_void, i32);
 
 /// Mirrors `EAppReleaseState` from `steamclientpublic.h`.
 #[repr(i32)]
@@ -592,54 +588,72 @@ mod tests {
     use core::mem;
 
     #[test]
-    fn package_info_offsets_match_steam_layout() {
-        assert_eq!(mem::offset_of!(package_info::PackageInfo, package_id), 0x00);
+    fn package_info_prefix_offsets_match_steam_layout() {
         assert_eq!(
-            mem::offset_of!(package_info::PackageInfo, change_number),
+            mem::offset_of!(package_info::PackageInfoPrefix, package_id),
+            0x00
+        );
+        assert_eq!(
+            mem::offset_of!(package_info::PackageInfoPrefix, change_number),
             0x04
         );
-        assert_eq!(mem::offset_of!(package_info::PackageInfo, pics_token), 0x08);
         assert_eq!(
-            mem::offset_of!(package_info::PackageInfo, billing_type),
+            mem::offset_of!(package_info::PackageInfoPrefix, pics_token),
+            0x08
+        );
+        assert_eq!(
+            mem::offset_of!(package_info::PackageInfoPrefix, billing_type),
             0x10
         );
         assert_eq!(
-            mem::offset_of!(package_info::PackageInfo, license_type),
+            mem::offset_of!(package_info::PackageInfoPrefix, license_type),
             0x14
         );
-        assert_eq!(mem::offset_of!(package_info::PackageInfo, status), 0x18);
-        assert_eq!(mem::offset_of!(package_info::PackageInfo, sha1_hash), 0x1c);
         assert_eq!(
-            mem::offset_of!(package_info::PackageInfo, package_info_node_begin),
+            mem::offset_of!(package_info::PackageInfoPrefix, status),
+            0x18
+        );
+        assert_eq!(
+            mem::offset_of!(package_info::PackageInfoPrefix, sha1_hash),
+            0x1c
+        );
+        assert_eq!(
+            mem::offset_of!(package_info::PackageInfoPrefix, package_info_node_begin),
             0x30
         );
 
         #[cfg(target_pointer_width = "32")]
         {
             assert_eq!(
-                mem::offset_of!(package_info::PackageInfo, extend_node_begin),
+                mem::offset_of!(package_info::PackageInfoPrefix, extend_node_begin),
                 0x34
             );
-            assert_eq!(mem::offset_of!(package_info::PackageInfo, app_id_vec), 0x38);
             assert_eq!(
-                mem::offset_of!(package_info::PackageInfo, depot_id_vec),
+                mem::offset_of!(package_info::PackageInfoPrefix, app_id_vec),
+                0x38
+            );
+            assert_eq!(
+                mem::offset_of!(package_info::PackageInfoPrefix, depot_id_vec),
                 0x48
             );
-            assert_eq!(mem::size_of::<package_info::PackageInfo>(), 0x58);
+            assert_eq!(mem::size_of::<package_info::PackageInfoPrefix>(), 0x58);
         }
 
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(
-                mem::offset_of!(package_info::PackageInfo, extend_node_begin),
+                mem::offset_of!(package_info::PackageInfoPrefix, extend_node_begin),
                 0x38
             );
-            assert_eq!(mem::offset_of!(package_info::PackageInfo, app_id_vec), 0x40);
             assert_eq!(
-                mem::offset_of!(package_info::PackageInfo, depot_id_vec),
+                mem::offset_of!(package_info::PackageInfoPrefix, app_id_vec),
+                0x40
+            );
+            assert_eq!(
+                mem::offset_of!(package_info::PackageInfoPrefix, depot_id_vec),
                 0x58
             );
-            assert_eq!(mem::size_of::<package_info::PackageInfo>(), 0x70);
+            assert_eq!(mem::size_of::<package_info::PackageInfoPrefix>(), 0x70);
         }
     }
 
