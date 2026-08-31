@@ -25,7 +25,7 @@ pub struct ToastRequest {
     message_key: String,
     title: String,
     body: String,
-    icon: String,
+    logo: ToastLogo,
     duration_ms: u32,
 }
 
@@ -46,6 +46,15 @@ pub enum ToastStyle {
 pub enum ToastAction {
     Dismiss,
     OpenSteamUrl(String),
+    OpenDeckyRoute(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ToastLogo {
+    #[default]
+    Default,
+    Hidden,
+    Custom(String),
 }
 
 impl ToastRequest {
@@ -54,7 +63,7 @@ impl ToastRequest {
         style: ToastStyle,
         title: &str,
         body: &str,
-        icon: Option<&str>,
+        logo: ToastLogo,
         duration_ms: u32,
         action: ToastAction,
     ) -> Self {
@@ -70,7 +79,7 @@ impl ToastRequest {
                 title.to_owned()
             },
             body: body.to_owned(),
-            icon: icon.unwrap_or("").to_owned(),
+            logo,
             duration_ms,
         }
     }
@@ -124,29 +133,47 @@ impl ToastAction {
         match self {
             Self::Dismiss => "dismiss",
             Self::OpenSteamUrl(_) => "steam-url",
+            Self::OpenDeckyRoute(_) => "decky-route",
         }
     }
 
     fn target(&self) -> &str {
         match self {
             Self::Dismiss => "",
-            Self::OpenSteamUrl(target) => target,
+            Self::OpenSteamUrl(target) | Self::OpenDeckyRoute(target) => target,
         }
     }
 }
 
-pub fn show_toast(title: &str, body: &str, icon: Option<&str>, duration_ms: u32) {
-    show_toast_with_kind(ToastKind::Info, title, body, icon, duration_ms);
+impl ToastLogo {
+    fn as_js_mode(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Hidden => "hidden",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    fn icon(&self) -> &str {
+        match self {
+            Self::Custom(icon) => icon,
+            Self::Default | Self::Hidden => "",
+        }
+    }
+}
+
+pub fn show_toast(title: &str, body: &str, logo: ToastLogo, duration_ms: u32) {
+    show_toast_with_kind(ToastKind::Info, title, body, logo, duration_ms);
 }
 
 pub fn show_toast_with_kind(
     kind: ToastKind,
     title: &str,
     body: &str,
-    icon: Option<&str>,
+    logo: ToastLogo,
     duration_ms: u32,
 ) {
-    show_toast_with_style(kind, kind.default_style(), title, body, icon, duration_ms);
+    show_toast_with_style(kind, kind.default_style(), title, body, logo, duration_ms);
 }
 
 pub fn show_toast_with_style(
@@ -154,7 +181,7 @@ pub fn show_toast_with_style(
     style: ToastStyle,
     title: &str,
     body: &str,
-    icon: Option<&str>,
+    logo: ToastLogo,
     duration_ms: u32,
 ) {
     show_toast_with_style_and_action(
@@ -162,7 +189,7 @@ pub fn show_toast_with_style(
         style,
         title,
         body,
-        icon,
+        logo,
         duration_ms,
         ToastAction::Dismiss,
     );
@@ -173,7 +200,7 @@ pub fn show_toast_with_style_and_action(
     style: ToastStyle,
     title: &str,
     body: &str,
-    icon: Option<&str>,
+    logo: ToastLogo,
     duration_ms: u32,
     action: ToastAction,
 ) {
@@ -182,7 +209,7 @@ pub fn show_toast_with_style_and_action(
         style,
         title,
         body,
-        icon,
+        logo,
         duration_ms,
         action,
     ));
@@ -209,7 +236,7 @@ pub fn show_init_toast(config: &RuntimeConfig) {
                 ToastStyle::Accent,
                 DEFAULT_TITLE,
                 INIT_BODY,
-                None,
+                ToastLogo::Default,
                 DEFAULT_DURATION_MS,
                 ToastAction::Dismiss,
             )
@@ -268,14 +295,15 @@ pub fn toast_script(toast: &ToastRequest) -> String {
         toast.duration_ms
     };
     format!(
-        "(function(){{try{{if(!window.VaporForgeToastBridge||!window.VaporForgeToastBridge.showToast){{return false;}}window.VaporForgeToastBridge.showToast({{id:{},kind:\"{}\",style:\"{}\",messageKey:\"{}\",title:\"{}\",body:\"{}\",icon:\"{}\",duration:{},playSound:true,sound:{},eType:{},critical:{},action:{{kind:\"{}\",target:\"{}\"}}}});return true;}}catch(e){{try{{console.log('[VaporForgeToast] show error: '+e);}}catch(_){{}}}}}})();",
+        "(function(){{try{{if(!window.VaporForgeToastBridge||!window.VaporForgeToastBridge.showToast){{return false;}}window.VaporForgeToastBridge.showToast({{id:{},kind:\"{}\",style:\"{}\",messageKey:\"{}\",title:\"{}\",body:\"{}\",logoMode:\"{}\",icon:\"{}\",duration:{},playSound:true,sound:{},eType:{},critical:{},action:{{kind:\"{}\",target:\"{}\"}}}});return true;}}catch(e){{try{{console.log('[VaporForgeToast] show error: '+e);}}catch(_){{}}}}}})();",
         toast.id,
         toast.kind.as_js_str(),
         toast.style.as_js_str(),
         js_escape(&toast.message_key),
         js_escape(&toast.title),
         js_escape(&toast.body),
-        js_escape(&toast.icon),
+        toast.logo.as_js_mode(),
+        js_escape(toast.logo.icon()),
         duration,
         toast.kind.sound(),
         toast.kind.e_type(),
@@ -358,13 +386,14 @@ mod tests {
             message_key: String::new(),
             title: "t".to_owned(),
             body: "b".to_owned(),
-            icon: String::new(),
+            logo: ToastLogo::Default,
             duration_ms: 5000,
         };
         let script = toast_script(&toast);
         assert!(script.contains("VaporForgeToastBridge"));
         assert!(script.contains("kind:\"info\""));
         assert!(script.contains("style:\"accent\""));
+        assert!(script.contains("logoMode:\"default\""));
         assert!(script.contains("critical:false"));
         assert!(script.contains("action:{kind:\"dismiss\",target:\"\"}"));
         assert!(!script.contains("SLS"));
@@ -381,11 +410,12 @@ mod tests {
             message_key: String::new(),
             title: "t".to_owned(),
             body: "b".to_owned(),
-            icon: String::new(),
+            logo: ToastLogo::Hidden,
             duration_ms: 5000,
         };
         let script = toast_script(&toast);
         assert!(script.contains("kind:\"error\""));
+        assert!(script.contains("logoMode:\"hidden\""));
         assert!(script.contains("critical:true"));
     }
 
@@ -399,11 +429,30 @@ mod tests {
             message_key: String::new(),
             title: "t".to_owned(),
             body: "b".to_owned(),
-            icon: String::new(),
+            logo: ToastLogo::Custom("https://example.invalid/icon.png".to_owned()),
             duration_ms: 5000,
         };
         let script = toast_script(&toast);
+        assert!(script.contains("logoMode:\"custom\""));
+        assert!(script.contains("icon:\"https://example.invalid/icon.png\""));
         assert!(script.contains("action:{kind:\"steam-url\",target:\"steam://open/downloads\"}"));
+    }
+
+    #[test]
+    fn toast_script_serializes_decky_route_action() {
+        let toast = ToastRequest {
+            id: 45,
+            kind: ToastKind::Info,
+            style: ToastStyle::Accent,
+            action: ToastAction::OpenDeckyRoute("/decky/settings/plugins".to_owned()),
+            message_key: String::new(),
+            title: "t".to_owned(),
+            body: "b".to_owned(),
+            logo: ToastLogo::Default,
+            duration_ms: 5000,
+        };
+        let script = toast_script(&toast);
+        assert!(script.contains("action:{kind:\"decky-route\",target:\"/decky/settings/plugins\"}"));
     }
 
     #[test]
@@ -411,6 +460,117 @@ mod tests {
         let script = bridge_script();
         assert!(script.contains("notifications.filter(isVaporForgeNotification).map"));
         assert!(script.contains("notifications.some(isVaporForgeNotification)"));
+        assert!(script.contains("location === 1 || !isGamepadUiReady()"));
+    }
+
+    #[test]
+    fn bridge_patches_the_live_valve_renderer() {
+        let script = bridge_script();
+        assert!(script.contains("function injectRendererTrampoline("));
+        assert!(script.contains("component.prototype.isReactComponent = true"));
+        assert!(script.contains("function patchClassRenderer(renderer)"));
+        assert!(script.contains("prototype.render = wrapped"));
+        assert!(script.contains("const currentRenderer = findValveToastRenderer()"));
+        assert!(script.contains("const renderer = currentRenderer || state.renderer"));
+        assert!(script.contains("currentRenderer !== state.renderer"));
+        assert!(script.contains("state.renderPatched = false"));
+        assert!(script.contains("['createElement', 'PureComponent', 'useLayoutEffect']"));
+        assert!(script.contains("['createPortal', 'flushSync', 'version']"));
+        assert!(script.contains("Valve toast renderer trampoline ready"));
+        assert!(!script.contains("function patchJsxRuntime("));
+        assert!(!script.contains("Valve toast renderer export bridge ready"));
+    }
+
+    #[test]
+    fn bridge_publishes_after_before_login_initialization() {
+        let script = bridge_script();
+        assert!(script.contains("function isSteamAppBeforeLoginReady()"));
+        assert!(script.contains("app.BFinishedInitBeforeLogin()"));
+        assert!(script.contains("app.BFinishedInitStageOne()"));
+        assert!(script.contains("function findMobxObservable(target, property)"));
+        assert!(script.contains("Object.getOwnPropertySymbols(target)"));
+        assert!(script.contains("administration.values_"));
+        assert!(script.contains("values.get(property)"));
+        assert!(script.contains("typeof observable.observe_ === 'function'"));
+        assert!(script.contains("function observeSteamBeforeLoginReady()"));
+        assert!(script.contains("observable.observe_(function(change)"));
+        assert!(script.contains("change.newValue === true"));
+        assert!(script.contains("clearSteamStageOneSubscription()"));
+        assert!(script.contains("queueSteamReadiness()"));
+        assert!(script.contains("if (!isSteamAppBeforeLoginReady()) return false"));
+        assert!(script.contains("isSteamAppBeforeLoginReady() && state.store"));
+        assert!(script.contains("function isSteamServicesReady()"));
+        assert!(script.contains("function ensureSteamServicesReady()"));
+        assert!(script.contains("app.GetServicesInitialized()"));
+        assert!(script.contains("function markSteamServicesReady()"));
+        assert!(script.contains("function waitForSteamServices(app)"));
+        assert!(script.contains("app.WaitForServicesInitialized()"));
+        assert!(script.contains("Promise.resolve(app.WaitForServicesInitialized()).then"));
+        assert!(script.contains("state.steamServicesWaitStarted"));
+        assert!(!script.contains("var originalInitStage2 = app.InitStage2"));
+        assert!(script.contains("window.requestAnimationFrame(run)"));
+        assert!(script.contains("Steam before-login initialization ready"));
+        assert!(!script.contains("function waitForToastChannel(store)"));
+        assert!(!script.contains("store.GetCurrentToastNotification()"));
+        assert!(!script.contains("store.m_valueCurrentToast"));
+        assert!(script.contains("function ensurePreLoginSurface()"));
+        assert!(script.contains("function activeSteamDocument()"));
+        assert!(script.contains("function activeSteamWindow()"));
+        assert!(script.contains("navigation.ActiveWindowInstance"));
+        assert!(script.contains("store.MainWindowInstance || store.GamepadUIMainWindowInstance"));
+        assert!(script.contains("instance.BrowserWindow || instance.m_BrowserWindow"));
+        assert!(script.contains("function observeSteamWindowReady()"));
+        assert!(script.contains("findMobxObservable(store, 'MainWindowInstance')"));
+        assert!(script.contains("findMobxObservable(instance, 'm_BrowserWindow')"));
+        assert!(script.contains("clearSteamWindowSubscriptions()"));
+        assert!(script.contains("document.addEventListener('DOMContentLoaded', listener"));
+        assert!(script.contains("function findNativePopupSupport()"));
+        assert!(script.contains("hasOwnProperty.call(prototype, 'Show')"));
+        assert!(script.contains("hasOwnProperty.call(prototype, 'RegisterChildBrowserView')"));
+        assert!(script.contains("exp.EBrowserType_DirectHWND_Borderless === 4"));
+        assert!(script.contains("function renderGamepadPreLoginToast("));
+        assert!(script.contains("SteamClient.BrowserView.CreatePopup({"));
+        assert!(script.contains("parentPopupBrowserID: parentPopupBrowserID"));
+        assert!(script.contains("SteamClient.BrowserView.Destroy(created.browserView)"));
+        assert!(script.contains("entry.browserView.SetBounds(left, top, 320, 80)"));
+        assert!(script.contains("Number(owner.innerWidth) - 320"));
+        assert!(script.contains("Number(owner.innerHeight) - 80 - stackIndex * 88"));
+        assert!(script.contains("function renderDesktopPreLoginToast("));
+        assert!(script.contains("state.browserTypes.EBrowserType_DirectHWND_Borderless"));
+        assert!(script.contains("popup.OnLoad = function() {}"));
+        assert!(script.contains("Number(owner.screenY || 0) + top,\n                false"));
+        assert!(script.contains("if (!popup.BIsValid())"));
+        assert!(script.contains("function renderPreLoginNativeToast(data, notification)"));
+        assert!(script.contains("function renderNativeToastDom("));
+        assert!(script.contains("function nativeToastSurfaceClass(document)"));
+        assert!(script.contains("style.bottom === '0px' && style.left === '20px'"));
+        assert!(script.contains("life.style.setProperty('--toast-duration', duration + 'ms')"));
+        assert!(script.contains("life.addEventListener('animationend'"));
+        assert!(script.contains("event.target !== toast || ++completedAnimations < 2"));
+        assert!(script.contains("showToast: !beforeServices"));
+        assert!(
+            script.contains("if (beforeServices && !renderPreLoginNativeToast(toast, toastData))")
+        );
+        assert!(script.contains("state.pending.unshift(toast)"));
+        assert!(script.contains("clearPreLoginNativeToasts()"));
+        assert!(!script.contains("VaporForgePreLoginStack"));
+        assert!(script.contains("var store = findStore() || state.store"));
+        assert!(!script.contains("setInterval"));
+        assert!(!script.contains("setTimeout"));
+    }
+
+    #[test]
+    fn bridge_uses_the_renderer_jsx_runtime() {
+        let script = bridge_script();
+        let renderer_runtime = script.find("findJsxFromRendererFactory();").unwrap();
+        let export_scan = script[renderer_runtime..]
+            .find("eachExport(function(exp)")
+            .map(|offset| renderer_runtime + offset)
+            .unwrap();
+        assert!(renderer_runtime < export_scan);
+        assert!(script.contains("if (major === 19)"));
+        assert!(script.contains("jsx.jsx = function()"));
+        assert!(script.contains("jsx.jsxs = function()"));
     }
 
     #[test]
@@ -452,9 +612,27 @@ mod tests {
         assert!(script.contains("function dismissTrayNotification(notification)"));
         assert!(script.contains("store.GetNotificationsInTray()"));
         assert!(script.contains("store.RemoveGroupFromTray(group)"));
-        assert!(script.contains("function runToastAction(data)"));
+        assert!(script.contains("function runToastAction(data, notification)"));
         assert!(script.contains("target.indexOf('steam://') !== 0"));
         assert!(script.contains("client.URL.ExecuteSteamURL(target)"));
+        assert!(script.contains("action.kind === 'decky-route'"));
+        assert!(script.contains("function isDeckyRouteRegistered(target)"));
+        assert!(script.contains("function runPendingDeckyRoute()"));
+        assert!(script.contains("bus.addEventListener('update', listener)"));
+        assert!(script.contains("navigation.Navigate(target)"));
+        assert!(script
+            .contains("state.pendingDeckyRoute = { target: target, notification: notification }"));
+        assert!(script.contains("dismissTrayNotification(pending.notification)"));
+        assert!(script.contains("if (activateQamToast(data, notification))"));
+        assert!(script.contains("closePreLoginNativeToast(notification.notificationID)"));
+        let run_action = script
+            .find("var result = runToastAction(data, notification)")
+            .unwrap();
+        let dismiss = script[run_action..]
+            .find("dismissTrayNotification(notification)")
+            .map(|offset| run_action + offset)
+            .unwrap();
+        assert!(run_action < dismiss);
         assert!(!script.contains("setInterval"));
     }
 
@@ -586,11 +764,24 @@ mod tests {
         let script = bridge_script();
         assert!(script.contains("function toastKind(data)"));
         assert!(script.contains("function toastStyle(data, kind)"));
+        assert!(script.contains("function toastLogoMode(data)"));
+        assert!(script.contains("if (mode === 'hidden') return 'hidden'"));
         assert!(script.contains("VaporForgeToast-' + kind"));
         assert!(script.contains("function toastBannerBackground(kind)"));
         assert!(script.contains("if (kind === 'error') return '#de3618'"));
         assert!(script.contains("if (kind === 'warning') return '#ffc82c'"));
         assert!(script.contains("VaporForgeToastStyle-' + style"));
+        assert!(script.contains("function popupLogoClass(css)"));
+        assert!(script.contains("css.ShortLogoDimensions || css.StandardLogoDimensions"));
+        assert!(script.contains("function popupLogoStyle()"));
+        assert!(script.contains("if (!isGamepadUiReady()) root.width = '100%'"));
+        assert!(script.contains("root.paddingLeft = '10px'"));
+        assert!(!script.contains("flex: '0 0 13px'"));
+        assert!(script.contains("if (logo) toast.appendChild(logo)"));
+        assert!(script.contains("function defaultLogoStyle(kind, style)"));
+        assert!(script.contains("function renderDefaultLogo("));
+        assert!(script.contains("logo.textContent = 'SR'"));
+        assert!(script.contains("children: 'SR'"));
     }
 
     #[test]
@@ -623,11 +814,11 @@ mod tests {
         let _ = take_pending();
         let _ = take_ui_work();
 
-        show_toast("a", "b", None, 1000);
+        show_toast("a", "b", ToastLogo::Default, 1000);
         let retry = take_pending();
         assert_eq!(retry.len(), 1);
 
-        show_toast("new", "toast", None, 1000);
+        show_toast("new", "toast", ToastLogo::Default, 1000);
         restore_pending(&retry);
 
         let pending = take_pending();
@@ -644,7 +835,7 @@ mod tests {
         let _ = take_pending();
         let _ = take_ui_work();
 
-        show_toast("title", "body", None, 1000);
+        show_toast("title", "body", ToastLogo::Default, 1000);
         assert!(take_ui_work());
         assert!(!take_ui_work());
 

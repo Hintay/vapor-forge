@@ -135,7 +135,25 @@ fn toast_command_accepts_key_value_options() {
     assert!(script.contains("style:\"accent\""));
     assert!(script.contains("title:\"Readable Title\""));
     assert!(script.contains("body:\"Readable Body\""));
+    assert!(script.contains("logoMode:\"custom\""));
     assert!(script.contains("icon:\"https://example.invalid/icon.png\""));
+
+    let _ = vapor_forge_features::toast::take_ui_work();
+}
+
+#[test]
+fn toast_command_can_hide_the_logo() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = vapor_forge_features::toast::take_pending();
+    let _ = vapor_forge_features::toast::take_ui_work();
+
+    let response = dispatch("steamui toast logo=hidden body=\"No logo\"");
+    assert!(response.contains("kind=info"));
+    let pending = vapor_forge_features::toast::take_pending();
+    assert_eq!(pending.len(), 1);
+    let script = vapor_forge_features::toast::toast_script(&pending[0]);
+    assert!(script.contains("logoMode:\"hidden\""));
+    assert!(script.contains("icon:\"\""));
 
     let _ = vapor_forge_features::toast::take_ui_work();
 }
@@ -188,6 +206,34 @@ fn toast_command_rejects_non_steam_url_action() {
         response,
         "err invalid steam URL: \"https://example.invalid/\""
     );
+    assert_eq!(vapor_forge_features::toast::pending_count(), 0);
+}
+
+#[test]
+fn toast_command_accepts_decky_route_action() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = vapor_forge_features::toast::take_pending();
+    let _ = vapor_forge_features::toast::take_ui_work();
+
+    let response =
+        dispatch("steamui toast body=Plugins --decky-route /decky/settings/plugins duration=60000");
+    assert!(response.contains("queued toast"));
+    let pending = vapor_forge_features::toast::take_pending();
+    assert_eq!(pending.len(), 1);
+    let script = vapor_forge_features::toast::toast_script(&pending[0]);
+    assert!(script.contains("action:{kind:\"decky-route\",target:\"/decky/settings/plugins\"}"));
+
+    let _ = vapor_forge_features::toast::take_ui_work();
+}
+
+#[test]
+fn toast_command_rejects_non_decky_route_action() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let _ = vapor_forge_features::toast::take_pending();
+    let _ = vapor_forge_features::toast::take_ui_work();
+
+    let response = dispatch("steamui toast --decky-route /library/home");
+    assert_eq!(response, "err invalid Decky route: \"/library/home\"");
     assert_eq!(vapor_forge_features::toast::pending_count(), 0);
 }
 

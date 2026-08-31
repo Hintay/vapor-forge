@@ -132,12 +132,14 @@
     }
 
     function findJsx() {
+      const rendererJsx = findJsxFromRendererFactory();
+      if (rendererJsx) return rendererJsx;
       var found = null;
       eachExport(function(exp) {
         found = pickJsxRuntime(exp);
         return !!found;
       });
-      return found || findJsxFromRendererFactory();
+      return found;
     }
 
     function findModal() {

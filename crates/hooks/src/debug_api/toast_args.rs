@@ -8,7 +8,7 @@ pub(crate) struct ParsedToast {
     pub title: String,
     pub body: String,
     pub duration_ms: u32,
-    pub icon: Option<String>,
+    pub logo: vapor_forge_features::toast::ToastLogo,
 }
 
 struct ToastOptions {
@@ -17,7 +17,7 @@ struct ToastOptions {
     title: Option<String>,
     body: Option<String>,
     duration_ms: u32,
-    icon: Option<String>,
+    logo: vapor_forge_features::toast::ToastLogo,
     action: vapor_forge_features::toast::ToastAction,
 }
 
@@ -29,7 +29,7 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
         title: None,
         body: None,
         duration_ms: DEFAULT_DURATION_MS,
-        icon: None,
+        logo: vapor_forge_features::toast::ToastLogo::Default,
         action: vapor_forge_features::toast::ToastAction::Dismiss,
     };
     let mut body_words = Vec::new();
@@ -71,7 +71,7 @@ pub(crate) fn parse_toast_args(args: &str) -> Result<ParsedToast, String> {
         title: non_empty(options.title.as_deref().unwrap_or(""), "Vapor Forge").to_owned(),
         body: non_empty(options.body.as_deref().unwrap_or(""), DEFAULT_TOAST_BODY).to_owned(),
         duration_ms: options.duration_ms,
-        icon: options.icon,
+        logo: options.logo,
     })
 }
 
@@ -123,7 +123,15 @@ fn apply_toast_option(key: &str, value: &str, options: &mut ToastOptions) -> Res
         "title" => options.title = Some(value.to_owned()),
         "body" | "message" | "text" => options.body = Some(value.to_owned()),
         "duration" | "duration_ms" | "ms" => options.duration_ms = parse_duration(value)?,
-        "icon" => options.icon = Some(value.to_owned()),
+        "logo" => {
+            options.logo = parse_toast_logo(value).ok_or_else(|| {
+                format!(
+                    "err invalid toast logo: {}",
+                    super::command::quote_text(value)
+                )
+            })?;
+        }
+        "icon" => options.logo = vapor_forge_features::toast::ToastLogo::Custom(value.to_owned()),
         "steam-url" | "steam_url" => {
             if !value.starts_with("steam://") {
                 return Err(format!(
@@ -133,6 +141,16 @@ fn apply_toast_option(key: &str, value: &str, options: &mut ToastOptions) -> Res
             }
             options.action =
                 vapor_forge_features::toast::ToastAction::OpenSteamUrl(value.to_owned());
+        }
+        "decky-route" | "decky_route" => {
+            if !value.starts_with("/decky/") {
+                return Err(format!(
+                    "err invalid Decky route: {}",
+                    super::command::quote_text(value)
+                ));
+            }
+            options.action =
+                vapor_forge_features::toast::ToastAction::OpenDeckyRoute(value.to_owned());
         }
         _ => {
             return Err(format!(
@@ -206,6 +224,14 @@ fn parse_toast_style(value: &str) -> Option<vapor_forge_features::toast::ToastSt
     match value.trim().to_ascii_lowercase().as_str() {
         "accent" => Some(vapor_forge_features::toast::ToastStyle::Accent),
         "banner" => Some(vapor_forge_features::toast::ToastStyle::Banner),
+        _ => None,
+    }
+}
+
+fn parse_toast_logo(value: &str) -> Option<vapor_forge_features::toast::ToastLogo> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Some(vapor_forge_features::toast::ToastLogo::Default),
+        "hidden" => Some(vapor_forge_features::toast::ToastLogo::Hidden),
         _ => None,
     }
 }
