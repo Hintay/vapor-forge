@@ -174,7 +174,7 @@ fn queue_toast_command(target: DebugTarget, args: ToastArgs<'_>) -> String {
                 vapor_forge_features::toast::ToastKind::Info,
                 "Vapor Forge",
                 DEFAULT_TOAST_BODY,
-                None,
+                vapor_forge_features::toast::ToastLogo::Default,
                 DEFAULT_DURATION_MS,
             );
             request_target_pump(target);
@@ -198,7 +198,7 @@ fn queue_toast_fields(args: &str) -> Result<String, String> {
         style,
         &parsed.title,
         &parsed.body,
-        parsed.icon.as_deref(),
+        parsed.logo,
         parsed.duration_ms,
         parsed.action,
     );
