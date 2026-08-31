@@ -126,10 +126,10 @@ follow = "relative"
 # Follow the pkg0 CUtlVector<u32> append helper callsite to CUtlMemory<u32>::Grow(int).
 pattern = "E8 ? ? ? ? 8B ? 10 8D 70 01 EB ? 66 0F 1F 44 00 00 29 C6 48 89 ? E8 ? ? ? ? 8B ? 10 8D 70 01 E9 ? FF FF FF 0F 1F 00 48 8D 15 ? ?"
 
-# Linux x86_64 package lookup by package token key.
+# Package lookup by package ID and access token.
 [steamclient."CPackageInfo::GetPackageInfo"]
 follow = "none"
-pattern = "48 63 87 70 05 00 00 83 F8 FF 74 ? 48 8B ? 88 05 00 00 48 8B ? EB 10 0F 1F 84 00 00 00 00 00"
+pattern = "41 ? 41 ? 41 ? 41 ? 49 89 ? 55 48 89 ? 53 89 ? 48 83 EC ? 48 63 47 ? 83 F8 FF 74 ? 48 8B ? ? EB ?"
 
 [steamclient."CConfigStore::WriteVdfFile"]
 follow = "none"

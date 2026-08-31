@@ -68,7 +68,7 @@ pub fn validate_live_pattern(
         };
         return valid
             .then_some(())
-            .ok_or_else(|| "package-info map semantics are incomplete".to_owned());
+            .ok_or_else(|| "package-info accessor semantics are incomplete".to_owned());
     }
     let checks = semantic_checks(module, arch)?;
     let check = checks

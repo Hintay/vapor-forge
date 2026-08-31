@@ -177,7 +177,14 @@ fn load_helper_now() {
 
     // SAFETY: orig is the relocated LdrLoadDll trampoline and all pointers live
     // through the call.
-    let status = unsafe { orig(std::ptr::null_mut(), 0, &mut us, &mut base) };
+    let status = unsafe {
+        orig(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut us,
+            &mut base,
+        )
+    };
     if status == STATUS_SUCCESS {
         log("DLL loaded successfully");
         crate::ipc::send_dll_inject_result(true);
@@ -196,7 +203,7 @@ fn load_helper_now() {
 /// Called from Wine's PE code. Must not panic (would unwind through PE stack).
 unsafe extern "win64" fn hook_ldr_load_dll(
     search_path: *mut u16,
-    flags: u32,
+    dll_characteristics: *mut u32,
     dll_name: *mut UnicodeString,
     base_address: *mut *mut core::ffi::c_void,
 ) -> i32 {
@@ -210,7 +217,7 @@ unsafe extern "win64" fn hook_ldr_load_dll(
     let orig: LdrLoadDllFn = unsafe { std::mem::transmute(tramp) };
     // SAFETY: The hook receives LdrLoadDll's original arguments and forwards
     // them unchanged to the original trampoline with the same ABI.
-    let status = unsafe { orig(search_path, flags, dll_name, base_address) };
+    let status = unsafe { orig(search_path, dll_characteristics, dll_name, base_address) };
 
     if status == STATUS_SUCCESS && !dll_name.is_null() {
         // Wrap in catch_unwind: a panic here would unwind through PE frames.

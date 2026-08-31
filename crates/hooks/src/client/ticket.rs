@@ -27,14 +27,14 @@ pub(crate) type TicketExtDataFn = unsafe extern "C" fn(
     *mut u32,    // pi_signature (out)
     *mut u32,    // pcb_signature (out)
 ) -> u32;
-pub(crate) type UpdateTicketFn = unsafe extern "C" fn(*mut c_void, u32, bool) -> u32;
+pub(crate) type UpdateTicketFn = unsafe extern "C" fn(*mut c_void, u32, bool) -> bool;
 #[cfg(target_pointer_width = "32")]
 pub(crate) type IsSubscribedInTicketFn =
-    unsafe extern "C" fn(*mut c_void, u32, u32, *const u64, u32) -> u8;
+    unsafe extern "C" fn(*mut c_void, u32, u32, *const u64, u32) -> i32;
 #[cfg(target_pointer_width = "64")]
 pub(crate) type IsSubscribedInTicketFn =
-    unsafe extern "C" fn(*mut c_void, u64, *const u64, u32) -> u8;
-const USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE: u8 = 0;
+    unsafe extern "C" fn(*mut c_void, u64, *const u64, u32) -> i32;
+const USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE: i32 = 0;
 
 pub(crate) fn resolve_adapter_implementation(
     code: &crate::pattern_resolver::CodeRegion,
@@ -960,8 +960,8 @@ pub(crate) unsafe extern "C" fn hk_update_ticket(
     this: *mut c_void,
     app_id: u32,
     only_update_if_stale: bool,
-) -> u32 {
-    let original = detour_or_return!("BUpdateAppOwnershipTicket", UPDATE_TICKET_DETOUR, 0);
+) -> bool {
+    let original = detour_or_return!("BUpdateAppOwnershipTicket", UPDATE_TICKET_DETOUR, false);
     if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
         // SAFETY: forwards Steam's untouched ticket update request.
         return unsafe { original(this, app_id, only_update_if_stale) };
@@ -992,7 +992,7 @@ unsafe { original(this, app_id, only_update_if_stale) };
             app_id,
             result, "ticket: BUpdateAppOwnershipTicket forwarded for controlled app"
         );
-        1
+        true
     } else {
         result
     }
@@ -1009,7 +1009,7 @@ pub(crate) unsafe extern "C" fn hk_is_subscribed_in_ticket(
     steam_id_high: u32,
     game_id_ptr: *const u64,
     app_id: u32,
-) -> u8 {
+) -> i32 {
     let original = detour_or_return!(
         "IsUserSubscribedAppInTicket",
         IS_SUBSCRIBED_IN_TICKET_DETOUR,
@@ -1035,7 +1035,7 @@ pub(crate) unsafe extern "C" fn hk_is_subscribed_in_ticket(
     steam_id: u64,
     game_id_ptr: *const u64,
     app_id: u32,
-) -> u8 {
+) -> i32 {
     let original = detour_or_return!(
         "IsUserSubscribedAppInTicket",
         IS_SUBSCRIBED_IN_TICKET_DETOUR,

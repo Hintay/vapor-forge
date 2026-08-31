@@ -38,12 +38,12 @@ static HANDLERS: Mutex<Vec<Pin<Box<InternalCallback>>>> = Mutex::new(Vec::new())
 #[repr(C)]
 struct InternalCallbackVTable {
     run: unsafe extern "C" fn(*mut InternalCallback, *const c_void),
-    describe: unsafe extern "C" fn(*mut InternalCallback) -> i32,
+    validate: unsafe extern "C" fn(*mut InternalCallback, *mut c_void, *mut c_void),
 }
 
 static INTERNAL_CALLBACK_VTABLE: InternalCallbackVTable = InternalCallbackVTable {
     run: run_internal_callback,
-    describe: describe_internal_callback,
+    validate: validate_internal_callback,
 };
 
 #[repr(C)]
@@ -455,8 +455,11 @@ unsafe extern "C" fn run_internal_callback(handler: *mut InternalCallback, paylo
     }
 }
 
-unsafe extern "C" fn describe_internal_callback(_handler: *mut InternalCallback) -> i32 {
-    0
+unsafe extern "C" fn validate_internal_callback(
+    _handler: *mut InternalCallback,
+    _output: *mut c_void,
+    _context: *mut c_void,
+) {
 }
 
 fn enqueue(event: CallbackEvent) -> bool {

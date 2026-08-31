@@ -4703,11 +4703,16 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     );
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
+        let ownership_calls_lookup = resolved
+            .get("CUser::CheckAppOwnership")
+            .is_some_and(|&ownership_offset| {
+                has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
+            });
         match discover_package_info64_layout(code, get_package_info_offset) {
-            Some(layout) => {
+            Some(layout) if ownership_calls_lookup => {
                 println!(
                     "  OK   {:<58} root=0x{:x} elements=0x{:x} node=0x{:x} key=0x{:x} value=0x{:x}",
-                    "CPackageInfo::GetPackageInfo token map",
+                    "CPackageInfo::GetPackageInfo package map",
                     layout.count_off,
                     layout.elements_off,
                     layout.node_size,
@@ -4715,10 +4720,14 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
                     layout.node_value_off
                 );
             }
-            None => {
-                let evidence = package_info64_evidence(code, get_package_info_offset);
+            _ => {
+                let evidence = package_info64_evidence(
+                    code,
+                    get_package_info_offset,
+                    ownership_calls_lookup,
+                );
                 print_evidence_failure(
-                    "CPackageInfo::GetPackageInfo token map",
+                    "CPackageInfo::GetPackageInfo package map",
                     vaddr + get_package_info_offset as u64,
                     evidence.as_ref(),
                     "layout discovery failed",
@@ -4742,8 +4751,13 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     );
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
+        let ownership_calls_lookup = resolved
+            .get("CUser::CheckAppOwnership")
+            .is_some_and(|&ownership_offset| {
+                has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
+            });
         match discover_package_info32_layout(code, get_package_info_offset) {
-            Some(layout) => {
+            Some(layout) if ownership_calls_lookup => {
                 println!(
                     "  OK   {:<58} root=0x{:x} elements=0x{:x} node=0x{:x} key=0x{:x} value=0x{:x}",
                     "CPackageInfo::GetPackageInfo package map",
@@ -4754,8 +4768,12 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
                     layout.node_value_off
                 );
             }
-            None => {
-                let evidence = package_info32_evidence(code, get_package_info_offset);
+            _ => {
+                let evidence = package_info32_evidence(
+                    code,
+                    get_package_info_offset,
+                    ownership_calls_lookup,
+                );
                 print_evidence_failure(
                     "CPackageInfo::GetPackageInfo package map",
                     vaddr + get_package_info_offset as u64,
@@ -4968,7 +4986,7 @@ fn discover_package_info32_layout(
 
     // CPackageInfo::GetPackageInfo(this, package_id, access_token) must load
     // both halves of access_token from stack and search the package-id map.
-    if !find_x86_get_package_info_args(bytes) {
+    if !find_x86_get_package_info_args(bytes) || !has_x86_package_info_allocation(bytes) {
         return None;
     }
 
@@ -4978,16 +4996,29 @@ fn discover_package_info32_layout(
     let node_key_off = find_x86_node_key_off(bytes)?;
     let node_value_off = find_x86_node_value_off(bytes)?;
 
-    Some(PackageMapLayout {
+    let layout = PackageMapLayout {
         count_off: root_off,
         elements_off,
         node_size,
         node_key_off,
         node_value_off,
-    })
+    };
+    (layout
+        == PackageMapLayout {
+            count_off: 0x18,
+            elements_off: 0x2c,
+            node_size: 0x18,
+            node_key_off: 0x10,
+            node_value_off: 0x14,
+        })
+    .then_some(layout)
 }
 
-fn package_info32_evidence(code: &[u8], get_package_info_offset: usize) -> Option<Evidence> {
+fn package_info32_evidence(
+    code: &[u8],
+    get_package_info_offset: usize,
+    ownership_calls_lookup: bool,
+) -> Option<Evidence> {
     let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x240))?;
     let has_args = find_x86_get_package_info_args(bytes);
     let root_off = find_x86_mov_eax_eax_disp8(bytes);
@@ -4995,14 +5026,22 @@ fn package_info32_evidence(code: &[u8], get_package_info_offset: usize) -> Optio
     let node_size = find_x86_node_size(bytes);
     let node_key_off = find_x86_node_key_off(bytes);
     let node_value_off = find_x86_node_value_off(bytes);
+    let allocates_package = has_x86_package_info_allocation(bytes);
 
     let mut evidence = Evidence::default();
     evidence.require("package id and access token args", has_args);
+    evidence.require("PackageInfo size 0x78 allocation", allocates_package);
+    evidence.require("CheckAppOwnership caller", ownership_calls_lookup);
     evidence.require("package map root offset", root_off.is_some());
     evidence.require("package map elements offset", elements_off.is_some());
     evidence.require("package map node size", node_size.is_some());
     evidence.require("package map key offset", node_key_off.is_some());
     evidence.require("package map value offset", node_value_off.is_some());
+    evidence.require(
+        "expected package map layout",
+        (root_off, elements_off, node_size, node_key_off, node_value_off)
+            == (Some(0x18), Some(0x2c), Some(0x18), Some(0x10), Some(0x14)),
+    );
     Some(evidence)
 }
 
@@ -5010,38 +5049,62 @@ fn discover_package_info64_layout(
     code: &[u8],
     get_package_info_offset: usize,
 ) -> Option<PackageMapLayout> {
-    let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x120))?;
-    let root_off = find_x64_movslq_rdi_disp32(bytes)?;
+    let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x280))?;
+    if !find_x64_get_package_info_args(bytes) || !has_x64_package_info_allocation(bytes) {
+        return None;
+    }
+    let root_off = find_x64_package_root_off(bytes)?;
     let elements_off = find_x64_elements_load_from_rdi(bytes)?;
     let node_size = find_x64_node_size(bytes)?;
     let node_key_off = find_x64_node_key_off(bytes)?;
-    let node_value_off =
-        find_x64_inline_return_off(bytes).or_else(|| find_x64_pointer_return_off(bytes))?;
+    let node_value_off = find_x64_pointer_return_off(bytes)?;
 
-    Some(PackageMapLayout {
+    let layout = PackageMapLayout {
         count_off: root_off,
         elements_off,
         node_size,
         node_key_off,
         node_value_off,
-    })
+    };
+    (layout
+        == PackageMapLayout {
+            count_off: 0x20,
+            elements_off: 0x38,
+            node_size: 0x20,
+            node_key_off: 0x10,
+            node_value_off: 0x18,
+        })
+    .then_some(layout)
 }
 
-fn package_info64_evidence(code: &[u8], get_package_info_offset: usize) -> Option<Evidence> {
-    let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x120))?;
-    let root_off = find_x64_movslq_rdi_disp32(bytes);
+fn package_info64_evidence(
+    code: &[u8],
+    get_package_info_offset: usize,
+    ownership_calls_lookup: bool,
+) -> Option<Evidence> {
+    let bytes = code.get(get_package_info_offset..get_package_info_offset.saturating_add(0x280))?;
+    let has_args = find_x64_get_package_info_args(bytes);
+    let allocates_package = has_x64_package_info_allocation(bytes);
+    let root_off = find_x64_package_root_off(bytes);
     let elements_off = find_x64_elements_load_from_rdi(bytes);
     let node_size = find_x64_node_size(bytes);
     let node_key_off = find_x64_node_key_off(bytes);
-    let node_value_off =
-        find_x64_inline_return_off(bytes).or_else(|| find_x64_pointer_return_off(bytes));
+    let node_value_off = find_x64_pointer_return_off(bytes);
 
     let mut evidence = Evidence::default();
-    evidence.require("token map root offset", root_off.is_some());
-    evidence.require("token map elements offset", elements_off.is_some());
-    evidence.require("token map node size", node_size.is_some());
-    evidence.require("token map key offset", node_key_off.is_some());
-    evidence.require("token map value offset", node_value_off.is_some());
+    evidence.require("package ID and access token args", has_args);
+    evidence.require("PackageInfo size 0xa0 allocation", allocates_package);
+    evidence.require("CheckAppOwnership caller", ownership_calls_lookup);
+    evidence.require("package map root offset", root_off.is_some());
+    evidence.require("package map elements offset", elements_off.is_some());
+    evidence.require("package map node size", node_size.is_some());
+    evidence.require("package map key offset", node_key_off.is_some());
+    evidence.require("package map value offset", node_value_off.is_some());
+    evidence.require(
+        "expected package map layout",
+        (root_off, elements_off, node_size, node_key_off, node_value_off)
+            == (Some(0x20), Some(0x38), Some(0x20), Some(0x10), Some(0x18)),
+    );
     Some(evidence)
 }
 
@@ -5066,6 +5129,43 @@ fn find_x86_get_package_info_args(bytes: &[u8]) -> bool {
     package_id
         && (token_stack_pair || token_stack_xmm)
         && (token_compare_sse || token_compare_scalar)
+}
+
+fn has_x86_package_info_allocation(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|w| w == [0x6a, 0x78])
+        || bytes
+            .windows(7)
+            .any(|w| w == [0xc7, 0x04, 0x24, 0x78, 0x00, 0x00, 0x00])
+}
+
+fn find_x64_get_package_info_args(bytes: &[u8]) -> bool {
+    let args = bytes.get(..bytes.len().min(0x40)).unwrap_or(bytes);
+    let saves_access_token = args.windows(3).any(|w| {
+        matches!(w[0], 0x48 | 0x49) && w[1] == 0x89 && w[2] & 0xf8 == 0xd0
+    });
+    let saves_package_id = args.windows(2).any(|w| w[0] == 0x89 && w[1] & 0xf8 == 0xf0)
+        || args.windows(3).any(|w| {
+            w[0] == 0x41 && w[1] == 0x89 && w[2] & 0xf8 == 0xf0
+        });
+    let compares_access_token = bytes.windows(4).any(|w| {
+        matches!(w[0], 0x48 | 0x49 | 0x4c | 0x4d)
+            && matches!(w[1], 0x39 | 0x3b)
+            && w[2] & 0xc0 == 0x40
+            && w[3] == 0x08
+    });
+    let updates_access_token = bytes.windows(4).any(|w| {
+        matches!(w[0], 0x48 | 0x49 | 0x4c | 0x4d)
+            && w[1] == 0x89
+            && w[2] & 0xc0 == 0x40
+            && w[3] == 0x08
+    });
+    saves_access_token && saves_package_id && compares_access_token && updates_access_token
+}
+
+fn has_x64_package_info_allocation(bytes: &[u8]) -> bool {
+    bytes
+        .windows(5)
+        .any(|w| w == [0xbf, 0xa0, 0x00, 0x00, 0x00])
 }
 
 fn find_x86_mov_eax_eax_disp8(bytes: &[u8]) -> Option<usize> {
@@ -5135,20 +5235,36 @@ fn find_x86_node_value_off(bytes: &[u8]) -> Option<usize> {
         })
 }
 
-fn find_x64_movslq_rdi_disp32(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(7).enumerate().find_map(|(idx, w)| {
-        (w[0..3] == [0x48, 0x63, 0x87])
-            .then(|| read_u32_le(bytes, idx + 3))
-            .flatten()
-    })
+fn find_x64_package_root_off(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .find_map(|w| {
+            ((w[0] & 0xfb) == 0x48 && w[1] == 0x63 && w[2] & 0xc7 == 0x47)
+                .then_some(w[3] as usize)
+        })
+        .or_else(|| {
+            bytes.windows(7).enumerate().find_map(|(idx, w)| {
+                ((w[0] & 0xfb) == 0x48 && w[1] == 0x63 && w[2] & 0xc7 == 0x87)
+                    .then(|| read_u32_le(bytes, idx + 3))
+                    .flatten()
+            })
+        })
 }
 
 fn find_x64_elements_load_from_rdi(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(7).enumerate().find_map(|(idx, w)| {
-        (w[0..3] == [0x48, 0x8b, 0xbf] || w[0..3] == [0x48, 0x8b, 0x8f])
-            .then(|| read_u32_le(bytes, idx + 3))
-            .flatten()
-    })
+    bytes
+        .windows(4)
+        .find_map(|w| {
+            ((w[0] & 0xfb) == 0x48 && w[1] == 0x8b && w[2] & 0xc7 == 0x47)
+                .then_some(w[3] as usize)
+        })
+        .or_else(|| {
+            bytes.windows(7).enumerate().find_map(|(idx, w)| {
+                ((w[0] & 0xfb) == 0x48 && w[1] == 0x8b && w[2] & 0xc7 == 0x87)
+                    .then(|| read_u32_le(bytes, idx + 3))
+                    .flatten()
+            })
+        })
 }
 
 fn find_x64_node_size(bytes: &[u8]) -> Option<usize> {
@@ -5172,30 +5288,18 @@ fn find_x64_node_size(bytes: &[u8]) -> Option<usize> {
 }
 
 fn find_x64_node_key_off(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).find_map(|w| {
-        ((w[0..3] == [0x48, 0x8b, 0x50]) || (w[0..3] == [0x48, 0x8b, 0x48]))
-            .then_some(w[3] as usize)
-            .or_else(|| {
-                (w[0..3] == [0x48, 0x3b, 0x50] || w[0..3] == [0x48, 0x3b, 0x48])
-                    .then_some(w[3] as usize)
-            })
-    })
-}
-
-fn find_x64_inline_return_off(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(5)
-        .find_map(|w| (w[0..3] == [0x48, 0x83, 0xc0] && w[4] == 0xc3).then_some(w[3] as usize))
-        .or_else(|| {
-            bytes.windows(7).find_map(|w| {
-                (w[0..2] == [0x48, 0x05] && w[6] == 0xc3)
-                    .then(|| u32::from_le_bytes([w[2], w[3], w[4], w[5]]) as usize)
-            })
-        })
+        .find_map(|w| (w[0..2] == [0x8b, 0x4a] && w[3..5] == [0x39, 0xcb]).then_some(w[2] as usize))
 }
 
 fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(5)
         .find_map(|w| (w[0..4] == [0x48, 0x8b, 0x44, 0x07]).then_some(w[4] as usize))
+        .or_else(|| {
+            bytes.windows(5).find_map(|w| {
+                (w[0..4] == [0x4c, 0x8b, 0x6c, 0x06]).then_some(w[4] as usize)
+            })
+        })
 }
