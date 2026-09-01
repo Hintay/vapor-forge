@@ -542,14 +542,17 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_resolves_purchase_time_sources() {
-        let mut config = RuntimeConfig::default();
-        config.apps =
-            vapor_forge_config::AppsSection::with_inject(vec![vapor_forge_config::InjectApp {
-                id: AppId(480),
-                dlc: Vec::new(),
-                ticket: vapor_forge_config::TicketMode::Forge,
-                purchase_time: 123,
-            }]);
+        let config = RuntimeConfig {
+            apps: vapor_forge_config::AppsSection::with_inject(vec![
+                vapor_forge_config::InjectApp {
+                    id: AppId(480),
+                    dlc: Vec::new(),
+                    ticket: vapor_forge_config::TicketMode::Forge,
+                    purchase_time: 123,
+                },
+            ]),
+            ..RuntimeConfig::default()
+        };
         let mut scripts = ScriptRuntime::default();
         scripts.state.app_purchase_times.insert(AppId(480), 456);
         scripts.state.app_purchase_times.insert(AppId(481), 789);
