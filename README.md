@@ -34,13 +34,11 @@ cargo build-main64-release
 cargo build-inject-release
 ```
 
-Published artifacts are cross-linked with Zig against glibc 2.17. Local builds
-using the commands above inherit the host system's glibc baseline.
+Published artifacts are cross-linked with Zig against glibc 2.17. Local builds using the commands above inherit the host system's glibc baseline.
 
 ## Install
 
-Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment.
-Use the library whose target architecture matches the Steam process:
+Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment. Use the library whose target architecture matches the Steam process:
 
 - 32-bit Steam: `target/i686-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
 - 64-bit Steam: `target/x86_64-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
@@ -49,11 +47,7 @@ Use the library whose target architecture matches the Steam process:
 LD_AUDIT=/path/to/libvapor_forge.so
 ```
 
-The 64-bit audit loader initializes configuration, scripting, diagnostics, debug IPC, SteamClient
-hooks, SteamUI hooks, VMT-scanner hooks, and launch-environment injection. pkg0 PackageInfo field
-offsets are verified for the current 64-bit Steam baseline (`PackageId` at `+0x00`, `status` at
-`+0x18`, `m_vecAppIDs` at `+0x40`). The 64-bit `CPackageInfo::GetPackageInfo` hook captures the
-package-store object and calls Steam's token-map lookup with pkg0's known access token.
+The 64-bit audit loader initializes configuration, scripting, diagnostics, debug IPC, SteamClient hooks, SteamUI hooks, VMT-scanner hooks, and launch-environment injection. pkg0 PackageInfo field offsets are verified for the current 64-bit Steam baseline (`PackageId` at `+0x00`, `status` at `+0x18`, `m_vecAppIDs` at `+0x40`). The 64-bit `CPackageInfo::GetPackageInfo` hook captures the package-store object and calls Steam's token-map lookup with pkg0's known access token.
 
 ### File layout
 
@@ -73,19 +67,11 @@ All configuration lives in `~/.config/vapor-forge/config.toml`. The file is opti
 
 See `res/config.default.toml` for the full generated template and commented examples.
 
-`runtime.patterns_url` configures an optional HTTPS hotfix source. The URL must
-contain `{arch}` and `{family}` placeholders. A downloaded candidate becomes
-active for a module only after that module validates it against the live Steam
-binary during a later hook installation, normally on the next Steam start.
-Source changes made after SteamClient hooks are installed also take effect on
-the next Steam start.
-Clearing the URL stops downloads and candidate promotion; it does not remove or
-disable an active cache, which is revalidated before every use.
+`runtime.patterns_url` configures an optional HTTPS hotfix source. The URL must contain `{arch}` and `{family}` placeholders. A downloaded candidate becomes active for a module only after that module validates it against the live Steam binary during a later hook installation, normally on the next Steam start. Source changes made after SteamClient hooks are installed also take effect on the next Steam start. Clearing the URL stops downloads and candidate promotion; it does not remove or disable an active cache, which is revalidated before every use.
 
 ### Cumulus cloud saves
 
-Select the Cumulus backend and configure its origin and device bearer token.
-Owned apps remain on Steam's normal cloud path.
+Select the Cumulus backend and configure its origin and device bearer token. Owned apps remain on Steam's normal cloud path.
 
 ```toml
 [cloud]
@@ -98,13 +84,9 @@ timeout_connect_ms = 5000
 timeout_ms = 15000
 ```
 
-The token is sent to Cumulus by both the metadata adapter and Steam's HTTP byte
-transfers. Use HTTPS outside a trusted private network.
+The token is sent to Cumulus by both the metadata adapter and Steam's HTTP byte transfers. Use HTTPS outside a trusted private network.
 
-`IClientRemoteStorage` is used only to keep Steam's per-app cloud enable gate
-open. Save synchronization is handled separately by intercepting the Steam
-client's decoded `Cloud.*#1` service RPCs on the CM connection; game-facing
-`FileRead`/`FileWrite` calls are not redirected.
+`IClientRemoteStorage` is used only to keep Steam's per-app cloud enable gate open. Save synchronization is handled separately by intercepting the Steam client's decoded `Cloud.*#1` service RPCs on the CM connection; game-facing `FileRead`/`FileWrite` calls are not redirected.
 
 ### Lua scripting
 
