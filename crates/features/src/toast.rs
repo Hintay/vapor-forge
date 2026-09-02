@@ -464,20 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn bridge_patches_the_live_valve_renderer() {
+    fn bridge_patches_the_valve_renderer_without_a_trampoline() {
         let script = bridge_script();
-        assert!(script.contains("function injectRendererTrampoline("));
-        assert!(script.contains("component.prototype.isReactComponent = true"));
+        assert!(script.contains("function patchJsxRuntime(jsx)"));
+        assert!(script.contains("jsx.jsx = wrap(originalJsx)"));
+        assert!(script.contains("jsx.jsxs = wrap(originalJsxs)"));
+        assert!(script.contains("JSX notification bridge ready"));
         assert!(script.contains("function patchClassRenderer(renderer)"));
         assert!(script.contains("prototype.render = wrapped"));
-        assert!(script.contains("const currentRenderer = findValveToastRenderer()"));
-        assert!(script.contains("const renderer = currentRenderer || state.renderer"));
-        assert!(script.contains("currentRenderer !== state.renderer"));
-        assert!(script.contains("state.renderPatched = false"));
-        assert!(script.contains("['createElement', 'PureComponent', 'useLayoutEffect']"));
-        assert!(script.contains("['createPortal', 'flushSync', 'version']"));
-        assert!(script.contains("Valve toast renderer trampoline ready"));
-        assert!(!script.contains("function patchJsxRuntime("));
+        assert!(script.contains("var renderer = state.renderer || findValveToastRenderer()"));
+        assert!(script.contains("state.renderPatched = jsxPatched || renderPatched"));
+        assert!(script.contains("Valve toast renderer render patch ready"));
+        assert!(!script.contains("injectRendererTrampoline"));
+        assert!(!script.contains("isReactComponent = true"));
+        assert!(!script.contains("Object.create(component.prototype)"));
+        assert!(!script.contains("trampoline ready"));
         assert!(!script.contains("Valve toast renderer export bridge ready"));
     }
 
@@ -547,16 +548,73 @@ mod tests {
         assert!(script.contains("life.style.setProperty('--toast-duration', duration + 'ms')"));
         assert!(script.contains("life.addEventListener('animationend'"));
         assert!(script.contains("event.target !== toast || ++completedAnimations < 2"));
-        assert!(script.contains("showToast: !beforeServices"));
+        assert!(script.contains("function hookAfterLogin(app)"));
+        assert!(script.contains("app.InitAfterLogin = function()"));
+        assert!(script.contains("if (!beforeServices && !state.afterLoginReady) return false"));
+        assert!(script.contains("state.trayPending.push({ toast: toast, toastData: toastData })"));
         assert!(
-            script.contains("if (beforeServices && !renderPreLoginNativeToast(toast, toastData))")
+            script.contains("processNotification(held.toast, held.toastData, false, false, true)")
         );
+        assert!(script.contains(
+            "processNotification(toast, toastData, false, toast.playSound !== false, false)"
+        ));
+        assert!(script.contains(
+            "processNotification(toast, toastData, true, toast.playSound !== false, true)"
+        ));
+        assert!(script.contains(
+            "function processNotification(toast, toastData, showToast, playSound, withTray)"
+        ));
+        assert!(script.contains("fnTray: withTray ? fnTray : null"));
+        assert!(script.contains("if (!renderPreLoginNativeToast(toast, toastData))"));
         assert!(script.contains("state.pending.unshift(toast)"));
         assert!(script.contains("clearPreLoginNativeToasts()"));
         assert!(!script.contains("VaporForgePreLoginStack"));
         assert!(script.contains("var store = findStore() || state.store"));
         assert!(!script.contains("setInterval"));
         assert!(!script.contains("setTimeout"));
+    }
+
+    #[test]
+    fn bridge_reveals_native_toasts_after_styles_load() {
+        let script = bridge_script();
+        assert!(script.contains("function copySteamStyles(source, target, onReady)"));
+        assert!(script.contains("copy.addEventListener('load', finish)"));
+        assert!(script.contains("copy.addEventListener('error', finish)"));
+        assert!(script.contains("if (notified || pending > 0) return"));
+        assert!(
+            script.contains("copySteamStyles(ownerWindow.document, popup.document, function() {")
+        );
+        assert!(script.contains("if (entry.removed || entry.closing) return"));
+        assert!(script.contains("entry.stylesReady = true"));
+        assert!(script.contains("if (entry.stylesReady) entry.browserView.SetVisible(true)"));
+        assert!(!script.contains(
+            "SetBounds(left, top, 320, 80);\n              entry.browserView.SetVisible(true);"
+        ));
+    }
+
+    #[test]
+    fn bridge_waits_for_the_owner_popup_before_native_toasts() {
+        let script = bridge_script();
+        assert!(script.contains("function findPopupTracker(exports)"));
+        assert!(script.contains("typeof value.GetPopupForWindow === 'function'"));
+        assert!(script.contains("if (parent) state.popupTracker = findPopupTracker(parent)"));
+        assert!(script.contains("function hookPopupCreate(popup)"));
+        assert!(script.contains("popup.OnCreate = function()"));
+        assert!(script.contains("function isPopupHostReady(ownerWindow, requireOtherPopup)"));
+        assert!(script.contains("Array.from(tracker.GetPopups()).forEach"));
+        assert!(script.contains("tracker.AddPopupCreatedCallback(function(popup)"));
+        assert!(script.contains("if (ownerReady && otherReady) return true"));
+        assert!(script.contains("if (!requireOtherPopup) otherReady = true"));
+        assert!(script
+            .contains("if (!isPopupHostReady(ownerWindow, !isGamepadUiReady())) return false"));
+        assert!(script.contains("if (beforeServices) ensureSteamServicesReady()"));
+        assert!(script.contains("native notification waits for popups owner="));
+        assert!(script.contains("function isOwnerDocumentComplete(ownerWindow)"));
+        assert!(script.contains("document.readyState === 'complete'"));
+        assert!(script.contains("ownerWindow.addEventListener('load', function() { queueSteamReadiness(); }, { once: true })"));
+        assert!(script.contains("if (!isOwnerDocumentComplete(ownerWindow)) return false"));
+        assert!(script.contains("native notification waits for owner load state="));
+        assert!(script.contains("native notification popup shown valid="));
     }
 
     #[test]
@@ -568,9 +626,9 @@ mod tests {
             .map(|offset| renderer_runtime + offset)
             .unwrap();
         assert!(renderer_runtime < export_scan);
-        assert!(script.contains("if (major === 19)"));
-        assert!(script.contains("jsx.jsx = function()"));
-        assert!(script.contains("jsx.jsxs = function()"));
+        assert!(script.contains("var jsx = state.jsx || bridge.findJsx()"));
+        assert!(!script.contains("jsx.jsx = function()"));
+        assert!(!script.contains("jsx.jsxs = function()"));
     }
 
     #[test]
