@@ -7,12 +7,16 @@ use std::time::Duration;
 use keyvalues_parser::Obj;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use vapor_forge_patterns::scan::{scan_module, ModuleScanReport, PatternScanEntry};
+use vapor_forge_patterns::elf::{ElfClass, ElfImage};
+use vapor_forge_patterns::registry::parse_toml_patterns;
+use vapor_forge_patterns::scan::{scan_module, ModuleScanReport, PatternRef, PatternScanEntry};
 use zip::ZipArchive;
 
 const CDN_BASE: &str = "https://client-update.akamai.steamstatic.com";
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+const PATTERNS_X86: &str = include_str!("../../../../res/patterns.toml");
+const PATTERNS_X86_64: &str = include_str!("../../../../res/patterns.x86_64.toml");
 
 fn main() {
     if let Err(error) = run() {
@@ -48,7 +52,7 @@ fn run() -> Result<(), String> {
     }
 
     let (scans, scan_failed) = if args.scan {
-        scan_extracted_libraries(&args, &packages)
+        scan_extracted_libraries(&args, &packages)?
     } else {
         (Vec::new(), false)
     };
@@ -62,7 +66,6 @@ fn run() -> Result<(), String> {
             out_dir: args.out_dir.display().to_string(),
             packages,
             scan_enabled: args.scan,
-            scan_unsupported: args.scan_unsupported,
             scans,
             pattern_failures,
         };
@@ -168,7 +171,6 @@ struct Args {
     keep_zip: bool,
     format: OutputFormat,
     scan: bool,
-    scan_unsupported: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -186,7 +188,6 @@ impl Args {
         let mut keep_zip = true;
         let mut format = OutputFormat::Text;
         let mut scan = false;
-        let mut scan_unsupported = false;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
@@ -197,10 +198,6 @@ impl Args {
                 "--out" => out_dir = PathBuf::from(next_value(&mut args, "--out")?),
                 "--no-keep-zip" => keep_zip = false,
                 "--scan" => scan = true,
-                "--scan-unsupported" => {
-                    scan = true;
-                    scan_unsupported = true;
-                }
                 "--format" => {
                     let value = next_value(&mut args, "--format")?;
                     format = match value.as_str() {
@@ -222,7 +219,6 @@ impl Args {
             keep_zip,
             format,
             scan,
-            scan_unsupported,
         })
     }
 
@@ -263,7 +259,7 @@ fn usage() -> String {
         "usage: vapor-forge-steam-cdn-fetch ",
         "[--channel public|publicbeta] [--arch x86|x64|both] ",
         "[--version MANIFEST_VERSION] [--out DIR] [--no-keep-zip] ",
-        "[--scan] [--scan-unsupported] [--format text|json]\n",
+        "[--scan] [--format text|json]\n",
         "\n",
         "Defaults: --channel public uses x86; --channel publicbeta uses steamrt32+steamrt64; ",
         "--out $TMPDIR/vapor-steam-cdn"
@@ -290,7 +286,6 @@ struct JsonOutput {
     out_dir: String,
     packages: Vec<JsonPackage>,
     scan_enabled: bool,
-    scan_unsupported: bool,
     scans: Vec<JsonPatternScan>,
     pattern_failures: Vec<JsonPatternFailure>,
 }
@@ -320,7 +315,6 @@ struct JsonPatternScan {
     path: String,
     arch_bits: u8,
     status: &'static str,
-    expected_miss: bool,
     reason: Option<String>,
     text_file_off: Option<u64>,
     text_vaddr: Option<u64>,
@@ -537,7 +531,21 @@ fn fetch_package(
     })
 }
 
-fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonPatternScan>, bool) {
+fn scan_extracted_libraries(
+    args: &Args,
+    packages: &[JsonPackage],
+) -> Result<(Vec<JsonPatternScan>, bool), String> {
+    let patterns_x86 = parse_toml_patterns(PATTERNS_X86)?;
+    let patterns_x86_64 = parse_toml_patterns(PATTERNS_X86_64)?;
+    let refs_x86 = patterns_x86
+        .iter()
+        .map(PatternRef::from)
+        .collect::<Vec<_>>();
+    let refs_x86_64 = patterns_x86_64
+        .iter()
+        .map(PatternRef::from)
+        .collect::<Vec<_>>();
+
     let mut libraries = Vec::new();
     for package in packages {
         for extracted in &package.extracted {
@@ -545,39 +553,15 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
             let Some(module) = module_from_library_path(&path) else {
                 continue;
             };
-            let arch_bits = arch_bits_from_library_path(&path).unwrap_or(0);
-            libraries.push((module, path, arch_bits));
+            libraries.push((module, path));
         }
     }
     libraries.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut failed = false;
     let mut scans = Vec::new();
-    for (module, path, arch_bits) in libraries {
-        if arch_bits == 64 && !args.scan_unsupported {
-            args.text_print(format_args!(
-                "scan {module} 64-bit: UNSUPPORTED expected_miss path={}",
-                path.display()
-            ));
-            scans.push(JsonPatternScan {
-                module: module.to_owned(),
-                path: path.display().to_string(),
-                arch_bits,
-                status: "unsupported",
-                expected_miss: true,
-                reason: Some("64-bit patterns are not supported yet".to_owned()),
-                text_file_off: None,
-                text_vaddr: None,
-                text_size: None,
-                ok_count: 0,
-                miss_count: 0,
-                failures: Vec::new(),
-                entries: Vec::new(),
-            });
-            continue;
-        }
-
-        match scan_module(module, &path) {
+    for (module, path) in libraries {
+        match scan_library(module, &path, &refs_x86, &refs_x86_64) {
             Ok(report) => {
                 let fail_count = report.failure_count();
                 failed |= fail_count != 0;
@@ -594,8 +578,8 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
                 scans.push(json_scan_from_report(report));
             }
             Err(error) => {
-                let should_fail = arch_bits != 64 || args.scan_unsupported;
-                failed |= should_fail;
+                failed = true;
+                let arch_bits = arch_bits_from_library_path(&path).unwrap_or(0);
                 args.text_print(format_args!(
                     "scan {module} {}-bit: FAIL path={} ({error})",
                     arch_bits_label(arch_bits),
@@ -606,7 +590,6 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
                     path: path.display().to_string(),
                     arch_bits,
                     status: "error",
-                    expected_miss: false,
                     reason: Some(error),
                     text_file_off: None,
                     text_vaddr: None,
@@ -620,7 +603,35 @@ fn scan_extracted_libraries(args: &Args, packages: &[JsonPackage]) -> (Vec<JsonP
         }
     }
 
-    (scans, failed)
+    Ok((scans, failed))
+}
+
+/// Scan a library with the pattern set of its own ELF class, so a tool built
+/// for any host covers both the 32-bit and the 64-bit Steam client.
+fn scan_library(
+    module: &str,
+    path: &Path,
+    patterns_x86: &[PatternRef<'_>],
+    patterns_x86_64: &[PatternRef<'_>],
+) -> Result<ModuleScanReport, String> {
+    let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (patterns, pointer_width) = match ElfImage::parse(&data)?.class {
+        ElfClass::Elf32 => (patterns_x86, 4),
+        ElfClass::Elf64 => (patterns_x86_64, 8),
+    };
+    // Several matches of one pattern are settled by the entry's registered
+    // body validator, the rule the runtime applies as well.
+    let accept = |code: &[u8], name: &str, offset: usize| {
+        vapor_forge_patterns::full_semantic::validate_live_pattern(
+            module,
+            pointer_width,
+            name,
+            code,
+            offset,
+        )
+        .is_ok()
+    };
+    scan_module(module, path, &data, patterns, Some(&accept))
 }
 
 fn module_from_library_path(path: &Path) -> Option<&'static str> {
@@ -666,7 +677,6 @@ fn json_scan_from_report(report: ModuleScanReport) -> JsonPatternScan {
         path,
         arch_bits,
         status: "scanned",
-        expected_miss: false,
         reason: None,
         text_file_off: Some(report.text_file_off),
         text_vaddr: Some(report.text_vaddr),
@@ -869,6 +879,16 @@ mod tests {
         assert_eq!(package.file, "bins_steamrt_ubuntu12.zip.hash");
         assert_eq!(package.size, 42);
         assert_eq!(package.sha2, "abc");
+    }
+
+    #[test]
+    fn embedded_pattern_sets_cover_both_modules() {
+        for text in [PATTERNS_X86, PATTERNS_X86_64] {
+            let entries = parse_toml_patterns(text).expect("embedded patterns parse");
+            for module in ["steamclient", "steamui"] {
+                assert!(entries.iter().any(|(_, entry)| entry.module == module));
+            }
+        }
     }
 
     #[test]
