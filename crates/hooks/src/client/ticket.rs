@@ -48,6 +48,9 @@ pub(crate) fn resolve_adapter_implementation(
     if name == super::eticket::GET_ENCRYPTED_NAME {
         return resolve_get_enc_implementation(code, entry);
     }
+    if name == super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME {
+        return super::legacy_cdkey::resolve_implementation(code, entry);
+    }
     if name != IS_SUBSCRIBED_IN_TICKET_NAME
         && validate_direct_adapter_entry(code, name, entry, check_ownership)
     {

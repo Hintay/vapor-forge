@@ -114,6 +114,11 @@ impl AppAuthority {
             }
         )
     }
+
+    /// Controlled apps stay under injected behavior in every ownership state.
+    pub fn is_controlled(self) -> bool {
+        matches!(self, Self::Controlled { .. })
+    }
 }
 
 /// Return the genuine ownership result captured before pkg0 could affect it.
@@ -253,6 +258,22 @@ pub fn get_subscribed_count_adjustment(config: &RuntimeConfig) -> u32 {
 mod tests {
     use super::*;
     use vapor_forge_config::InjectApp;
+
+    #[test]
+    fn controlled_authority_is_controlled_in_every_ownership_state() {
+        for ownership in [
+            OwnershipState::Unknown,
+            OwnershipState::Unowned,
+            OwnershipState::Owned,
+        ] {
+            let authority = AppAuthority::Controlled {
+                category: AppCategory::Inject,
+                ownership,
+            };
+            assert!(authority.is_controlled());
+        }
+        assert!(!AppAuthority::Uncontrolled.is_controlled());
+    }
 
     fn config_with_inject(ids: &[u32]) -> RuntimeConfig {
         RuntimeConfig {

@@ -80,6 +80,7 @@ const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
     crate::capability::Capability::CloudControl,
     crate::capability::Capability::CloudHttp,
     crate::capability::Capability::LaunchEnvironment,
+    crate::capability::Capability::LegacyCdKeyControl,
 ];
 
 const STEAMUI_CAPABILITIES: &[crate::capability::Capability] = &[
@@ -790,6 +791,13 @@ fn do_install() {
         check_ownership,
         super::eticket::hk_get_encrypted_app_ticket as super::eticket::GetEncryptedAppTicketFn,
     );
+    let d_requires_legacy_cdkey = resolve_cuser_adapter(
+        &code,
+        super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME,
+        "RequiresLegacyCDKey",
+        check_ownership,
+        super::legacy_cdkey::hk_requires_legacy_cdkey as super::legacy_cdkey::RequiresLegacyCdKeyFn,
+    );
     let mut d_build_depot = resolve_from_registry(
         &registry,
         &code,
@@ -989,6 +997,10 @@ fn do_install() {
             super::shader::GET_SHADER_CACHE_DEPOT_NAME,
             d_shader_cache_depot
         ),
+        hr!(
+            super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME,
+            d_requires_legacy_cdkey
+        ),
     ];
 
     macro_rules! finalize {
@@ -1150,6 +1162,12 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::shader::GET_SHADER_CACHE_DEPOT_DETOUR),
         d_shader_cache_depot
     );
+    finalize!(
+        25,
+        super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME,
+        std::ptr::addr_of_mut!(super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_DETOUR),
+        d_requires_legacy_cdkey
+    );
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
         (hook_results[1].name, hook_results[1].installed),
@@ -1215,6 +1233,10 @@ fn do_install() {
     crate::capability::set_from_requirements(
         crate::capability::Capability::ShaderCacheControl,
         &[(hook_results[24].name, hook_results[24].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::LegacyCdKeyControl,
+        &[(hook_results[25].name, hook_results[25].installed)],
     );
     crate::capability::set_from_requirements(
         crate::capability::Capability::DlcOverrides,
