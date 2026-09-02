@@ -2,10 +2,13 @@ fn requires_interface_implementation(name: &str) -> bool {
     name.starts_with("IClient")
 }
 
+/// Body validator of one pattern entry: returns evidence on success.
+type SemanticValidator = fn(&[u8], usize) -> Option<&'static str>;
+
 struct SemanticCheck {
     name: &'static str,
     label: &'static str,
-    validate: fn(&[u8], usize) -> Option<&'static str>,
+    validate: SemanticValidator,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -381,14 +384,30 @@ const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
 
 const STEAMCLIENT_SPECIAL_SEMANTIC_CHECKS: &[&str] = &["CPackageInfo::GetPackageInfo"];
 
-fn has_semantic_validation(module: &str, arch: SemanticArch, name: &str) -> bool {
-    let checks = match (module, arch) {
+fn semantic_check_table(module: &str, arch: SemanticArch) -> &'static [SemanticCheck] {
+    match (module, arch) {
         ("steamclient", SemanticArch::X86) => STEAMCLIENT32_SEMANTIC_CHECKS,
         ("steamclient", SemanticArch::X86_64) => STEAMCLIENT64_SEMANTIC_CHECKS,
         ("steamui", SemanticArch::X86) => STEAMUI32_SEMANTIC_CHECKS,
         ("steamui", SemanticArch::X86_64) => STEAMUI64_SEMANTIC_CHECKS,
         _ => &[],
-    };
+    }
+}
+
+/// The body validator registered for one pattern entry, if any.
+fn semantic_validator(
+    module: &str,
+    arch: SemanticArch,
+    name: &str,
+) -> Option<SemanticValidator> {
+    semantic_check_table(module, arch)
+        .iter()
+        .find(|check| check.name == name)
+        .map(|check| check.validate)
+}
+
+fn has_semantic_validation(module: &str, arch: SemanticArch, name: &str) -> bool {
+    let checks = semantic_check_table(module, arch);
 
     checks.iter().any(|check| check.name == name)
         || (module == "steamclient" && STEAMCLIENT_SPECIAL_SEMANTIC_CHECKS.contains(&name))

@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::elf::{ElfImage, ExecutableSegment};
-use crate::registry::{FollowMode, PatternDef, EMBEDDED_PATTERNS};
+use crate::registry::{FollowMode, PatternDef, RuntimePatternEntry};
 use crate::{find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern};
 
 const FOLLOW_CALL_SCAN_BYTES: usize = 256;
@@ -39,6 +39,21 @@ impl<'a> From<&'a PatternDef> for PatternRef<'a> {
             pic_entry: entry.pic_entry,
             steamrt_variant: entry.steamrt_variant,
             module: entry.module,
+        }
+    }
+}
+
+impl<'a> From<&'a (String, RuntimePatternEntry)> for PatternRef<'a> {
+    fn from((name, entry): &'a (String, RuntimePatternEntry)) -> Self {
+        Self {
+            name,
+            pattern: &entry.pattern,
+            follow: entry.follow,
+            prologue: entry.prologue.as_deref(),
+            callee_pattern: entry.callee_pattern.as_deref(),
+            pic_entry: entry.pic_entry,
+            steamrt_variant: entry.steamrt_variant,
+            module: &entry.module,
         }
     }
 }
@@ -114,25 +129,29 @@ impl PatternScanStatus {
     }
 }
 
-pub fn scan_module(module: &str, path: &Path) -> Result<ModuleScanReport, String> {
-    let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let segment = executable_segment(&data)?;
-    let patterns: Vec<_> = EMBEDDED_PATTERNS
-        .iter()
-        .filter(|entry| entry.module == module)
-        .collect();
-    if patterns.is_empty() {
-        return Err(format!("no embedded patterns for module {module:?}"));
-    }
-
+/// Scan one library image with the pattern set that matches its
+/// architecture. `path` only selects the library family and labels the report.
+pub fn scan_module(
+    module: &str,
+    path: &Path,
+    data: &[u8],
+    patterns: &[PatternRef<'_>],
+    accept: Option<CandidateCheck<'_>>,
+) -> Result<ModuleScanReport, String> {
+    let segment = executable_segment(data)?;
     let variants = patterns
         .iter()
-        .map(|entry| PatternRef::from(*entry))
+        .copied()
+        .filter(|entry| entry.module == module)
         .collect::<Vec<_>>();
+    if variants.is_empty() {
+        return Err(format!("no patterns for module {module:?}"));
+    }
+
     let variants = select_variants_for_library_path(&variants, path);
     let entries = group_variants(&variants)
         .into_iter()
-        .map(|group| scan_entry_group(segment.bytes, &group))
+        .map(|group| scan_entry_group(segment.bytes, &group, accept))
         .collect();
 
     Ok(ModuleScanReport {
@@ -193,9 +212,13 @@ pub fn group_variants<'a>(entries: &[PatternRef<'a>]) -> Vec<Vec<PatternRef<'a>>
     groups
 }
 
-fn scan_entry_group(haystack: &[u8], entries: &[PatternRef<'_>]) -> PatternScanEntry {
+fn scan_entry_group(
+    haystack: &[u8],
+    entries: &[PatternRef<'_>],
+    accept: Option<CandidateCheck<'_>>,
+) -> PatternScanEntry {
     let entry = entries[0];
-    match resolve_entry_group(haystack, entries) {
+    match resolve_entry_group_with(haystack, entries, accept) {
         Ok(result) => PatternScanEntry {
             name: entry.name.to_owned(),
             status: PatternScanStatus::Ok,
@@ -221,6 +244,13 @@ pub struct ResolveResult {
     pub variant_index: usize,
 }
 
+/// Chooses between several matches of one pattern. It receives the scanned
+/// code, the entry name and a candidate match offset; returning true accepts
+/// that candidate. Accepted candidates are equivalent for the caller (for
+/// example several instantiations of one template), so the first accepted
+/// match wins. Callers plug in the entry's semantic validator here.
+pub type CandidateCheck<'c> = &'c dyn Fn(&[u8], &str, usize) -> bool;
+
 /// Where one variant of a conflicting group resolved to.
 #[derive(Clone, Copy, Debug)]
 pub struct VariantTarget {
@@ -233,10 +263,20 @@ pub fn resolve_entry_group(
     haystack: &[u8],
     entries: &[PatternRef<'_>],
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_entry_group_with(haystack, entries, None)
+}
+
+/// [`resolve_entry_group`] with a candidate check that settles patterns
+/// matching more than once.
+pub fn resolve_entry_group_with(
+    haystack: &[u8],
+    entries: &[PatternRef<'_>],
+    accept: Option<CandidateCheck<'_>>,
+) -> Result<ResolveResult, ResolveError> {
     let mut best_error = None;
     let mut successes = Vec::new();
     for (variant_index, entry) in entries.iter().enumerate() {
-        match resolve_entry(haystack, entry) {
+        match resolve_entry(haystack, entry, accept) {
             Ok(mut result) => {
                 result.variant_index = variant_index;
                 successes.push(result);
@@ -360,7 +400,11 @@ impl fmt::Display for ResolveError {
     }
 }
 
-fn resolve_entry(haystack: &[u8], entry: &PatternRef<'_>) -> Result<ResolveResult, ResolveError> {
+fn resolve_entry(
+    haystack: &[u8],
+    entry: &PatternRef<'_>,
+    accept: Option<CandidateCheck<'_>>,
+) -> Result<ResolveResult, ResolveError> {
     let pattern = Pattern::parse(entry.pattern)
         .map_err(|error| ResolveError::PatternParse(error.to_string()))?;
     let matches = pattern.find_all(haystack);
@@ -370,9 +414,9 @@ fn resolve_entry(haystack: &[u8], entry: &PatternRef<'_>) -> Result<ResolveResul
 
     let match_count = matches.len();
     let target_offset = match entry.follow {
-        FollowMode::None => unique_match(&matches)?,
+        FollowMode::None => select_match(haystack, entry, &matches, accept)?,
         FollowMode::Relative => {
-            let offset = unique_match(&matches)?;
+            let offset = select_match(haystack, entry, &matches, accept)?;
             let target = follow_relative_call(haystack, offset)
                 .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?;
             if target < 0 || target as usize >= haystack.len() {
@@ -384,7 +428,7 @@ fn resolve_entry(haystack: &[u8], entry: &PatternRef<'_>) -> Result<ResolveResul
             target as usize
         }
         FollowMode::Upward => {
-            let offset = unique_match(&matches)?;
+            let offset = select_match(haystack, entry, &matches, accept)?;
             let prologue = entry.prologue.ok_or(ResolveError::MissingPrologue)?;
             find_prologue_upwards(haystack, offset, prologue, UPWARD_SCAN_BYTES)
                 .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?
@@ -405,11 +449,29 @@ fn resolve_entry(haystack: &[u8], entry: &PatternRef<'_>) -> Result<ResolveResul
     })
 }
 
-fn unique_match(matches: &[usize]) -> Result<usize, ResolveError> {
+fn select_match(
+    haystack: &[u8],
+    entry: &PatternRef<'_>,
+    matches: &[usize],
+    accept: Option<CandidateCheck<'_>>,
+) -> Result<usize, ResolveError> {
     match matches {
         [] => Err(ResolveError::NoMatch),
         [offset] => Ok(*offset),
-        many => Err(ResolveError::Ambiguous(many.len())),
+        many => {
+            let accepted = accept
+                .map(|accept| {
+                    many.iter()
+                        .copied()
+                        .filter(|&offset| accept(haystack, entry.name, offset))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            accepted
+                .first()
+                .copied()
+                .ok_or(ResolveError::Ambiguous(many.len()))
+        }
     }
 }
 
@@ -503,6 +565,43 @@ mod tests {
         steamrt_variant: true,
         module: "steamclient",
     };
+
+    static AMBIGUOUS: PatternDef = PatternDef {
+        name: "Test::Ambiguous",
+        pattern: "AA BB",
+        follow: FollowMode::None,
+        prologue: None,
+        callee_pattern: None,
+        pic_entry: false,
+        steamrt_variant: false,
+        module: "steamclient",
+    };
+
+    #[test]
+    fn candidate_check_settles_ambiguous_matches() {
+        let haystack = [0xAA, 0xBB, 0x90, 0xAA, 0xBB];
+        let entries = [PatternRef::from(&AMBIGUOUS)];
+        assert!(matches!(
+            resolve_entry_group(&haystack, &entries),
+            Err(ResolveError::Ambiguous(2))
+        ));
+
+        let accept_second =
+            |_: &[u8], name: &str, offset: usize| name == "Test::Ambiguous" && offset == 3;
+        let result = resolve_entry_group_with(&haystack, &entries, Some(&accept_second)).unwrap();
+        assert_eq!((result.target_offset, result.match_count), (3, 2));
+
+        // Equivalent candidates: the first accepted match wins.
+        let accept_all = |_: &[u8], _: &str, _: usize| true;
+        let result = resolve_entry_group_with(&haystack, &entries, Some(&accept_all)).unwrap();
+        assert_eq!((result.target_offset, result.match_count), (0, 2));
+
+        let reject_all = |_: &[u8], _: &str, _: usize| false;
+        assert!(matches!(
+            resolve_entry_group_with(&haystack, &entries, Some(&reject_all)),
+            Err(ResolveError::Ambiguous(2))
+        ));
+    }
 
     #[test]
     fn entry_group_reports_variant_target_conflicts() {
