@@ -464,20 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn bridge_patches_the_live_valve_renderer() {
+    fn bridge_patches_the_valve_renderer_without_a_trampoline() {
         let script = bridge_script();
-        assert!(script.contains("function injectRendererTrampoline("));
-        assert!(script.contains("component.prototype.isReactComponent = true"));
+        assert!(script.contains("function patchJsxRuntime(jsx)"));
+        assert!(script.contains("jsx.jsx = wrap(originalJsx)"));
+        assert!(script.contains("jsx.jsxs = wrap(originalJsxs)"));
+        assert!(script.contains("JSX notification bridge ready"));
         assert!(script.contains("function patchClassRenderer(renderer)"));
         assert!(script.contains("prototype.render = wrapped"));
-        assert!(script.contains("const currentRenderer = findValveToastRenderer()"));
-        assert!(script.contains("const renderer = currentRenderer || state.renderer"));
-        assert!(script.contains("currentRenderer !== state.renderer"));
-        assert!(script.contains("state.renderPatched = false"));
-        assert!(script.contains("['createElement', 'PureComponent', 'useLayoutEffect']"));
-        assert!(script.contains("['createPortal', 'flushSync', 'version']"));
-        assert!(script.contains("Valve toast renderer trampoline ready"));
-        assert!(!script.contains("function patchJsxRuntime("));
+        assert!(script.contains("var renderer = state.renderer || findValveToastRenderer()"));
+        assert!(script.contains("state.renderPatched = jsxPatched || renderPatched"));
+        assert!(script.contains("Valve toast renderer render patch ready"));
+        assert!(!script.contains("injectRendererTrampoline"));
+        assert!(!script.contains("isReactComponent = true"));
+        assert!(!script.contains("Object.create(component.prototype)"));
+        assert!(!script.contains("trampoline ready"));
         assert!(!script.contains("Valve toast renderer export bridge ready"));
     }
 
@@ -568,9 +569,9 @@ mod tests {
             .map(|offset| renderer_runtime + offset)
             .unwrap();
         assert!(renderer_runtime < export_scan);
-        assert!(script.contains("if (major === 19)"));
-        assert!(script.contains("jsx.jsx = function()"));
-        assert!(script.contains("jsx.jsxs = function()"));
+        assert!(script.contains("var jsx = state.jsx || bridge.findJsx()"));
+        assert!(!script.contains("jsx.jsx = function()"));
+        assert!(!script.contains("jsx.jsxs = function()"));
     }
 
     #[test]

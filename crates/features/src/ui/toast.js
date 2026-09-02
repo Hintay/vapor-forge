@@ -18,11 +18,9 @@
         pending: [],
         seen: {},
         renderPatched: false,
+        jsxPatched: false,
         renderer: null,
         rendererHook: null,
-        react: null,
-        reactDom: null,
-        reactHooks: null,
         steamApp: null,
         steamServicesReady: false,
         steamServicesWaitStarted: false,
@@ -1068,227 +1066,6 @@
         return found;
       }
 
-      function findReact() {
-        var found = null;
-        bridge.eachExport(function(exp) {
-          if (exp && typeof exp.createElement === 'function' &&
-              typeof exp.Component === 'function' &&
-              typeof exp.PureComponent === 'function' &&
-              typeof exp.useLayoutEffect === 'function') {
-            found = exp;
-            return true;
-          }
-          return false;
-        }, function(text) {
-          return bridge.hasAll(text, ['createElement', 'PureComponent', 'useLayoutEffect']);
-        });
-        return found;
-      }
-
-      function findReactDom() {
-        var found = null;
-        bridge.eachExport(function(exp) {
-          if (exp && typeof exp.createPortal === 'function' &&
-              (typeof exp.createRoot === 'function' ||
-               exp.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE)) {
-            found = exp;
-            return true;
-          }
-          return false;
-        }, function(text) {
-          return bridge.hasAll(text, ['createPortal', 'flushSync', 'version']);
-        });
-        return found;
-      }
-
-      function findReactHooks(react) {
-        try {
-          var legacy = react &&
-            react.__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
-          var dispatcher = legacy && legacy.ReactCurrentDispatcher;
-          if (dispatcher && dispatcher.current) return dispatcher.current;
-          var client = react &&
-            react.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
-          if (!client) return null;
-          return Object.values(client).find(function(value) {
-            return value && typeof value.useEffect === 'function';
-          }) || null;
-        } catch (_) {
-          return null;
-        }
-      }
-
-      function reactMajorVersion(reactDom) {
-        var version = String(reactDom && reactDom.version || '');
-        if (version.indexOf('18.') === 0) return 18;
-        if (version.indexOf('19.') === 0) return 19;
-        return 0;
-      }
-
-      function injectRendererTrampoline(component, react, reactDom, jsx, hooks) {
-        if (!component || !component.prototype) return false;
-        if (component.prototype.isReactComponent &&
-            typeof component.prototype.render === 'function') return true;
-
-        var major = reactMajorVersion(reactDom);
-        if (major !== 18 && major !== 19) return false;
-
-        var forwarded = function() {
-          return component.apply(this, arguments);
-        };
-        var activeComponent = { component: forwarded };
-        component.prototype.render = function() {
-          return react.createElement(
-            activeComponent.component,
-            this.props,
-            this.props && this.props.children
-          );
-        };
-        component.prototype.isReactComponent = true;
-
-        var stubsApplied = false;
-        var oldHooks = null;
-        var oldCreateElement = react.createElement;
-        var oldJsx = jsx && jsx.jsx;
-        var oldJsxs = jsx && jsx.jsxs;
-
-        function applyStubs() {
-          if (stubsApplied) return;
-          stubsApplied = true;
-          oldHooks = {
-            useContext: hooks.useContext,
-            useCallback: hooks.useCallback,
-            useLayoutEffect: hooks.useLayoutEffect,
-            useEffect: hooks.useEffect,
-            useMemo: hooks.useMemo,
-            useRef: hooks.useRef,
-            useState: hooks.useState
-          };
-          hooks.useCallback = function(callback) { return callback; };
-          hooks.useContext = function(context) { return context && context._currentValue; };
-          hooks.useLayoutEffect = function() {};
-          hooks.useEffect = function() {};
-          hooks.useMemo = function(callback) { return callback(); };
-          hooks.useRef = function(value) { return { current: value || {} }; };
-          hooks.useState = function(value) {
-            var current = value;
-            return [current, function(next) { current = next; }];
-          };
-          react.createElement = function() {
-            return Object.create(component.prototype);
-          };
-          if (major === 19) {
-            jsx.jsx = function() { return Object.create(component.prototype); };
-            jsx.jsxs = function() { return Object.create(component.prototype); };
-          }
-        }
-
-        function removeStubs() {
-          if (!stubsApplied) return;
-          stubsApplied = false;
-          if (oldHooks) Object.assign(hooks, oldHooks);
-          oldHooks = null;
-          react.createElement = oldCreateElement;
-          if (major === 19) {
-            jsx.jsx = oldJsx;
-            jsx.jsxs = oldJsxs;
-          }
-        }
-
-        var renderStep = 0;
-        if (major === 19) {
-          Object.defineProperty(component, 'contextType', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 0) renderStep = 1;
-              if (this._contextType == null) this._contextType = {};
-              if (!this._contextType.__vaporForgeCurrentValueHook) {
-                this._contextType.__vaporForgeCurrentValueHook = true;
-                Object.defineProperty(this._contextType, '_currentValue', {
-                  configurable: true,
-                  get: function() {
-                    if (renderStep === 1) {
-                      renderStep = 2;
-                      applyStubs();
-                    }
-                    return this.__vaporForgeCurrentValue;
-                  },
-                  set: function(value) { this.__vaporForgeCurrentValue = value; }
-                });
-              }
-              return this._contextType;
-            },
-            set: function(value) { this._contextType = value; }
-          });
-          Object.defineProperty(component.prototype, 'updater', {
-            configurable: true,
-            get: function() { return this._updater; },
-            set: function(value) {
-              if (renderStep === 1 || renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              this._updater = value;
-            }
-          });
-          Object.defineProperty(component, 'getDerivedStateFromProps', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 1 || renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              return this._getDerivedStateFromProps;
-            },
-            set: function(value) { this._getDerivedStateFromProps = value; }
-          });
-        } else {
-          Object.defineProperty(component, 'contextType', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 0) renderStep = 1;
-              else if (renderStep === 3) renderStep = 4;
-              return this._contextType;
-            },
-            set: function(value) { this._contextType = value; }
-          });
-          Object.defineProperty(component, 'contextTypes', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 1) {
-                renderStep = 2;
-                applyStubs();
-              }
-              return this._contextTypes;
-            },
-            set: function(value) { this._contextTypes = value; }
-          });
-          Object.defineProperty(component.prototype, 'updater', {
-            configurable: true,
-            get: function() { return this._updater; },
-            set: function(value) {
-              if (renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              this._updater = value;
-            }
-          });
-          Object.defineProperty(component, 'getDerivedStateFromProps', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              return this._getDerivedStateFromProps;
-            },
-            set: function(value) { this._getDerivedStateFromProps = value; }
-          });
-        }
-        return true;
-      }
-
       function renderFallback(jsx, title, body) {
         return jsx.jsx('div', {
           className: 'VaporForgeToastFallback',
@@ -1564,6 +1341,32 @@
         }
       }
 
+      function patchJsxRuntime(jsx) {
+        if (!jsx || state.jsxPatched) return !!jsx;
+        var originalJsx = jsx.jsx;
+        var originalJsxs = jsx.jsxs;
+        if (typeof originalJsx !== 'function' || typeof originalJsxs !== 'function') return false;
+        function wrap(create) {
+          return function(type, props, key) {
+            if (type !== renderVaporForgeToast && typeof type === 'function' &&
+                isVaporForgeProps(props)) {
+              return create.call(this, renderVaporForgeToast, props, key);
+            }
+            return create.apply(this, arguments);
+          };
+        }
+        try {
+          jsx.jsx = wrap(originalJsx);
+          jsx.jsxs = wrap(originalJsxs);
+          state.jsxPatched = true;
+          bridge.log('JSX notification bridge ready');
+          return true;
+        } catch (error) {
+          bridge.log('JSX patch error: ' + error);
+          return false;
+        }
+      }
+
       function patchClassRenderer(renderer) {
         var prototype = renderer && renderer.prototype;
         var current = prototype && prototype.render;
@@ -1596,35 +1399,30 @@
         if (gamepadUiReady) {
           state.navigation = state.navigation || bridge.findWindowStore();
         }
-        const currentRenderer = findValveToastRenderer();
-        if (currentRenderer && currentRenderer !== state.renderer) {
-          state.renderPatched = false;
-        }
-        const renderer = currentRenderer || state.renderer;
-        const jsx = bridge.findJsx() || state.jsx;
-        const css = findCss() || state.css;
-        const react = findReact() || state.react;
-        const reactDom = findReactDom() || state.reactDom;
-        const hooks = findReactHooks(react) || state.reactHooks;
-        if (!renderer || !jsx || !css || !react || !reactDom || !hooks) return false;
-        if (typeof jsx.jsx !== 'function' || typeof jsx.jsxs !== 'function') return false;
-        if (!injectRendererTrampoline(renderer, react, reactDom, jsx, hooks)) return false;
-        state.renderer = renderer;
+        var jsx = state.jsx || bridge.findJsx();
+        var css = state.css || findCss();
+        if (!jsx || !css) return false;
         state.jsx = jsx;
         state.css = css;
-        state.react = react;
-        state.reactDom = reactDom;
-        state.reactHooks = hooks;
-        var previousHook = state.rendererHook;
-        if (patchClassRenderer(renderer)) {
-          state.renderPatched = true;
-          if (state.rendererHook !== previousHook) {
-            bridge.log('Valve toast renderer trampoline ready');
+        // Element creation is intercepted on the renderer's own JSX runtime, so a
+        // plain function renderer is never converted into a class here: other
+        // loaders (Decky) install that kind of trampoline on the same component,
+        // and two of them leave React with stubbed element factories. A class
+        // renderer, Valve's own or one already converted by such a loader, also
+        // gets its render method wrapped.
+        var jsxPatched = patchJsxRuntime(jsx);
+        var renderer = state.renderer || findValveToastRenderer();
+        var renderPatched = false;
+        if (renderer) {
+          state.renderer = renderer;
+          var previousHook = state.rendererHook;
+          renderPatched = patchClassRenderer(renderer);
+          if (renderPatched && state.rendererHook !== previousHook) {
+            bridge.log('Valve toast renderer render patch ready');
           }
-          return true;
         }
-        state.renderPatched = false;
-        return false;
+        state.renderPatched = jsxPatched || renderPatched;
+        return state.renderPatched;
       }
 
       function flush() {
