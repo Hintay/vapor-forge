@@ -29,10 +29,11 @@ pub(crate) enum Capability {
     OverviewMetadata,
     LibrarySnapshot,
     ConflictUiBridge,
+    LegacyCdKeyControl,
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::CallbackEvents,
         Self::Ownership,
         Self::PackageInjection,
@@ -49,6 +50,7 @@ impl Capability {
         Self::OverviewMetadata,
         Self::LibrarySnapshot,
         Self::ConflictUiBridge,
+        Self::LegacyCdKeyControl,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -69,6 +71,7 @@ impl Capability {
             Self::OverviewMetadata => "overview-metadata",
             Self::LibrarySnapshot => "library-snapshot",
             Self::ConflictUiBridge => "conflict-ui-bridge",
+            Self::LegacyCdKeyControl => "legacy-cdkey-control",
         }
     }
 

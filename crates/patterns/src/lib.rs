@@ -5,6 +5,8 @@ extern crate self as vapor_forge_patterns;
 
 use thiserror::Error;
 
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod cuser_adapter;
 pub mod elf;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;

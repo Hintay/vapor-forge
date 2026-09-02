@@ -857,6 +857,7 @@ mod tests {
             "IClientUser::GetAppOwnershipTicketExtendedData",
             "IClientUser::BUpdateAppOwnershipTicket",
             "IClientUser::IsUserSubscribedAppInTicket",
+            "IClientUser::RequiresLegacyCDKey",
         ] {
             assert!(reg.get(name).is_none(), "{name} should use vtable scanning");
         }

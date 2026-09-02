@@ -831,6 +831,7 @@ enum CUserAdapterKind {
     TicketExtendedData,
     UpdateTicket,
     IsSubscribedInTicket,
+    RequiresLegacyCdKey,
 }
 
 fn scan_cuser_adapters(
@@ -883,6 +884,7 @@ fn scan_cuser_adapters(
             "IsUserSubscribedAppInTicket",
             CUserAdapterKind::IsSubscribedInTicket,
         ),
+        ("RequiresLegacyCDKey", CUserAdapterKind::RequiresLegacyCdKey),
     ];
 
     let mut failed = false;
@@ -973,6 +975,15 @@ fn resolve_cuser_adapter_implementation(
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
 ) -> Option<usize> {
+    if matches!(kind, CUserAdapterKind::RequiresLegacyCdKey) {
+        let bitness = match arch {
+            SemanticArch::X86 => 32,
+            SemanticArch::X86_64 => 64,
+        };
+        return vapor_forge_patterns::cuser_adapter::resolve_requires_legacy_cdkey_implementation(
+            code, text_vaddr, offset, bitness,
+        );
+    }
     if matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
         && !validate_is_subscribed_wrapper_abi(code, offset, arch)
     {
@@ -1095,6 +1106,8 @@ fn validate_cuser_adapter(
         (SemanticArch::X86_64, CUserAdapterKind::IsSubscribedInTicket) => {
             is_user_subscribed_app_in_ticket64_evidence(code, offset)
         }
+        // Resolved and validated by the shared cuser_adapter resolver instead.
+        (_, CUserAdapterKind::RequiresLegacyCdKey) => None,
     };
     evidence.is_some_and(|evidence| evidence.is_complete())
 }
