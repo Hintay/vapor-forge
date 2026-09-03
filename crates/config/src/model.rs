@@ -370,6 +370,10 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
 /// flag = "-onlinefix"
 /// apps = [480]
 /// ```
+///
+/// Native `.so` entries are merged in front of the `LD_PRELOAD` value Steam
+/// composes for the game (its overlay renderers), so they reach the game
+/// process even though Steam writes that variable after the launch hooks ran.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryInjectSection {
