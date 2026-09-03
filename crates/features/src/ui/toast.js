@@ -38,6 +38,8 @@
         nativeToastSurfaceClass: null,
         popupBase: null,
         popupTracker: null,
+        popupCreatedHooked: false,
+        popupHostWaitLogged: false,
         browserTypes: null,
         windowCreationFlags: null,
         deckyLoaderHooked: false,
@@ -1068,24 +1070,58 @@
         return true;
       }
 
+      function hookPopupCreate(popup) {
+        if (!popup || popup.__vaporForgeCreateHook) return;
+        popup.__vaporForgeCreateHook = true;
+        var original = popup.OnCreate;
+        popup.OnCreate = function() {
+          var result = typeof original === 'function' ? original.apply(this, arguments) : undefined;
+          queueSteamReadiness();
+          return result;
+        };
+      }
+
       // Steam's popup class finishes a window only after the native side reports
-      // "popup-created" for it (m_bCreated). Do not open our notification popup
-      // while its owner window is still short of that point; wait for the
-      // owner's OnCreate instead.
-      function isOwnerPopupCreated(ownerWindow) {
+      // "popup-created" for it (m_bCreated). A notification popup opened before
+      // its owner window reached that point, or as the very first popup of the
+      // browser process, races Steam's popup adoption in CEF: Chromium's outer
+      // popup window then never gets reparented and stays behind as an unnamed,
+      // focused taskbar entry. Wait until the owner and at least one other
+      // Steam popup are created; every not-yet-created popup re-runs readiness
+      // from its OnCreate.
+      function isPopupHostReady(ownerWindow) {
         var tracker = state.popupTracker;
         if (!tracker) return true;
-        var owner = null;
-        try { owner = tracker.GetPopupForWindow(ownerWindow); } catch (_) { return true; }
-        if (!owner || owner.m_bCreated) return true;
-        if (!owner.__vaporForgeCreateHook) {
-          owner.__vaporForgeCreateHook = true;
-          var original = owner.OnCreate;
-          owner.OnCreate = function() {
-            var result = typeof original === 'function' ? original.apply(this, arguments) : undefined;
-            queueSteamReadiness();
-            return result;
-          };
+        var ownerTracked = false;
+        var ownerReady = false;
+        var otherReady = false;
+        try {
+          Array.from(tracker.GetPopups()).forEach(function(popup) {
+            var created = !!popup.m_bCreated;
+            if (popup.window === ownerWindow) {
+              ownerTracked = true;
+              ownerReady = created;
+            } else if (created) {
+              otherReady = true;
+            }
+            if (!created) hookPopupCreate(popup);
+          });
+          if (!state.popupCreatedHooked) {
+            state.popupCreatedHooked = true;
+            tracker.AddPopupCreatedCallback(function(popup) {
+              hookPopupCreate(popup);
+              queueSteamReadiness();
+            });
+          }
+        } catch (error) {
+          bridge.log('popup tracker error: ' + error);
+          return true;
+        }
+        if (!ownerTracked) ownerReady = true;
+        if (ownerReady && otherReady) return true;
+        if (!state.popupHostWaitLogged) {
+          state.popupHostWaitLogged = true;
+          bridge.log('native notification waits for popups owner=' + ownerReady + ' other=' + otherReady);
         }
         return false;
       }
@@ -1115,7 +1151,7 @@
         var ownerWindow = active && active.browserWindow;
         if (!ownerWindow || !ownerWindow.document || !ownerWindow.document.body) return false;
         if (!nativeToastSurfaceClass(ownerWindow.document)) return false;
-        if (!isOwnerPopupCreated(ownerWindow)) return false;
+        if (!isPopupHostReady(ownerWindow)) return false;
         if (!isOwnerDocumentComplete(ownerWindow)) return false;
         try {
           bridge.log('native notification path=' + (isGamepadUiReady() ? 'gamepad' : 'desktop') +
