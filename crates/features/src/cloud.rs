@@ -27,6 +27,24 @@ pub fn on_is_cloud_enabled(config: &RuntimeConfig, app_id: AppId, original: bool
     original
 }
 
+/// Controlled apps whose Steam cloud has to be switched off up front.
+///
+/// Steam's logon sync visits every app that still has cloud enabled before it
+/// consults the per-app gate, so waiting for the gate leaves a window in which
+/// controlled apps sync against Valve and fail.
+pub fn apps_to_disable(config: &RuntimeConfig) -> Vec<AppId> {
+    if config.cloud_enabled_for_controlled_apps() {
+        return Vec::new();
+    }
+    config
+        .apps
+        .inject()
+        .iter()
+        .map(|app| app.id)
+        .filter(|&app_id| crate::apps::classify_app(config, app_id).requires_injected_ownership())
+        .collect()
+}
+
 /// Report what Steam itself answered for an app, once per app. Whether the gate
 /// needs to be forced open depends entirely on that value, and it is not
 /// observable from the outside.
@@ -278,6 +296,37 @@ mod tests {
     };
 
     const TEST_APP_ID: AppId = AppId(246_813_579);
+
+    fn config_with_inject(ids: &[u32]) -> RuntimeConfig {
+        RuntimeConfig {
+            apps: vapor_forge_config::AppsSection::with_inject(
+                ids.iter()
+                    .map(|&id| InjectApp {
+                        id: AppId(id),
+                        dlc: Vec::new(),
+                        ticket: Default::default(),
+                        purchase_time: 0,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apps_to_disable_lists_controlled_apps_without_genuine_ownership() {
+        let config = config_with_inject(&[5_551, 5_552]);
+        assert_eq!(apps_to_disable(&config), vec![AppId(5_551), AppId(5_552)]);
+        crate::apps::record_actual_ownership(AppId(5_552), true);
+        assert_eq!(apps_to_disable(&config), vec![AppId(5_551)]);
+    }
+
+    #[test]
+    fn apps_to_disable_is_empty_when_a_backend_serves_cloud() {
+        let mut config = config_with_inject(&[5_553]);
+        config.cloud.backend = CloudBackendMode::Local;
+        assert!(apps_to_disable(&config).is_empty());
+    }
 
     fn controlled_config(cloud: CloudSection) -> RuntimeConfig {
         RuntimeConfig {
