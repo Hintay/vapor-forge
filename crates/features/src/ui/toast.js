@@ -37,6 +37,7 @@
         preLoginNativeEntries: [],
         nativeToastSurfaceClass: null,
         popupBase: null,
+        popupTracker: null,
         browserTypes: null,
         windowCreationFlags: null,
         deckyLoaderHooked: false,
@@ -691,8 +692,19 @@
         return false;
       }
 
+      function findPopupTracker(exports) {
+        try {
+          return Object.keys(exports).map(function(key) { return exports[key]; }).find(function(value) {
+            return !!value && typeof value === 'object' &&
+              typeof value.GetPopupForWindow === 'function';
+          }) || null;
+        } catch (_) {
+          return null;
+        }
+      }
+
       function findNativePopupSupport() {
-        bridge.eachExport(function(exp) {
+        bridge.eachExport(function(exp, id, mod, parent) {
           var prototype = exp && exp.prototype;
           if (!state.popupBase && typeof exp === 'function' && prototype &&
               Object.prototype.hasOwnProperty.call(prototype, 'Show') &&
@@ -702,6 +714,7 @@
               typeof prototype.Close === 'function' &&
               typeof prototype.RegisterChildBrowserView === 'function') {
             state.popupBase = exp;
+            if (parent) state.popupTracker = findPopupTracker(parent);
           }
           if (!state.browserTypes && exp && typeof exp === 'object' &&
               exp.EBrowserType_DirectHWND_Borderless === 4) {
@@ -1032,17 +1045,21 @@
           }
         );
         popup.Render = function(_, element) {
+          bridge.log('native notification popup render');
           installNativeToastSurface(element.ownerDocument);
           renderNativeToastDom(element, data, notification, entry);
           relayoutPreLoginNativeToasts();
         };
         popup.OnLoad = function() {};
         popup.OnClose = function() {
+          bridge.log('native notification popup closed');
           removePreLoginNativeEntry(entry);
         };
         entry.popup = popup;
         state.preLoginNativeEntries.push(entry);
         popup.Show(false);
+        bridge.log('native notification popup shown valid=' + popup.BIsValid() +
+          ' created=' + popup.m_bCreated);
         if (!popup.BIsValid()) {
           removePreLoginNativeEntry(entry);
           return false;
@@ -1051,13 +1068,58 @@
         return true;
       }
 
+      // Steam's popup class finishes a window only after the native side reports
+      // "popup-created" for it (m_bCreated). Do not open our notification popup
+      // while its owner window is still short of that point; wait for the
+      // owner's OnCreate instead.
+      function isOwnerPopupCreated(ownerWindow) {
+        var tracker = state.popupTracker;
+        if (!tracker) return true;
+        var owner = null;
+        try { owner = tracker.GetPopupForWindow(ownerWindow); } catch (_) { return true; }
+        if (!owner || owner.m_bCreated) return true;
+        if (!owner.__vaporForgeCreateHook) {
+          owner.__vaporForgeCreateHook = true;
+          var original = owner.OnCreate;
+          owner.OnCreate = function() {
+            var result = typeof original === 'function' ? original.apply(this, arguments) : undefined;
+            queueSteamReadiness();
+            return result;
+          };
+        }
+        return false;
+      }
+
+      // A popup opened from the shared context while the owner page is still
+      // loading races Steam's popup adoption in CEF: the desktop client then
+      // leaves CEF's default top-level window behind as an unnamed, focused
+      // taskbar entry. Wait for the owner's load event first.
+      function isOwnerDocumentComplete(ownerWindow) {
+        var document = ownerWindow.document;
+        if (!document || document.readyState === 'complete') return true;
+        if (!document.__vaporForgeLoadHook) {
+          document.__vaporForgeLoadHook = true;
+          try {
+            ownerWindow.addEventListener('load', function() { queueSteamReadiness(); }, { once: true });
+          } catch (_) {
+            return true;
+          }
+          bridge.log('native notification waits for owner load state=' + document.readyState);
+        }
+        return false;
+      }
+
       function renderPreLoginNativeToast(data, notification) {
         if (!ensurePreLoginSurface() || !findNativePopupSupport()) return false;
         var active = activeSteamWindow();
         var ownerWindow = active && active.browserWindow;
         if (!ownerWindow || !ownerWindow.document || !ownerWindow.document.body) return false;
         if (!nativeToastSurfaceClass(ownerWindow.document)) return false;
+        if (!isOwnerPopupCreated(ownerWindow)) return false;
+        if (!isOwnerDocumentComplete(ownerWindow)) return false;
         try {
+          bridge.log('native notification path=' + (isGamepadUiReady() ? 'gamepad' : 'desktop') +
+            ' owner=' + ownerWindow.document.readyState);
           if (isGamepadUiReady()) {
             return renderGamepadPreLoginToast(data, notification, ownerWindow);
           }

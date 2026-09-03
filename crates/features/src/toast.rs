@@ -579,6 +579,25 @@ mod tests {
     }
 
     #[test]
+    fn bridge_waits_for_the_owner_popup_before_native_toasts() {
+        let script = bridge_script();
+        assert!(script.contains("function findPopupTracker(exports)"));
+        assert!(script.contains("typeof value.GetPopupForWindow === 'function'"));
+        assert!(script.contains("if (parent) state.popupTracker = findPopupTracker(parent)"));
+        assert!(script.contains("function isOwnerPopupCreated(ownerWindow)"));
+        assert!(script.contains("owner = tracker.GetPopupForWindow(ownerWindow)"));
+        assert!(script.contains("if (!owner || owner.m_bCreated) return true"));
+        assert!(script.contains("owner.OnCreate = function()"));
+        assert!(script.contains("if (!isOwnerPopupCreated(ownerWindow)) return false"));
+        assert!(script.contains("function isOwnerDocumentComplete(ownerWindow)"));
+        assert!(script.contains("document.readyState === 'complete'"));
+        assert!(script.contains("ownerWindow.addEventListener('load', function() { queueSteamReadiness(); }, { once: true })"));
+        assert!(script.contains("if (!isOwnerDocumentComplete(ownerWindow)) return false"));
+        assert!(script.contains("native notification waits for owner load state="));
+        assert!(script.contains("native notification popup shown valid="));
+    }
+
+    #[test]
     fn bridge_uses_the_renderer_jsx_runtime() {
         let script = bridge_script();
         let renderer_runtime = script.find("findJsxFromRendererFactory();").unwrap();
