@@ -4,12 +4,22 @@
 #[cfg(target_os = "linux")]
 use once_cell::sync::Lazy;
 #[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
 use vapor_forge_core::{Lifecycle, SteamModuleState};
 
 #[cfg(target_os = "linux")]
 static LIFECYCLE: Lazy<Lifecycle> = Lazy::new(Lifecycle::new);
 #[cfg(target_os = "linux")]
 static STEAM_MODULES: Lazy<SteamModuleState> = Lazy::new(SteamModuleState::new);
+#[cfg(target_os = "linux")]
+static INIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static INIT_WORKER_STARTING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static INIT_WORKER: OnceLock<std::thread::Thread> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 mod linux_audit {
@@ -18,7 +28,7 @@ mod linux_audit {
     use vapor_forge_diagnostics::{log_cstr, log_early};
     use vapor_forge_memory::is_steam_target_name;
 
-    use super::{LIFECYCLE, STEAM_MODULES};
+    use super::{INIT_REQUESTED, INIT_WORKER, INIT_WORKER_STARTING, LIFECYCLE, STEAM_MODULES};
 
     const LAV_CURRENT: c_uint = 2;
 
@@ -118,12 +128,68 @@ mod linux_audit {
         let steamclient_seen = STEAM_MODULES.steamclient_seen();
         let steamui_seen = STEAM_MODULES.steamui_seen();
 
+        if steamclient_seen || steamui_seen {
+            request_runtime_initialization();
+        }
+    }
+
+    /// Request heavy setup on a normal Rust thread instead of running Lua,
+    /// filesystem work, or detour installation from glibc's loader callback.
+    fn request_runtime_initialization() {
+        INIT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+
+        if let Some(worker) = INIT_WORKER.get() {
+            worker.unpark();
+            return;
+        }
+
+        if INIT_WORKER_STARTING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let result = std::thread::Builder::new()
+                .name("vapor-forge-init".into())
+                .spawn(runtime_initialization_worker);
+            if let Err(error) = result {
+                INIT_WORKER_STARTING.store(false, std::sync::atomic::Ordering::Release);
+                log_early(&format!("la_activity: cannot start init worker: {error}"));
+            }
+        }
+
+        if let Some(worker) = INIT_WORKER.get() {
+            worker.unpark();
+        }
+    }
+
+    fn runtime_initialization_worker() {
+        let current = std::thread::current();
+        if INIT_WORKER.set(current).is_err() {
+            log_early("la_activity: duplicate init worker started");
+        }
+        INIT_WORKER_STARTING.store(false, std::sync::atomic::Ordering::Release);
+
+        loop {
+            while !INIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Acquire) {
+                std::thread::park();
+            }
+            initialize_runtime_and_hooks();
+        }
+    }
+
+    fn initialize_runtime_and_hooks() {
         use vapor_forge_hooks::{
             ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
         };
 
-        if (steamclient_seen || steamui_seen) && !ensure_runtime_initialized() {
-            log_early("la_activity: runtime initialization rejected; hooks disabled");
+        let steamclient_seen = STEAM_MODULES.steamclient_seen();
+        let steamui_seen = STEAM_MODULES.steamui_seen();
+        if !ensure_runtime_initialized() {
+            log_early("init worker: runtime initialization rejected; hooks disabled");
             return;
         }
         if steamclient_seen {

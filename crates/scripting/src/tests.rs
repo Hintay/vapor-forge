@@ -95,6 +95,37 @@ fn executes_setmanifestid_script() {
 }
 
 #[test]
+fn numeric_setmanifestid_preserves_large_gid() {
+    let dir = std::env::temp_dir().join(format!("lua-manifest-numeric-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("test.lua"),
+        concat!(
+            "setmanifestid(228983, 8124929965194586177)\n",
+            "setmanifestid(228990, 1829726630299308803)\n",
+        ),
+    )
+    .unwrap();
+
+    let report = execute_scripts_report(&[dir.to_string_lossy().into_owned()]);
+    assert!(
+        report.files[0].result.is_ok(),
+        "script failed: {:?}",
+        report.files
+    );
+    assert_eq!(
+        report.state.manifests[&DepotId(228983)].gid,
+        ManifestId(8124929965194586177)
+    );
+    assert_eq!(
+        report.state.manifests[&DepotId(228990)].gid,
+        ManifestId(1829726630299308803)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn executes_setstat_script() {
     let dir = std::env::temp_dir().join(format!("lua-stat-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);

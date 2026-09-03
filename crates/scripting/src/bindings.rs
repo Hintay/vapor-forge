@@ -170,8 +170,9 @@ pub(crate) fn execute_source(
         }
         chunk.push_str(line);
 
+        let executable_chunk = normalize_legacy_setmanifestid_chunk(&chunk);
         match lua
-            .load(&chunk)
+            .load(&executable_chunk)
             .set_name(path.to_string_lossy())
             .into_function()
         {
@@ -198,6 +199,100 @@ pub(crate) fn execute_source(
         ));
     }
     errors
+}
+
+/// Steam's generated Lua files historically wrote large manifest GIDs as Lua
+/// numbers instead of strings. LuaJIT stores `number` values as doubles, so a
+/// GID above 2^53 can be rounded before the callback receives it. Preserve the
+/// source token by converting only a leading, unquoted `setmanifestid` GID to a
+/// string before Lua parses the chunk.
+fn normalize_legacy_setmanifestid_chunk(chunk: &str) -> String {
+    // The Steam-generated form is one call per line. Avoid rewriting
+    // multiline chunks because a line that resembles a call can also be part
+    // of a Lua long string or another multiline construct.
+    if chunk.contains('\n') {
+        return chunk.to_owned();
+    }
+
+    let mut normalized = String::with_capacity(chunk.len());
+    normalized.push_str(&normalize_legacy_setmanifestid_line(chunk));
+    normalized
+}
+
+fn normalize_legacy_setmanifestid_line(line: &str) -> String {
+    let name_start = line.len() - line.trim_start().len();
+    let name_end = name_start + "setmanifestid".len();
+    if line.len() < name_end || !line[name_start..name_end].eq_ignore_ascii_case("setmanifestid") {
+        return line.to_owned();
+    }
+
+    let after_name = line.as_bytes().get(name_end).copied();
+    if !matches!(after_name, None | Some(b'(') | Some(b' ' | b'\t')) {
+        return line.to_owned();
+    }
+
+    let open_paren = skip_ascii_whitespace(line.as_bytes(), name_end);
+    if line.as_bytes().get(open_paren) != Some(&b'(') {
+        return line.to_owned();
+    }
+
+    let first_arg_start = open_paren + 1;
+    let Some(comma) = find_argument_comma(line.as_bytes(), first_arg_start) else {
+        return line.to_owned();
+    };
+    let gid_start = skip_ascii_whitespace(line.as_bytes(), comma + 1);
+    if matches!(line.as_bytes().get(gid_start), Some(b'"' | b'\'')) {
+        return line.to_owned();
+    }
+
+    let mut gid_end = gid_start;
+    while line.as_bytes().get(gid_end).is_some_and(u8::is_ascii_digit) {
+        gid_end += 1;
+    }
+    if gid_end == gid_start {
+        return line.to_owned();
+    }
+
+    let delimiter = skip_ascii_whitespace(line.as_bytes(), gid_end);
+    if !matches!(line.as_bytes().get(delimiter), Some(b',' | b')')) {
+        return line.to_owned();
+    }
+
+    let mut normalized = String::with_capacity(line.len() + 2);
+    normalized.push_str(&line[..gid_start]);
+    normalized.push('"');
+    normalized.push_str(&line[gid_start..gid_end]);
+    normalized.push('"');
+    normalized.push_str(&line[gid_end..]);
+    normalized
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    index
+}
+
+fn find_argument_comma(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start) {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == active_quote {
+                quote = None;
+            }
+        } else if matches!(*byte, b'"' | b'\'') {
+            quote = Some(*byte);
+        } else if *byte == b',' {
+            return Some(index);
+        }
+    }
+    None
 }
 
 pub(crate) fn snapshot_state(state: &Shared<RuntimeState>) -> ScriptState {
@@ -851,4 +946,38 @@ pub(crate) fn parse_hex_key(hex: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_legacy_setmanifestid_chunk;
+
+    #[test]
+    fn normalizes_unquoted_large_manifest_gid() {
+        assert_eq!(
+            normalize_legacy_setmanifestid_chunk("setmanifestid(228983, 8124929965194586177)"),
+            "setmanifestid(228983, \"8124929965194586177\")"
+        );
+    }
+
+    #[test]
+    fn leaves_quoted_and_multiline_inputs_unchanged() {
+        let quoted = "setmanifestid(228983, \"8124929965194586177\")";
+        assert_eq!(normalize_legacy_setmanifestid_chunk(quoted), quoted);
+
+        let multiline = "setmanifestid(228983,\n8124929965194586177)";
+        assert_eq!(normalize_legacy_setmanifestid_chunk(multiline), multiline);
+    }
+
+    #[test]
+    fn leaves_non_decimal_and_unrelated_lines_unchanged() {
+        for source in [
+            "setmanifestid(228983, 1.25)",
+            "setmanifestid(228983, 1e10)",
+            "not_setmanifestid(228983, 8124929965194586177)",
+            "-- setmanifestid(228983, 8124929965194586177)",
+        ] {
+            assert_eq!(normalize_legacy_setmanifestid_chunk(source), source);
+        }
+    }
 }
