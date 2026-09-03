@@ -151,9 +151,15 @@ unsafe { original(this, app_list, size, a3) };
     }
 
     let cfg = config();
+    let pkg0_injected = PKG0_INJECTED.load(Ordering::Acquire);
 
-    if app_list.is_null() || size == 0 {
-        return count + vapor_forge_features::apps::get_subscribed_count_adjustment(&cfg);
+    // Steam calls this twice: once with (NULL, 0) to size a CUtlVector, then
+    // with the buffer, ignoring the second return value and consuming every
+    // sized slot. Both answers must therefore describe the same list, and the
+    // fill path must never leave slots unwritten.
+    if app_list.is_null() || size == 0 || count > size {
+        return count
+            + vapor_forge_features::apps::get_subscribed_count_adjustment(&cfg, pkg0_injected);
     }
 
     // SAFETY: app_list buffer has `size` u32 slots, provided by Steam's caller.

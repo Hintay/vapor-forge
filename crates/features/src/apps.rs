@@ -232,12 +232,14 @@ pub fn on_get_subscribed_apps(
     // deferred ownership spoofing can start.
     mark_license_sync_complete();
 
-    let inject_ids: Vec<AppId> = config.apps.inject().iter().map(|a| a.id).collect();
-    if inject_ids.is_empty() {
+    let mut count = original_count as usize;
+    if count > app_list.len() {
+        // Steam writes nothing when the buffer is too small and reports the
+        // size it needs; there is nothing to append to or clear.
         return original_count;
     }
 
-    let mut count = original_count as usize;
+    let inject_ids: Vec<AppId> = config.apps.inject().iter().map(|a| a.id).collect();
     for &app_id in &inject_ids {
         if app_list[..count].contains(&app_id.0) {
             continue;
@@ -247,10 +249,25 @@ pub fn on_get_subscribed_apps(
             count += 1;
         }
     }
+
+    // Steam sizes its receiving vector from the earlier NULL/0 call and ignores
+    // the count returned here, so every slot past `count` is consumed as an app
+    // id. Leaving them untouched exposes stale heap contents as subscriptions.
+    for slot in &mut app_list[count..] {
+        *slot = 0;
+    }
     count as u32
 }
 
-pub fn get_subscribed_count_adjustment(config: &RuntimeConfig) -> u32 {
+/// Extra entries to report on the sizing call (`NULL`, 0).
+///
+/// Once the controlled apps live in pkg0, Steam's own license walk already
+/// enumerates them, so reporting them again only inflates the caller's buffer
+/// with slots the fill call never writes.
+pub fn get_subscribed_count_adjustment(config: &RuntimeConfig, pkg0_injected: bool) -> u32 {
+    if pkg0_injected {
+        return 0;
+    }
     config.apps.inject().len() as u32
 }
 
@@ -496,5 +513,38 @@ mod tests {
         let count = on_get_subscribed_apps(&config, &mut buf, 1);
         assert_eq!(count, 2);
         assert_eq!(buf[1], 480);
+    }
+
+    #[test]
+    fn subscribed_apps_zero_fills_unwritten_tail() {
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let config = config_with_inject(&[480]);
+        // Steam already lists 480 through pkg0; the slots past its count hold
+        // whatever the heap had before.
+        let mut buf = [100, 480, 0xdead_beef, 0xfeed_face];
+        let count = on_get_subscribed_apps(&config, &mut buf, 2);
+        assert_eq!(count, 2);
+        assert_eq!(buf, [100, 480, 0, 0]);
+    }
+
+    #[test]
+    fn subscribed_apps_leaves_small_buffer_untouched() {
+        let _guard = SYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let config = config_with_inject(&[480]);
+        let mut buf = [0xdead_beef; 2];
+        let count = on_get_subscribed_apps(&config, &mut buf, 5);
+        assert_eq!(count, 5);
+        assert_eq!(buf, [0xdead_beef; 2]);
+    }
+
+    #[test]
+    fn subscribed_count_adjustment_stops_once_pkg0_is_injected() {
+        let config = config_with_inject(&[480, 730]);
+        assert_eq!(get_subscribed_count_adjustment(&config, false), 2);
+        assert_eq!(get_subscribed_count_adjustment(&config, true), 0);
     }
 }
