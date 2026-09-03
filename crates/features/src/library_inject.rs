@@ -17,29 +17,33 @@ use vapor_forge_config::{AppId, LibraryInjectEntry, LibraryInjectSection};
 pub struct PendingInjection {
     pub native_libs: Vec<String>,   // .so paths for LD_PRELOAD
     pub proton_dll: Option<String>, // .dll path for Proton helper
-    /// Load the Proton helper so it can disable thread callouts on a duplicate
-    /// USER32 loader entry (see `LibraryInjectSection::loader_fix_apps`).
+    /// Load the Proton helper so it can disable thread callouts on duplicate
+    /// module loader entries (see `LoaderFixSection`).
     pub loader_fix: bool,
 }
 
 static PENDING: Mutex<Option<HashMap<AppId, PendingInjection>>> = Mutex::new(None);
 
-/// Whether the section asks for the duplicate-module loader fix on this launch.
+/// Whether the section asks for the duplicate-module loader fix on this
+/// launch: listed in `apps` or carrying `flag`, and not excluded.
 pub fn loader_fix_requested(
     section: &LibraryInjectSection,
     app_id: AppId,
     launch_opts: &str,
 ) -> bool {
-    section.loader_fix_apps.contains(&app_id)
-        || (!section.loader_fix_flag.is_empty()
-            && crate::launch_options::flag_appears_in(launch_opts, &section.loader_fix_flag))
+    let fix = &section.loader_fix;
+    if fix.exclude.contains(&app_id) {
+        return false;
+    }
+    fix.apps.contains(&app_id)
+        || (!fix.flag.is_empty() && crate::launch_options::flag_appears_in(launch_opts, &fix.flag))
 }
 
 /// Whether the section can produce any injection at all (fast path for hooks).
 pub fn section_is_active(section: &LibraryInjectSection) -> bool {
     !section.libs.is_empty()
-        || !section.loader_fix_apps.is_empty()
-        || !section.loader_fix_flag.is_empty()
+        || !section.loader_fix.apps.is_empty()
+        || !section.loader_fix.flag.is_empty()
 }
 
 /// Evaluate every rule of the section for an app launch.
@@ -161,6 +165,7 @@ pub fn has_pending() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vapor_forge_config::LoaderFixSection;
 
     fn entry(path: &str, flag: &str, apps: Vec<u32>, exclude: Vec<u32>) -> LibraryInjectEntry {
         LibraryInjectEntry {
@@ -179,12 +184,27 @@ mod tests {
     }
 
     fn section(apps: Vec<u32>, flag: &str) -> LibraryInjectSection {
+        section_with_exclude(apps, Vec::new(), flag)
+    }
+
+    fn section_with_exclude(apps: Vec<u32>, exclude: Vec<u32>, flag: &str) -> LibraryInjectSection {
         LibraryInjectSection {
             libs: Vec::new(),
             helper_path: String::new(),
-            loader_fix_apps: apps.into_iter().map(AppId).collect(),
-            loader_fix_flag: flag.to_owned(),
+            loader_fix: LoaderFixSection {
+                apps: apps.into_iter().map(AppId).collect(),
+                exclude: exclude.into_iter().map(AppId).collect(),
+                flag: flag.to_owned(),
+            },
         }
+    }
+
+    #[test]
+    fn loader_fix_exclude_wins_over_apps_and_flag() {
+        let app = AppId(999105);
+        let section = section_with_exclude(vec![app.0], vec![app.0], "-loaderfix");
+        on_launch_section(app, &section, "-loaderfix %command%");
+        assert!(take_pending(app).is_none());
     }
 
     #[test]

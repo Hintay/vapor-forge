@@ -381,16 +381,32 @@ pub struct LibraryInjectSection {
     pub libs: Vec<LibraryInjectEntry>,
     #[serde(default)]
     pub helper_path: String,
-    /// Apps whose Proton process gets the duplicate-module loader fix: the
-    /// helper disables thread callouts on any extra loader entry that shares a
-    /// loaded module's name and entry point, as some third-party loaders register for
-    /// user32, which otherwise makes wine run that DllMain twice per thread
-    /// attach and exit.
     #[serde(default)]
-    pub loader_fix_apps: Vec<AppId>,
-    /// Launch-option flag that enables the same fix for any app (e.g. `-loaderfix`).
+    pub loader_fix: LoaderFixSection,
+}
+
+/// Duplicate-module loader fix, applied by the Proton helper.
+///
+/// The helper disables thread callouts on any extra loader entry that shares
+/// a loaded module's name and entry point, as some third-party loaders register for
+/// user32, which otherwise makes wine run that DllMain twice per thread attach
+/// and exit. It is only applied where asked for:
+///
+/// ```toml
+/// [library_inject.loader_fix]
+/// apps = [812140]      # always on for these apps
+/// exclude = []         # never, even when flagged
+/// flag = "-loaderfix"  # on for any app whose launch options carry the flag
+/// ```
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoaderFixSection {
     #[serde(default)]
-    pub loader_fix_flag: String,
+    pub apps: Vec<AppId>,
+    #[serde(default)]
+    pub exclude: Vec<AppId>,
+    #[serde(default)]
+    pub flag: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
