@@ -136,6 +136,28 @@ unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
         .and_then(|i| i.proton_dll.as_ref())
         .is_some();
 
+    // Duplicate-module loader fix: the helper needs to be loaded and told to
+    // look for the duplicate entry; the DLL and IPC paths below set LD_AUDIT
+    // themselves, so only add it here when neither of them will.
+    if injection.as_ref().is_some_and(|i| i.loader_fix) {
+        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+        unsafe { set_env(env_map, c"VAPOR_FORGE_LOADER_FIX".as_ptr(), c"1".as_ptr()) };
+        if !has_proton_dll && ipc_server.is_none() {
+            match resolve_helper_path(&cfg.library_inject.helper_path) {
+                Some(path) => {
+                    if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
+                        /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+                        unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
+                        info!(app = app_id.0, helper = %path, "library_inject: loader fix armed");
+                    }
+                }
+                None => warn!(app = app_id.0, "library_inject: proton helper not found"),
+            }
+        } else {
+            info!(app = app_id.0, "library_inject: loader fix armed");
+        }
+    }
+
     // IPC token injection: register a per-launch token whenever the IPC
     // server is running, regardless of whether this game has a DLL to
     // inject. The helper may be loaded solely for PE scanning.
@@ -262,10 +284,10 @@ pub(crate) unsafe extern "C" fn hk_spawn_process(
                 &launch_opts,
             );
         }
-        if !cfg.library_inject.libs.is_empty() {
-            vapor_forge_features::library_inject::on_launch_app(
+        if vapor_forge_features::library_inject::section_is_active(&cfg.library_inject) {
+            vapor_forge_features::library_inject::on_launch_section(
                 app_id,
-                &cfg.library_inject.libs,
+                &cfg.library_inject,
                 &launch_opts,
             );
         }
