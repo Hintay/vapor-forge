@@ -13,6 +13,7 @@ pub(crate) mod dlc;
 pub(crate) mod env;
 pub(crate) mod eticket;
 pub(crate) mod internal_callbacks;
+pub(crate) mod legacy_cdkey;
 pub(crate) mod network;
 pub(crate) mod ownership;
 pub(crate) mod playtime_downlink;

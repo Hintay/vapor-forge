@@ -370,6 +370,10 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
 /// flag = "-onlinefix"
 /// apps = [480]
 /// ```
+///
+/// Native `.so` entries are merged in front of the `LD_PRELOAD` value Steam
+/// composes for the game (its overlay renderers), so they reach the game
+/// process even though Steam writes that variable after the launch hooks ran.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryInjectSection {
@@ -377,6 +381,32 @@ pub struct LibraryInjectSection {
     pub libs: Vec<LibraryInjectEntry>,
     #[serde(default)]
     pub helper_path: String,
+    #[serde(default)]
+    pub loader_fix: LoaderFixSection,
+}
+
+/// Duplicate-module loader fix, applied by the Proton helper.
+///
+/// The helper disables thread callouts on any extra loader entry that shares
+/// a loaded module's name and entry point, as DenuvOwO's loader registers for
+/// user32, which otherwise makes wine run that DllMain twice per thread attach
+/// and exit. It is only applied where asked for:
+///
+/// ```toml
+/// [library_inject.loader_fix]
+/// apps = [812140]      # always on for these apps
+/// exclude = []         # never, even when flagged
+/// flag = "-loaderfix"  # on for any app whose launch options carry the flag
+/// ```
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoaderFixSection {
+    #[serde(default)]
+    pub apps: Vec<AppId>,
+    #[serde(default)]
+    pub exclude: Vec<AppId>,
+    #[serde(default)]
+    pub flag: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -7,11 +7,9 @@ use vapor_forge_patterns::registry::{
     parse_toml_patterns, FollowMode, PatternDef, RuntimePatternEntry, EMBEDDED_PATTERNS,
 };
 use vapor_forge_patterns::scan::{
-    group_variants, resolve_entry_group, select_variants_for_library_path, PatternRef,
-    ResolveError, ResolveResult,
+    group_variants, resolve_entry_group_with, select_variants_for_library_path, PatternRef,
 };
 use vapor_forge_patterns::vtable_scan::{self, ElfClass};
-use vapor_forge_patterns::Pattern;
 
 fn main() {
     if let Err(error) = run() {
@@ -269,14 +267,20 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
         .map(|entry| PatternRef::from(*entry))
         .collect::<Vec<_>>();
     let variants = select_variants_for_library_path(&variants, path);
+    let arch = if is_elf64 {
+        SemanticArch::X86_64
+    } else {
+        SemanticArch::X86
+    };
+    // Several matches of one pattern are settled by the entry's registered
+    // body validator, the rule the runtime and the CDN gate share.
+    let accept = |code: &[u8], name: &str, offset: usize| {
+        semantic_validator(module, arch, name)
+            .is_some_and(|validate| validate(code, offset).is_some())
+    };
     for group in group_variants(&variants) {
         let entry = group[0];
-        let resolution = if is_elf64 && entry.name == "google::protobuf::RepeatedField<uint32>::Add"
-        {
-            resolve_equivalent_repeated_field_add64(segment.bytes, &group)
-        } else {
-            resolve_entry_group(segment.bytes, &group)
-        };
+        let resolution = resolve_entry_group_with(segment.bytes, &group, Some(&accept));
         match resolution {
             Ok(result) => {
                 if group.len() == 1 {
@@ -362,34 +366,6 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     println!();
 
     Ok(failed)
-}
-
-fn resolve_equivalent_repeated_field_add64(
-    code: &[u8],
-    entries: &[PatternRef<'_>],
-) -> Result<ResolveResult, ResolveError> {
-    let mut match_count = 0usize;
-    for (variant_index, entry) in entries.iter().enumerate() {
-        let pattern = Pattern::parse(entry.pattern)
-            .map_err(|error| ResolveError::PatternParse(error.to_string()))?;
-        let matches = pattern.find_all(code);
-        match_count += matches.len();
-        if let Some(target_offset) = matches.into_iter().find(|&offset| {
-            repeated_field_add64_evidence(code, offset)
-                .is_some_and(|evidence| evidence.is_complete())
-        }) {
-            return Ok(ResolveResult {
-                target_offset,
-                match_count,
-                variant_index,
-            });
-        }
-    }
-    if match_count == 0 {
-        Err(ResolveError::NoMatch)
-    } else {
-        Err(ResolveError::CalleePatternMismatch(match_count))
-    }
 }
 
 fn scan_public_wrapper_collisions(

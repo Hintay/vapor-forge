@@ -18,14 +18,15 @@
         pending: [],
         seen: {},
         renderPatched: false,
+        jsxPatched: false,
         renderer: null,
         rendererHook: null,
-        react: null,
-        reactDom: null,
-        reactHooks: null,
         steamApp: null,
         steamServicesReady: false,
         steamServicesWaitStarted: false,
+        afterLoginHooked: false,
+        afterLoginReady: false,
+        trayPending: [],
         steamReadinessQueued: false,
         steamStageOneObservable: null,
         steamStageOneDisposer: null,
@@ -39,6 +40,9 @@
         preLoginNativeEntries: [],
         nativeToastSurfaceClass: null,
         popupBase: null,
+        popupTracker: null,
+        popupCreatedHooked: false,
+        popupHostWaitLogged: false,
         browserTypes: null,
         windowCreationFlags: null,
         deckyLoaderHooked: false,
@@ -242,6 +246,29 @@
         return false;
       }
 
+      // Steam's notification store is rebuilt while App.InitAfterLogin runs, so
+      // anything handed to it before that settles is lost. Follow the promise
+      // and hold post-login deliveries until it resolves.
+      function hookAfterLogin(app) {
+        if (state.afterLoginHooked) return;
+        state.afterLoginHooked = true;
+        if (typeof app.InitAfterLogin !== 'function' || app.m_bStartedInitAfterLogin) {
+          state.afterLoginReady = true;
+          return;
+        }
+        var original = app.InitAfterLogin;
+        app.InitAfterLogin = function() {
+          var result = original.apply(this, arguments);
+          var settle = function() {
+            state.afterLoginReady = true;
+            bridge.log('Steam after-login initialization ready');
+            queueSteamReadiness();
+          };
+          try { Promise.resolve(result).then(settle, settle); } catch (_) { settle(); }
+          return result;
+        };
+      }
+
       function trackSteamApp() {
         var app = window.App;
         if (!app || state.steamApp === app) return;
@@ -251,6 +278,9 @@
         state.steamApp = app;
         state.steamServicesReady = false;
         state.steamServicesWaitStarted = false;
+        state.afterLoginHooked = false;
+        state.afterLoginReady = false;
+        hookAfterLogin(app);
       }
 
       function localizeToast(toast) {
@@ -693,8 +723,19 @@
         return false;
       }
 
+      function findPopupTracker(exports) {
+        try {
+          return Object.keys(exports).map(function(key) { return exports[key]; }).find(function(value) {
+            return !!value && typeof value === 'object' &&
+              typeof value.GetPopupForWindow === 'function';
+          }) || null;
+        } catch (_) {
+          return null;
+        }
+      }
+
       function findNativePopupSupport() {
-        bridge.eachExport(function(exp) {
+        bridge.eachExport(function(exp, id, mod, parent) {
           var prototype = exp && exp.prototype;
           if (!state.popupBase && typeof exp === 'function' && prototype &&
               Object.prototype.hasOwnProperty.call(prototype, 'Show') &&
@@ -704,6 +745,7 @@
               typeof prototype.Close === 'function' &&
               typeof prototype.RegisterChildBrowserView === 'function') {
             state.popupBase = exp;
+            if (parent) state.popupTracker = findPopupTracker(parent);
           }
           if (!state.browserTypes && exp && typeof exp === 'object' &&
               exp.EBrowserType_DirectHWND_Borderless === 4) {
@@ -768,16 +810,39 @@
         return null;
       }
 
-      function copySteamStyles(source, target) {
+      // Steam ships its UI styles as linked stylesheets, so the copies load
+      // asynchronously in the popup document. onReady fires once every copied
+      // link has loaded or failed (synchronously when nothing is pending); the
+      // caller keeps the popup hidden until then so no unstyled frame shows.
+      function copySteamStyles(source, target, onReady) {
+        var pending = 0;
+        var notified = false;
+        function settle() {
+          if (notified || pending > 0) return;
+          notified = true;
+          if (onReady) onReady();
+        }
         try {
           source.head.querySelectorAll('link[rel="stylesheet"],style').forEach(function(node) {
             var copy = node.cloneNode(true);
-            if (node.tagName === 'LINK' && node.href) copy.href = node.href;
+            if (node.tagName === 'LINK' && node.href) {
+              copy.href = node.href;
+              pending++;
+              var finish = function() {
+                copy.removeEventListener('load', finish);
+                copy.removeEventListener('error', finish);
+                pending--;
+                settle();
+              };
+              copy.addEventListener('load', finish);
+              copy.addEventListener('error', finish);
+            }
             target.head.appendChild(copy);
           });
         } catch (error) {
           bridge.log('native notification style error: ' + error);
         }
+        settle();
       }
 
       function removePreLoginNativeEntry(entry) {
@@ -915,7 +980,7 @@
           try {
             if (entry.browserView) {
               entry.browserView.SetBounds(left, top, 320, 80);
-              entry.browserView.SetVisible(true);
+              if (entry.stylesReady) entry.browserView.SetVisible(true);
             } else if (entry.popup && entry.popup.window &&
                 entry.popup.window.SteamClient.Window.MoveTo) {
               entry.popup.window.SteamClient.Window.MoveTo(
@@ -953,7 +1018,6 @@
         );
         popup.document.title = name;
         popup.document.close();
-        copySteamStyles(ownerWindow.document, popup.document);
         installNativeToastSurface(popup.document);
         var mount = popup.document.getElementById('browserview_target');
         var entry = {
@@ -962,6 +1026,7 @@
           mount: null,
           browserView: created.browserView,
           popup: null,
+          stylesReady: false,
           closing: false,
           removed: false
         };
@@ -970,13 +1035,24 @@
           popup.addEventListener('unload', function() { removePreLoginNativeEntry(entry); }, {
             once: true
           });
-          renderNativeToastDom(mount, data, notification, entry);
-          relayoutPreLoginNativeToasts();
         } catch (error) {
           try { SteamClient.BrowserView.Destroy(created.browserView); } catch (_) {}
           removePreLoginNativeEntry(entry);
           throw error;
         }
+        // Build and reveal the toast only once Steam's stylesheets apply in the
+        // popup, so the entry animation starts on a fully styled layout.
+        copySteamStyles(ownerWindow.document, popup.document, function() {
+          if (entry.removed || entry.closing) return;
+          try {
+            renderNativeToastDom(mount, data, notification, entry);
+            entry.stylesReady = true;
+            relayoutPreLoginNativeToasts();
+          } catch (error) {
+            bridge.log('native notification render error: ' + error);
+            closePreLoginNativeEntry(entry);
+          }
+        });
         return true;
       }
 
@@ -1000,17 +1076,21 @@
           }
         );
         popup.Render = function(_, element) {
+          bridge.log('native notification popup render');
           installNativeToastSurface(element.ownerDocument);
           renderNativeToastDom(element, data, notification, entry);
           relayoutPreLoginNativeToasts();
         };
         popup.OnLoad = function() {};
         popup.OnClose = function() {
+          bridge.log('native notification popup closed');
           removePreLoginNativeEntry(entry);
         };
         entry.popup = popup;
         state.preLoginNativeEntries.push(entry);
         popup.Show(false);
+        bridge.log('native notification popup shown valid=' + popup.BIsValid() +
+          ' created=' + popup.m_bCreated);
         if (!popup.BIsValid()) {
           removePreLoginNativeEntry(entry);
           return false;
@@ -1019,13 +1099,94 @@
         return true;
       }
 
+      function hookPopupCreate(popup) {
+        if (!popup || popup.__vaporForgeCreateHook) return;
+        popup.__vaporForgeCreateHook = true;
+        var original = popup.OnCreate;
+        popup.OnCreate = function() {
+          var result = typeof original === 'function' ? original.apply(this, arguments) : undefined;
+          queueSteamReadiness();
+          return result;
+        };
+      }
+
+      // Steam's popup class finishes a window only after the native side reports
+      // "popup-created" for it (m_bCreated). A notification popup opened before
+      // its owner window reached that point, or as the very first popup of the
+      // browser process, races Steam's popup adoption in CEF: Chromium's outer
+      // popup window then never gets reparented and stays behind as an unnamed,
+      // focused taskbar entry. Wait until the owner and at least one other
+      // Steam popup are created; every not-yet-created popup re-runs readiness
+      // from its OnCreate. The gamepad UI hosts its toast in a BrowserView and
+      // tracks no other popup before login, so it only waits for the owner.
+      function isPopupHostReady(ownerWindow, requireOtherPopup) {
+        var tracker = state.popupTracker;
+        if (!tracker) return true;
+        var ownerTracked = false;
+        var ownerReady = false;
+        var otherReady = false;
+        try {
+          Array.from(tracker.GetPopups()).forEach(function(popup) {
+            var created = !!popup.m_bCreated;
+            if (popup.window === ownerWindow) {
+              ownerTracked = true;
+              ownerReady = created;
+            } else if (created) {
+              otherReady = true;
+            }
+            if (!created) hookPopupCreate(popup);
+          });
+          if (!state.popupCreatedHooked) {
+            state.popupCreatedHooked = true;
+            tracker.AddPopupCreatedCallback(function(popup) {
+              hookPopupCreate(popup);
+              queueSteamReadiness();
+            });
+          }
+        } catch (error) {
+          bridge.log('popup tracker error: ' + error);
+          return true;
+        }
+        if (!ownerTracked) ownerReady = true;
+        if (!requireOtherPopup) otherReady = true;
+        if (ownerReady && otherReady) return true;
+        if (!state.popupHostWaitLogged) {
+          state.popupHostWaitLogged = true;
+          bridge.log('native notification waits for popups owner=' + ownerReady + ' other=' + otherReady);
+        }
+        return false;
+      }
+
+      // A popup opened from the shared context while the owner page is still
+      // loading races Steam's popup adoption in CEF: the desktop client then
+      // leaves CEF's default top-level window behind as an unnamed, focused
+      // taskbar entry. Wait for the owner's load event first.
+      function isOwnerDocumentComplete(ownerWindow) {
+        var document = ownerWindow.document;
+        if (!document || document.readyState === 'complete') return true;
+        if (!document.__vaporForgeLoadHook) {
+          document.__vaporForgeLoadHook = true;
+          try {
+            ownerWindow.addEventListener('load', function() { queueSteamReadiness(); }, { once: true });
+          } catch (_) {
+            return true;
+          }
+          bridge.log('native notification waits for owner load state=' + document.readyState);
+        }
+        return false;
+      }
+
       function renderPreLoginNativeToast(data, notification) {
         if (!ensurePreLoginSurface() || !findNativePopupSupport()) return false;
         var active = activeSteamWindow();
         var ownerWindow = active && active.browserWindow;
         if (!ownerWindow || !ownerWindow.document || !ownerWindow.document.body) return false;
         if (!nativeToastSurfaceClass(ownerWindow.document)) return false;
+        if (!isPopupHostReady(ownerWindow, !isGamepadUiReady())) return false;
+        if (!isOwnerDocumentComplete(ownerWindow)) return false;
         try {
+          bridge.log('native notification path=' + (isGamepadUiReady() ? 'gamepad' : 'desktop') +
+            ' owner=' + ownerWindow.document.readyState);
           if (isGamepadUiReady()) {
             return renderGamepadPreLoginToast(data, notification, ownerWindow);
           }
@@ -1066,227 +1227,6 @@
           return true;
         }, bridge.isRendererFactory);
         return found;
-      }
-
-      function findReact() {
-        var found = null;
-        bridge.eachExport(function(exp) {
-          if (exp && typeof exp.createElement === 'function' &&
-              typeof exp.Component === 'function' &&
-              typeof exp.PureComponent === 'function' &&
-              typeof exp.useLayoutEffect === 'function') {
-            found = exp;
-            return true;
-          }
-          return false;
-        }, function(text) {
-          return bridge.hasAll(text, ['createElement', 'PureComponent', 'useLayoutEffect']);
-        });
-        return found;
-      }
-
-      function findReactDom() {
-        var found = null;
-        bridge.eachExport(function(exp) {
-          if (exp && typeof exp.createPortal === 'function' &&
-              (typeof exp.createRoot === 'function' ||
-               exp.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE)) {
-            found = exp;
-            return true;
-          }
-          return false;
-        }, function(text) {
-          return bridge.hasAll(text, ['createPortal', 'flushSync', 'version']);
-        });
-        return found;
-      }
-
-      function findReactHooks(react) {
-        try {
-          var legacy = react &&
-            react.__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED;
-          var dispatcher = legacy && legacy.ReactCurrentDispatcher;
-          if (dispatcher && dispatcher.current) return dispatcher.current;
-          var client = react &&
-            react.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
-          if (!client) return null;
-          return Object.values(client).find(function(value) {
-            return value && typeof value.useEffect === 'function';
-          }) || null;
-        } catch (_) {
-          return null;
-        }
-      }
-
-      function reactMajorVersion(reactDom) {
-        var version = String(reactDom && reactDom.version || '');
-        if (version.indexOf('18.') === 0) return 18;
-        if (version.indexOf('19.') === 0) return 19;
-        return 0;
-      }
-
-      function injectRendererTrampoline(component, react, reactDom, jsx, hooks) {
-        if (!component || !component.prototype) return false;
-        if (component.prototype.isReactComponent &&
-            typeof component.prototype.render === 'function') return true;
-
-        var major = reactMajorVersion(reactDom);
-        if (major !== 18 && major !== 19) return false;
-
-        var forwarded = function() {
-          return component.apply(this, arguments);
-        };
-        var activeComponent = { component: forwarded };
-        component.prototype.render = function() {
-          return react.createElement(
-            activeComponent.component,
-            this.props,
-            this.props && this.props.children
-          );
-        };
-        component.prototype.isReactComponent = true;
-
-        var stubsApplied = false;
-        var oldHooks = null;
-        var oldCreateElement = react.createElement;
-        var oldJsx = jsx && jsx.jsx;
-        var oldJsxs = jsx && jsx.jsxs;
-
-        function applyStubs() {
-          if (stubsApplied) return;
-          stubsApplied = true;
-          oldHooks = {
-            useContext: hooks.useContext,
-            useCallback: hooks.useCallback,
-            useLayoutEffect: hooks.useLayoutEffect,
-            useEffect: hooks.useEffect,
-            useMemo: hooks.useMemo,
-            useRef: hooks.useRef,
-            useState: hooks.useState
-          };
-          hooks.useCallback = function(callback) { return callback; };
-          hooks.useContext = function(context) { return context && context._currentValue; };
-          hooks.useLayoutEffect = function() {};
-          hooks.useEffect = function() {};
-          hooks.useMemo = function(callback) { return callback(); };
-          hooks.useRef = function(value) { return { current: value || {} }; };
-          hooks.useState = function(value) {
-            var current = value;
-            return [current, function(next) { current = next; }];
-          };
-          react.createElement = function() {
-            return Object.create(component.prototype);
-          };
-          if (major === 19) {
-            jsx.jsx = function() { return Object.create(component.prototype); };
-            jsx.jsxs = function() { return Object.create(component.prototype); };
-          }
-        }
-
-        function removeStubs() {
-          if (!stubsApplied) return;
-          stubsApplied = false;
-          if (oldHooks) Object.assign(hooks, oldHooks);
-          oldHooks = null;
-          react.createElement = oldCreateElement;
-          if (major === 19) {
-            jsx.jsx = oldJsx;
-            jsx.jsxs = oldJsxs;
-          }
-        }
-
-        var renderStep = 0;
-        if (major === 19) {
-          Object.defineProperty(component, 'contextType', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 0) renderStep = 1;
-              if (this._contextType == null) this._contextType = {};
-              if (!this._contextType.__vaporForgeCurrentValueHook) {
-                this._contextType.__vaporForgeCurrentValueHook = true;
-                Object.defineProperty(this._contextType, '_currentValue', {
-                  configurable: true,
-                  get: function() {
-                    if (renderStep === 1) {
-                      renderStep = 2;
-                      applyStubs();
-                    }
-                    return this.__vaporForgeCurrentValue;
-                  },
-                  set: function(value) { this.__vaporForgeCurrentValue = value; }
-                });
-              }
-              return this._contextType;
-            },
-            set: function(value) { this._contextType = value; }
-          });
-          Object.defineProperty(component.prototype, 'updater', {
-            configurable: true,
-            get: function() { return this._updater; },
-            set: function(value) {
-              if (renderStep === 1 || renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              this._updater = value;
-            }
-          });
-          Object.defineProperty(component, 'getDerivedStateFromProps', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 1 || renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              return this._getDerivedStateFromProps;
-            },
-            set: function(value) { this._getDerivedStateFromProps = value; }
-          });
-        } else {
-          Object.defineProperty(component, 'contextType', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 0) renderStep = 1;
-              else if (renderStep === 3) renderStep = 4;
-              return this._contextType;
-            },
-            set: function(value) { this._contextType = value; }
-          });
-          Object.defineProperty(component, 'contextTypes', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 1) {
-                renderStep = 2;
-                applyStubs();
-              }
-              return this._contextTypes;
-            },
-            set: function(value) { this._contextTypes = value; }
-          });
-          Object.defineProperty(component.prototype, 'updater', {
-            configurable: true,
-            get: function() { return this._updater; },
-            set: function(value) {
-              if (renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              this._updater = value;
-            }
-          });
-          Object.defineProperty(component, 'getDerivedStateFromProps', {
-            configurable: true,
-            get: function() {
-              if (renderStep === 2) {
-                renderStep = 0;
-                removeStubs();
-              }
-              return this._getDerivedStateFromProps;
-            },
-            set: function(value) { this._getDerivedStateFromProps = value; }
-          });
-        }
-        return true;
       }
 
       function renderFallback(jsx, title, body) {
@@ -1564,6 +1504,32 @@
         }
       }
 
+      function patchJsxRuntime(jsx) {
+        if (!jsx || state.jsxPatched) return !!jsx;
+        var originalJsx = jsx.jsx;
+        var originalJsxs = jsx.jsxs;
+        if (typeof originalJsx !== 'function' || typeof originalJsxs !== 'function') return false;
+        function wrap(create) {
+          return function(type, props, key) {
+            if (type !== renderVaporForgeToast && typeof type === 'function' &&
+                isVaporForgeProps(props)) {
+              return create.call(this, renderVaporForgeToast, props, key);
+            }
+            return create.apply(this, arguments);
+          };
+        }
+        try {
+          jsx.jsx = wrap(originalJsx);
+          jsx.jsxs = wrap(originalJsxs);
+          state.jsxPatched = true;
+          bridge.log('JSX notification bridge ready');
+          return true;
+        } catch (error) {
+          bridge.log('JSX patch error: ' + error);
+          return false;
+        }
+      }
+
       function patchClassRenderer(renderer) {
         var prototype = renderer && renderer.prototype;
         var current = prototype && prototype.render;
@@ -1596,35 +1562,30 @@
         if (gamepadUiReady) {
           state.navigation = state.navigation || bridge.findWindowStore();
         }
-        const currentRenderer = findValveToastRenderer();
-        if (currentRenderer && currentRenderer !== state.renderer) {
-          state.renderPatched = false;
-        }
-        const renderer = currentRenderer || state.renderer;
-        const jsx = bridge.findJsx() || state.jsx;
-        const css = findCss() || state.css;
-        const react = findReact() || state.react;
-        const reactDom = findReactDom() || state.reactDom;
-        const hooks = findReactHooks(react) || state.reactHooks;
-        if (!renderer || !jsx || !css || !react || !reactDom || !hooks) return false;
-        if (typeof jsx.jsx !== 'function' || typeof jsx.jsxs !== 'function') return false;
-        if (!injectRendererTrampoline(renderer, react, reactDom, jsx, hooks)) return false;
-        state.renderer = renderer;
+        var jsx = state.jsx || bridge.findJsx();
+        var css = state.css || findCss();
+        if (!jsx || !css) return false;
         state.jsx = jsx;
         state.css = css;
-        state.react = react;
-        state.reactDom = reactDom;
-        state.reactHooks = hooks;
-        var previousHook = state.rendererHook;
-        if (patchClassRenderer(renderer)) {
-          state.renderPatched = true;
-          if (state.rendererHook !== previousHook) {
-            bridge.log('Valve toast renderer trampoline ready');
+        // Element creation is intercepted on the renderer's own JSX runtime, so a
+        // plain function renderer is never converted into a class here: other
+        // loaders (Decky) install that kind of trampoline on the same component,
+        // and two of them leave React with stubbed element factories. A class
+        // renderer, Valve's own or one already converted by such a loader, also
+        // gets its render method wrapped.
+        var jsxPatched = patchJsxRuntime(jsx);
+        var renderer = state.renderer || findValveToastRenderer();
+        var renderPatched = false;
+        if (renderer) {
+          state.renderer = renderer;
+          var previousHook = state.rendererHook;
+          renderPatched = patchClassRenderer(renderer);
+          if (renderPatched && state.rendererHook !== previousHook) {
+            bridge.log('Valve toast renderer render patch ready');
           }
-          return true;
         }
-        state.renderPatched = false;
-        return false;
+        state.renderPatched = jsxPatched || renderPatched;
+        return state.renderPatched;
       }
 
       function flush() {
@@ -1634,11 +1595,24 @@
         if (isGamepadUiReady() && !state.focusable) return false;
         if (pendingNeedsLanguage() && !state.languageReady) return false;
         var beforeServices = !isSteamServicesReady();
+        // Toasts held back before login must be flushed again once Steam's
+        // services come up, whether or not anything else re-runs readiness.
+        if (beforeServices) ensureSteamServicesReady();
         if (!beforeServices && state.preLoginNativeEntries.length) {
           clearPreLoginNativeToasts();
         }
+        if (!beforeServices && !state.afterLoginReady) return false;
         if (beforeServices &&
             (!ensurePreLoginSurface() || !findNativePopupSupport())) return false;
+        if (!beforeServices) {
+          // Toasts shown natively before login only reach the tray now: the
+          // store discards entries added while login is still in progress.
+          while (state.trayPending.length) {
+            var held = state.trayPending.shift();
+            processNotification(held.toast, held.toastData, false, false, true);
+            bridge.log('toast registered in tray id=' + held.toastData.notificationID);
+          }
+        }
         while (state.pending.length) {
           var toast = localizeToast(state.pending.shift());
           var flushedKey = toast.id != null ? 'flushed:' + toast.id : '';
@@ -1656,25 +1630,40 @@
             vaporForge: true
           };
           toastData.data.vaporForge = true;
-          function fnTray(notification, tray) {
-            tray.unshift({ eType: notification.eType, notifications: [notification] });
-          }
-          if (beforeServices && !renderPreLoginNativeToast(toast, toastData)) {
-            state.pending.unshift(toast);
-            return false;
+          if (beforeServices) {
+            if (!renderPreLoginNativeToast(toast, toastData)) {
+              state.pending.unshift(toast);
+              return false;
+            }
+            if (flushedKey) state.seen[flushedKey] = true;
+            // The store plays the sound right away for a non-toast notification,
+            // so this call keeps the sound in step with the native popup; the
+            // tray entry follows after login.
+            processNotification(toast, toastData, false, toast.playSound !== false, false);
+            state.trayPending.push({ toast: toast, toastData: toastData });
+            bridge.log('toast shown natively id=' + id);
+            continue;
           }
           if (flushedKey) state.seen[flushedKey] = true;
-          state.store.ProcessNotification({
-            showToast: !beforeServices,
-            sound: toast.sound == null ? 6 : toast.sound,
-            playSound: toast.playSound !== false,
-            eFeature: 0,
-            toastDurationMS: toastData.nToastDurationMS,
-            bCritical: !!toast.critical,
-            fnTray: fnTray
-          }, toastData, 0);
+          processNotification(toast, toastData, true, toast.playSound !== false, true);
+          bridge.log('toast delivered id=' + id);
         }
         return true;
+      }
+
+      function processNotification(toast, toastData, showToast, playSound, withTray) {
+        function fnTray(notification, tray) {
+          tray.unshift({ eType: notification.eType, notifications: [notification] });
+        }
+        state.store.ProcessNotification({
+          showToast: showToast,
+          sound: toast.sound == null ? 6 : toast.sound,
+          playSound: playSound,
+          eFeature: 0,
+          toastDurationMS: toastData.nToastDurationMS,
+          bCritical: !!toast.critical,
+          fnTray: withTray ? fnTray : null
+        }, toastData, 0);
       }
 
       function showToast(toast) {
