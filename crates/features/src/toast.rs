@@ -548,10 +548,14 @@ mod tests {
         assert!(script.contains("life.style.setProperty('--toast-duration', duration + 'ms')"));
         assert!(script.contains("life.addEventListener('animationend'"));
         assert!(script.contains("event.target !== toast || ++completedAnimations < 2"));
-        assert!(script.contains("showToast: !beforeServices"));
-        assert!(
-            script.contains("if (beforeServices && !renderPreLoginNativeToast(toast, toastData))")
-        );
+        assert!(script.contains("function hookAfterLogin(app)"));
+        assert!(script.contains("app.InitAfterLogin = function()"));
+        assert!(script.contains("if (!beforeServices && !state.afterLoginReady) return false"));
+        assert!(script.contains("state.trayPending.push({ toast: toast, toastData: toastData })"));
+        assert!(script.contains("processNotification(held.toast, held.toastData, false)"));
+        assert!(script.contains("processNotification(toast, toastData, true)"));
+        assert!(script.contains("function processNotification(toast, toastData, showToast)"));
+        assert!(script.contains("if (!renderPreLoginNativeToast(toast, toastData))"));
         assert!(script.contains("state.pending.unshift(toast)"));
         assert!(script.contains("clearPreLoginNativeToasts()"));
         assert!(!script.contains("VaporForgePreLoginStack"));

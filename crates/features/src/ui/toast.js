@@ -24,6 +24,9 @@
         steamApp: null,
         steamServicesReady: false,
         steamServicesWaitStarted: false,
+        afterLoginHooked: false,
+        afterLoginReady: false,
+        trayPending: [],
         steamReadinessQueued: false,
         steamStageOneObservable: null,
         steamStageOneDisposer: null,
@@ -243,6 +246,29 @@
         return false;
       }
 
+      // Steam's notification store is rebuilt while App.InitAfterLogin runs, so
+      // anything handed to it before that settles is lost. Follow the promise
+      // and hold post-login deliveries until it resolves.
+      function hookAfterLogin(app) {
+        if (state.afterLoginHooked) return;
+        state.afterLoginHooked = true;
+        if (typeof app.InitAfterLogin !== 'function' || app.m_bStartedInitAfterLogin) {
+          state.afterLoginReady = true;
+          return;
+        }
+        var original = app.InitAfterLogin;
+        app.InitAfterLogin = function() {
+          var result = original.apply(this, arguments);
+          var settle = function() {
+            state.afterLoginReady = true;
+            bridge.log('Steam after-login initialization ready');
+            queueSteamReadiness();
+          };
+          try { Promise.resolve(result).then(settle, settle); } catch (_) { settle(); }
+          return result;
+        };
+      }
+
       function trackSteamApp() {
         var app = window.App;
         if (!app || state.steamApp === app) return;
@@ -252,6 +278,9 @@
         state.steamApp = app;
         state.steamServicesReady = false;
         state.steamServicesWaitStarted = false;
+        state.afterLoginHooked = false;
+        state.afterLoginReady = false;
+        hookAfterLogin(app);
       }
 
       function localizeToast(toast) {
@@ -1572,8 +1601,18 @@
         if (!beforeServices && state.preLoginNativeEntries.length) {
           clearPreLoginNativeToasts();
         }
+        if (!beforeServices && !state.afterLoginReady) return false;
         if (beforeServices &&
             (!ensurePreLoginSurface() || !findNativePopupSupport())) return false;
+        if (!beforeServices) {
+          // Toasts shown natively before login only reach the tray now: the
+          // store discards entries added while login is still in progress.
+          while (state.trayPending.length) {
+            var held = state.trayPending.shift();
+            processNotification(held.toast, held.toastData, false);
+            bridge.log('toast registered in tray id=' + held.toastData.notificationID);
+          }
+        }
         while (state.pending.length) {
           var toast = localizeToast(state.pending.shift());
           var flushedKey = toast.id != null ? 'flushed:' + toast.id : '';
@@ -1591,25 +1630,36 @@
             vaporForge: true
           };
           toastData.data.vaporForge = true;
-          function fnTray(notification, tray) {
-            tray.unshift({ eType: notification.eType, notifications: [notification] });
-          }
-          if (beforeServices && !renderPreLoginNativeToast(toast, toastData)) {
-            state.pending.unshift(toast);
-            return false;
+          if (beforeServices) {
+            if (!renderPreLoginNativeToast(toast, toastData)) {
+              state.pending.unshift(toast);
+              return false;
+            }
+            if (flushedKey) state.seen[flushedKey] = true;
+            state.trayPending.push({ toast: toast, toastData: toastData });
+            bridge.log('toast shown natively id=' + id);
+            continue;
           }
           if (flushedKey) state.seen[flushedKey] = true;
-          state.store.ProcessNotification({
-            showToast: !beforeServices,
-            sound: toast.sound == null ? 6 : toast.sound,
-            playSound: toast.playSound !== false,
-            eFeature: 0,
-            toastDurationMS: toastData.nToastDurationMS,
-            bCritical: !!toast.critical,
-            fnTray: fnTray
-          }, toastData, 0);
+          processNotification(toast, toastData, true);
+          bridge.log('toast delivered id=' + id);
         }
         return true;
+      }
+
+      function processNotification(toast, toastData, showToast) {
+        function fnTray(notification, tray) {
+          tray.unshift({ eType: notification.eType, notifications: [notification] });
+        }
+        state.store.ProcessNotification({
+          showToast: showToast,
+          sound: toast.sound == null ? 6 : toast.sound,
+          playSound: toast.playSound !== false,
+          eFeature: 0,
+          toastDurationMS: toastData.nToastDurationMS,
+          bCritical: !!toast.critical,
+          fnTray: fnTray
+        }, toastData, 0);
       }
 
       function showToast(toast) {
