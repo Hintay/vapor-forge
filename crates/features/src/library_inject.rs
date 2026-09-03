@@ -117,6 +117,29 @@ fn evaluate(app_id: AppId, libs: &[LibraryInjectEntry], loader_fix: bool, launch
     }
 }
 
+/// Merge the native libraries into the `LD_PRELOAD` value Steam is about to
+/// write for the child process.
+///
+/// Steam composes that value from its own environment plus the overlay
+/// renderers and writes it after BuildSpawnEnvBlock's callers have run, so a
+/// value stored earlier in the map is lost. Our entries go first and keep
+/// Steam's list, including its empty leading component, untouched.
+pub fn merge_ld_preload(native_libs: &[String], steam_value: &str) -> String {
+    let existing: Vec<&str> = steam_value.split(':').collect();
+    let mut merged: Vec<&str> = native_libs
+        .iter()
+        .map(String::as_str)
+        .filter(|lib| !lib.is_empty() && !existing.contains(lib))
+        .collect();
+    if merged.is_empty() {
+        return steam_value.to_owned();
+    }
+    if !steam_value.is_empty() {
+        merged.push(steam_value);
+    }
+    merged.join(":")
+}
+
 /// Get pending injection for an app and consume it.
 pub fn take_pending(app_id: AppId) -> Option<PendingInjection> {
     PENDING
@@ -184,6 +207,28 @@ mod tests {
         assert!(take_pending(app).is_none());
         on_launch_section(app, &section, "-loaderfix %command%");
         assert!(take_pending(app).unwrap().loader_fix);
+    }
+
+    #[test]
+    fn merge_ld_preload_puts_our_libraries_before_steams() {
+        let ours = vec!["/home/u/a.so".to_owned(), "/home/u/b.so".to_owned()];
+        let steam =
+            ":/steam/ubuntu12_32/gameoverlayrenderer.so:/steam/ubuntu12_64/gameoverlayrenderer.so";
+        assert_eq!(
+            merge_ld_preload(&ours, steam),
+            format!("/home/u/a.so:/home/u/b.so:{steam}")
+        );
+        assert_eq!(merge_ld_preload(&ours, ""), "/home/u/a.so:/home/u/b.so");
+    }
+
+    #[test]
+    fn merge_ld_preload_skips_duplicates_and_empty_entries() {
+        let ours = vec!["/home/u/a.so".to_owned(), String::new()];
+        assert_eq!(
+            merge_ld_preload(&ours, "/x.so:/home/u/a.so"),
+            "/x.so:/home/u/a.so"
+        );
+        assert_eq!(merge_ld_preload(&[], "/x.so"), "/x.so");
     }
 
     #[test]

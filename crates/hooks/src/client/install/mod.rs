@@ -882,10 +882,19 @@ fn do_install() {
         None
     };
 
-    // Resolve SetEnvString as a raw fn pointer for library injection.
-    if env_hooks_supported() {
+    // Resolve SetEnvString as a raw fn pointer for library injection, and as a
+    // detour so LD_PRELOAD writes made by Steam can be merged with ours.
+    let d_set_env_string = if env_hooks_supported() {
         super::env::resolve_set_env_string(&registry, &code);
-    }
+        resolve_from_registry(
+            &registry,
+            &code,
+            "SetEnvString",
+            super::env::hk_set_env_string as super::env::SetEnvStringFn,
+        )
+    } else {
+        None
+    };
 
     let callback_group_resolved = d_set_api_call_result.is_some()
         && d_register_internal_callback.is_some()
@@ -1012,6 +1021,7 @@ fn do_install() {
             super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME,
             d_is_cloud_enabled_for_account
         ),
+        hr!("SetEnvString", d_set_env_string),
     ];
 
     macro_rules! finalize {
@@ -1186,6 +1196,14 @@ fn do_install() {
         super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME,
         std::ptr::addr_of_mut!(super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR),
         d_is_cloud_enabled_for_account
+    );
+    // Optional: without it native .so entries still reach the map, but Steam's
+    // own LD_PRELOAD write replaces them (see hk_set_env_string).
+    finalize!(
+        27,
+        "SetEnvString",
+        std::ptr::addr_of_mut!(super::env::SET_ENV_STRING_DETOUR),
+        d_set_env_string
     );
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
