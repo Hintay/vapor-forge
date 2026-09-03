@@ -33,11 +33,13 @@ pub(crate) static mut IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR: Option<
 pub(crate) static mut WRITE_VDF_DETOUR: Option<Detour<WriteVdfFileFn>> = None;
 pub(crate) static mut SET_CLOUD_FN: Option<SetCloudEnabledForAppFn> = None;
 
-// The IClientRemoteStorage receiver Steam last used, the runtime generation
-// the controlled apps were last swept for, and a re-entrancy latch for the
-// sweep itself (SetCloudEnabledForApp may consult IsCloudEnabledForApp).
+// The IClientRemoteStorage receiver Steam last used, the runtime and
+// ownership generations the controlled apps were last swept for, and a
+// re-entrancy latch for the sweep itself (SetCloudEnabledForApp may consult
+// IsCloudEnabledForApp).
 static REMOTE_STORAGE: AtomicUsize = AtomicUsize::new(0);
 static SWEPT_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+static SWEPT_OWNERSHIP_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
 static SWEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,8 @@ unsafe { original(this, app_id) };
         .requires_injected_ownership()
         && !cfg.cloud_enabled_for_controlled_apps();
 
+    // SAFETY: captured from this object's VMT before the hook is enabled.
+    let set_fn = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) };
     if should_disable {
         // Write cloudenabled=false into Steam's in-memory config store. This
         // prevents the "out of date" cloud badge after hot-reload; the VDF
@@ -76,8 +80,7 @@ unsafe { original(this, app_id) };
         // value is applied again.
         let first = vapor_forge_features::cloud::mark_cloud_wrote(AppId(app_id));
         if first || result {
-            // SAFETY: captured from this object's VMT before the hook is enabled.
-            if let Some(set_fn) = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) } {
+            if let Some(set_fn) = set_fn {
                 /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
                 unsafe { set_fn(this, app_id, false) };
                 if first {
@@ -90,6 +93,21 @@ unsafe { original(this, app_id) };
                 }
             }
         }
+    } else if vapor_forge_features::cloud::is_forced_off(AppId(app_id)) {
+        // The app no longer qualifies (script removed, backend configured,
+        // genuine ownership learned): hand its cloud back to Steam.
+        let result = if result {
+            true
+        } else if let Some(set_fn) = set_fn {
+            /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
+            unsafe { set_fn(this, app_id, true) };
+            true
+        } else {
+            result
+        };
+        vapor_forge_features::cloud::mark_cloud_restored(AppId(app_id));
+        info!(app_id, "cloud: SetCloudEnabledForApp(true) — restored");
+        return vapor_forge_features::cloud::on_is_cloud_enabled(&cfg, AppId(app_id), result);
     }
 
     vapor_forge_features::cloud::on_is_cloud_enabled(&cfg, AppId(app_id), result)
@@ -114,17 +132,24 @@ pub(crate) unsafe extern "C" fn hk_is_cloud_enabled_for_account(this: *mut c_voi
     result
 }
 
-/// Switch Steam cloud off for every controlled app as soon as a receiver is
-/// known, and again whenever the runtime generation changes (script reload).
+/// Reconcile Steam's per-app cloud switches with the configuration as soon as
+/// a receiver is known, and again whenever the runtime generation (script or
+/// config reload) or the ownership generation (genuine ownership learned)
+/// changes. Controlled apps without genuine ownership are switched off; apps
+/// we switched off that no longer qualify get their cloud back.
 /// `trigger_app` is 0 when the account-level gate supplied the receiver.
 ///
 /// # Safety
 /// `this` must be the live IClientRemoteStorage receiver of the current call.
 unsafe fn sweep_controlled_apps(this: *mut c_void, cfg: &RuntimeConfig, trigger_app: u32) {
     let generation = crate::client::install::runtime_generation();
+    let ownership_generation = vapor_forge_features::apps::ownership_generation();
     let receiver = this as usize;
     let receiver_changed = REMOTE_STORAGE.swap(receiver, Ordering::AcqRel) != receiver;
-    if !receiver_changed && SWEPT_GENERATION.load(Ordering::Acquire) == generation {
+    if !receiver_changed
+        && SWEPT_GENERATION.load(Ordering::Acquire) == generation
+        && SWEPT_OWNERSHIP_GENERATION.load(Ordering::Acquire) == ownership_generation
+    {
         return;
     }
     if SWEEP_ACTIVE.swap(true, Ordering::AcqRel) {
@@ -132,36 +157,55 @@ unsafe fn sweep_controlled_apps(this: *mut c_void, cfg: &RuntimeConfig, trigger_
     }
     // SAFETY: installation publishes the slot before the hook is enabled.
     let set_fn = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) };
-    let mut targets = vapor_forge_features::cloud::apps_to_disable(cfg);
+    let mut plan = vapor_forge_features::cloud::cloud_plan(cfg);
     // Each write is an IPC message that Steam applies while its logon sync is
     // already walking the installed apps, so those go first.
     let installed = crate::client::install::steam_install_root()
         .map(|root| vapor_forge_features::cloud::installed_app_ids(&root))
         .unwrap_or_default();
-    vapor_forge_features::cloud::order_installed_first(&mut targets, &installed);
-    let installed_targets = targets
+    vapor_forge_features::cloud::order_installed_first(&mut plan.disable, &installed);
+    let installed_targets = plan
+        .disable
         .iter()
         .filter(|app_id| installed.contains(app_id))
         .count();
-    let mut applied = 0usize;
+    let mut disabled = 0usize;
+    let mut restored = 0usize;
     if let Some(set_fn) = set_fn {
-        for app_id in &targets {
+        for app_id in &plan.disable {
             if vapor_forge_features::cloud::mark_cloud_wrote(*app_id) {
                 // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
                 unsafe { set_fn(this, app_id.0, false) };
-                applied += 1;
+                disabled += 1;
+            }
+        }
+        for app_id in &plan.enable {
+            if vapor_forge_features::cloud::mark_cloud_restored(*app_id) {
+                // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+                unsafe { set_fn(this, app_id.0, true) };
+                restored += 1;
+                info!(
+                    app_id = app_id.0,
+                    "cloud: SetCloudEnabledForApp(true) — restored"
+                );
             }
         }
     }
     SWEPT_GENERATION.store(generation, Ordering::Release);
+    SWEPT_OWNERSHIP_GENERATION.store(ownership_generation, Ordering::Release);
     SWEEP_ACTIVE.store(false, Ordering::Release);
+    if disabled == 0 && restored == 0 && !receiver_changed {
+        return;
+    }
     info!(
         receiver = format_args!("0x{receiver:x}"),
         generation,
+        ownership_generation,
         trigger_app,
-        controlled = targets.len(),
+        controlled = plan.disable.len(),
         installed = installed_targets,
-        applied,
+        disabled,
+        restored,
         "cloud: controlled apps swept"
     );
 }

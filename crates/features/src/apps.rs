@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, info};
@@ -25,6 +26,20 @@ impl AccountState {
 
 static ACCOUNT_STATE: Mutex<AccountState> = Mutex::new(AccountState::new());
 
+/// Serializes tests that mutate the process-global account state.
+#[cfg(test)]
+pub(crate) static ACCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+// Bumped whenever a recorded genuine-ownership value changes or the account
+// state is reset, so consumers that cache decisions (cloud gate sweeps) can
+// re-evaluate without polling every app.
+static OWNERSHIP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic counter of genuine-ownership changes.
+pub fn ownership_generation() -> u64 {
+    OWNERSHIP_GENERATION.load(Ordering::Acquire)
+}
+
 pub fn mark_license_sync_complete() {
     ACCOUNT_STATE
         .lock()
@@ -48,6 +63,7 @@ pub fn reset_account_state() {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .reset();
+    OWNERSHIP_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,12 +185,15 @@ pub fn original_result_is_genuinely_owned(observation: OwnershipObservation) -> 
 
 /// Record an ownership result obtained before the app is added to pkg0.
 pub fn record_actual_ownership(app_id: AppId, owned: bool) {
-    ACCOUNT_STATE
+    let previous = ACCOUNT_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .actual_ownership
         .get_or_insert_with(HashMap::new)
         .insert(app_id, owned);
+    if previous != Some(owned) {
+        OWNERSHIP_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 pub fn decide_check_ownership(

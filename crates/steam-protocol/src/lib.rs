@@ -1519,6 +1519,45 @@ pub struct ClientStatsUpdated {
 /// EMsg for CMsgClientPICSProductInfoRequest
 pub const EMSG_PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
 
+/// EMsg for CMsgClientLicenseList: the account's package licenses, sent at
+/// logon and again whenever they change (purchases, gifts, refunds).
+pub const EMSG_CLIENT_LICENSE_LIST: u32 = 780;
+
+/// One license of CMsgClientLicenseList (only the fields ownership needs).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ClientLicense {
+    #[prost(uint32, optional, tag = "1")]
+    pub package_id: Option<u32>,
+    #[prost(uint64, optional, tag = "17")]
+    pub access_token: Option<u64>,
+}
+
+/// CMsgClientLicenseList body.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ClientLicenseList {
+    #[prost(int32, optional, tag = "1")]
+    pub eresult: Option<i32>,
+    #[prost(message, repeated, tag = "2")]
+    pub licenses: Vec<ClientLicense>,
+}
+
+/// Package ids and access tokens of a CMsgClientLicenseList body, package 0
+/// excluded: it is granted to every account and carries vapor-forge's own
+/// injected apps, so it says nothing about genuine ownership.
+pub fn licensed_packages(body: &[u8]) -> Option<Vec<(u32, u64)>> {
+    use prost::Message;
+    let list = ClientLicenseList::decode(body).ok()?;
+    Some(
+        list.licenses
+            .iter()
+            .filter_map(|license| {
+                let package_id = license.package_id?;
+                (package_id != 0).then_some((package_id, license.access_token.unwrap_or(0)))
+            })
+            .collect(),
+    )
+}
+
 /// EMsg for CMsgClientRequestEncryptedAppTicketResponse
 pub const EMSG_ENCRYPTED_APPTICKET_RESPONSE: u32 = 5527;
 /// EMsg for CMsgClientRequestEncryptedAppTicket.
@@ -1789,6 +1828,31 @@ pub struct ClientRichPresenceUpload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn licensed_packages_skips_package_zero_and_keeps_tokens() {
+        use prost::Message;
+        let list = ClientLicenseList {
+            eresult: Some(1),
+            licenses: vec![
+                ClientLicense {
+                    package_id: Some(0),
+                    access_token: Some(1),
+                },
+                ClientLicense {
+                    package_id: Some(342),
+                    access_token: Some(0xdead_beef),
+                },
+                ClientLicense {
+                    package_id: Some(451),
+                    access_token: None,
+                },
+            ],
+        };
+        let packages = licensed_packages(&list.encode_to_vec()).unwrap();
+        assert_eq!(packages, vec![(342, 0xdead_beef), (451, 0)]);
+        assert!(licensed_packages(&[0xff, 0xff, 0xff]).is_none());
+    }
+
     use super::*;
     use prost::Message;
 
