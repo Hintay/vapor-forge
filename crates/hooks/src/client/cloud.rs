@@ -14,7 +14,10 @@ use super::install::config;
 // ---------------------------------------------------------------------------
 
 pub(crate) const IS_CLOUD_ENABLED_NAME: &str = "IClientRemoteStorage::IsCloudEnabledForApp";
+pub(crate) const IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME: &str =
+    "IClientRemoteStorage::IsCloudEnabledForAccount";
 pub(crate) type IsCloudEnabledForAppFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
+pub(crate) type IsCloudEnabledForAccountFn = unsafe extern "C" fn(*mut c_void) -> bool;
 pub(crate) type SetCloudEnabledForAppFn = unsafe extern "C" fn(*mut c_void, u32, bool);
 pub(crate) type WriteVdfFileFn =
     unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *const u8, u32) -> u32;
@@ -24,6 +27,9 @@ pub(crate) type WriteVdfFileFn =
 // ---------------------------------------------------------------------------
 
 pub(crate) static mut IS_CLOUD_ENABLED_DETOUR: Option<Detour<IsCloudEnabledForAppFn>> = None;
+pub(crate) static mut IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR: Option<
+    Detour<IsCloudEnabledForAccountFn>,
+> = None;
 pub(crate) static mut WRITE_VDF_DETOUR: Option<Detour<WriteVdfFileFn>> = None;
 pub(crate) static mut SET_CLOUD_FN: Option<SetCloudEnabledForAppFn> = None;
 
@@ -89,8 +95,28 @@ unsafe { original(this, app_id) };
     vapor_forge_features::cloud::on_is_cloud_enabled(&cfg, AppId(app_id), result)
 }
 
+/// Account-level gate, hooked only to see the receiver before Steam's logon
+/// sync enumerates per-app jobs; the answer is passed through untouched.
+pub(crate) unsafe extern "C" fn hk_is_cloud_enabled_for_account(this: *mut c_void) -> bool {
+    // SAFETY: installation initializes the detour before enabling it.
+    let original = detour_or_return!(
+        IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME,
+        IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR,
+        true
+    );
+    // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
+    let result = unsafe { original(this) };
+    if crate::capability::is_ready(crate::capability::Capability::CloudControl) {
+        let cfg = config();
+        // SAFETY: `this` is the live receiver Steam is calling through right now.
+        unsafe { sweep_controlled_apps(this, &cfg, 0) };
+    }
+    result
+}
+
 /// Switch Steam cloud off for every controlled app as soon as a receiver is
 /// known, and again whenever the runtime generation changes (script reload).
+/// `trigger_app` is 0 when the account-level gate supplied the receiver.
 ///
 /// # Safety
 /// `this` must be the live IClientRemoteStorage receiver of the current call.
@@ -106,7 +132,17 @@ unsafe fn sweep_controlled_apps(this: *mut c_void, cfg: &RuntimeConfig, trigger_
     }
     // SAFETY: installation publishes the slot before the hook is enabled.
     let set_fn = unsafe { *std::ptr::addr_of!(SET_CLOUD_FN) };
-    let targets = vapor_forge_features::cloud::apps_to_disable(cfg);
+    let mut targets = vapor_forge_features::cloud::apps_to_disable(cfg);
+    // Each write is an IPC message that Steam applies while its logon sync is
+    // already walking the installed apps, so those go first.
+    let installed = crate::client::install::steam_install_root()
+        .map(|root| vapor_forge_features::cloud::installed_app_ids(&root))
+        .unwrap_or_default();
+    vapor_forge_features::cloud::order_installed_first(&mut targets, &installed);
+    let installed_targets = targets
+        .iter()
+        .filter(|app_id| installed.contains(app_id))
+        .count();
     let mut applied = 0usize;
     if let Some(set_fn) = set_fn {
         for app_id in &targets {
@@ -124,6 +160,7 @@ unsafe fn sweep_controlled_apps(this: *mut c_void, cfg: &RuntimeConfig, trigger_
         generation,
         trigger_app,
         controlled = targets.len(),
+        installed = installed_targets,
         applied,
         "cloud: controlled apps swept"
     );
