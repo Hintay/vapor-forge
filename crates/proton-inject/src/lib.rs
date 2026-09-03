@@ -15,6 +15,8 @@ mod ipc;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod loader;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod loader_fix;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod mapping_event;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod maps;
@@ -50,8 +52,9 @@ pub extern "C" fn la_version(version: c_uint) -> c_uint {
 pub extern "C" fn la_preinit(_cookie: *mut usize) {
     let has_dll = std::env::var_os("VAPOR_FORGE_INJECT_DLL").is_some();
     let has_ipc = std::env::var_os(vapor_forge_game_bridge::ENV_GAME_BRIDGE_SOCK).is_some();
+    let has_loader_fix = loader_fix::enabled();
 
-    if !has_dll && !has_ipc {
+    if !has_dll && !has_ipc && !has_loader_fix {
         return;
     }
 

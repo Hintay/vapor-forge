@@ -377,6 +377,15 @@ pub struct LibraryInjectSection {
     pub libs: Vec<LibraryInjectEntry>,
     #[serde(default)]
     pub helper_path: String,
+    /// Apps whose Proton process gets the duplicate-module loader fix: the
+    /// helper disables thread callouts on a second USER32 loader entry that a
+    /// third-party loader registers with the real user32 entry point,
+    /// which otherwise makes wine run user32's DllMain twice per thread exit.
+    #[serde(default)]
+    pub loader_fix_apps: Vec<AppId>,
+    /// Launch-option flag that enables the same fix for any app (e.g. `-loaderfix`).
+    #[serde(default)]
+    pub loader_fix_flag: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
