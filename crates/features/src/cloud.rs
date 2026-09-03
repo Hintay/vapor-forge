@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tracing::info;
@@ -43,6 +44,57 @@ pub fn apps_to_disable(config: &RuntimeConfig) -> Vec<AppId> {
         .map(|app| app.id)
         .filter(|&app_id| crate::apps::classify_app(config, app_id).requires_injected_ownership())
         .collect()
+}
+
+/// App ids with an `appmanifest_<id>.acf` in any Steam library folder.
+///
+/// Steam's logon sync only evaluates installed apps, and it runs while the
+/// sweep's writes are still being applied, so those apps have to go first.
+pub fn installed_app_ids(steam_root: &Path) -> HashSet<AppId> {
+    let mut libraries = vec![steam_root.to_path_buf()];
+    if let Ok(text) = std::fs::read_to_string(steam_root.join("steamapps/libraryfolders.vdf")) {
+        for line in text.lines() {
+            if let Some(path) = vdf_string_value(line, "path") {
+                let path = PathBuf::from(path.replace("\\\\", "\\"));
+                if !libraries.contains(&path) {
+                    libraries.push(path);
+                }
+            }
+        }
+    }
+    let mut installed = HashSet::new();
+    for library in libraries {
+        let Ok(entries) = std::fs::read_dir(library.join("steamapps")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(app_id) = name
+                .strip_prefix("appmanifest_")
+                .and_then(|rest| rest.strip_suffix(".acf"))
+                .and_then(|digits| digits.parse::<u32>().ok())
+            {
+                installed.insert(AppId(app_id));
+            }
+        }
+    }
+    installed
+}
+
+/// Value of a `"key" "value"` VDF line when `key` matches.
+fn vdf_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let mut parts = line.trim().splitn(2, char::is_whitespace);
+    let found_key = parts.next()?.trim_matches('"');
+    if found_key != key {
+        return None;
+    }
+    Some(parts.next()?.trim().trim_matches('"'))
+}
+
+/// Move installed apps to the front, keeping the relative order otherwise.
+pub fn order_installed_first(app_ids: &mut [AppId], installed: &HashSet<AppId>) {
+    app_ids.sort_by_key(|app_id| !installed.contains(app_id));
 }
 
 /// Report what Steam itself answered for an app, once per app. Whether the gate
@@ -326,6 +378,42 @@ mod tests {
         let mut config = config_with_inject(&[5_553]);
         config.cloud.backend = CloudBackendMode::Local;
         assert!(apps_to_disable(&config).is_empty());
+    }
+
+    #[test]
+    fn installed_app_ids_reads_every_library_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("steamapps")).unwrap();
+        std::fs::create_dir_all(extra.path().join("steamapps")).unwrap();
+        std::fs::write(
+            root.path().join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+                root.path().display(),
+                extra.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("steamapps/appmanifest_232430.acf"), "").unwrap();
+        std::fs::write(extra.path().join("steamapps/appmanifest_648590.acf"), "").unwrap();
+        std::fs::write(extra.path().join("steamapps/appmanifest_x.acf"), "").unwrap();
+
+        let installed = installed_app_ids(root.path());
+        assert_eq!(installed, HashSet::from([AppId(232_430), AppId(648_590)]));
+    }
+
+    #[test]
+    fn installed_app_ids_is_empty_without_a_library() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(installed_app_ids(root.path()).is_empty());
+    }
+
+    #[test]
+    fn order_installed_first_keeps_relative_order() {
+        let mut ids = vec![AppId(1), AppId(2), AppId(3), AppId(4)];
+        order_installed_first(&mut ids, &HashSet::from([AppId(4), AppId(2)]));
+        assert_eq!(ids, vec![AppId(2), AppId(4), AppId(1), AppId(3)]);
     }
 
     fn controlled_config(cloud: CloudSection) -> RuntimeConfig {

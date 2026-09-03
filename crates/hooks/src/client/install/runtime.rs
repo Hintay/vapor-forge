@@ -255,7 +255,7 @@ fn build_script_dirs_for(
     dirs
 }
 
-fn steam_install_root() -> Option<PathBuf> {
+pub(crate) fn steam_install_root() -> Option<PathBuf> {
     let current_exe = std::env::current_exe().ok();
     let compat_root = std::env::var_os("STEAM_COMPAT_CLIENT_INSTALL_PATH").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
