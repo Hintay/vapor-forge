@@ -56,6 +56,71 @@ pub(crate) type SpawnProcessFn = unsafe extern "C" fn(
 pub(crate) static mut BUILD_SPAWN_ENV_DETOUR: Option<Detour<BuildSpawnEnvBlockFn>> = None;
 pub(crate) static mut SPAWN_PROCESS_DETOUR: Option<Detour<SpawnProcessFn>> = None;
 pub(crate) static mut SET_ENV_STRING_FN: Option<SetEnvStringFn> = None;
+pub(crate) static mut SET_ENV_STRING_DETOUR: Option<Detour<SetEnvStringFn>> = None;
+
+// Native libraries to merge into the LD_PRELOAD value Steam writes while the
+// tagged env map's BuildSpawnEnvBlock call is active.
+static PENDING_PRELOAD: std::sync::Mutex<Option<(usize, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Writer for the env map: the SetEnvString trampoline when the detour is
+/// installed, the raw resolved function otherwise.
+fn env_writer() -> Option<SetEnvStringFn> {
+    // SAFETY: installation publishes both slots before any hook can run.
+    unsafe {
+        if (*std::ptr::addr_of!(SET_ENV_STRING_DETOUR)).is_some() {
+            vapor_forge_hook_engine::original::original_detour(
+                "SetEnvString",
+                std::ptr::addr_of!(SET_ENV_STRING_DETOUR),
+            )
+        } else {
+            *std::ptr::addr_of!(SET_ENV_STRING_FN)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hook replacement functions: SetEnvString (LD_PRELOAD merge)
+// ---------------------------------------------------------------------------
+
+/// Steam composes the child's LD_PRELOAD from its own environment plus the
+/// overlay renderers and writes it after the launch hooks ran, which discards
+/// anything stored in the map earlier. Prepend the pending native libraries.
+pub(crate) unsafe extern "C" fn hk_set_env_string(
+    env_map: *mut c_void,
+    key: *const i8,
+    value: *const i8,
+) {
+    let original = detour_or_return!("SetEnvString", SET_ENV_STRING_DETOUR);
+    if !key.is_null() && !value.is_null() {
+        // SAFETY: Steam passes NUL-terminated strings for the duration of the call.
+        let is_preload = unsafe { std::ffi::CStr::from_ptr(key) }.to_bytes() == b"LD_PRELOAD";
+        if is_preload {
+            let pending = PENDING_PRELOAD
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or(None);
+            if let Some((map, libs)) = pending {
+                if map == env_map as usize {
+                    // SAFETY: value is a live NUL-terminated string from Steam.
+                    let steam_value = unsafe { std::ffi::CStr::from_ptr(value) }
+                        .to_string_lossy()
+                        .into_owned();
+                    let merged =
+                        vapor_forge_features::library_inject::merge_ld_preload(&libs, &steam_value);
+                    if let Ok(merged_c) = std::ffi::CString::new(merged.as_str()) {
+                        info!(value = %merged, "library_inject: LD_PRELOAD merged with Steam's");
+                        // SAFETY: forwards Steam's map and key with our merged value.
+                        unsafe { original(env_map, key, merged_c.as_ptr()) };
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // SAFETY: forwards Steam's untouched arguments.
+    unsafe { original(env_map, key, value) }
+}
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: BuildSpawnEnvBlock (native .so injection)
@@ -74,6 +139,7 @@ pub(crate) unsafe extern "C" fn hk_build_spawn_env_block(
     // SAFETY: BUILD_SPAWN_ENV_DETOUR set before hook enabled, never modified after.
     let original = detour_or_return!("BuildSpawnEnvBlock", BUILD_SPAWN_ENV_DETOUR, 0);
 
+    let mut native_libs = None;
     if crate::capability::is_ready(crate::capability::Capability::LaunchEnvironment)
         && !game_id.is_null()
         && !env_map.is_null()
@@ -81,11 +147,19 @@ pub(crate) unsafe extern "C" fn hk_build_spawn_env_block(
         // BuildSpawnEnvBlock forks and executes the child while the original call
         // is active. Update its input map before Steam snapshots the environment.
         // SAFETY: both pointers were validated above and belong to this invocation.
-        unsafe { inject_spawn_environment(game_id, env_map) };
+        native_libs = unsafe { inject_spawn_environment(game_id, env_map) };
+    }
+
+    // Steam overwrites LD_PRELOAD inside the original call; let the
+    // SetEnvString detour merge our libraries into that write.
+    if let Some(libs) = native_libs.clone() {
+        if let Ok(mut pending) = PENDING_PRELOAD.lock() {
+            *pending = Some((env_map as usize, libs));
+        }
     }
 
     // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
-    unsafe {
+    let result = unsafe {
         original(
             game_id,
             exe_path,
@@ -96,10 +170,22 @@ pub(crate) unsafe extern "C" fn hk_build_spawn_env_block(
             env_map,
             context,
         )
+    };
+
+    if native_libs.is_some() {
+        if let Ok(mut pending) = PENDING_PRELOAD.lock() {
+            *pending = None;
+        }
     }
+    result
 }
 
-unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
+/// Returns the native libraries written as LD_PRELOAD, if any, so the caller
+/// can keep them merged into Steam's later write.
+unsafe fn inject_spawn_environment(
+    game_id: *mut c_void,
+    env_map: *mut c_void,
+) -> Option<Vec<String>> {
     // CGameID low 24 bits = AppId.
     // SAFETY: game_id is a valid CGameID* from Steam's caller.
     let raw = unsafe { *(game_id as *const u32) };
@@ -110,16 +196,16 @@ unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
     let ipc_server = IPC_SERVER.get();
 
     if injection.is_none() && ipc_server.is_none() {
-        return;
+        return None;
     }
 
-    // SAFETY: SET_ENV_STRING_FN resolved once at install time, never modified after.
-    let Some(set_env) = (unsafe { *std::ptr::addr_of!(SET_ENV_STRING_FN) }) else {
+    let Some(set_env) = env_writer() else {
         warn!(app = app_id.0, "library_inject: SetEnvString unresolved");
-        return;
+        return None;
     };
 
     // Native .so injection via LD_PRELOAD
+    let mut native_libs = None;
     if let Some(ref inj) = injection {
         if !inj.native_libs.is_empty() {
             let ld_preload = inj.native_libs.join(":");
@@ -127,6 +213,7 @@ unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
                 /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
                 unsafe { set_env(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr()) };
                 info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
+                native_libs = Some(inj.native_libs.clone());
             }
         }
     }
@@ -224,6 +311,7 @@ unsafe fn inject_spawn_environment(game_id: *mut c_void, env_map: *mut c_void) {
             }
         }
     }
+    native_libs
 }
 
 // ---------------------------------------------------------------------------
