@@ -1088,8 +1088,9 @@
       // popup window then never gets reparented and stays behind as an unnamed,
       // focused taskbar entry. Wait until the owner and at least one other
       // Steam popup are created; every not-yet-created popup re-runs readiness
-      // from its OnCreate.
-      function isPopupHostReady(ownerWindow) {
+      // from its OnCreate. The gamepad UI hosts its toast in a BrowserView and
+      // tracks no other popup before login, so it only waits for the owner.
+      function isPopupHostReady(ownerWindow, requireOtherPopup) {
         var tracker = state.popupTracker;
         if (!tracker) return true;
         var ownerTracked = false;
@@ -1118,6 +1119,7 @@
           return true;
         }
         if (!ownerTracked) ownerReady = true;
+        if (!requireOtherPopup) otherReady = true;
         if (ownerReady && otherReady) return true;
         if (!state.popupHostWaitLogged) {
           state.popupHostWaitLogged = true;
@@ -1151,7 +1153,7 @@
         var ownerWindow = active && active.browserWindow;
         if (!ownerWindow || !ownerWindow.document || !ownerWindow.document.body) return false;
         if (!nativeToastSurfaceClass(ownerWindow.document)) return false;
-        if (!isPopupHostReady(ownerWindow)) return false;
+        if (!isPopupHostReady(ownerWindow, !isGamepadUiReady())) return false;
         if (!isOwnerDocumentComplete(ownerWindow)) return false;
         try {
           bridge.log('native notification path=' + (isGamepadUiReady() ? 'gamepad' : 'desktop') +
@@ -1564,6 +1566,9 @@
         if (isGamepadUiReady() && !state.focusable) return false;
         if (pendingNeedsLanguage() && !state.languageReady) return false;
         var beforeServices = !isSteamServicesReady();
+        // Toasts held back before login must be flushed again once Steam's
+        // services come up, whether or not anything else re-runs readiness.
+        if (beforeServices) ensureSteamServicesReady();
         if (!beforeServices && state.preLoginNativeEntries.length) {
           clearPreLoginNativeToasts();
         }

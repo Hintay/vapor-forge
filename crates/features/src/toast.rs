@@ -586,11 +586,14 @@ mod tests {
         assert!(script.contains("if (parent) state.popupTracker = findPopupTracker(parent)"));
         assert!(script.contains("function hookPopupCreate(popup)"));
         assert!(script.contains("popup.OnCreate = function()"));
-        assert!(script.contains("function isPopupHostReady(ownerWindow)"));
+        assert!(script.contains("function isPopupHostReady(ownerWindow, requireOtherPopup)"));
         assert!(script.contains("Array.from(tracker.GetPopups()).forEach"));
         assert!(script.contains("tracker.AddPopupCreatedCallback(function(popup)"));
         assert!(script.contains("if (ownerReady && otherReady) return true"));
-        assert!(script.contains("if (!isPopupHostReady(ownerWindow)) return false"));
+        assert!(script.contains("if (!requireOtherPopup) otherReady = true"));
+        assert!(script
+            .contains("if (!isPopupHostReady(ownerWindow, !isGamepadUiReady())) return false"));
+        assert!(script.contains("if (beforeServices) ensureSteamServicesReady()"));
         assert!(script.contains("native notification waits for popups owner="));
         assert!(script.contains("function isOwnerDocumentComplete(ownerWindow)"));
         assert!(script.contains("document.readyState === 'complete'"));
