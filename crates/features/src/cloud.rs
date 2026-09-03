@@ -121,27 +121,84 @@ fn log_cloud_gate(app_id: AppId, controlled: bool, original: bool, config: &Runt
 }
 
 // ---------------------------------------------------------------------------
-// Cloud-write tracking for VDF filtering
+// Cloud gate state: apps currently forced off, and apps ever written
 // ---------------------------------------------------------------------------
 
-static CLOUD_WROTE_APPS: Mutex<Option<HashSet<AppId>>> = Mutex::new(None);
-
-/// Record that we called SetCloudEnabledForApp(false) for this app.
-/// Called from the IsCloudEnabledForApp hook before the Set call.
-pub fn mark_cloud_wrote(app_id: AppId) -> bool {
-    let mut guard = CLOUD_WROTE_APPS.lock().unwrap();
-    let set = guard.get_or_insert_with(HashSet::new);
-    set.insert(app_id)
+struct GateState {
+    /// Apps whose cloud we currently hold at `false`.
+    forced_off: HashSet<AppId>,
+    /// Apps we ever wrote a `cloudenabled` value for; the VDF filter keeps
+    /// every such entry out of the on-disk roaming config.
+    touched: HashSet<AppId>,
 }
 
-/// Snapshot the set of apps we wrote cloudenabled for.
+static GATE_STATE: Mutex<Option<GateState>> = Mutex::new(None);
+
+fn with_gate_state<R>(f: impl FnOnce(&mut GateState) -> R) -> R {
+    let mut guard = GATE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(|| GateState {
+        forced_off: HashSet::new(),
+        touched: HashSet::new(),
+    });
+    f(state)
+}
+
+/// Record that we are about to call SetCloudEnabledForApp(false) for this app.
+/// Returns true the first time the app is forced off.
+pub fn mark_cloud_wrote(app_id: AppId) -> bool {
+    with_gate_state(|state| {
+        state.touched.insert(app_id);
+        state.forced_off.insert(app_id)
+    })
+}
+
+/// Record that we switched the app's cloud back on. The app stays in the VDF
+/// filter so the explicit `cloudenabled` entry never reaches disk either.
+pub fn mark_cloud_restored(app_id: AppId) -> bool {
+    with_gate_state(|state| {
+        state.touched.insert(app_id);
+        state.forced_off.remove(&app_id)
+    })
+}
+
+/// Whether we currently hold this app's cloud at `false`.
+pub fn is_forced_off(app_id: AppId) -> bool {
+    with_gate_state(|state| state.forced_off.contains(&app_id))
+}
+
+/// Apps the VDF filter must strip `cloudenabled` for.
 fn snapshot_wrote_apps() -> HashSet<AppId> {
-    CLOUD_WROTE_APPS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned()
-        .unwrap_or_default()
+    with_gate_state(|state| state.touched.clone())
+}
+
+/// What the next sweep has to change to match the configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloudPlan {
+    /// Controlled apps that still need SetCloudEnabledForApp(false).
+    pub disable: Vec<AppId>,
+    /// Apps we forced off that no longer qualify (script removed, backend
+    /// configured, genuine ownership learned) and get their cloud back.
+    pub enable: Vec<AppId>,
+}
+
+/// Reconcile the forced-off set with the current configuration and ownership.
+pub fn cloud_plan(config: &RuntimeConfig) -> CloudPlan {
+    let desired = apps_to_disable(config);
+    with_gate_state(|state| {
+        let disable = desired
+            .iter()
+            .copied()
+            .filter(|app_id| !state.forced_off.contains(app_id))
+            .collect();
+        let mut enable: Vec<AppId> = state
+            .forced_off
+            .iter()
+            .copied()
+            .filter(|app_id| !desired.contains(app_id))
+            .collect();
+        enable.sort_unstable();
+        CloudPlan { disable, enable }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +435,38 @@ mod tests {
         let mut config = config_with_inject(&[5_553]);
         config.cloud.backend = CloudBackendMode::Local;
         assert!(apps_to_disable(&config).is_empty());
+    }
+
+    #[test]
+    fn cloud_plan_disables_new_apps_and_restores_dropped_ones() {
+        let _guard = crate::apps::ACCOUNT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let a = AppId(5_561);
+        let b = AppId(5_562);
+        let config = config_with_inject(&[a.0, b.0]);
+        let plan = cloud_plan(&config);
+        assert!(plan.disable.contains(&a) && plan.disable.contains(&b));
+        assert!(plan.enable.is_empty());
+
+        assert!(mark_cloud_wrote(a));
+        assert!(!mark_cloud_wrote(a));
+        assert!(mark_cloud_wrote(b));
+        assert_eq!(cloud_plan(&config), CloudPlan::default());
+
+        // `b` becomes genuinely owned: it must get its cloud back.
+        crate::apps::record_actual_ownership(b, true);
+        assert_eq!(cloud_plan(&config).enable, vec![b]);
+        assert!(mark_cloud_restored(b));
+        assert!(!is_forced_off(b));
+        assert!(is_forced_off(a));
+
+        // Backend configured: nothing stays forced off.
+        let mut with_backend = config_with_inject(&[a.0]);
+        with_backend.cloud.backend = CloudBackendMode::Local;
+        assert_eq!(cloud_plan(&with_backend).enable, vec![a]);
+        mark_cloud_restored(a);
+        crate::apps::record_actual_ownership(b, false);
     }
 
     #[test]

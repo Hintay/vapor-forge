@@ -151,6 +151,9 @@ unsafe { original(this, app_list, size, a3) };
     }
 
     let cfg = config();
+    // Steam enumerates subscriptions right after it processed a license change,
+    // so this is where a pending license list gets turned into ownership.
+    super::package::run_pending_ownership_refresh(&cfg);
     let pkg0_injected = PKG0_INJECTED.load(Ordering::Acquire);
 
     // Steam calls this twice: once with (NULL, 0) to size a CUtlVector, then
