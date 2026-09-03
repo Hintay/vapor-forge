@@ -561,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn bridge_reveals_native_toasts_after_styles_load() {
+        let script = bridge_script();
+        assert!(script.contains("function copySteamStyles(source, target, onReady)"));
+        assert!(script.contains("copy.addEventListener('load', finish)"));
+        assert!(script.contains("copy.addEventListener('error', finish)"));
+        assert!(script.contains("if (notified || pending > 0) return"));
+        assert!(
+            script.contains("copySteamStyles(ownerWindow.document, popup.document, function() {")
+        );
+        assert!(script.contains("if (entry.removed || entry.closing) return"));
+        assert!(script.contains("entry.stylesReady = true"));
+        assert!(script.contains("if (entry.stylesReady) entry.browserView.SetVisible(true)"));
+        assert!(!script.contains(
+            "SetBounds(left, top, 320, 80);\n              entry.browserView.SetVisible(true);"
+        ));
+    }
+
+    #[test]
     fn bridge_uses_the_renderer_jsx_runtime() {
         let script = bridge_script();
         let renderer_runtime = script.find("findJsxFromRendererFactory();").unwrap();

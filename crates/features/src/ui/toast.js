@@ -766,16 +766,39 @@
         return null;
       }
 
-      function copySteamStyles(source, target) {
+      // Steam ships its UI styles as linked stylesheets, so the copies load
+      // asynchronously in the popup document. onReady fires once every copied
+      // link has loaded or failed (synchronously when nothing is pending); the
+      // caller keeps the popup hidden until then so no unstyled frame shows.
+      function copySteamStyles(source, target, onReady) {
+        var pending = 0;
+        var notified = false;
+        function settle() {
+          if (notified || pending > 0) return;
+          notified = true;
+          if (onReady) onReady();
+        }
         try {
           source.head.querySelectorAll('link[rel="stylesheet"],style').forEach(function(node) {
             var copy = node.cloneNode(true);
-            if (node.tagName === 'LINK' && node.href) copy.href = node.href;
+            if (node.tagName === 'LINK' && node.href) {
+              copy.href = node.href;
+              pending++;
+              var finish = function() {
+                copy.removeEventListener('load', finish);
+                copy.removeEventListener('error', finish);
+                pending--;
+                settle();
+              };
+              copy.addEventListener('load', finish);
+              copy.addEventListener('error', finish);
+            }
             target.head.appendChild(copy);
           });
         } catch (error) {
           bridge.log('native notification style error: ' + error);
         }
+        settle();
       }
 
       function removePreLoginNativeEntry(entry) {
@@ -913,7 +936,7 @@
           try {
             if (entry.browserView) {
               entry.browserView.SetBounds(left, top, 320, 80);
-              entry.browserView.SetVisible(true);
+              if (entry.stylesReady) entry.browserView.SetVisible(true);
             } else if (entry.popup && entry.popup.window &&
                 entry.popup.window.SteamClient.Window.MoveTo) {
               entry.popup.window.SteamClient.Window.MoveTo(
@@ -951,7 +974,6 @@
         );
         popup.document.title = name;
         popup.document.close();
-        copySteamStyles(ownerWindow.document, popup.document);
         installNativeToastSurface(popup.document);
         var mount = popup.document.getElementById('browserview_target');
         var entry = {
@@ -960,6 +982,7 @@
           mount: null,
           browserView: created.browserView,
           popup: null,
+          stylesReady: false,
           closing: false,
           removed: false
         };
@@ -968,13 +991,24 @@
           popup.addEventListener('unload', function() { removePreLoginNativeEntry(entry); }, {
             once: true
           });
-          renderNativeToastDom(mount, data, notification, entry);
-          relayoutPreLoginNativeToasts();
         } catch (error) {
           try { SteamClient.BrowserView.Destroy(created.browserView); } catch (_) {}
           removePreLoginNativeEntry(entry);
           throw error;
         }
+        // Build and reveal the toast only once Steam's stylesheets apply in the
+        // popup, so the entry animation starts on a fully styled layout.
+        copySteamStyles(ownerWindow.document, popup.document, function() {
+          if (entry.removed || entry.closing) return;
+          try {
+            renderNativeToastDom(mount, data, notification, entry);
+            entry.stylesReady = true;
+            relayoutPreLoginNativeToasts();
+          } catch (error) {
+            bridge.log('native notification render error: ' + error);
+            closePreLoginNativeEntry(entry);
+          }
+        });
         return true;
       }
 
