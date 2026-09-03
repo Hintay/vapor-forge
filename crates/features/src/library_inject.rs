@@ -11,19 +11,50 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tracing::{debug, info};
-use vapor_forge_config::{AppId, LibraryInjectEntry};
+use vapor_forge_config::{AppId, LibraryInjectEntry, LibraryInjectSection};
 
 /// Resolved injection for a single game launch.
 pub struct PendingInjection {
     pub native_libs: Vec<String>,   // .so paths for LD_PRELOAD
     pub proton_dll: Option<String>, // .dll path for Proton helper
+    /// Load the Proton helper so it can disable thread callouts on a duplicate
+    /// USER32 loader entry (see `LibraryInjectSection::loader_fix_apps`).
+    pub loader_fix: bool,
 }
 
 static PENDING: Mutex<Option<HashMap<AppId, PendingInjection>>> = Mutex::new(None);
 
+/// Whether the section asks for the duplicate-module loader fix on this launch.
+pub fn loader_fix_requested(
+    section: &LibraryInjectSection,
+    app_id: AppId,
+    launch_opts: &str,
+) -> bool {
+    section.loader_fix_apps.contains(&app_id)
+        || (!section.loader_fix_flag.is_empty()
+            && crate::launch_options::flag_appears_in(launch_opts, &section.loader_fix_flag))
+}
+
+/// Whether the section can produce any injection at all (fast path for hooks).
+pub fn section_is_active(section: &LibraryInjectSection) -> bool {
+    !section.libs.is_empty()
+        || !section.loader_fix_apps.is_empty()
+        || !section.loader_fix_flag.is_empty()
+}
+
+/// Evaluate every rule of the section for an app launch.
+pub fn on_launch_section(app_id: AppId, section: &LibraryInjectSection, launch_opts: &str) {
+    let loader_fix = loader_fix_requested(section, app_id, launch_opts);
+    evaluate(app_id, &section.libs, loader_fix, launch_opts);
+}
+
 /// Evaluate injection rules for an app launch.
 /// `launch_opts` comes from CConfigStore (read in the hooks layer).
 pub fn on_launch_app(app_id: AppId, libs: &[LibraryInjectEntry], launch_opts: &str) {
+    evaluate(app_id, libs, false, launch_opts);
+}
+
+fn evaluate(app_id: AppId, libs: &[LibraryInjectEntry], loader_fix: bool, launch_opts: &str) {
     // Clear any previous pending injection for this app before re-evaluating.
     if let Some(map) = PENDING.lock().unwrap().as_mut() {
         map.remove(&app_id);
@@ -61,13 +92,14 @@ pub fn on_launch_app(app_id: AppId, libs: &[LibraryInjectEntry], launch_opts: &s
         }
     }
 
-    if !native_libs.is_empty() || proton_dll.is_some() {
+    if !native_libs.is_empty() || proton_dll.is_some() || loader_fix {
         let native_count = native_libs.len();
         let has_dll = proton_dll.is_some();
         info!(
             app = app_id.0,
             native = native_count,
             dll = has_dll,
+            loader_fix,
             "library_inject: pending injection set"
         );
         PENDING
@@ -79,6 +111,7 @@ pub fn on_launch_app(app_id: AppId, libs: &[LibraryInjectEntry], launch_opts: &s
                 PendingInjection {
                     native_libs,
                     proton_dll,
+                    loader_fix,
                 },
             );
     }
@@ -120,6 +153,46 @@ mod tests {
         let app = AppId(999001);
         on_launch_app(app, &[], "");
         assert!(take_pending(app).is_none());
+    }
+
+    fn section(apps: Vec<u32>, flag: &str) -> LibraryInjectSection {
+        LibraryInjectSection {
+            libs: Vec::new(),
+            helper_path: String::new(),
+            loader_fix_apps: apps.into_iter().map(AppId).collect(),
+            loader_fix_flag: flag.to_owned(),
+        }
+    }
+
+    #[test]
+    fn loader_fix_app_list_sets_pending_without_libraries() {
+        let app = AppId(999101);
+        let section = section(vec![app.0], "");
+        assert!(section_is_active(&section));
+        on_launch_section(app, &section, "");
+        let p = take_pending(app).unwrap();
+        assert!(p.loader_fix);
+        assert!(p.native_libs.is_empty());
+        assert!(p.proton_dll.is_none());
+    }
+
+    #[test]
+    fn loader_fix_flag_requires_the_launch_option() {
+        let app = AppId(999102);
+        let section = section(vec![], "-loaderfix");
+        on_launch_section(app, &section, "PROTON_LOG=1 %command%");
+        assert!(take_pending(app).is_none());
+        on_launch_section(app, &section, "-loaderfix %command%");
+        assert!(take_pending(app).unwrap().loader_fix);
+    }
+
+    #[test]
+    fn loader_fix_is_off_for_other_apps() {
+        let app = AppId(999103);
+        let section = section(vec![999104], "");
+        on_launch_section(app, &section, "");
+        assert!(take_pending(app).is_none());
+        assert!(!section_is_active(&LibraryInjectSection::default()));
     }
 
     #[test]

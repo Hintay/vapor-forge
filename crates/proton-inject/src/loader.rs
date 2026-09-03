@@ -103,6 +103,9 @@ pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
         scan_loaded_pe(base_address);
     }
 
+    // Runs on this PE thread, where the TEB is available.
+    crate::loader_fix::on_module_loaded();
+
     let trigger_seen = trigger::is_trigger_name(name);
     let pending_pickup = PENDING.swap(false, Ordering::AcqRel);
 
