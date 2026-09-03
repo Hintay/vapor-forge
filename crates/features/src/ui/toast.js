@@ -1609,7 +1609,7 @@
           // store discards entries added while login is still in progress.
           while (state.trayPending.length) {
             var held = state.trayPending.shift();
-            processNotification(held.toast, held.toastData, false);
+            processNotification(held.toast, held.toastData, false, false, true);
             bridge.log('toast registered in tray id=' + held.toastData.notificationID);
           }
         }
@@ -1636,29 +1636,33 @@
               return false;
             }
             if (flushedKey) state.seen[flushedKey] = true;
+            // The store plays the sound right away for a non-toast notification,
+            // so this call keeps the sound in step with the native popup; the
+            // tray entry follows after login.
+            processNotification(toast, toastData, false, toast.playSound !== false, false);
             state.trayPending.push({ toast: toast, toastData: toastData });
             bridge.log('toast shown natively id=' + id);
             continue;
           }
           if (flushedKey) state.seen[flushedKey] = true;
-          processNotification(toast, toastData, true);
+          processNotification(toast, toastData, true, toast.playSound !== false, true);
           bridge.log('toast delivered id=' + id);
         }
         return true;
       }
 
-      function processNotification(toast, toastData, showToast) {
+      function processNotification(toast, toastData, showToast, playSound, withTray) {
         function fnTray(notification, tray) {
           tray.unshift({ eType: notification.eType, notifications: [notification] });
         }
         state.store.ProcessNotification({
           showToast: showToast,
           sound: toast.sound == null ? 6 : toast.sound,
-          playSound: toast.playSound !== false,
+          playSound: playSound,
           eFeature: 0,
           toastDurationMS: toastData.nToastDurationMS,
           bCritical: !!toast.critical,
-          fnTray: fnTray
+          fnTray: withTray ? fnTray : null
         }, toastData, 0);
       }
 

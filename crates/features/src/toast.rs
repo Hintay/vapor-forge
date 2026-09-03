@@ -552,9 +552,19 @@ mod tests {
         assert!(script.contains("app.InitAfterLogin = function()"));
         assert!(script.contains("if (!beforeServices && !state.afterLoginReady) return false"));
         assert!(script.contains("state.trayPending.push({ toast: toast, toastData: toastData })"));
-        assert!(script.contains("processNotification(held.toast, held.toastData, false)"));
-        assert!(script.contains("processNotification(toast, toastData, true)"));
-        assert!(script.contains("function processNotification(toast, toastData, showToast)"));
+        assert!(
+            script.contains("processNotification(held.toast, held.toastData, false, false, true)")
+        );
+        assert!(script.contains(
+            "processNotification(toast, toastData, false, toast.playSound !== false, false)"
+        ));
+        assert!(script.contains(
+            "processNotification(toast, toastData, true, toast.playSound !== false, true)"
+        ));
+        assert!(script.contains(
+            "function processNotification(toast, toastData, showToast, playSound, withTray)"
+        ));
+        assert!(script.contains("fnTray: withTray ? fnTray : null"));
         assert!(script.contains("if (!renderPreLoginNativeToast(toast, toastData))"));
         assert!(script.contains("state.pending.unshift(toast)"));
         assert!(script.contains("clearPreLoginNativeToasts()"));
