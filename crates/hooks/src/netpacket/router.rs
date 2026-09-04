@@ -21,8 +21,8 @@ use vapor_forge_steam_protocol::{
     EncryptedAppTicketResponse, GetAppOwnershipTicketRequest, GetAppOwnershipTicketResponse,
     PlayerGetUserStatsRequest, PlayerGetUserStatsResponse, PlayerPlayHistory,
     PlayerRecordDisconnectedPlaytimeRequest, PlayerRecordDisconnectedPlaytimeResponse,
-    EMSG_CLIENT_LOGGED_OFF, EMSG_CLIENT_LOG_ON, EMSG_CLIENT_LOG_ON_RESPONSE,
-    EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
+    EMSG_CLIENT_LICENSE_LIST, EMSG_CLIENT_LOGGED_OFF, EMSG_CLIENT_LOG_ON,
+    EMSG_CLIENT_LOG_ON_RESPONSE, EMSG_CLIENT_PERSONA_STATE, EMSG_CLIENT_RICH_PRESENCE_UPLOAD,
     EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING, EMSG_ENCRYPTED_APPTICKET_REQUEST,
     EMSG_ENCRYPTED_APPTICKET_RESPONSE, EMSG_GAMESPLAYED, EMSG_GAMESPLAYED_WITH_DATABLOB,
     EMSG_GET_APP_OWNERSHIP_TICKET, EMSG_GET_APP_OWNERSHIP_TICKET_RESPONSE,
@@ -1010,6 +1010,18 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
     };
     let emsg = emsg_raw & !K_MSG_HDR_PROTO_FLAG;
     let mut change = PacketChange::Unchanged;
+
+    // License list (780): the account's real packages, sent at logon and on
+    // every purchase, gift or refund. Ownership is re-derived from it.
+    if emsg == EMSG_CLIENT_LICENSE_LIST {
+        if let Some(packages) = vapor_forge_steam_protocol::licensed_packages(body_bytes) {
+            info!(
+                packages = packages.len(),
+                "netpacket: license list received"
+            );
+            crate::client::package::note_license_list(packages);
+        }
+    }
     let mut final_len = None;
     let mut replacement = None;
 

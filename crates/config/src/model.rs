@@ -388,7 +388,7 @@ pub struct LibraryInjectSection {
 /// Duplicate-module loader fix, applied by the Proton helper.
 ///
 /// The helper disables thread callouts on any extra loader entry that shares
-/// a loaded module's name and entry point, as DenuvOwO's loader registers for
+/// a loaded module's name and entry point, as some third-party loaders register for
 /// user32, which otherwise makes wine run that DllMain twice per thread attach
 /// and exit. It is only applied where asked for:
 ///

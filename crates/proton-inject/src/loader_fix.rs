@@ -1,6 +1,6 @@
 // Duplicate-module loader fix.
 //
-// Some third-party loaders (DenuvOwO's winmm.dll) register extra loader
+// Some third-party loaders register extra loader
 // entries for modules that are already loaded: the entry's DllBase is a
 // synthetic stub but its EntryPoint is the real module's DllMain. Wine then
 // runs that DllMain twice for every thread attach and detach, and user32's

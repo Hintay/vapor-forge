@@ -537,6 +537,136 @@ pub fn queue_reload(controlled: Vec<AppId>) {
     try_post_update();
 }
 
+// ---------------------------------------------------------------------------
+// Genuine ownership from the account's license list
+// ---------------------------------------------------------------------------
+
+// Packages (id, access token) from the last CMsgClientLicenseList, kept until
+// every package's info is available and the controlled apps were re-evaluated.
+static PENDING_LICENSES: Mutex<Option<PendingLicenses>> = Mutex::new(None);
+const MAX_LICENSE_REFRESH_ATTEMPTS: u32 = 40;
+
+struct PendingLicenses {
+    packages: Vec<(u32, u64)>,
+    attempts: u32,
+}
+
+/// Remember the account's licenses; the next GetSubscribedApps call, which
+/// Steam makes after processing a license change, re-evaluates ownership.
+pub(crate) fn note_license_list(packages: Vec<(u32, u64)>) {
+    let mut pending = PENDING_LICENSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *pending = Some(PendingLicenses {
+        packages,
+        attempts: 0,
+    });
+}
+
+/// Re-derive which controlled apps the account genuinely owns from the
+/// licensed packages' app lists. Package 0 is never consulted, so the result is
+/// independent of pkg0 injection; a purchase, gift or refund made while Steam
+/// runs therefore updates the ownership cache instead of being frozen at the
+/// pre-injection snapshot. Retries on later calls while package info is still
+/// arriving from PICS.
+pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::RuntimeConfig) {
+    let packages = {
+        let mut guard = PENDING_LICENSES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = guard.as_mut() else {
+            return;
+        };
+        if CPKG_INFO_PTR.load(Ordering::Acquire) == 0 {
+            // Package store not captured yet: keep the list for a later call.
+            return;
+        }
+        pending.attempts += 1;
+        if pending.attempts > MAX_LICENSE_REFRESH_ATTEMPTS {
+            warn!(
+                packages = pending.packages.len(),
+                "package: license list refresh gave up, package info never completed"
+            );
+            *guard = None;
+            return;
+        }
+        pending.packages.clone()
+    };
+    // SAFETY: resolved once before hook installation and read-only afterward.
+    let Some(get_pkg) = (unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) }) else {
+        return;
+    };
+    let this = CPKG_INFO_PTR.load(Ordering::Acquire) as *mut c_void;
+    let mut owned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut missing = 0usize;
+    for &(package_id, access_token) in &packages {
+        // SAFETY: the receiver was captured from Steam's own GetPackageInfo
+        // call and the callable was validated against this ABI.
+        let pkg = unsafe { get_pkg(this, package_id, access_token) };
+        if pkg.is_null() {
+            missing += 1;
+            continue;
+        }
+        // SAFETY: pkg was returned by Steam's typed package lookup.
+        if unsafe { package_info::status(pkg) } != PKG_STATUS_AVAILABLE {
+            missing += 1;
+            continue;
+        }
+        // SAFETY: pkg was returned by Steam's typed package lookup.
+        let app_ids = unsafe { &*package_info::app_id_vec(pkg) };
+        let count = app_ids.len();
+        let base = app_ids.m_memory.m_p_memory;
+        if count > 0 && !base.is_null() {
+            // SAFETY: Steam's vector header describes `count` live u32 elements.
+            owned.extend(unsafe { std::slice::from_raw_parts(base as *const u32, count) });
+        }
+    }
+    let runtime = crate::client::install::runtime_snapshot();
+    let controlled =
+        vapor_forge_features::package::controlled_app_ids(config, &runtime.script_state.apps);
+    // With package info still missing for some licenses only positive findings
+    // are safe to record: an app absent from the packages seen so far may live
+    // in one of the missing ones. Downgrades wait for a complete picture.
+    let complete = missing == 0;
+    let mut changed = Vec::new();
+    let mut owned_controlled = 0usize;
+    for app_id in controlled {
+        let is_owned = owned.contains(&app_id.0);
+        if is_owned {
+            owned_controlled += 1;
+        }
+        if !is_owned && !complete {
+            continue;
+        }
+        let before = vapor_forge_features::apps::actual_ownership(app_id);
+        vapor_forge_features::apps::record_actual_ownership(app_id, is_owned);
+        if before != vapor_forge_features::apps::actual_ownership(app_id) {
+            changed.push(app_id.0);
+        }
+    }
+    let attempts = {
+        let mut guard = PENDING_LICENSES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attempts = guard.as_ref().map_or(0, |pending| pending.attempts);
+        if complete {
+            *guard = None;
+        }
+        attempts
+    };
+    if complete || attempts == 1 || !changed.is_empty() {
+        info!(
+            packages = packages.len(),
+            missing,
+            complete,
+            owned_controlled,
+            changed = changed.len(),
+            changed_apps = ?changed.iter().take(16).collect::<Vec<_>>(),
+            "package: ownership refreshed from license list"
+        );
+    }
+}
+
 fn queue_initial_injection() {
     if crate::client::install::PKG0_INJECTED.load(Ordering::Acquire) {
         try_post_update();
