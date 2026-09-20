@@ -393,15 +393,15 @@ fn join_path(prefix: &str, key: &str) -> String {
     }
 }
 
-fn assign_table_positions(table: &mut Table, position: &mut usize) {
+fn assign_table_positions(table: &mut Table, position: &mut isize) {
     for (_, item) in table.iter_mut() {
         if let Some(child) = item.as_table_mut() {
-            child.set_position(*position);
+            child.set_position(Some(*position));
             *position += 1;
             assign_table_positions(child, position);
         } else if let Some(array) = item.as_array_of_tables_mut() {
             for child in array.iter_mut() {
-                child.set_position(*position);
+                child.set_position(Some(*position));
                 *position += 1;
                 assign_table_positions(child, position);
             }
