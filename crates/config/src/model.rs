@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::de::{IntoDeserializer, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -456,11 +457,19 @@ pub enum TicketCacheMode {
 #[serde(deny_unknown_fields)]
 pub struct ManifestSection {
     #[serde(default = "default_manifest_providers")]
-    pub providers: Vec<ManifestProvider>,
+    pub providers: Vec<ManifestSource>,
     #[serde(default = "default_timeout_connect_ms")]
     pub timeout_connect_ms: u64,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Minimum gap between two requests to the same provider.
+    ///
+    /// These endpoints are small shared services — 20770407 publishes 10
+    /// requests / 10 s per IP and degrades for everyone when one client
+    /// floods it — and Steam asks for one code per depot, so a big install
+    /// would burst without this.
+    #[serde(default = "default_min_interval_ms")]
+    pub min_interval_ms: u64,
 }
 
 impl Default for ManifestSection {
@@ -469,12 +478,21 @@ impl Default for ManifestSection {
             providers: default_manifest_providers(),
             timeout_connect_ms: default_timeout_connect_ms(),
             timeout_ms: default_timeout_ms(),
+            min_interval_ms: default_min_interval_ms(),
         }
     }
 }
 
+/// A provider shipped with the build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
 pub enum ManifestProvider {
+    /// A pool of accounts that hold real licences. Since 2026-09-09 Valve only
+    /// mints a request code for an account that owns the app, so this is the
+    /// shape that still works: it asks Valve per request and takes Valve's own
+    /// (depot, manifest) parameters, resolving the app id itself. A title
+    /// nobody in the pool owns answers `Unauthorized`.
+    #[serde(rename = "20770407")]
+    Pool20770407,
     #[serde(rename = "manifestdex")]
     ManifestDex,
     #[serde(rename = "opensteamtool")]
@@ -485,12 +503,248 @@ pub enum ManifestProvider {
     SteamRun,
 }
 
-fn default_manifest_providers() -> Vec<ManifestProvider> {
+impl ManifestProvider {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pool20770407 => "20770407",
+            Self::ManifestDex => "manifestdex",
+            Self::OpenSteamTool => "opensteamtool",
+            Self::Wudrm => "wudrm",
+            Self::SteamRun => "steamrun",
+        }
+    }
+
+    pub const fn url_template(self) -> &'static str {
+        match self {
+            Self::Pool20770407 => "https://20770407.xyz/manifest/{depotId}/{gid}",
+            Self::ManifestDex => "https://manifest.manifestdex.com/{gid}",
+            Self::OpenSteamTool => "https://manifest.opensteamtool.com/{gid}",
+            Self::Wudrm => "http://gmrc.wudrm.com/manifest/{gid}",
+            Self::SteamRun => "https://manifest.steam.run/api/manifest/{gid}",
+        }
+    }
+
+    /// Providers that reject or rate-limit the default agent string.
+    pub const fn user_agent(self) -> Option<&'static str> {
+        match self {
+            // Identify as ourselves rather than borrow another client's string:
+            // this endpoint is a small shared service whose operator may one day
+            // quota by client, and we would rather be our own small bucket.
+            Self::Pool20770407 => Some(concat!("vapor-forge/", env!("CARGO_PKG_VERSION"))),
+            Self::ManifestDex => Some("ManifestDeX/1.0"),
+            Self::OpenSteamTool => Some("OpenSteamTool/1.0"),
+            Self::Wudrm | Self::SteamRun => None,
+        }
+    }
+
+    pub const fn response_format(self) -> ManifestResponseFormat {
+        match self {
+            Self::SteamRun => ManifestResponseFormat::Json,
+            _ => ManifestResponseFormat::Plain,
+        }
+    }
+
+    /// Field holding the code for [`ManifestResponseFormat::Json`] providers.
+    pub const fn json_field(self) -> Option<&'static str> {
+        match self {
+            Self::SteamRun => Some("content"),
+            _ => None,
+        }
+    }
+}
+
+/// How a provider's 200 response carries the request code.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestResponseFormat {
+    /// Whole body is the decimal code.
+    #[default]
+    Plain,
+    /// Code sits in a top-level JSON string or number field.
+    Json,
+}
+
+/// A provider defined in the config file, so a new source can be used without
+/// waiting for a build that knows about it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomManifestProvider {
+    /// Identifies the entry in logs and in the rate-limit cooldown table.
+    pub name: String,
+    /// Endpoint with a `{gid}` placeholder.
+    pub url: String,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub format: ManifestResponseFormat,
+    /// Required when `format = "json"`.
+    #[serde(default)]
+    pub json_field: Option<String>,
+    /// Overrides `[manifest] min_interval_ms` for this provider.
+    #[serde(default)]
+    pub min_interval_ms: Option<u64>,
+}
+
+/// One entry of the provider chain: a built-in name, or an inline table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManifestSource {
+    BuiltIn(ManifestProvider),
+    Custom(CustomManifestProvider),
+}
+
+impl ManifestSource {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::BuiltIn(provider) => provider.name(),
+            Self::Custom(custom) => &custom.name,
+        }
+    }
+
+    pub fn url_template(&self) -> &str {
+        match self {
+            Self::BuiltIn(provider) => provider.url_template(),
+            Self::Custom(custom) => &custom.url,
+        }
+    }
+
+    pub fn user_agent(&self) -> Option<&str> {
+        match self {
+            Self::BuiltIn(provider) => provider.user_agent(),
+            Self::Custom(custom) => custom.user_agent.as_deref(),
+        }
+    }
+
+    pub fn response_format(&self) -> ManifestResponseFormat {
+        match self {
+            Self::BuiltIn(provider) => provider.response_format(),
+            Self::Custom(custom) => custom.format,
+        }
+    }
+
+    pub fn json_field(&self) -> Option<&str> {
+        match self {
+            Self::BuiltIn(provider) => provider.json_field(),
+            Self::Custom(custom) => custom.json_field.as_deref(),
+        }
+    }
+
+    /// Minimum gap before the next request to this provider.
+    pub fn min_interval(&self, section_default_ms: u64) -> std::time::Duration {
+        let ms = match self {
+            Self::BuiltIn(_) => section_default_ms,
+            Self::Custom(custom) => custom.min_interval_ms.unwrap_or(section_default_ms),
+        };
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// Expand the endpoint template for one request.
+    ///
+    /// `{gid}` is always substituted; `{depotId}` and `{appId}` let a provider
+    /// that mints codes through licensed accounts take Valve's own
+    /// GetManifestRequestCode shape (depot plus manifest).
+    pub fn resolve_url(&self, app_id: u32, depot_id: u32, gid: u64) -> String {
+        self.url_template()
+            .replace("{gid}", &gid.to_string())
+            .replace("{depotId}", &depot_id.to_string())
+            .replace("{appId}", &app_id.to_string())
+    }
+
+    /// Why this entry cannot be used, or `None` when it is well-formed.
+    ///
+    /// A bad entry is skipped rather than failing the whole config: the point
+    /// of custom providers is that users edit them without a build, so one typo
+    /// must not take the other sources down with it.
+    pub fn rejection(&self) -> Option<String> {
+        let Self::Custom(custom) = self else {
+            return None;
+        };
+        if custom.name.trim().is_empty() {
+            return Some("custom manifest provider has an empty name".to_owned());
+        }
+        if !custom.url.contains("{gid}") {
+            return Some(format!(
+                "custom manifest provider `{}` has no {{gid}} placeholder in its url",
+                custom.name
+            ));
+        }
+        if !custom.url.starts_with("http://") && !custom.url.starts_with("https://") {
+            return Some(format!(
+                "custom manifest provider `{}` must use an http:// or https:// url",
+                custom.name
+            ));
+        }
+        if custom.format == ManifestResponseFormat::Json
+            && custom.json_field.as_deref().unwrap_or("").trim().is_empty()
+        {
+            return Some(format!(
+                "custom manifest provider `{}` sets format = \"json\" but no json_field",
+                custom.name
+            ));
+        }
+        None
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SourceVisitor;
+
+        impl<'de> Visitor<'de> for SourceVisitor {
+            type Value = ManifestSource;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a built-in provider name or a custom provider table")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                // Delegate so an unknown name still reports the built-in list.
+                ManifestProvider::deserialize(value.into_deserializer())
+                    .map(ManifestSource::BuiltIn)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                CustomManifestProvider::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    map,
+                ))
+                .map(ManifestSource::Custom)
+            }
+        }
+
+        deserializer.deserialize_any(SourceVisitor)
+    }
+}
+
+impl ManifestSection {
+    /// Problems that make individual entries unusable, plus duplicate names.
+    ///
+    /// Names key the rate-limit cooldown table, so a duplicate would make two
+    /// sources share one cooldown.
+    pub fn rejections(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for source in &self.providers {
+            if let Some(problem) = source.rejection() {
+                problems.push(problem);
+                continue;
+            }
+            if !seen.insert(source.name()) {
+                problems.push(format!(
+                    "duplicate manifest provider name `{}`",
+                    source.name()
+                ));
+            }
+        }
+        problems
+    }
+}
+
+fn default_manifest_providers() -> Vec<ManifestSource> {
     vec![
-        ManifestProvider::ManifestDex,
-        ManifestProvider::OpenSteamTool,
-        ManifestProvider::Wudrm,
-        ManifestProvider::SteamRun,
+        ManifestSource::BuiltIn(ManifestProvider::Pool20770407),
+        ManifestSource::BuiltIn(ManifestProvider::ManifestDex),
+        ManifestSource::BuiltIn(ManifestProvider::OpenSteamTool),
+        ManifestSource::BuiltIn(ManifestProvider::Wudrm),
+        ManifestSource::BuiltIn(ManifestProvider::SteamRun),
     ]
 }
 
@@ -500,6 +754,10 @@ fn default_timeout_connect_ms() -> u64 {
 
 fn default_timeout_ms() -> u64 {
     15000
+}
+
+fn default_min_interval_ms() -> u64 {
+    1000
 }
 
 fn default_syncthing_url() -> String {

@@ -18,6 +18,10 @@ fn run() -> Result<(), String> {
     let config = toml::from_str::<RuntimeConfig>(&dry_run.synced)
         .map_err(|error| format!("synced config parse failed: {error}"))?;
 
+    // Custom manifest providers are hand-written, so surface what the runtime
+    // would skip instead of leaving the user to read the logs.
+    let manifest_rejections = config.manifest.rejections();
+
     if args.format == OutputFormat::Json {
         let output = JsonOutput {
             config_path: args.config_path.display().to_string(),
@@ -25,6 +29,7 @@ fn run() -> Result<(), String> {
             auto_added_fields: dry_run.added_fields,
             kept_commented_examples: dry_run.kept_commented_examples,
             pruned_commented_examples: dry_run.pruned_commented_examples,
+            manifest_rejections,
             final_config_debug: format!("{config:#?}"),
             synced_toml: args.show_synced.then_some(dry_run.synced),
         };
@@ -43,6 +48,7 @@ fn run() -> Result<(), String> {
         "pruned_commented_examples",
         &dry_run.pruned_commented_examples,
     );
+    print_list("manifest_rejections", &manifest_rejections);
 
     println!("final_config:");
     println!("{config:#?}");
@@ -129,6 +135,7 @@ struct JsonOutput {
     auto_added_fields: Vec<String>,
     kept_commented_examples: Vec<String>,
     pruned_commented_examples: Vec<String>,
+    manifest_rejections: Vec<String>,
     final_config_debug: String,
     synced_toml: Option<String>,
 }

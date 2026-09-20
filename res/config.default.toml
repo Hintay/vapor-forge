@@ -49,11 +49,38 @@ timeout_ms = 15000
 cache = "disk"              # disk or session
 auto_delegate = false       # enable delegate mode when the helper detects it
 
-# Manifest request-code providers for controlled apps.
+# Manifest request-code providers for controlled apps, tried in order.
+# An entry is either a built-in name ("20770407", "manifestdex", "opensteamtool",
+# "wudrm", "steamrun") or a table describing your own endpoint, so a new source
+# can be added without waiting for a new build. Tables may span several lines:
+#
+#   providers = [
+#       "manifestdex",
+#       {
+#           name = "mirror",                    # shown in logs; must be unique
+#           url = "https://my.mirror/{gid}",    # {gid} required; {depotId} and
+#                                               # {appId} also substituted
+#           user_agent = "MyClient/1.0",        # optional
+#           min_interval_ms = 1000,             # optional; overrides the default below
+#       },
+#       {
+#           name = "jsonsrc",
+#           url = "https://x/{gid}",
+#           format = "json",                    # "plain" (default) or "json"
+#           json_field = "content",             # required when format = "json"
+#       },
+#   ]
+#
+# An entry that fails these rules is skipped and the rest of the chain still
+# runs; `vapor-forge-config-check` lists what would be skipped.
 [manifest]
-providers = ["manifestdex", "opensteamtool", "wudrm", "steamrun"]
+providers = ["20770407", "manifestdex", "opensteamtool", "wudrm", "steamrun"]
 timeout_connect_ms = 5000
 timeout_ms = 15000
+# Minimum gap between two requests to the same provider. These are small shared
+# services that degrade for everyone when one client bursts, and Steam asks for
+# one code per depot, so leave this at 1s unless a provider documents otherwise.
+min_interval_ms = 1000
 
 # Offline achievement schema support.
 [achievements]
