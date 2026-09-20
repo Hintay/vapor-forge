@@ -130,6 +130,30 @@ providers = [
 }
 
 #[test]
+fn patterns_url_default_is_identical_in_both_compiled_copies() {
+    // Two literals ship in the binary and each wins in a different situation:
+    // an existing config file without the key falls through to the serde
+    // default, while a first run writes CONFIG_TEMPLATE and reads that back.
+    // Nothing links them, so a one-sided edit would silently hand new and old
+    // installs different hotfix sources.
+    let from_serde = toml::from_str::<RuntimeConfig>("[runtime]\nlog_level = \"info\"\n")
+        .expect("a config without patterns_url should parse")
+        .runtime
+        .patterns_url;
+    let from_template = toml::from_str::<RuntimeConfig>(crate::CONFIG_TEMPLATE)
+        .expect("the shipped template should parse")
+        .runtime
+        .patterns_url;
+
+    assert_eq!(
+        from_serde, from_template,
+        "res/config.default.toml and default_patterns_url() have drifted apart"
+    );
+    assert_eq!(from_serde, RuntimeConfig::default().runtime.patterns_url);
+    assert!(from_serde.contains("{arch}"));
+}
+
+#[test]
 fn manifest_rejects_unknown_providers() {
     let error =
         toml::from_str::<RuntimeConfig>("[manifest]\nproviders = [\"opensteamtool\", \"unknown\"]")
