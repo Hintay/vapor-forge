@@ -15,8 +15,8 @@ use zip::ZipArchive;
 const CDN_BASE: &str = "https://client-update.akamai.steamstatic.com";
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
-const PATTERNS_X86: &str = include_str!("../../../../res/patterns.toml");
-const PATTERNS_X86_64: &str = include_str!("../../../../res/patterns.x86_64.toml");
+const PATTERNS_X86: &str = include_str!("../../../../res/patterns/x86.toml");
+const PATTERNS_X86_64: &str = include_str!("../../../../res/patterns/x86_64.toml");
 
 fn main() {
     if let Err(error) = run() {

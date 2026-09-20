@@ -10,7 +10,6 @@ use crate::RuntimeConfig;
 pub const CONFIG_TEMPLATE: &str = include_str!("../../../res/config.default.toml");
 
 pub(crate) const TEMPLATE_EXAMPLES: &[&str] = &[
-    "runtime.patterns_url",
     "apps.shared.include",
     "apps.shared.exclude",
     "[debug]",
