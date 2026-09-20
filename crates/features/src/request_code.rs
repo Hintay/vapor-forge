@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use prost::Message;
 use tracing::{debug, info, warn};
-use vapor_forge_config::{AppId, ManifestProvider, ManifestSection, RuntimeConfig};
+use vapor_forge_config::{
+    AppId, ManifestResponseFormat, ManifestSection, ManifestSource, RuntimeConfig,
+};
 use vapor_forge_steam_protocol::{
     CMsgProtoBufHeader, GetManifestRequestCodeResponse, EMSG_SERVICE_METHOD_RESPONSE,
     ERESULT_NO_CONNECTION, K_MSG_HDR_PROTO_FLAG,
@@ -140,6 +142,7 @@ impl PendingQueue {
         let providers = manifest.providers.clone();
         let timeout_connect_ms = manifest.timeout_connect_ms;
         let timeout_ms = manifest.timeout_ms;
+        let min_interval_ms = manifest.min_interval_ms;
         let spawn_result = std::thread::Builder::new()
             .name("manifest-code-fetch".to_owned())
             .spawn(move || {
@@ -157,7 +160,17 @@ impl PendingQueue {
                     }
                 });
                 let code = script_code.or_else(|| {
-                    fetch_manifest_code(gid, &providers, timeout_connect_ms, timeout_ms)
+                    fetch_manifest_code(
+                        FetchContext {
+                            app_id,
+                            depot_id,
+                            gid,
+                        },
+                        &providers,
+                        timeout_connect_ms,
+                        timeout_ms,
+                        min_interval_ms,
+                    )
                 });
                 {
                     let mut lock = result_clone.lock().unwrap();
@@ -240,8 +253,6 @@ pub fn should_intercept_with_ownership(
 // Built-in providers
 // ---------------------------------------------------------------------------
 
-const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
-const MANIFESTDEX_USER_AGENT: &str = "ManifestDeX/1.0";
 const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4096;
 
 /// Cooldown applied when a provider answers 429 without a usable `Retry-After`.
@@ -249,16 +260,82 @@ const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// Ceiling on any cooldown, so one absurd `Retry-After` cannot park a provider
 /// for the rest of the Steam session.
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(300);
+/// Applied when a provider itself is unhealthy (transport error, 5xx, a
+/// Cloudflare block). Steam asks for one code per depot, so without this a
+/// dead source costs a wasted round trip on every single gid.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Instants before which a rate-limited provider must not be contacted again.
 ///
 /// Steam resolves several depot manifests back to back. Without this, one 429
 /// would be re-earned on every following gid: a wasted round trip each time,
 /// and more load on a provider that just asked us to back off.
-static PROVIDER_COOLDOWNS: OnceLock<Mutex<HashMap<ManifestProvider, Instant>>> = OnceLock::new();
+static PROVIDER_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
-fn provider_cooldowns() -> &'static Mutex<HashMap<ManifestProvider, Instant>> {
+fn provider_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
     PROVIDER_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// When each provider was last contacted, for the self-imposed pacing.
+static PROVIDER_LAST_REQUEST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn provider_last_request() -> &'static Mutex<HashMap<String, Instant>> {
+    PROVIDER_LAST_REQUEST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What one manifest code request is for. `{depotId}` / `{appId}` providers
+/// need more than the gid.
+#[derive(Clone, Copy, Debug)]
+struct FetchContext {
+    app_id: u32,
+    depot_id: u32,
+    gid: u64,
+}
+
+/// How long to wait before the next request to `name` may go out, reserving
+/// the slot when the wait is zero.
+///
+/// Returning the wait instead of sleeping keeps the lock out of the sleep and
+/// keeps this testable.
+fn reserve_slot_in(
+    last: &mut HashMap<String, Instant>,
+    name: &str,
+    now: Instant,
+    min_interval: Duration,
+) -> Option<Duration> {
+    match last.get(name) {
+        Some(&previous) => {
+            let elapsed = now.saturating_duration_since(previous);
+            if elapsed < min_interval {
+                return Some(min_interval - elapsed);
+            }
+            last.insert(name.to_owned(), now);
+            None
+        }
+        None => {
+            last.insert(name.to_owned(), now);
+            None
+        }
+    }
+}
+
+/// Block until this provider may be contacted again.
+fn wait_for_slot(name: &str, min_interval: Duration) {
+    if min_interval.is_zero() {
+        return;
+    }
+    loop {
+        let wait = {
+            let mut last = provider_last_request()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            reserve_slot_in(&mut last, name, Instant::now(), min_interval)
+        };
+        match wait {
+            Some(wait) => std::thread::sleep(wait),
+            None => return,
+        }
+    }
 }
 
 /// Outcome of one provider attempt. 429 is kept distinct from ordinary failure
@@ -267,47 +344,53 @@ fn provider_cooldowns() -> &'static Mutex<HashMap<ManifestProvider, Instant>> {
 enum ProviderOutcome {
     Code(u64),
     RateLimited(Duration),
+    /// The provider is answering, but not for this target — a pool that holds
+    /// no licence for the app says so per request (20770407 replies 401
+    /// `Unauthorized`). Nothing is wrong with the source, so it must NOT be
+    /// put on cooldown: the next gid may well be one it can serve.
+    Denied(u16),
+    /// The provider itself is unhealthy; put it on cooldown.
     Failed(String),
 }
 
 /// Remaining cooldown for `provider`, clearing the entry once it has expired.
 fn cooldown_remaining_in(
-    cooldowns: &mut HashMap<ManifestProvider, Instant>,
-    provider: ManifestProvider,
+    cooldowns: &mut HashMap<String, Instant>,
+    name: &str,
     now: Instant,
 ) -> Option<Duration> {
-    let until = *cooldowns.get(&provider)?;
+    let until = *cooldowns.get(name)?;
     if until > now {
         Some(until - now)
     } else {
-        cooldowns.remove(&provider);
+        cooldowns.remove(name);
         None
     }
 }
 
 fn start_cooldown_in(
-    cooldowns: &mut HashMap<ManifestProvider, Instant>,
-    provider: ManifestProvider,
+    cooldowns: &mut HashMap<String, Instant>,
+    name: &str,
     now: Instant,
     retry_after: Duration,
 ) -> Duration {
     let capped = retry_after.min(MAX_RATE_LIMIT_COOLDOWN);
-    cooldowns.insert(provider, now + capped);
+    cooldowns.insert(name.to_owned(), now + capped);
     capped
 }
 
-fn cooldown_remaining(provider: ManifestProvider) -> Option<Duration> {
+fn cooldown_remaining(name: &str) -> Option<Duration> {
     let mut cooldowns = provider_cooldowns()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    cooldown_remaining_in(&mut cooldowns, provider, Instant::now())
+    cooldown_remaining_in(&mut cooldowns, name, Instant::now())
 }
 
-fn start_cooldown(provider: ManifestProvider, retry_after: Duration) -> Duration {
+fn start_cooldown(name: &str, retry_after: Duration) -> Duration {
     let mut cooldowns = provider_cooldowns()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    start_cooldown_in(&mut cooldowns, provider, Instant::now(), retry_after)
+    start_cooldown_in(&mut cooldowns, name, Instant::now(), retry_after)
 }
 
 /// `Retry-After` in its delta-seconds form. The HTTP-date form is not accepted:
@@ -319,15 +402,29 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 }
 
 fn fetch_manifest_code(
-    gid: u64,
-    providers: &[ManifestProvider],
+    context: FetchContext,
+    providers: &[ManifestSource],
     timeout_connect_ms: u64,
     timeout_ms: u64,
+    min_interval_ms: u64,
 ) -> Option<u64> {
-    for &provider in providers {
-        let (name, url_template) = provider_endpoint(provider);
+    let FetchContext {
+        app_id,
+        depot_id,
+        gid,
+    } = context;
 
-        if let Some(remaining) = cooldown_remaining(provider) {
+    for provider in providers {
+        let name = provider.name();
+
+        // A user-defined entry can be malformed; skip it and keep the rest of
+        // the chain working rather than failing the whole fetch.
+        if let Some(rejection) = provider.rejection() {
+            warn!(gid, %rejection, "request_code: skipping unusable provider");
+            continue;
+        }
+
+        if let Some(remaining) = cooldown_remaining(name) {
             debug!(
                 provider = name,
                 gid,
@@ -337,11 +434,15 @@ fn fetch_manifest_code(
             continue;
         }
 
-        let url = url_template.replace("{gid}", &gid.to_string());
+        let url = provider.resolve_url(app_id, depot_id, gid);
         debug!(
             provider = name,
-            gid, "request_code: trying built-in provider"
+            gid, depot_id, "request_code: trying provider"
         );
+
+        // Pace before the request, not after a 429: these are small shared
+        // services and the cooldown only reacts once the damage is done.
+        wait_for_slot(name, provider.min_interval(min_interval_ms));
 
         match fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms) {
             ProviderOutcome::Code(code) if code > 0 => {
@@ -355,7 +456,7 @@ fn fetch_manifest_code(
                 warn!(provider = name, gid, "request_code: provider returned zero")
             }
             ProviderOutcome::RateLimited(retry_after) => {
-                let cooldown = start_cooldown(provider, retry_after);
+                let cooldown = start_cooldown(name, retry_after);
                 warn!(
                     provider = name,
                     gid,
@@ -363,8 +464,22 @@ fn fetch_manifest_code(
                     "request_code: provider rate limited, backing off"
                 );
             }
+            ProviderOutcome::Denied(status) => {
+                // Per-target answer, not a provider fault: no cooldown.
+                debug!(
+                    provider = name,
+                    gid, depot_id, status, "request_code: provider does not have this manifest"
+                );
+            }
             ProviderOutcome::Failed(error) => {
-                warn!(provider = name, gid, %error, "request_code: provider failed");
+                let cooldown = start_cooldown(name, FAILURE_COOLDOWN);
+                warn!(
+                    provider = name,
+                    gid,
+                    %error,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "request_code: provider failed, backing off"
+                );
             }
         }
     }
@@ -372,28 +487,8 @@ fn fetch_manifest_code(
     None
 }
 
-fn provider_endpoint(provider: ManifestProvider) -> (&'static str, &'static str) {
-    match provider {
-        ManifestProvider::ManifestDex => ("manifestdex", "https://manifest.manifestdex.com/{gid}"),
-        ManifestProvider::OpenSteamTool => {
-            ("opensteamtool", "https://manifest.opensteamtool.com/{gid}")
-        }
-        ManifestProvider::Wudrm => ("wudrm", "http://gmrc.wudrm.com/manifest/{gid}"),
-        ManifestProvider::SteamRun => ("steamrun", "https://manifest.steam.run/api/manifest/{gid}"),
-    }
-}
-
-/// Providers that reject or rate-limit the default agent string.
-fn provider_user_agent(provider: ManifestProvider) -> Option<&'static str> {
-    match provider {
-        ManifestProvider::ManifestDex => Some(MANIFESTDEX_USER_AGENT),
-        ManifestProvider::OpenSteamTool => Some(OPENSTEAMTOOL_USER_AGENT),
-        ManifestProvider::Wudrm | ManifestProvider::SteamRun => None,
-    }
-}
-
 fn fetch_from_provider(
-    provider: ManifestProvider,
+    provider: &ManifestSource,
     url: &str,
     timeout_connect_ms: u64,
     timeout_ms: u64,
@@ -408,7 +503,7 @@ fn fetch_from_provider(
         .new_agent();
 
     let mut request = agent.get(url);
-    if let Some(user_agent) = provider_user_agent(provider) {
+    if let Some(user_agent) = provider.user_agent() {
         request = request.header("User-Agent", user_agent);
     }
 
@@ -427,6 +522,12 @@ fn fetch_from_provider(
         )
         .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
         return ProviderOutcome::RateLimited(retry_after);
+    }
+    // 401/404 mean "not this manifest", not "this source is broken". Everything
+    // else non-2xx — including 403, which here is a Cloudflare block rather than
+    // a per-target refusal — is treated as the provider being unhealthy.
+    if matches!(status.as_u16(), 401 | 404) {
+        return ProviderOutcome::Denied(status.as_u16());
     }
     if !status.is_success() {
         return ProviderOutcome::Failed(format!("http status {}", status.as_u16()));
@@ -448,17 +549,29 @@ fn fetch_from_provider(
     }
 }
 
-fn parse_provider_response(provider: ManifestProvider, body: &str) -> Result<u64, String> {
+fn parse_provider_response(provider: &ManifestSource, body: &str) -> Result<u64, String> {
     let body = body.trim();
-    if provider == ManifestProvider::SteamRun {
+    if provider.response_format() == ManifestResponseFormat::Json {
+        let field = provider
+            .json_field()
+            .ok_or_else(|| "json provider has no json_field".to_owned())?;
         let value: serde_json::Value =
             serde_json::from_str(body).map_err(|error| error.to_string())?;
-        return value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "missing string content field".to_owned())?
-            .parse::<u64>()
-            .map_err(|error| error.to_string());
+        let found = value
+            .get(field)
+            .ok_or_else(|| format!("missing {field} field"))?;
+        // Accept both `{"content":"123"}` and `{"content":123}`: a custom
+        // endpoint's shape is not ours to dictate.
+        return match found {
+            serde_json::Value::String(text) => text
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| error.to_string()),
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| format!("{field} is not an unsigned integer")),
+            _ => Err(format!("{field} is neither a string nor a number")),
+        };
     }
 
     body.parse::<u64>().map_err(|error| error.to_string())
@@ -508,6 +621,7 @@ pub fn build_response_packet(req_hdr_bytes: &[u8], _job_id: u64, _gid: u64, code
 mod tests {
     use super::*;
     use prost::Message;
+    use vapor_forge_config::{CustomManifestProvider, ManifestProvider};
 
     fn make_req_header(job_id: u64, method: &str) -> Vec<u8> {
         CMsgProtoBufHeader {
@@ -769,26 +883,211 @@ mod tests {
         assert_eq!(completed[0].code, 0);
     }
 
+    fn built_in(provider: ManifestProvider) -> ManifestSource {
+        ManifestSource::BuiltIn(provider)
+    }
+
+    fn custom(
+        name: &str,
+        format: ManifestResponseFormat,
+        json_field: Option<&str>,
+    ) -> ManifestSource {
+        ManifestSource::Custom(CustomManifestProvider {
+            name: name.to_owned(),
+            url: format!("https://{name}.example/{{gid}}"),
+            user_agent: None,
+            format,
+            json_field: json_field.map(str::to_owned),
+            min_interval_ms: None,
+        })
+    }
+
     #[test]
     fn parses_built_in_provider_responses() {
         assert_eq!(
-            parse_provider_response(ManifestProvider::ManifestDex, "123456").unwrap(),
+            parse_provider_response(&built_in(ManifestProvider::ManifestDex), "123456").unwrap(),
             123456
         );
         assert_eq!(
-            parse_provider_response(ManifestProvider::OpenSteamTool, "123456").unwrap(),
+            parse_provider_response(&built_in(ManifestProvider::OpenSteamTool), "123456").unwrap(),
             123456
         );
         assert_eq!(
-            parse_provider_response(ManifestProvider::Wudrm, " 654321 ").unwrap(),
+            parse_provider_response(&built_in(ManifestProvider::Wudrm), " 654321 ").unwrap(),
             654321
         );
         assert_eq!(
-            parse_provider_response(ManifestProvider::SteamRun, r#"{"content":"9999999999"}"#,)
-                .unwrap(),
+            parse_provider_response(
+                &built_in(ManifestProvider::SteamRun),
+                r#"{"content":"9999999999"}"#,
+            )
+            .unwrap(),
             9_999_999_999
         );
-        assert!(parse_provider_response(ManifestProvider::SteamRun, r#"{"other":"1"}"#).is_err());
+        assert!(
+            parse_provider_response(&built_in(ManifestProvider::SteamRun), r#"{"other":"1"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_custom_provider_responses() {
+        let plain = custom("plain", ManifestResponseFormat::Plain, None);
+        assert_eq!(parse_provider_response(&plain, " 42 ").unwrap(), 42);
+        assert!(parse_provider_response(&plain, "42abc").is_err());
+
+        // A custom JSON endpoint may quote the code or leave it a number.
+        let json = custom("json", ManifestResponseFormat::Json, Some("code"));
+        assert_eq!(
+            parse_provider_response(&json, r#"{"code":"777"}"#).unwrap(),
+            777
+        );
+        assert_eq!(
+            parse_provider_response(&json, r#"{"code":777}"#).unwrap(),
+            777
+        );
+        assert!(parse_provider_response(&json, r#"{"code":true}"#).is_err());
+        assert!(parse_provider_response(&json, r#"{"other":1}"#).is_err());
+    }
+
+    #[test]
+    fn malformed_custom_entries_are_rejected_before_any_request() {
+        let no_placeholder = ManifestSource::Custom(CustomManifestProvider {
+            name: "mirror".to_owned(),
+            url: "https://my.mirror/latest".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+
+        // fetch_manifest_code skips these, so an empty chain yields no code and
+        // — the point of the check — issues no HTTP request.
+        assert!(no_placeholder.rejection().is_some());
+        let context = FetchContext {
+            app_id: 730,
+            depot_id: 731,
+            gid: 1,
+        };
+        assert_eq!(
+            fetch_manifest_code(context, &[no_placeholder], 10, 10, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_every_placeholder_in_a_custom_url() {
+        let pool = ManifestSource::Custom(CustomManifestProvider {
+            name: "pool".to_owned(),
+            // Valve's own GetManifestRequestCode shape: depot, then manifest.
+            url: "https://example.test/manifest/{depotId}/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+        assert_eq!(
+            pool.resolve_url(730, 731, 555),
+            "https://example.test/manifest/731/555"
+        );
+        assert!(pool.rejection().is_none());
+
+        let with_app = ManifestSource::Custom(CustomManifestProvider {
+            name: "withapp".to_owned(),
+            url: "https://example.test/{appId}/{depotId}/{gid}".to_owned(),
+            user_agent: None,
+            format: ManifestResponseFormat::Plain,
+            json_field: None,
+            min_interval_ms: None,
+        });
+        assert_eq!(
+            with_app.resolve_url(730, 731, 555),
+            "https://example.test/730/731/555"
+        );
+
+        // Built-ins that take only the gid leave the other placeholders inert.
+        assert_eq!(
+            built_in(ManifestProvider::Wudrm).resolve_url(730, 731, 555),
+            "http://gmrc.wudrm.com/manifest/555"
+        );
+        // The built-in pool provider is itself depot-shaped.
+        assert_eq!(
+            built_in(ManifestProvider::Pool20770407).resolve_url(730, 731, 555),
+            "https://20770407.xyz/manifest/731/555"
+        );
+        assert!(built_in(ManifestProvider::Pool20770407)
+            .user_agent()
+            .is_some_and(|ua| ua.starts_with("vapor-forge/")));
+    }
+
+    #[test]
+    fn denial_is_not_a_provider_fault() {
+        // A pool that holds no licence for the app answers 401 per request.
+        // Cooling it down would hide it from every later gid, including the
+        // ones it can serve — so Denied must stay distinct from Failed.
+        let denied = ProviderOutcome::Denied(401);
+        let failed = ProviderOutcome::Failed("http status 503".to_owned());
+
+        assert!(matches!(denied, ProviderOutcome::Denied(401)));
+        assert!(matches!(failed, ProviderOutcome::Failed(_)));
+
+        // The cooldown table is only ever written for the failure classes.
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+        start_cooldown_in(&mut cooldowns, "unhealthy", now, FAILURE_COOLDOWN);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "unhealthy", now),
+            Some(FAILURE_COOLDOWN)
+        );
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, "denied-but-healthy", now),
+            None
+        );
+    }
+
+    #[test]
+    fn pacing_defers_a_second_request_then_lets_it_through() {
+        let mut last = HashMap::new();
+        let now = Instant::now();
+        let interval = Duration::from_millis(1000);
+
+        // First request reserves the slot immediately.
+        assert_eq!(reserve_slot_in(&mut last, "pool", now, interval), None);
+
+        // A second one inside the window is told how long to wait, and does
+        // not reserve — otherwise concurrent callers would all think they won.
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(400),
+                interval
+            ),
+            Some(Duration::from_millis(600))
+        );
+
+        // Another provider is unaffected.
+        assert_eq!(reserve_slot_in(&mut last, "other", now, interval), None);
+
+        // Past the window it goes through and re-reserves.
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(1200),
+                interval
+            ),
+            None
+        );
+        assert_eq!(
+            reserve_slot_in(
+                &mut last,
+                "pool",
+                now + Duration::from_millis(1300),
+                interval
+            ),
+            Some(Duration::from_millis(900))
+        );
     }
 
     #[test]
@@ -811,30 +1110,25 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
             None
         );
 
-        start_cooldown_in(
-            &mut cooldowns,
-            ManifestProvider::ManifestDex,
-            now,
-            Duration::from_secs(30),
-        );
+        start_cooldown_in(&mut cooldowns, "manifestdex", now, Duration::from_secs(30));
 
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
             Some(Duration::from_secs(30))
         );
         // Other providers stay usable.
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, ManifestProvider::OpenSteamTool, now),
+            cooldown_remaining_in(&mut cooldowns, "opensteamtool", now),
             None
         );
 
         let later = now + Duration::from_secs(31);
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, later),
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", later),
             None
         );
         // The expired entry is dropped rather than left to accumulate.
@@ -848,14 +1142,14 @@ mod tests {
 
         let applied = start_cooldown_in(
             &mut cooldowns,
-            ManifestProvider::ManifestDex,
+            "manifestdex",
             now,
             Duration::from_secs(86_400),
         );
 
         assert_eq!(applied, MAX_RATE_LIMIT_COOLDOWN);
         assert_eq!(
-            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
             Some(MAX_RATE_LIMIT_COOLDOWN)
         );
     }

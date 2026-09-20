@@ -1,7 +1,7 @@
 use crate::template::{parse_commented_section_header, CommentedSectionHeader, TEMPLATE_EXAMPLES};
 use crate::{
-    AppCategory, AppId, CloudBackendMode, ManifestProvider, RuntimeConfig, TicketCacheMode,
-    CONFIG_TEMPLATE,
+    AppCategory, AppId, CloudBackendMode, ManifestProvider, ManifestResponseFormat, ManifestSource,
+    RuntimeConfig, TicketCacheMode, CONFIG_TEMPLATE,
 };
 
 #[test]
@@ -84,14 +84,49 @@ fn template_parses_and_keeps_safe_defaults() {
     assert_eq!(
         config.manifest.providers,
         vec![
-            ManifestProvider::ManifestDex,
-            ManifestProvider::OpenSteamTool,
-            ManifestProvider::Wudrm,
-            ManifestProvider::SteamRun,
+            ManifestSource::BuiltIn(ManifestProvider::Pool20770407),
+            ManifestSource::BuiltIn(ManifestProvider::ManifestDex),
+            ManifestSource::BuiltIn(ManifestProvider::OpenSteamTool),
+            ManifestSource::BuiltIn(ManifestProvider::Wudrm),
+            ManifestSource::BuiltIn(ManifestProvider::SteamRun),
         ]
     );
     assert_eq!(config.manifest.timeout_connect_ms, 5000);
     assert_eq!(config.manifest.timeout_ms, 15000);
+    assert_eq!(config.manifest.min_interval_ms, 1000);
+}
+
+#[test]
+fn manifest_custom_provider_takes_valve_shaped_urls() {
+    // 20770407-style providers mint codes through licensed accounts and so
+    // take Valve's own (depot, manifest) shape rather than the gid alone.
+    let config = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [
+    { name = "pool", url = "https://example.test/manifest/{depotId}/{gid}", min_interval_ms = 2000 },
+    "manifestdex",
+]
+"#,
+    )
+    .expect("a depot-shaped custom provider should parse");
+
+    let pool = &config.manifest.providers[0];
+    assert!(pool.rejection().is_none());
+    assert_eq!(
+        pool.resolve_url(730, 731, 555),
+        "https://example.test/manifest/731/555"
+    );
+    assert_eq!(
+        pool.min_interval(config.manifest.min_interval_ms),
+        std::time::Duration::from_millis(2000)
+    );
+
+    // Built-ins fall back to the section default.
+    assert_eq!(
+        config.manifest.providers[1].min_interval(config.manifest.min_interval_ms),
+        std::time::Duration::from_millis(1000)
+    );
 }
 
 #[test]
@@ -101,6 +136,108 @@ fn manifest_rejects_unknown_providers() {
             .expect_err("unknown manifest provider should be rejected");
 
     assert!(error.to_string().contains("unknown variant `unknown`"));
+}
+
+#[test]
+fn manifest_accepts_custom_providers_inline() {
+    let config = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [
+    "manifestdex",
+    { name = "mirror", url = "https://my.mirror/{gid}", user_agent = "MyClient/1.0" },
+    { name = "jsonsrc", url = "https://json.example/{gid}", format = "json", json_field = "code" },
+]
+"#,
+    )
+    .expect("custom providers should parse");
+
+    assert_eq!(config.manifest.providers.len(), 3);
+    assert_eq!(
+        config.manifest.providers[0],
+        ManifestSource::BuiltIn(ManifestProvider::ManifestDex)
+    );
+
+    let mirror = &config.manifest.providers[1];
+    assert_eq!(mirror.name(), "mirror");
+    assert_eq!(mirror.url_template(), "https://my.mirror/{gid}");
+    assert_eq!(mirror.user_agent(), Some("MyClient/1.0"));
+    assert_eq!(mirror.response_format(), ManifestResponseFormat::Plain);
+
+    let json_source = &config.manifest.providers[2];
+    assert_eq!(json_source.response_format(), ManifestResponseFormat::Json);
+    assert_eq!(json_source.json_field(), Some("code"));
+
+    assert!(config.manifest.rejections().is_empty());
+}
+
+#[test]
+fn manifest_custom_providers_may_span_multiple_lines() {
+    // Multi-line inline tables are a TOML 1.1 feature; the parser must keep
+    // accepting them, because the documented custom-provider form relies on
+    // one field per line staying readable and commentable.
+    let config = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [
+    "manifestdex",
+    {
+        name = "mirror",
+        url = "https://my.mirror/{gid}",
+        user_agent = "MyClient/1.0",
+    },
+]
+"#,
+    )
+    .expect("multi-line inline tables should parse");
+
+    assert_eq!(config.manifest.providers.len(), 2);
+    assert_eq!(config.manifest.providers[1].name(), "mirror");
+    assert_eq!(
+        config.manifest.providers[1].user_agent(),
+        Some("MyClient/1.0")
+    );
+    assert!(config.manifest.rejections().is_empty());
+}
+
+#[test]
+fn manifest_custom_provider_rejects_unknown_keys() {
+    let error = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [{ name = "mirror", url = "https://x/{gid}", agent = "typo" }]
+"#,
+    )
+    .expect_err("an unknown key should be rejected");
+
+    assert!(error.to_string().contains("agent"));
+}
+
+#[test]
+fn manifest_rejections_name_malformed_custom_entries() {
+    let config = toml::from_str::<RuntimeConfig>(
+        r#"
+[manifest]
+providers = [
+    { name = "nogid", url = "https://my.mirror/latest" },
+    { name = "badscheme", url = "ftp://my.mirror/{gid}" },
+    { name = "nofield", url = "https://x/{gid}", format = "json" },
+    "manifestdex",
+    { name = "manifestdex", url = "https://dup/{gid}" },
+]
+"#,
+    )
+    .expect("malformed entries still parse; they are rejected at use time");
+
+    let rejections = config.manifest.rejections();
+    assert_eq!(rejections.len(), 4, "{rejections:?}");
+    assert!(rejections[0].contains("{gid}"));
+    assert!(rejections[1].contains("http://"));
+    assert!(rejections[2].contains("json_field"));
+    assert!(rejections[3].contains("duplicate"));
+
+    // A valid entry alongside broken ones is left usable.
+    assert!(config.manifest.providers[3].rejection().is_none());
 }
 
 #[test]
