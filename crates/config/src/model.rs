@@ -473,8 +473,10 @@ impl Default for ManifestSection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize)]
 pub enum ManifestProvider {
+    #[serde(rename = "manifestdex")]
+    ManifestDex,
     #[serde(rename = "opensteamtool")]
     OpenSteamTool,
     #[serde(rename = "wudrm")]
@@ -485,6 +487,7 @@ pub enum ManifestProvider {
 
 fn default_manifest_providers() -> Vec<ManifestProvider> {
     vec![
+        ManifestProvider::ManifestDex,
         ManifestProvider::OpenSteamTool,
         ManifestProvider::Wudrm,
         ManifestProvider::SteamRun,

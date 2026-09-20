@@ -84,6 +84,7 @@ fn template_parses_and_keeps_safe_defaults() {
     assert_eq!(
         config.manifest.providers,
         vec![
+            ManifestProvider::ManifestDex,
             ManifestProvider::OpenSteamTool,
             ManifestProvider::Wudrm,
             ManifestProvider::SteamRun,
