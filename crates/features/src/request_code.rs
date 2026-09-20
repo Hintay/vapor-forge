@@ -4,9 +4,11 @@
 //! `ContentServerDirectory.GetManifestRequestCode#1` RPCs, all without
 //! any `unsafe` code.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use tracing::{debug, info, warn};
@@ -239,7 +241,82 @@ pub fn should_intercept_with_ownership(
 // ---------------------------------------------------------------------------
 
 const OPENSTEAMTOOL_USER_AGENT: &str = "OpenSteamTool/1.0";
+const MANIFESTDEX_USER_AGENT: &str = "ManifestDeX/1.0";
 const MAX_PROVIDER_RESPONSE_BYTES: u64 = 4096;
+
+/// Cooldown applied when a provider answers 429 without a usable `Retry-After`.
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+/// Ceiling on any cooldown, so one absurd `Retry-After` cannot park a provider
+/// for the rest of the Steam session.
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Instants before which a rate-limited provider must not be contacted again.
+///
+/// Steam resolves several depot manifests back to back. Without this, one 429
+/// would be re-earned on every following gid: a wasted round trip each time,
+/// and more load on a provider that just asked us to back off.
+static PROVIDER_COOLDOWNS: OnceLock<Mutex<HashMap<ManifestProvider, Instant>>> = OnceLock::new();
+
+fn provider_cooldowns() -> &'static Mutex<HashMap<ManifestProvider, Instant>> {
+    PROVIDER_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Outcome of one provider attempt. 429 is kept distinct from ordinary failure
+/// so the caller can park the provider instead of just moving to the next one.
+#[derive(Debug)]
+enum ProviderOutcome {
+    Code(u64),
+    RateLimited(Duration),
+    Failed(String),
+}
+
+/// Remaining cooldown for `provider`, clearing the entry once it has expired.
+fn cooldown_remaining_in(
+    cooldowns: &mut HashMap<ManifestProvider, Instant>,
+    provider: ManifestProvider,
+    now: Instant,
+) -> Option<Duration> {
+    let until = *cooldowns.get(&provider)?;
+    if until > now {
+        Some(until - now)
+    } else {
+        cooldowns.remove(&provider);
+        None
+    }
+}
+
+fn start_cooldown_in(
+    cooldowns: &mut HashMap<ManifestProvider, Instant>,
+    provider: ManifestProvider,
+    now: Instant,
+    retry_after: Duration,
+) -> Duration {
+    let capped = retry_after.min(MAX_RATE_LIMIT_COOLDOWN);
+    cooldowns.insert(provider, now + capped);
+    capped
+}
+
+fn cooldown_remaining(provider: ManifestProvider) -> Option<Duration> {
+    let mut cooldowns = provider_cooldowns()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cooldown_remaining_in(&mut cooldowns, provider, Instant::now())
+}
+
+fn start_cooldown(provider: ManifestProvider, retry_after: Duration) -> Duration {
+    let mut cooldowns = provider_cooldowns()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    start_cooldown_in(&mut cooldowns, provider, Instant::now(), retry_after)
+}
+
+/// `Retry-After` in its delta-seconds form. The HTTP-date form is not accepted:
+/// ManifestDeX documents seconds, and anything unparsable falls back to
+/// [`DEFAULT_RATE_LIMIT_COOLDOWN`] rather than being treated as "retry now".
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let seconds = value?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
 
 fn fetch_manifest_code(
     gid: u64,
@@ -249,6 +326,17 @@ fn fetch_manifest_code(
 ) -> Option<u64> {
     for &provider in providers {
         let (name, url_template) = provider_endpoint(provider);
+
+        if let Some(remaining) = cooldown_remaining(provider) {
+            debug!(
+                provider = name,
+                gid,
+                remaining_ms = remaining.as_millis() as u64,
+                "request_code: provider rate limited, skipping"
+            );
+            continue;
+        }
+
         let url = url_template.replace("{gid}", &gid.to_string());
         debug!(
             provider = name,
@@ -256,15 +344,26 @@ fn fetch_manifest_code(
         );
 
         match fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms) {
-            Ok(code) if code > 0 => {
+            ProviderOutcome::Code(code) if code > 0 => {
                 info!(
                     provider = name,
                     gid, code, "request_code: manifest code obtained"
                 );
                 return Some(code);
             }
-            Ok(_) => warn!(provider = name, gid, "request_code: provider returned zero"),
-            Err(error) => {
+            ProviderOutcome::Code(_) => {
+                warn!(provider = name, gid, "request_code: provider returned zero")
+            }
+            ProviderOutcome::RateLimited(retry_after) => {
+                let cooldown = start_cooldown(provider, retry_after);
+                warn!(
+                    provider = name,
+                    gid,
+                    cooldown_ms = cooldown.as_millis() as u64,
+                    "request_code: provider rate limited, backing off"
+                );
+            }
+            ProviderOutcome::Failed(error) => {
                 warn!(provider = name, gid, %error, "request_code: provider failed");
             }
         }
@@ -275,6 +374,7 @@ fn fetch_manifest_code(
 
 fn provider_endpoint(provider: ManifestProvider) -> (&'static str, &'static str) {
     match provider {
+        ManifestProvider::ManifestDex => ("manifestdex", "https://manifest.manifestdex.com/{gid}"),
         ManifestProvider::OpenSteamTool => {
             ("opensteamtool", "https://manifest.opensteamtool.com/{gid}")
         }
@@ -283,31 +383,69 @@ fn provider_endpoint(provider: ManifestProvider) -> (&'static str, &'static str)
     }
 }
 
+/// Providers that reject or rate-limit the default agent string.
+fn provider_user_agent(provider: ManifestProvider) -> Option<&'static str> {
+    match provider {
+        ManifestProvider::ManifestDex => Some(MANIFESTDEX_USER_AGENT),
+        ManifestProvider::OpenSteamTool => Some(OPENSTEAMTOOL_USER_AGENT),
+        ManifestProvider::Wudrm | ManifestProvider::SteamRun => None,
+    }
+}
+
 fn fetch_from_provider(
     provider: ManifestProvider,
     url: &str,
     timeout_connect_ms: u64,
     timeout_ms: u64,
-) -> Result<u64, String> {
+) -> ProviderOutcome {
     let agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_millis(timeout_connect_ms)))
-        .timeout_global(Some(std::time::Duration::from_millis(timeout_ms)))
+        .timeout_connect(Some(Duration::from_millis(timeout_connect_ms)))
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
+        // Keep non-2xx as a response so 429 can be told apart from a transport
+        // failure and its Retry-After header read.
+        .http_status_as_error(false)
         .build()
         .new_agent();
 
     let mut request = agent.get(url);
-    if provider == ManifestProvider::OpenSteamTool {
-        request = request.header("User-Agent", OPENSTEAMTOOL_USER_AGENT);
+    if let Some(user_agent) = provider_user_agent(provider) {
+        request = request.header("User-Agent", user_agent);
     }
 
-    let mut response = request.call().map_err(|error| error.to_string())?;
-    let body = response
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(error) => return ProviderOutcome::Failed(error.to_string()),
+    };
+
+    let status = response.status();
+    if status.as_u16() == 429 {
+        let retry_after = parse_retry_after(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+        )
+        .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN);
+        return ProviderOutcome::RateLimited(retry_after);
+    }
+    if !status.is_success() {
+        return ProviderOutcome::Failed(format!("http status {}", status.as_u16()));
+    }
+
+    let body = match response
         .body_mut()
         .with_config()
         .limit(MAX_PROVIDER_RESPONSE_BYTES)
         .read_to_string()
-        .map_err(|error| error.to_string())?;
-    parse_provider_response(provider, body.trim())
+    {
+        Ok(body) => body,
+        Err(error) => return ProviderOutcome::Failed(error.to_string()),
+    };
+
+    match parse_provider_response(provider, body.trim()) {
+        Ok(code) => ProviderOutcome::Code(code),
+        Err(error) => ProviderOutcome::Failed(error),
+    }
 }
 
 fn parse_provider_response(provider: ManifestProvider, body: &str) -> Result<u64, String> {
@@ -634,6 +772,10 @@ mod tests {
     #[test]
     fn parses_built_in_provider_responses() {
         assert_eq!(
+            parse_provider_response(ManifestProvider::ManifestDex, "123456").unwrap(),
+            123456
+        );
+        assert_eq!(
             parse_provider_response(ManifestProvider::OpenSteamTool, "123456").unwrap(),
             123456
         );
@@ -647,5 +789,74 @@ mod tests {
             9_999_999_999
         );
         assert!(parse_provider_response(ManifestProvider::SteamRun, r#"{"other":"1"}"#).is_err());
+    }
+
+    #[test]
+    fn parses_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after(Some("30")), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after(Some(" 5 ")), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after(Some("0")), Some(Duration::ZERO));
+        // HTTP-date form is deliberately unsupported; caller substitutes the default.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn cooldown_hides_a_provider_until_it_expires() {
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            None
+        );
+
+        start_cooldown_in(
+            &mut cooldowns,
+            ManifestProvider::ManifestDex,
+            now,
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            Some(Duration::from_secs(30))
+        );
+        // Other providers stay usable.
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, ManifestProvider::OpenSteamTool, now),
+            None
+        );
+
+        let later = now + Duration::from_secs(31);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, later),
+            None
+        );
+        // The expired entry is dropped rather than left to accumulate.
+        assert!(cooldowns.is_empty());
+    }
+
+    #[test]
+    fn cooldown_is_capped() {
+        let mut cooldowns = HashMap::new();
+        let now = Instant::now();
+
+        let applied = start_cooldown_in(
+            &mut cooldowns,
+            ManifestProvider::ManifestDex,
+            now,
+            Duration::from_secs(86_400),
+        );
+
+        assert_eq!(applied, MAX_RATE_LIMIT_COOLDOWN);
+        assert_eq!(
+            cooldown_remaining_in(&mut cooldowns, ManifestProvider::ManifestDex, now),
+            Some(MAX_RATE_LIMIT_COOLDOWN)
+        );
     }
 }
