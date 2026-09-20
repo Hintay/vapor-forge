@@ -184,9 +184,12 @@ fn candidate_pattern_file_name(target: PatternTarget, expanded_url: &str) -> Str
 }
 
 fn expand_source_url(template: &str, target: PatternTarget) -> Result<String, String> {
-    if !template.contains("{arch}") || !template.contains("{family}") {
-        return Err("patterns_url must contain {arch} and {family}".to_owned());
+    if !template.contains("{arch}") {
+        return Err("patterns_url must contain {arch}".to_owned());
     }
+    // `{family}` is optional: a pattern file carries ordinary and steamrt as
+    // in-file `[[...variants]]` entries picked at match time, so one file per
+    // architecture already serves both. A template may still split by family.
     let expanded = template
         .replace("{arch}", target.architecture.as_str())
         .replace("{family}", target.binary_family.as_str());
@@ -442,9 +445,48 @@ pattern = "{pattern}"
     }
 
     #[test]
-    fn url_template_requires_both_target_dimensions() {
+    fn url_template_requires_arch_and_https() {
+        // A hard-coded architecture would feed 64-bit offsets to a 32-bit client.
         assert!(expand_source_url("https://patterns.example/x86_64.toml", TARGET).is_err());
         assert!(expand_source_url("http://patterns.example/{arch}/{family}.toml", TARGET).is_err());
+    }
+
+    #[test]
+    fn url_template_may_omit_family() {
+        // One file per architecture is the normal shape: ordinary and steamrt
+        // are variants inside it, so demanding {family} would force two
+        // byte-identical files.
+        let expanded =
+            expand_source_url("https://patterns.example/patterns/{arch}.toml", TARGET).unwrap();
+        assert_eq!(expanded, "https://patterns.example/patterns/x86_64.toml");
+    }
+
+    #[test]
+    fn shipped_default_url_satisfies_its_own_contract() {
+        let default_url = vapor_forge_config::RuntimeConfig::default()
+            .runtime
+            .patterns_url;
+        assert!(
+            !default_url.is_empty(),
+            "online pattern hotfixes ship enabled"
+        );
+
+        for (architecture, expected) in [
+            (PatternArchitecture::X86, "patterns/x86.toml"),
+            (PatternArchitecture::X86_64, "patterns/x86_64.toml"),
+        ] {
+            let target = PatternTarget {
+                architecture,
+                binary_family: SteamBinaryFamily::SteamRt,
+            };
+            let expanded = expand_source_url(&default_url, target)
+                .expect("the default we ship must pass our own validation");
+            assert!(expanded.starts_with("https://"));
+            assert!(
+                expanded.ends_with(expected),
+                "{expanded} should end with {expected}"
+            );
+        }
     }
 
     #[test]

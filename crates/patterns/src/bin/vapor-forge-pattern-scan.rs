@@ -129,8 +129,8 @@ impl PatternArch {
     fn patterns_path(self) -> PathBuf {
         let res_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../res");
         match self {
-            Self::X86 => res_dir.join("patterns.toml"),
-            Self::X86_64 => res_dir.join("patterns.x86_64.toml"),
+            Self::X86 => res_dir.join("patterns/x86.toml"),
+            Self::X86_64 => res_dir.join("patterns/x86_64.toml"),
         }
     }
 
@@ -777,7 +777,7 @@ mod tests {
             "--arch".to_owned(),
             "x86_64".to_owned(),
             "--patterns".to_owned(),
-            "res/patterns.x86_64.toml".to_owned(),
+            "res/patterns/x86_64.toml".to_owned(),
             "--steamclient".to_owned(),
             "steamclient.so".to_owned(),
         ])
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn x86_patterns_have_semantic_validation() {
         let missing = missing_semantic_validations(
-            include_str!("../../../../res/patterns.toml"),
+            include_str!("../../../../res/patterns/x86.toml"),
             SemanticArch::X86,
         );
         assert!(
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn x86_64_patterns_have_semantic_validation() {
         let missing = missing_semantic_validations(
-            include_str!("../../../../res/patterns.x86_64.toml"),
+            include_str!("../../../../res/patterns/x86_64.toml"),
             SemanticArch::X86_64,
         );
         assert!(

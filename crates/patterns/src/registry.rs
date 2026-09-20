@@ -102,7 +102,7 @@ pub struct PatternDef {
     pub module: &'static str,
 }
 
-// Generated at compile time from res/patterns.toml
+// Generated at compile time from res/patterns/x86.toml
 include!(concat!(env!("OUT_DIR"), "/patterns_generated.rs"));
 
 /// Runtime pattern entry (loaded from external TOML file).
@@ -237,7 +237,7 @@ impl PatternRegistry {
     }
 }
 
-/// Parse a complete TOML pattern file (same format as res/patterns.toml).
+/// Parse a complete TOML pattern file (same format as res/patterns/x86.toml).
 pub fn parse_toml_patterns(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, String> {
     parse_toml_entries(text)
 }
@@ -332,7 +332,7 @@ impl<'a> PatternVariantLookup<'a> {
     }
 }
 
-/// Parse TOML overrides (same format as res/patterns.toml).
+/// Parse TOML overrides (same format as res/patterns/x86.toml).
 fn parse_toml_overrides(text: &str) -> Result<HashMap<String, Vec<RuntimePatternEntry>>, String> {
     let mut result = HashMap::new();
     for (name, entry) in parse_toml_entries(text)? {
@@ -826,8 +826,8 @@ mod tests {
             "SetEnvString",
         ];
         for (architecture, source) in [
-            ("x86", include_str!("../../../res/patterns.toml")),
-            ("x86_64", include_str!("../../../res/patterns.x86_64.toml")),
+            ("x86", include_str!("../../../res/patterns/x86.toml")),
+            ("x86_64", include_str!("../../../res/patterns/x86_64.toml")),
         ] {
             let entries = parse_toml_patterns(source).unwrap();
             for name in REQUIRED {

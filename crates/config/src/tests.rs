@@ -407,8 +407,8 @@ diagnostics = true
         .find("# [debug]")
         .expect("debug example should exist");
     let runtime_example_pos = synced
-        .find("# patterns_url")
-        .expect("runtime example should exist");
+        .find("patterns_url =")
+        .expect("patterns_url should be a live default, not a commented example");
     let shared_example_pos = synced
         .find("# include")
         .expect("apps.shared example should exist");

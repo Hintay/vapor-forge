@@ -41,7 +41,7 @@ pub struct RuntimeSection {
     pub log_level: String,
     #[serde(default)]
     pub diagnostics: bool,
-    #[serde(default)]
+    #[serde(default = "default_patterns_url")]
     pub patterns_url: String,
 }
 
@@ -773,7 +773,7 @@ impl Default for RuntimeSection {
         Self {
             log_level: default_log_level(),
             diagnostics: false,
-            patterns_url: String::new(),
+            patterns_url: default_patterns_url(),
         }
     }
 }
@@ -793,6 +793,14 @@ impl Default for DebugSection {
             control_api: default_debug_control_api(),
         }
     }
+}
+
+/// Online pattern hotfixes come from this repository's own pattern sources, so
+/// a Steam update can be answered by pushing a file instead of shipping a build.
+/// `{arch}` selects the per-architecture file; ordinary and steamrt are already
+/// covered inside it as `[[...variants]]`. An empty value disables the fetch.
+fn default_patterns_url() -> String {
+    "https://raw.githubusercontent.com/Hintay/vapor-forge/main/res/patterns/{arch}.toml".to_owned()
 }
 
 fn default_log_level() -> String {

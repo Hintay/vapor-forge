@@ -6,8 +6,8 @@ use std::path::Path;
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let res_dir = Path::new(&manifest_dir).join("../../res");
-    let default_toml_path = res_dir.join("patterns.toml");
-    let x86_64_toml_path = res_dir.join("patterns.x86_64.toml");
+    let default_toml_path = res_dir.join("patterns/x86.toml");
+    let x86_64_toml_path = res_dir.join("patterns/x86_64.toml");
     let toml_path = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
         && x86_64_toml_path.exists()
@@ -20,7 +20,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", toml_path.display());
     println!(
         "cargo:rerun-if-changed={}",
-        res_dir.join("patterns.x86_64.toml").display()
+        res_dir.join("patterns/x86_64.toml").display()
     );
 
     let toml_str = fs::read_to_string(&toml_path)
@@ -47,7 +47,7 @@ fn main() {
     let out_path = Path::new(&out_dir).join("patterns_generated.rs");
 
     let mut code = String::new();
-    code.push_str("// Auto-generated from res/patterns.toml. Do not edit.\n\n");
+    code.push_str("// Auto-generated from res/patterns/x86.toml. Do not edit.\n\n");
     code.push_str(&format!(
         "pub const EMBEDDED_PATTERNS: &[crate::registry::PatternDef; {}] = &[\n",
         all_entries.len()

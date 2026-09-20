@@ -7,10 +7,14 @@
 [runtime]
 log_level = "info"          # trace, debug, info, warn, error
 diagnostics = false         # write extra hook/module diagnostics to logs
-# Source changes take effect when SteamClient hooks next install.
-# Downloaded candidates are validated on a later matching module installation.
-# Clearing this URL leaves validated active caches enabled.
-# patterns_url = "https://example.invalid/patterns/{arch}/{family}.toml"
+# Online pattern hotfixes, enabled by default against this project's own pattern
+# sources, so a Steam update can be answered by pushing a file rather than
+# shipping a build. {arch} picks the per-architecture file; ordinary and steamrt
+# live inside it as variants, and an optional {family} can split them instead.
+# A download is adopted only after it validates against the live module, so a
+# stale or bad file cannot break hooks. Set to "" to stop fetching; that leaves
+# an already-validated cache active.
+patterns_url = "https://raw.githubusercontent.com/Hintay/vapor-forge/main/res/patterns/{arch}.toml"
 
 # SteamUI toast notifications.
 [toast]
