@@ -482,18 +482,26 @@ mod tests {
         ))
     }
 
-    fn wait_for_flags(inotify: &mut Inotify, watches: &WatchSet) -> (bool, bool, bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    /// Classify every event the kernel has already queued, without waiting.
+    ///
+    /// The kernel queues an inotify event before the syscall that caused it returns, so
+    /// a change this thread just made is readable the moment the call comes back. That
+    /// makes draining the right way to assert an event did *not* happen: an empty queue
+    /// is the answer, not a symptom of having asked too early, so no timeout has to be
+    /// spent proving it.
+    fn drain_flags(inotify: &mut Inotify, watches: &WatchSet) -> (bool, bool, bool) {
         let mut buf = [0u8; 4096];
         let mut config_changed = false;
         let mut lua_changes: HashMap<PathBuf, LuaChange> = HashMap::new();
         let mut lua_order: Vec<PathBuf> = Vec::new();
         let mut script_dirs_changed = false;
 
-        while Instant::now() < deadline {
+        loop {
             match inotify.read_events(&mut buf) {
                 Ok(events) => {
+                    let mut seen = false;
                     for event in events {
+                        seen = true;
                         classify_event(
                             watches,
                             &event,
@@ -503,17 +511,31 @@ mod tests {
                             &mut script_dirs_changed,
                         );
                     }
-                    if config_changed || !lua_changes.is_empty() || script_dirs_changed {
+                    if !seen {
                         break;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("failed to read inotify events: {error}"),
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
 
         (config_changed, !lua_changes.is_empty(), script_dirs_changed)
+    }
+
+    /// Drain until an event this test is waiting for shows up, or the limit expires.
+    ///
+    /// Only a change made by another thread or process can be genuinely pending here,
+    /// so the limit is a hang detector rather than a budget the happy path spends.
+    fn wait_for_flags(inotify: &mut Inotify, watches: &WatchSet) -> (bool, bool, bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let flags = drain_flags(inotify, watches);
+            if flags.0 || flags.1 || flags.2 || Instant::now() >= deadline {
+                return flags;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -561,9 +583,8 @@ mod tests {
         assert_eq!(rebuilds, 1);
         assert_eq!(fs::read_to_string(&path).unwrap(), contents);
 
-        std::thread::sleep(Duration::from_millis(100));
         let (config_changed, lua_changed, script_dirs_changed) =
-            wait_for_flags(&mut inotify, &watches);
+            drain_flags(&mut inotify, &watches);
         assert!(!config_changed);
         assert!(!lua_changed);
         assert!(!script_dirs_changed);
