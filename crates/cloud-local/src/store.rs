@@ -47,10 +47,16 @@ impl Drop for RepositoryCoordination {
         let mut coordinators = coordinators
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let is_current = coordinators
+        // Only a live coordination that took over this root may keep the work directory:
+        // it has already cleared and claimed the same path. An absent entry does not mean
+        // that happened — `repository_coordination` sweeps entries whose strong count has
+        // reached zero, and that count drops before this destructor runs, so any opener of
+        // any repository can retire this entry out from under us. Treating that as "someone
+        // else owns it" leaked the work directory for the rest of the process's life.
+        let superseded = coordinators
             .get(&self.root)
-            .is_some_and(|coordination| std::ptr::eq(coordination.as_ptr(), self));
-        if !is_current {
+            .is_some_and(|coordination| !std::ptr::eq(coordination.as_ptr(), self));
+        if superseded {
             return;
         }
         coordinators.remove(&self.root);
@@ -2364,6 +2370,28 @@ mod tests {
         assert!(work_root.exists());
 
         drop(other);
+        assert!(!work_root.exists());
+    }
+
+    #[test]
+    fn work_root_is_removed_even_after_the_registry_entry_is_swept() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FolderStore::open_account(temporary.path(), TEST_ACCOUNT).unwrap();
+        let root = store.coordination.root.clone();
+        let work_root = store.coordination.work_root.clone();
+        create_durable_dir_all(&work_root.join("orphan")).unwrap();
+
+        // Opening any repository sweeps registry entries whose strong count has already
+        // reached zero, and that count drops before the destructor runs, so an unrelated
+        // store can retire this entry first. Reproduce that state directly rather than
+        // racing for it: the store is still alive, but the registry no longer lists it.
+        REPOSITORY_COORDINATORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&root);
+
+        drop(store);
         assert!(!work_root.exists());
     }
 
