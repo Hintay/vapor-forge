@@ -3,7 +3,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use vapor_forge_cloud_local::{
     CommitIdentity, FolderStore, LocalGcCoordinator, ManifestCandidate, StoreView,
 };
@@ -100,6 +100,7 @@ struct State {
 
 pub(crate) struct LocalConflictCoordinator {
     state: Mutex<State>,
+    state_changed: Condvar,
     ui_ready: std::sync::atomic::AtomicBool,
     choices: mpsc::Sender<Choice>,
 }
@@ -109,6 +110,7 @@ impl LocalConflictCoordinator {
         let (choices, receiver) = mpsc::channel::<Choice>();
         let coordinator = Arc::new(Self {
             state: Mutex::new(State::default()),
+            state_changed: Condvar::new(),
             ui_ready: std::sync::atomic::AtomicBool::new(false),
             choices,
         });
@@ -352,6 +354,41 @@ impl LocalConflictCoordinator {
         ConflictSubmitResult::Accepted
     }
 
+    /// Block until an acknowledgement for `context` is queued, or `limit` elapses.
+    ///
+    /// The resolver thread commits the chosen manifest to disk before it queues the
+    /// ack, so how long that takes is a property of the machine rather than of the code
+    /// under test. Waiting on `state_changed` keeps `limit` a detector for a dead or
+    /// wedged worker instead of a bet on disk speed.
+    #[cfg(test)]
+    fn blocking_ack(
+        &self,
+        context: ConflictUiContext,
+        limit: std::time::Duration,
+    ) -> Option<ConflictUiAck> {
+        let deadline = std::time::Instant::now() + limit;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            let queued = state
+                .acks
+                .iter()
+                .find(|pending| pending.context == context)
+                .map(|pending| pending.ack.clone());
+            if let Some(ack) = queued {
+                return Some(ack);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            state = self
+                .state_changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
+        }
+    }
+
     #[cfg(test)]
     fn acks(&self, context: ConflictUiContext) -> Vec<ConflictUiAck> {
         self.state
@@ -547,7 +584,14 @@ impl LocalConflictCoordinator {
         self.signal_change();
     }
 
+    /// Wake anything blocked on the coordinator and ask the UI thread for a pass.
+    ///
+    /// Every mutation that a waiter could care about already funnels through here, so
+    /// notifying from one place keeps the signal and the change impossible to separate.
+    /// Waiters re-test their own condition, so the extra wake-ups this sends for
+    /// changes they do not care about are harmless.
     fn signal_change(&self) {
+        self.state_changed.notify_all();
         vapor_forge_features::toast::request_ui_work();
     }
 }
@@ -621,7 +665,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use vapor_forge_cloud_core::FileMetadata;
 
     fn candidate(byte: char, client_id: u64) -> ManifestCandidate {
@@ -748,17 +792,13 @@ mod tests {
         coordinator: &LocalConflictCoordinator,
         context: ConflictUiContext,
     ) -> ConflictUiAck {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(ack) = coordinator.acks(context).into_iter().next() {
-                return ack;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "conflict choice did not complete"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The resolver thread fsyncs the chosen manifest before it queues the ack, so a
+        // wall-clock budget here would only measure the build host: under load one of
+        // these commits has taken over two seconds. Wait on the coordinator's own signal
+        // and keep the limit wide enough that only a wedged worker can trip it.
+        coordinator
+            .blocking_ack(context, Duration::from_secs(60))
+            .expect("conflict choice did not complete")
     }
 
     #[test]
