@@ -322,6 +322,18 @@ fn read_cstr(data: &[u8], pos: &mut usize) -> String {
 mod tests {
     use super::*;
     use prost::Message;
+    use std::sync::MutexGuard;
+
+    // Serializes tests that touch the module-global state.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Takes the test lock and clears the global state, so each test starts
+    /// from scratch regardless of what earlier tests left behind.
+    fn lock_state() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        reset_account_state();
+        guard
+    }
 
     #[test]
     fn parse_kv1_flat_pairs() {
@@ -349,6 +361,7 @@ mod tests {
 
     #[test]
     fn apply_game_fields_sets_flag_and_kvs() {
+        let _guard = lock_state();
         RP_KVS.lock().unwrap().replace({
             let mut m = HashMap::new();
             m.insert(
@@ -368,13 +381,11 @@ mod tests {
             entry.persona_state_flags.unwrap() & EPERSONASTATEFLAG_HAS_RICH_PRESENCE,
             EPERSONASTATEFLAG_HAS_RICH_PRESENCE
         );
-
-        *RP_KVS.lock().unwrap() = None;
     }
 
     #[test]
     fn persona_rewrite_preserves_non_game_fields() {
-        *RP_KVS.lock().unwrap() = None;
+        let _guard = lock_state();
         let message = vapor_forge_steam_protocol::ClientPersonaState {
             status_flags: Some(7),
             friends: vec![vapor_forge_steam_protocol::PersonaStateFriend {
@@ -420,6 +431,7 @@ mod tests {
 
     #[test]
     fn tracked_app_updates_on_avatared_topmost() {
+        let _guard = lock_state();
         on_games_played_update(&[AppId(480)], |id| id == AppId(480));
         assert_eq!(tracked_app(), AppId(480));
         assert!(take_inject_pending());
