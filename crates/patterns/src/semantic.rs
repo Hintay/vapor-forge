@@ -46,7 +46,11 @@ fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<SetApiCa
         api_result_map: (has_x86_rm32_disp32_load(bytes, 0x14ac)
             && has_x86_rm32_disp32_load(bytes, 0x14c0))
             || (has_seq(bytes, &[0x05, 0x98, 0x14, 0x00, 0x00])
-                && has_x86_rm32_disp32_operand(bytes, 0x14c0)),
+                && has_x86_rm32_disp32_operand(bytes, 0x14c0))
+            // Builds that place the map block 0x338 further into CSteamEngine.
+            || (has_x86_rm32_disp32_operand(bytes, 0x17f8)
+                && (has_x86_rm32_disp32_operand(bytes, 0x17e4)
+                    || has_x86_rm32_disp32_operand(bytes, 0x17d0))),
         result_record_stride: (has_seq(bytes, &[0x8d, 0x0c, 0x7f])
             && has_seq(bytes, &[0xc1, 0xe1, 0x04]))
             || (has_seq(bytes, &[0x8d, 0x34, 0x40]) && has_seq(bytes, &[0xc1, 0xe6, 0x04])),
@@ -72,12 +76,15 @@ fn set_api_call_result64_evidence(code: &[u8], offset: usize) -> Option<SetApiCa
         && has_seq(bytes, &[0x48, 0x8b, 0x8f, 0xd8, 0x19, 0x00, 0x00]);
     let steamrt = has_x64_rm32_disp32_load(bytes, 0x19a8)
         && has_seq(bytes, &[0x4d, 0x8b, 0x8d, 0xd8, 0x19, 0x00, 0x00]);
+    // Builds that place the map block 0x428 further into CSteamEngine.
+    let steamrt_moved = has_seq(bytes, &[0x49, 0x8d, 0xbd, 0xd0, 0x1d, 0x00, 0x00])
+        && has_seq(bytes, &[0x4d, 0x8b, 0x8d, 0x00, 0x1e, 0x00, 0x00]);
 
     Some(SetApiCallResultEvidence {
         api_call_argument: has_seq(bytes, &[0x48, 0x89, 0xd5])
             || has_seq(bytes, &[0x49, 0x89, 0xd4])
             || has_seq(bytes, &[0x49, 0x89, 0xd5]),
-        api_result_map: ordinary_current || ordinary_older || steamrt,
+        api_result_map: ordinary_current || ordinary_older || steamrt || steamrt_moved,
         result_record_stride: has_seq(bytes, &[0x48, 0x6b, 0xdb, 0x38])
             || has_seq(bytes, &[0x4d, 0x6b, 0xc0, 0x38])
             || has_seq(bytes, &[0x4d, 0x6b, 0xed, 0x38])

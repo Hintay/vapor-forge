@@ -1049,6 +1049,11 @@ mod tests {
         place_asm64(&mut code, start + 0x30, |a| {
             a.mov(dword_ptr(rsp + 0x70), -1)
         });
+        // The license vector base, its count, and the license state: the check
+        // matches the distances between the three, not their absolute offsets.
+        place_asm64(&mut code, start + 0x08, |a| {
+            a.mov(rax, qword_ptr(rbx + 0x2488))
+        });
         place_asm64(&mut code, start + 0x40, |a| {
             a.mov(edx, dword_ptr(rbx + 0x2498))
         });

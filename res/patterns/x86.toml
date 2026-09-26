@@ -20,12 +20,12 @@ follow = "none"
 pattern = "55 89 E5 57 ? ? ? ? ? ? ? ? ? ? ? ? 53 83 C4 80 0F B6 45 14 6A 00 6A 00"
 
 [[steamclient."CUser::GetSubscribedApps".variants]]
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 7C 8B 45 0C 8B 4D 08 89 45 84 0F B6 45 14 8B 91 D0 1B 00 00"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 7C 8B 45 0C 8B 4D 08 89 45 84 0F B6 45 14 8B 91 ? 1B 00 00"
 
 # API-call result storage. Registered vapor handles complete at this boundary.
 [steamclient."CSteamEngine::SetAPICallResult"]
 follow = "relative"
-pattern = "E8 ? ? ? ? C6 86 5C 01 00 00 01 83 C4 24 5B 5E C3"
+pattern = "E8 ? ? ? ? C6 86 ? ? 00 00 01 83 C4 24 5B 5E C3"
 
 # One-argument global internal-callback registration wrapper. Ordinary builds
 # share this wildcard shape across versions.
@@ -59,9 +59,11 @@ pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 24 8B 44 24 44 8B 6C 24 38
 [[steamclient."LoadDepotDecryptionKey".variants]]
 pattern = "55 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 24 8B 44 24 44 8B 5C 24 38 8B 74 24 3C 8B 6C 24 40 89 44 24 10 8B 44 24 48 89 44 24 14 56 53 E8 ? ? ? ? 83 C4 10 84 C0 75 ? 31 C0 83 C4 1C 5B 5E 5F 5D C3"
 
+# The two argument spills land at frame offsets that differ between builds, so
+# only the frame size and the spill shape are pinned.
 [steamclient."BuildDepotDependency"]
 follow = "none"
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 2C 02 00 00 8B 45 08 89 85 1C FE FF FF 8B 45 10 89 85 24 FE FF FF"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 2C 02 00 00 8B 45 08 89 85 ? ? FF FF 8B 45 10 89 85 ? ? FF FF"
 
 [[steamclient."BuildDepotDependency".variants]]
 pattern = "E8 ? ? ? ? 81 C2 ? ? ? ? 55 89 E5 57 56 53 83 EC 6C 8B 45 08 8B 5D 10 89 55 A0 8B 75 0C 89 45 9C 89 5D A4"
@@ -71,12 +73,16 @@ pattern = "E8 ? ? ? ? 81 C2 ? ? ? ? 55 89 E5 57 56 53 83 EC 6C 8B 45 08 8B 5D 10
 follow = "none"
 pattern = "57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 8B 83 ? ? ? ? 8B 40 44 85 C0 75 ?"
 
+# Reaches past the frame setup to the two argument spills: another function
+# shares the prologue and the 0xac frame, and diverges only at which register
+# takes the connection argument. The spill displacements are wildcards because
+# they describe this build's frame, not the function.
 [steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame"]
 follow = "none"
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC AC 00 00 00 8B 45 10"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC AC 00 00 00 8B 45 10 8B 55 08 89 85 ? ? ? ? 89 95 ? ? ? ?"
 
 [[steamclient."CWebSocketConnection::BBuildAndAsyncSendFrame".variants]]
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC AC 00 00 00 8B 45 10 8B 55 08 89 85 60 FF FF FF 89 95 5C FF FF FF"
+pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC AC 00 00 00 8B 45 10 8B 55 08 89 85 ? ? ? ? 89 95 ? ? ? ?"
 
 [steamclient."CCMConnection::RecvPkt"]
 follow = "none"
@@ -101,18 +107,20 @@ pattern = "E8 ? ? ? ? 8B 44 24 ? 83 C4 18 8B 00 57 FF 74 24 ? FF 50 0C 89 3C 24 
 follow = "relative"
 pattern = "E8 ? ? ? ? 8B 4C 24 ? 83 C4 10 29 E9 75 ? 83 C4 1C 5B 5E 5F 5D"
 
+# Stops at the pool-state read: builds differ in whether they spill that byte
+# before testing it, and both the byte's offset and the frame size differ.
 [steamclient."CWorkThreadPool::AddWorkItem"]
 follow = "none"
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 3C 8B 75 08 0F B6 86 CC 00 00 00 88 45 ? 84 C0 0F 85"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC ? 8B 75 08 0F B6 86 ? ? 00 00"
 
 # steamrt stack-canary implementation shape.
 [[steamclient."CWorkThreadPool::AddWorkItem".variants]]
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 4C 8B 45 0C 8B 75 08 89 45 ? 65 A1 14 00 00 00 89 45 ? 31 C0 0F B6 86 CC 00 00 00 84 C0 0F 85"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC ? 8B 45 0C 8B 75 08 89 45 ? 65 A1 14 00 00 00 89 45 ? 31 C0 0F B6 86 ? ? 00 00 84 C0 0F 85"
 
 # Read, not hooked: source of the CNet pool global and work-item timer vtable.
 [steamclient."CWebSocketConnection::PostDelayedCloseWorkItem"]
 follow = "none"
-pattern = "83 7E 10 02 75 ? 80 BE 04 01 00 00 00"
+pattern = "83 7E ? 02 75 ? 80 BE ? ? 00 00 00"
 
 # CHTTPRequestJob start boundary used by the process-local cloud transfer hook.
 [steamclient."CHTTPRequestJob::Start"]
@@ -127,14 +135,14 @@ follow = "none"
 pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"
 
 [[steamclient."CUser::MarkLicenseAsChanged".variants]]
-pattern = "E8 ? ? ? ? 81 C1 ? ? ? ? 55 57 56 53 83 EC 2C 8B 74 24 40 8B 44 24 48 89 4C 24 08 8B 5C 24 44 8B BE 14 1B 00 00 88 44 24 1C 8D 86 E4 1A 00 00"
+pattern = "E8 ? ? ? ? 81 C1 ? ? ? ? 55 57 56 53 83 EC 2C 8B 74 24 40 8B 44 24 48 89 4C 24 08 8B 5C 24 44 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"
 
 [steamclient."CUser::ProcessPendingLicenseUpdates"]
 follow = "none"
 pattern = "55 E8 ? ? ? ? 81 C5 ? ? ? ? 57 56 53 83 EC 0C 8B 7C 24 20 8B B7 ? 1B 00 00 83 EE 01 79 0F EB 5D"
 
 [[steamclient."CUser::ProcessPendingLicenseUpdates".variants]]
-pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 57 56 53 83 EC 1C 8B 6C 24 30 89 44 24 0C 8B BD D0 1B 00 00 8D 34 FF C1 E6 03 83 EF 01 79 ?"
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 57 56 53 83 EC 1C 8B 6C 24 30 89 44 24 0C 8B BD ? 1B 00 00 8D 34 FF C1 E6 03 83 EF 01 79 ?"
 
 [steamclient."CUtlMemory::Grow"]
 follow = "relative"
@@ -160,13 +168,13 @@ pattern = "65 8B 0D 14 00 00 00 89 8C 24 DC 00 00 00 31 C9 8B B4 24 14 01 00 00"
 [[steamclient."CConfigStore::WriteVdfFile".variants]]
 pattern = "65 8B 35 14 00 00 00 89 B4 24 DC 00 00 00 8B B4 24 14 01 00 00 8B 94 24 00 01 00 00 8B 84 24 0C 01 00 00"
 
+# Reaches the two argument spills so the frame size can be a wildcard: it
+# differs between builds, and another function shares the same frame. This shape covers the
+# steamrt build too, which is why it carries no variant.
 [steamclient."CUser::SpawnProcess"]
 follow = "none"
-pattern = "55 89 E5 57 56 53 81 EC 9C 10 00 00 8B 75 18"
+pattern = "55 89 E5 57 56 53 81 EC ? 10 00 00 8B 75 18 89 85 ? ? FF FF 8B 45 08 89 85 ? ? FF FF"
 pic_entry = true
-
-[[steamclient."CUser::SpawnProcess".variants]]
-pattern = "55 89 E5 57 56 53 81 EC AC 10 00 00 8B 75 18 89 85 A4 EF FF FF 8B 45 08 89 85 9C EF FF FF"
 
 [steamclient."CUser::BuildSpawnEnvBlock"]
 follow = "none"

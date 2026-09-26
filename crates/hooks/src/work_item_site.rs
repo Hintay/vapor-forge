@@ -93,7 +93,6 @@ pub(crate) fn decode(
     let mut item_registers: HashSet<Register> = HashSet::new();
     let mut ones: Vec<usize> = Vec::new();
     let mut sentinels: Vec<(usize, usize)> = Vec::new();
-    let mut first_lea = None;
     let mut pool_slot = None;
     let mut last_immediate = None;
     let mut item_size = None;
@@ -111,9 +110,13 @@ pub(crate) fn decode(
             {
                 calls.push((ip, instruction.near_branch_target() as usize));
             }
-            // The allocation size is the argument in flight at the allocator
-            // call that follows the first resolved lea.
-            if item_size.is_none() && first_lea.is_some_and(|lea| lea < ip) {
+            // The allocator call is the first one whose in-flight argument is a
+            // plausible item size. Some builds load the pool global only after
+            // this call, so a preceding lea does not mark it; the size does.
+            if item_size.is_none()
+                && last_immediate
+                    .is_some_and(|size| (MIN_ITEM_SIZE..=MAX_ITEM_SIZE).contains(&size))
+            {
                 item_size = last_immediate;
                 item_registers.clear();
                 item_registers.insert(return_register(bitness));
@@ -127,7 +130,6 @@ pub(crate) fn decode(
         if instruction.mnemonic() == Mnemonic::Lea {
             if let Some(address) = resolve_lea(&instruction, pic) {
                 tracked.insert(instruction.op0_register().full_register(), address);
-                first_lea.get_or_insert(ip);
                 continue;
             }
         }
@@ -258,11 +260,18 @@ fn resolve_lea(instruction: &Instruction, pic: Option<(Register, usize)>) -> Opt
     ))
 }
 
-/// `mov reg, [tracked]`, which is how a pointer global is read through its slot.
+/// `mov reg, [tracked]` or `push [tracked]`, the two ways a pointer global is
+/// read through its slot. i686 builds that pass the pool on the stack push it
+/// straight from the slot.
 fn dereferenced(instruction: &Instruction, tracked: &HashMap<Register, usize>) -> Option<usize> {
-    if instruction.mnemonic() != Mnemonic::Mov
-        || instruction.op0_kind() != OpKind::Register
-        || instruction.op1_kind() != OpKind::Memory
+    let reads_slot = match instruction.mnemonic() {
+        Mnemonic::Mov => {
+            instruction.op0_kind() == OpKind::Register && instruction.op1_kind() == OpKind::Memory
+        }
+        Mnemonic::Push => instruction.op0_kind() == OpKind::Memory,
+        _ => false,
+    };
+    if !reads_slot
         || instruction.memory_index() != Register::None
         || instruction.memory_displacement64() != 0
     {
@@ -465,6 +474,30 @@ mod tests {
         assert_eq!(site.refcount_offset, 0x04);
         assert_eq!(site.sentinel_offsets, vec![(0x84, 4), (0x88, 4), (0x98, 4)]);
         assert_eq!(site.add_work_item, 0x02d9_79c0);
+    }
+
+    /// The same site from a build that loads the pool global after the
+    /// allocation and uses a larger item, so no lea precedes the size.
+    const X64_1790380355_BASE: usize = 0x0284_cc60;
+    const X64_1790380355_CODE: &[u8] =
+        include_bytes!("testdata/post_delayed_close_x64_1790380355.bin");
+
+    #[test]
+    fn decodes_the_x86_64_site_with_the_pool_load_after_the_allocation() {
+        let site = decode(
+            64,
+            X64_1790380355_BASE,
+            X64_1790380355_CODE,
+            X64_1790380355_BASE,
+        )
+        .unwrap();
+        assert_eq!(site.pool_slot, 0x0329_c3c8);
+        assert_eq!(site.timer_vtable, 0x0309_dd20);
+        assert_eq!(site.item_size, 0xe8);
+        assert_eq!(site.timer_vptr_offsets, vec![0x40, 0x60, 0x80, 0xa0]);
+        assert_eq!(site.refcount_offset, 0x08);
+        assert_eq!(site.sentinel_offsets, vec![(0xc0, 8), (0xd8, 4)]);
+        assert_eq!(site.add_work_item, 0x0285_4dc0);
     }
 
     #[test]

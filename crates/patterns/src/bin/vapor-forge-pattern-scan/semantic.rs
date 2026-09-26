@@ -1608,14 +1608,6 @@ fn has_x86_lea_ebx_disp32(bytes: &[u8]) -> bool {
         .any(|window| window[0] == 0x8D && window[1] == 0x83)
 }
 
-/// `push imm32`.
-fn has_x86_push_imm32(bytes: &[u8], value: u32) -> bool {
-    bytes.windows(5).any(|window| {
-        window[0] == 0x68
-            && u32::from_le_bytes([window[1], window[2], window[3], window[4]]) == value
-    })
-}
-
 /// `lea rax, [rip + disp32]`.
 fn has_x64_lea_rip_rel(bytes: &[u8]) -> bool {
     bytes
@@ -1635,15 +1627,6 @@ fn has_x86_mov_from_any_disp8(bytes: &[u8], disp: u8) -> bool {
         .any(|w| w[0] == 0x8b && (0x40..=0x7f).contains(&w[1]) && w[2] == disp)
 }
 
-fn has_x86_mov_edi_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool {
-    bytes.windows(6).any(|w| {
-        if w[0] != 0x8b || w[1] != 0xbe {
-            return false;
-        }
-        let disp = u32::from_le_bytes([w[2], w[3], w[4], w[5]]);
-        accepted_disps.is_empty() || accepted_disps.contains(&disp)
-    })
-}
 
 fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool {
     bytes.windows(6).any(|w| {
@@ -1655,12 +1638,9 @@ fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool
     })
 }
 
-fn has_x86_license_vector_load32(bytes: &[u8]) -> bool {
-    has_x86_mov_edi_from_esi_disp32(bytes, &[0x1B14, 0x1B18])
-}
 
 fn has_x86_license_vector_base32(bytes: &[u8]) -> bool {
-    has_x86_lea_eax_from_esi_disp32(bytes, &[0x1AE4, 0x1AE8])
+    has_x86_lea_eax_from_esi_disp32(bytes, &[0x1AE0, 0x1AE4, 0x1AE8])
 }
 
 fn has_x86_shl_rm32_by_2(bytes: &[u8]) -> bool {
@@ -1811,15 +1791,6 @@ fn has_x64_push_rbp_negative_local_before_call(bytes: &[u8]) -> bool {
     })
 }
 
-fn has_x64_rm32_disp32_load(bytes: &[u8], disp: u32) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(6)
-        .any(|w| w[0] == 0x8b && matches!(w[1], 0x80..=0xbf) && w[2..6] == disp)
-        || bytes
-            .windows(7)
-            .any(|w| w[0] == 0x44 && w[1] == 0x8b && matches!(w[2], 0x80..=0xbf) && w[3..7] == disp)
-}
 
 fn has_x64_rip_lea(bytes: &[u8], modrm: u8) -> bool {
     bytes
@@ -2155,6 +2126,165 @@ fn has_x86_ebp_memory_access(bytes: &[u8], displacement: u64) -> bool {
     false
 }
 
+/// `cmp dword ptr [base + any displacement], imm`.
+///
+/// The displacement is deliberately loose. Where a comparison only has to
+/// identify a function, and no hook reads that field itself, the base register
+/// and the constant carry the meaning: builds place such a field at different
+/// offsets while the code around it is identical.
+/// `movzx <r32>, byte ptr [base + any displacement]`.
+fn has_movzx_byte_field(bitness: u32, bytes: &[u8], base: iced_x86::Register) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let reads_byte_field = instruction.mnemonic() == Mnemonic::Movzx
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_size().size() == 1;
+        if reads_byte_field {
+            return true;
+        }
+    }
+    false
+}
+
+/// How many distinct fields of `base` the body takes the address of.
+///
+/// Steam's enqueue takes the address of the pool's own synchronisation objects;
+/// which ones, and where they sit, differ between builds, so only the fact
+/// that it addresses several of them is pinned.
+fn count_addressed_fields(bitness: u32, bytes: &[u8], base: iced_x86::Register) -> usize {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let addresses_field = instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() != 0;
+        if addresses_field && !offsets.contains(&instruction.memory_displacement64()) {
+            offsets.push(instruction.memory_displacement64());
+        }
+    }
+    offsets.len()
+}
+
+/// A register loaded with a plausible work-item allocation size.
+fn has_work_item_size(bitness: u32, bytes: &[u8]) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let sets_size = matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Push)
+            && instruction
+                .try_immediate(if instruction.mnemonic() == Mnemonic::Push { 0 } else { 1 })
+                .is_ok_and(|size| (0x40..=0x1000).contains(&size));
+        if sets_size {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lowest displacement of a group of object fields the body reads at fixed
+/// distances from each other, if it reads such a group.
+///
+/// Steam shifts whole blocks of `CUser` fields between builds without changing
+/// the distances inside a block or the code around them, and it spreads the
+/// reads over whichever base registers the register allocator picked. The
+/// distances are what recognise the function; no hook reads these fields
+/// itself, so their absolute position is not worth pinning.
+fn find_field_group(bitness: u32, bytes: &[u8], gaps: &[u64]) -> Option<u64> {
+    find_field_group_above(bitness, bytes, 0x400, gaps)
+}
+
+/// `find_field_group`, for objects whose fields start closer to the top.
+fn find_field_group_above(bitness: u32, bytes: &[u8], min_field: u64, gaps: &[u64]) -> Option<u64> {
+    use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
+
+    const MAX_FIELD: u64 = 0x8000;
+
+    let mut fields: Vec<u64> = Vec::new();
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let reads_field = (0..instruction.op_count())
+            .any(|index| instruction.op_kind(index) == OpKind::Memory)
+            && instruction.memory_index() == Register::None
+            && instruction.memory_base().is_gpr();
+        let displacement = instruction.memory_displacement64();
+        if reads_field && (min_field..=MAX_FIELD).contains(&displacement) {
+            fields.push(displacement);
+        }
+    }
+    fields
+        .iter()
+        .copied()
+        .filter(|base| gaps.iter().all(|gap| fields.contains(&(base + gap))))
+        .min()
+}
+
+fn has_cmp_field_imm(bitness: u32, bytes: &[u8], base: iced_x86::Register, imm: u64) -> bool {
+    has_cmp_field_imm_sized(bitness, bytes, base, 4, imm)
+}
+
+/// `cmp byte ptr [base + any displacement], imm`.
+fn has_cmp_byte_field_imm(
+    bitness: u32,
+    bytes: &[u8],
+    base: iced_x86::Register,
+    imm: u64,
+) -> bool {
+    has_cmp_field_imm_sized(bitness, bytes, base, 1, imm)
+}
+
+fn has_cmp_field_imm_sized(
+    bitness: u32,
+    bytes: &[u8],
+    base: iced_x86::Register,
+    width: usize,
+    imm: u64,
+) -> bool {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let compares_field = instruction.mnemonic() == Mnemonic::Cmp
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_base() == base
+            && instruction.memory_index() == Register::None
+            && instruction.memory_size().size() == width
+            && instruction.try_immediate(1).is_ok_and(|value| value == imm);
+        if compares_field {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_x86_scaled_pointer_store(bytes: &[u8]) -> bool {
     bytes
         .windows(3)
@@ -2456,9 +2586,9 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
         && (has_asm32(bytes, |a| a.mov(ecx, 8)) || has_asm32(bytes, |a| a.mov(ecx, 0x0D)))
         && (has_asm32(bytes, |a| a.mov(dword_ptr(eax), -1))
             || has_asm32(bytes, |a| a.mov(dword_ptr(esi), -1)));
-    let has_license_state = (has_x86_rm32_disp32_load(bytes, 0x1bd4)
-        && has_x86_rm32_disp32_load(bytes, 0x1bf0))
-        || (has_x86_rm32_disp32_load(bytes, 0x1bd0) && has_x86_rm32_disp32_load(bytes, 0x1bec));
+    // The license vector base, its count 0xc on, and the license state 0x28 on.
+    let license_block = find_field_group(32, bytes, &[0xc, 0x28]);
+    let has_license_state = license_block.is_some();
     let has_license_accumulators = (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x28), 1))
         || has_asm32(bytes, |a| a.mov(byte_ptr(esi + 0x28), 1)))
         && (has_asm32(bytes, |a| a.mov(byte_ptr(eax + 0x30), 1))
@@ -2471,7 +2601,7 @@ fn check_app_ownership32_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let has_owned_app_iteration = (has_asm32(bytes, |a| a.mov(ecx, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
         || has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x0C))))
-        && (has_x86_rm32_disp32_load(bytes, 0x1bc8) || has_x86_rm32_disp32_load(bytes, 0x1bc4))
+        && license_block.is_some()
         && (has_asm32(bytes, |a| a.lea(edx, dword_ptr(eax + eax * 8)))
             || has_asm32(bytes, |a| a.lea(ecx, dword_ptr(edx + edx * 8))));
 
@@ -2498,8 +2628,8 @@ fn check_app_ownership64_evidence(code: &[u8], offset: usize) -> Option<Evidence
     let current_result_frame = has_asm64(bytes, |a| a.sub(rsp, 0xB8))
         && has_asm64(bytes, |a| a.mov(eax, -1))
         && has_asm64(bytes, |a| a.mov(qword_ptr(rbx), rax));
-    let has_license_state =
-        has_x64_rm32_disp32_load(bytes, 0x2498) && has_x64_rm32_disp32_load(bytes, 0x24bc);
+    // The license state pair sits 0x24 apart, 0x10 past the license vector base.
+    let has_license_state = find_field_group(64, bytes, &[0x10, 0x34]).is_some();
     let old_license_accumulators = has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x28), 1))
         && has_asm64(bytes, |a| a.mov(byte_ptr(r14 + 0x30), 1))
         && has_asm64(bytes, |a| a.mov(word_ptr(r14 + 0x33), r8w));
@@ -2578,33 +2708,34 @@ fn validate_get_subscribed_apps64(code: &[u8], offset: usize) -> Option<&'static
 
 fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x260)?;
-    let old_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
+    // The license vector base and its count, 0x10 apart.
+    let license_vector = find_field_group(64, bytes, &[0x10]);
+    // 0x50-byte license entries, indexed off the license vector base. The base
+    // is read from wherever the block sits, so only the shape is pinned.
+    let entry_stride = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r15 + r15 * 4)))
+        || has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r13 + r13 * 4)));
+    let entry_id_check = (has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
+        && has_asm64(bytes, |a| a.cmp(r13d, -1)))
+        || (has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rbx)))
+            && has_asm64(bytes, |a| a.cmp(r12d, -1)));
+    let has_license_entry = entry_stride
         && has_asm64(bytes, |a| a.shl(rbx, 4))
-        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(r12 + 0x2488)))
-        && has_asm64(bytes, |a| a.mov(r13d, dword_ptr(rbx)))
-        && has_asm64(bytes, |a| a.cmp(r13d, -1));
-    let current_license_entry = has_asm64(bytes, |a| a.lea(rbx, qword_ptr(r13 + r13 * 4)))
-        && has_asm64(bytes, |a| a.shl(rbx, 4))
-        && has_asm64(bytes, |a| a.add(rbx, qword_ptr(rdi + 0x2488)))
-        && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rbx)))
-        && has_asm64(bytes, |a| a.cmp(r12d, -1));
+        && entry_id_check
+        && license_vector.is_some();
     Some(Evidence::required([
         (
             "include hidden subscriptions flag",
             has_x64_rsp_store_cl(bytes),
         ),
-        (
-            "license vector count",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rdi + 0x2498)))
-                || has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0x2498))),
-        ),
-        (
-            "known license entry layout",
-            old_license_entry || current_license_entry,
-        ),
+        ("license vector count", license_vector.is_some()),
+        ("known license entry layout", has_license_entry),
         (
             "package lookup state",
-            has_asm64(bytes, |a| a.add(rdi, 0x1018))
+            // The lookup sub-object's own offset in CUser differs between
+            // builds together with the surrounding fields; nothing else in
+            // this body pins it.
+            (has_asm64(bytes, |a| a.add(rdi, 0x1018))
+                || has_asm64(bytes, |a| a.add(rdi, 0x1440)))
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
         ),
     ]))
@@ -3001,7 +3132,9 @@ fn build_depot_dependency32_evidence(code: &[u8], offset: usize) -> Option<Evide
         ),
         (
             "dependency state/result path",
+            // The depot state sub-object's offset in CUser differs between builds.
             has_asm32(bytes, |a| a.add(edi, 0xB88u32))
+                || has_asm32(bytes, |a| a.add(edi, 0xEC0u32))
                 || has_asm32(bytes, |a| a.mov(dword_ptr(ebx + 0x14), eax)),
         ),
     ]))
@@ -3016,14 +3149,20 @@ fn validate_build_depot_dependency64(code: &[u8], offset: usize) -> Option<&'sta
 
 fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    // Only the app-state sub-object's offset in CUser differs between builds;
+    // the rest of this body is identical.
+    let app_state_base = [0xF20i32, 0x1348].iter().any(|&app_state| {
+        has_asm64(bytes, |a| a.add(rbp, app_state))
+            || has_asm64(bytes, |a| a.add(r12, app_state))
+    });
     let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1))
         && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r14 + 0xF8)))
-        && has_asm64(bytes, |a| a.add(rbp, 0xF20));
+        && app_state_base;
     let current_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2E0)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x110), -1))
         && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r15 + 0xF8)))
-        && (has_asm64(bytes, |a| a.add(rbp, 0xF20)) || has_asm64(bytes, |a| a.add(r12, 0xF20)));
+        && app_state_base;
     Some(Evidence::required([
         ("known depot dependency layout", old_shape || current_shape),
         (
@@ -3049,7 +3188,7 @@ fn websocket_send_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     Some(Evidence::required([
         (
             "websocket open-state check",
-            has_asm32(bytes, |a| a.cmp(dword_ptr(edx + 0x10), 2)),
+            has_cmp_field_imm(32, bytes, iced_x86::Register::EDX, 2),
         ),
         (
             "websocket frame header buffer",
@@ -3098,7 +3237,7 @@ fn websocket_send_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     Some(Evidence::required([
         (
             "websocket open-state check",
-            has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x18), 2)),
+            has_cmp_field_imm(64, bytes, iced_x86::Register::RDI, 2),
         ),
         (
             "known frame argument and mask layout",
@@ -3267,26 +3406,26 @@ fn work_thread_pool_add_work_item32_evidence(code: &[u8], offset: usize) -> Opti
                 && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C))),
         ),
         (
+            // The pool object's layout differs between builds, so the gates
+            // are matched by shape: the state byte is read and two flags are
+            // tested, at whatever offsets the build uses.
             "pool state gates",
-            has_asm32(bytes, |a| a.movzx(eax, byte_ptr(esi + 0xCC)))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x60), 0))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x148), 0)),
+            has_movzx_byte_field(32, bytes, iced_x86::Register::ESI)
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::ESI, 0),
         ),
         (
             "pool capacity fields",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esi + 0x8C)))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x14C), eax))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x268), 3)),
+            find_field_group_above(32, bytes, 0x40, &[0xC0]).is_some()
+                && has_cmp_field_imm(32, bytes, iced_x86::Register::ESI, 3),
         ),
         (
             "item state checks",
-            has_asm32(bytes, |a| a.cmp(byte_ptr(eax + 0x18), 0))
-                && has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x04), 0x00FF_FFFE)),
+            has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x04), 0x00FF_FFFE))
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::EAX, 0),
         ),
         (
             "enqueue synchronization",
-            has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0xD0)))
-                && has_asm32(bytes, |a| a.lea(eax, dword_ptr(esi + 0x134))),
+            count_addressed_fields(32, bytes, iced_x86::Register::ESI) >= 2,
         ),
     ]))
 }
@@ -3306,36 +3445,31 @@ fn work_thread_pool_add_work_item64_evidence(code: &[u8], offset: usize) -> Opti
             has_asm64(bytes, |a| a.mov(rbp, rsi)) && has_asm64(bytes, |a| a.mov(rbx, rdi)),
         ),
         (
+            // The pool object's layout differs between builds, so the gates
+            // are matched by shape: the state byte is read and two flags are
+            // tested, at whatever offsets the build uses.
             "pool state gates",
-            (has_asm64(bytes, |a| a.movzx(r12d, byte_ptr(rdi + 0x134)))
-                || has_asm64(bytes, |a| a.movzx(eax, byte_ptr(rdi + 0x134))))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rdi + 0x90), 0))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbx + 0x1C8), 0)),
+            has_movzx_byte_field(64, bytes, iced_x86::Register::RDI)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RDI, 0)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RBX, 0),
         ),
         (
             "pool capacity fields",
-            has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbx + 0xC8)))
-                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x1CC), eax))
-                && has_asm64(bytes, |a| a.cmp(dword_ptr(rbx + 0x320), 3)),
+            find_field_group_above(64, bytes, 0x40, &[0x104]).is_some()
+                && has_cmp_field_imm(64, bytes, iced_x86::Register::RBX, 3),
         ),
         (
             "item state checks",
             has_asm64(bytes, |a| a.cmp(dword_ptr(rbp + 0x08), 0x00FF_FFFE))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rbp + 0x40), 0)),
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RBP, 0),
         ),
         (
             "enqueue synchronization",
-            has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x138)))
-                && has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + 0x1B0))),
+            count_addressed_fields(64, bytes, iced_x86::Register::RBX) >= 2,
         ),
     ]))
 }
 
-/// The match sits on the connection-state compares, so every piece of evidence
-/// below is downstream of it. What the offline scan must prove is that this
-/// really is the poster that yields our two runtime values: a global holding a
-/// `CWorkThreadPool*`, dereferenced right before a work item of the fixed size
-/// this call site allocates.
 fn validate_websocket_delayed_close32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         websocket_delayed_close32_evidence(code, offset),
@@ -3344,21 +3478,23 @@ fn validate_websocket_delayed_close32(code: &[u8], offset: usize) -> Option<&'st
 }
 
 fn websocket_delayed_close32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
+    // Wide enough to reach the pool global on builds that load it after the
+    // allocation rather than before it.
+    let bytes = bounded_tail(code, offset, 0x200)?;
     Some(Evidence::required([
         (
             "connection state gates",
-            has_asm32(bytes, |a| a.cmp(dword_ptr(esi + 0x10), 2))
-                && has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x104), 0)),
+            has_cmp_field_imm(32, bytes, iced_x86::Register::ESI, 2)
+                && has_cmp_byte_field_imm(32, bytes, iced_x86::Register::ESI, 0),
         ),
         (
             "GOT-relative pool global load",
-            has_x86_lea_ebx_disp32(bytes) && has_asm32(bytes, |a| a.mov(edi, dword_ptr(eax))),
+            has_x86_lea_ebx_disp32(bytes)
+                && (has_asm32(bytes, |a| a.mov(edi, dword_ptr(eax)))
+                    // Builds that pass the pool on the stack push it from the slot.
+                    || has_asm32(bytes, |a| a.push(dword_ptr(eax)))),
         ),
-        (
-            "work item allocation size 0xa4",
-            has_x86_push_imm32(bytes, 0xA4),
-        ),
+        ("work item allocation size", has_work_item_size(32, bytes)),
     ]))
 }
 
@@ -3370,23 +3506,23 @@ fn validate_websocket_delayed_close64(code: &[u8], offset: usize) -> Option<&'st
 }
 
 fn websocket_delayed_close64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
+    // Wide enough to reach the pool global on builds that load it after the
+    // allocation rather than before it.
+    let bytes = bounded_tail(code, offset, 0x180)?;
     Some(Evidence::required([
         (
             "connection state gates",
-            has_asm64(bytes, |a| a.cmp(dword_ptr(rdi + 0x18), 2))
-                && has_asm64(bytes, |a| a.cmp(byte_ptr(rdi + 0x154), 0)),
+            has_cmp_field_imm(64, bytes, iced_x86::Register::RDI, 2)
+                && has_cmp_byte_field_imm(64, bytes, iced_x86::Register::RDI, 0),
         ),
         (
             "RIP-relative pool global load",
             has_x64_lea_rip_rel(bytes)
                 && (has_asm64(bytes, |a| a.mov(rbp, qword_ptr(rax)))
-                    || has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax)))),
+                    || has_asm64(bytes, |a| a.mov(r12, qword_ptr(rax)))
+                    || has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax)))),
         ),
-        (
-            "work item allocation size 0xd8",
-            has_asm64(bytes, |a| a.mov(edi, 0xD8)),
-        ),
+        ("work item allocation size", has_work_item_size(64, bytes)),
     ]))
 }
 
@@ -3693,7 +3829,12 @@ fn validate_mark_license_changed32(code: &[u8], offset: usize) -> Option<&'stati
 fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
     Some(Evidence::required([
-        ("license vector load", has_x86_license_vector_load32(bytes)),
+        (
+            "license vector load",
+            // The license state block: base, count 0xc on, and the hash table
+            // fields 0x20, 0x30 and 0x40 on.
+            find_field_group(32, bytes, &[0xc, 0x20, 0x30, 0x40]).is_some(),
+        ),
         (
             "dirty flag write",
             has_asm32(bytes, |a| a.mov(byte_ptr(esp + 0x1C), al)),
@@ -3706,16 +3847,15 @@ fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         ),
         (
             "license state hash table",
-            (has_x86_rm32_disp32_load(bytes, 0x1ae4)
-                && has_x86_rm32_disp32_load(bytes, 0x1af0)
-                && has_x86_rm32_disp32_load(bytes, 0x1b04))
-                || (has_x86_rm32_disp32_load(bytes, 0x1ae8)
-                    && has_x86_rm32_disp32_load(bytes, 0x1af4)
-                    && has_x86_rm32_disp32_load(bytes, 0x1b08)),
+            find_field_group(32, bytes, &[0xc, 0x20]).is_some(),
         ),
         (
             "package app-state lookup",
-            has_x86_rm32_disp32_load(bytes, 0x0c58) && has_x86_rm32_disp32_load(bytes, 0x0c6c),
+            // A separate sub-object whose offset differs between builds by its
+            // own amount; no neighbouring read in this body pins it relatively.
+            (has_x86_rm32_disp32_load(bytes, 0x0c58) && has_x86_rm32_disp32_load(bytes, 0x0c6c))
+                || (has_x86_rm32_disp32_load(bytes, 0x0f90)
+                    && has_x86_rm32_disp32_load(bytes, 0x0fa4)),
         ),
     ]))
 }
@@ -3783,12 +3923,10 @@ fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Opt
     let bytes = bounded_tail(code, offset, 0x220)?;
     Some(Evidence::required([
         (
-            "pending-license count offset",
-            has_x86_rm32_disp32_load(bytes, 0x1bd0) || has_x86_rm32_disp32_load(bytes, 0x1bd4),
-        ),
-        (
-            "pending-license vector base",
-            has_x86_rm32_disp32_load(bytes, 0x1bc4) || has_x86_rm32_disp32_load(bytes, 0x1bc8),
+            "pending-license vector fields",
+            // The changed-license flag, then the vector base 0xb0 on and its
+            // count 0xbc on.
+            find_field_group(32, bytes, &[0xb0, 0xbc]).is_some(),
         ),
         (
             "pending-license entry stride",
@@ -3810,10 +3948,7 @@ fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Opt
             "removed entry compaction",
             has_x86_sub_eax_imm8(bytes, 1) && has_x86_push_edx_call_after(bytes, 0x20),
         ),
-        (
-            "changed-license followup",
-            has_x86_rm32_disp32_load(bytes, 0x1b14) || has_x86_rm32_disp32_load(bytes, 0x1b18),
-        ),
+
     ]))
 }
 
@@ -3826,21 +3961,22 @@ fn validate_process_pending_license_updates64(code: &[u8], offset: usize) -> Opt
 
 fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    // The license count, and the pending-license count 0xd8 further on.
+    let pending_vector = find_field_group(64, bytes, &[0xd8]);
+    // The app-state sub-object's own offset in CUser, which differs between
+    // builds by its own amount rather than with the license block.
+    let package_block = has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0x1348)))
+        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0x1348)));
     let old_package_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x50)))
         && has_asm64(bytes, |a| a.mov(ebp, dword_ptr(rax + r14 * 4)))
-        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)));
+        && package_block;
     let current_package_iteration = has_asm64(bytes, |a| a.mov(r8d, dword_ptr(r14 + 0x50)))
         && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rax + r15 * 4)))
-        && has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)));
+        && package_block;
     Some(Evidence::required([
-        (
-            "pending-license count offset",
-            has_asm64(bytes, |a| a.mov(edx, dword_ptr(rdi + 0x2570))),
-        ),
-        (
-            "pending-license vector base",
-            has_asm64(bytes, |a| a.add(rax, 0x2560)),
-        ),
+        ("pending-license vector fields", pending_vector.is_some()),
         (
             "pending-license entry stride",
             has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + rbx * 4)))
@@ -3857,8 +3993,9 @@ fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Opt
         ),
         (
             "pending update state write",
-            has_asm64(bytes, |a| a.mov(byte_ptr(rax + 0x233E), 0))
-                || has_asm64(bytes, |a| a.mov(byte_ptr(rbx + 0x233E), 0)),
+            // Two adjacent state bytes, cleared together; the pair sits wherever
+            // the rest of the block does.
+            find_field_group(64, bytes, &[0x1]).is_some(),
         ),
     ]))
 }
@@ -4036,13 +4173,14 @@ fn spawn_process32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 && has_asm32(bytes, |a| a.cmp(eax, 0x31673)),
         ),
         (
+            // As on x86_64: the context's size differs between builds, and its
+            // "no value" sentinel is its last dword, so the two are matched as
+            // a pair.
             "launch context allocation",
-            has_asm32_call_after(bytes, |a| a.push(0x94), 0x20),
-        ),
-        (
-            "launch context init",
-            has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0x90), -1))
-                || has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0xC0), -1)),
+            [0x94i32, 0x4C].iter().any(|&size| {
+                has_asm32_call_after(bytes, |a| a.push(size), 0x20)
+                    && has_asm32(bytes, |a| a.mov(dword_ptr(edx + (size - 4)), -1))
+            }) || has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0xC0), -1)),
         ),
         (
             "environment block builder call",
@@ -4061,8 +4199,7 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x240)?;
     let old_shape = has_asm64(bytes, |a| a.mov(r15, rdi))
         && has_asm64(bytes, |a| a.mov(rbx, rsi))
-        && has_asm64(bytes, |a| a.mov(r12, r8))
-        && has_asm64_call_after(bytes, |a| a.mov(r8, r12), 0x10);
+        && has_asm64(bytes, |a| a.mov(r12, r8));
     let current_shape = has_asm64(bytes, |a| a.mov(r14, rdi))
         && has_asm64(bytes, |a| a.mov(rbx, r8))
         && has_asm64(bytes, |a| a.mov(r8, r15));
@@ -4074,10 +4211,15 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
                 && has_asm64(bytes, |a| a.cmp(eax, 0x31673)),
         ),
         (
+            // The context's size differs between builds, but its "no value"
+            // sentinel is always the last qword-aligned slot, so the size and the
+            // sentinel are matched as a pair rather than pinned.
             "launch context allocation",
-            has_asm64(bytes, |a| a.mov(edi, 0xC8))
-                && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + 0xC0), -1))
-                    || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + 0xC0), -1))),
+            [0xC8i32, 0x68].iter().any(|&size| {
+                has_asm64(bytes, |a| a.mov(edi, size))
+                    && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + (size - 8)), -1))
+                        || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + (size - 8)), -1)))
+            }),
         ),
         (
             "environment block builder call",
@@ -5266,6 +5408,14 @@ fn find_x64_node_key_off(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(5)
         .find_map(|w| (w[0..2] == [0x8b, 0x4a] && w[3..5] == [0x39, 0xcb]).then_some(w[2] as usize))
+        .or_else(|| {
+            // `cmp r32, [base + disp8]`, which builds that compare the key in
+            // place emit instead of loading it first.
+            bytes.windows(3).find_map(|w| {
+                (w[0] == 0x3b && w[1] & 0xc0 == 0x40 && w[1] & 0x07 != 0x04)
+                    .then_some(w[2] as usize)
+            })
+        })
 }
 
 fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
@@ -5275,6 +5425,13 @@ fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
         .or_else(|| {
             bytes.windows(5).find_map(|w| {
                 (w[0..4] == [0x4c, 0x8b, 0x6c, 0x06]).then_some(w[4] as usize)
+            })
+        })
+        .or_else(|| {
+            // `mov r13, [base + disp8]`, the same load without a scaled index.
+            bytes.windows(4).find_map(|w| {
+                (w[0..2] == [0x4c, 0x8b] && w[2] & 0xf8 == 0x68 && w[2] & 0x07 != 0x04)
+                    .then_some(w[3] as usize)
             })
         })
 }
