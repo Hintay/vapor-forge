@@ -158,72 +158,79 @@ pub mod package_info {
 
 pub mod cnet_packet {
     use core::ffi::c_void;
+    use core::mem::size_of;
 
-    #[repr(C)]
-    pub struct CNetPacketPrefix {
-        pub packet_type: u32,
-        pub data: *mut u8,
-        pub size: u32,
-        pub refs: i32,
-        pub owned_data: *mut u8,
-        _unknown_20: *mut c_void,
-        _unknown_tail: [u32; 2],
+    /// Offsets of the `CNetPacket` fields native code reads or rewrites.
+    ///
+    /// These differ between Steam builds, so they are read from the running
+    /// build's `CNetPacket::Init` and admitted here only if every field can be
+    /// addressed safely on this target.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Layout {
+        conn_id: usize,
+        data: usize,
+        size: usize,
+        owned_data: usize,
     }
 
-    // CNetPacket is not polymorphic. Native pointer alignment inserts four
-    // bytes after packet_type on x86_64.
-    pub const DATA_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, data);
-    pub const SIZE_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, size);
-    pub const REFS_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, refs);
-    pub const OWNED_DATA_OFFSET: usize = core::mem::offset_of!(CNetPacketPrefix, owned_data);
-
-    const _: () = {
-        #[cfg(target_pointer_width = "32")]
-        {
-            assert!(DATA_OFFSET == 0x04);
-            assert!(SIZE_OFFSET == 0x08);
-            assert!(REFS_OFFSET == 0x0c);
-            assert!(OWNED_DATA_OFFSET == 0x10);
-            assert!(core::mem::size_of::<CNetPacketPrefix>() == 0x20);
+    impl Layout {
+        /// `None` unless each field is naturally aligned and no two overlap.
+        pub fn new(conn_id: usize, data: usize, size: usize, owned_data: usize) -> Option<Self> {
+            let spans = [
+                (conn_id, size_of::<u32>()),
+                (data, size_of::<*mut u8>()),
+                (size, size_of::<u32>()),
+                (owned_data, size_of::<*mut u8>()),
+            ];
+            let aligned = spans.iter().all(|&(offset, width)| offset % width == 0);
+            let disjoint = spans.iter().enumerate().all(|(index, &(start, width))| {
+                spans[index + 1..].iter().all(|&(other, other_width)| {
+                    start + width <= other || other + other_width <= start
+                })
+            });
+            (aligned && disjoint).then_some(Self {
+                conn_id,
+                data,
+                size,
+                owned_data,
+            })
         }
-        #[cfg(target_pointer_width = "64")]
-        {
-            assert!(DATA_OFFSET == 0x08);
-            assert!(SIZE_OFFSET == 0x10);
-            assert!(REFS_OFFSET == 0x14);
-            assert!(OWNED_DATA_OFFSET == 0x18);
-            assert!(core::mem::size_of::<CNetPacketPrefix>() == 0x30);
+
+        pub const fn owned_data_offset(&self) -> usize {
+            self.owned_data
         }
-    };
 
-    /// # Safety
-    /// packet must point to a valid CNetPacket object.
-    pub unsafe fn data_slot(packet: *mut c_void) -> *mut *mut u8 {
-        let packet = packet.cast::<CNetPacketPrefix>();
-        // SAFETY: caller guarantees packet points to a valid CNetPacket object.
-        unsafe { core::ptr::addr_of_mut!((*packet).data) }
-    }
+        /// # Safety
+        /// packet must point to a valid CNetPacket of the build this layout was read from.
+        pub unsafe fn conn_id(&self, packet: *const c_void) -> u32 {
+            // SAFETY: the caller guarantees the packet; `new` checked alignment.
+            unsafe { packet.byte_add(self.conn_id).cast::<u32>().read() }
+        }
 
-    /// # Safety
-    /// packet must point to a valid CNetPacket object.
-    pub unsafe fn size_slot(packet: *mut c_void) -> *mut u32 {
-        let packet = packet.cast::<CNetPacketPrefix>();
-        // SAFETY: caller guarantees packet points to a valid CNetPacket object.
-        unsafe { core::ptr::addr_of_mut!((*packet).size) }
-    }
+        /// # Safety
+        /// packet must point to a valid CNetPacket of the build this layout was read from.
+        pub unsafe fn data_slot(&self, packet: *mut c_void) -> *mut *mut u8 {
+            // SAFETY: the caller guarantees the packet spans this field.
+            unsafe { packet.byte_add(self.data).cast() }
+        }
 
-    /// # Safety
-    /// packet must point to a valid CNetPacket object, and data must remain
-    /// valid until Steam has consumed the packet.
-    pub unsafe fn set_data(packet: *mut c_void, data: *mut u8, size: u32) {
-        // SAFETY: caller guarantees packet points to a valid CNetPacket object.
-        let p_data = unsafe { data_slot(packet) };
-        // SAFETY: caller guarantees packet points to a valid CNetPacket object.
-        let p_size = unsafe { size_slot(packet) };
-        // SAFETY: p_data and p_size point to CNetPacket fields.
-        unsafe {
-            *p_data = data;
-            *p_size = size;
+        /// # Safety
+        /// packet must point to a valid CNetPacket of the build this layout was read from.
+        pub unsafe fn size_slot(&self, packet: *mut c_void) -> *mut u32 {
+            // SAFETY: the caller guarantees the packet spans this field.
+            unsafe { packet.byte_add(self.size).cast() }
+        }
+
+        /// # Safety
+        /// packet must point to a valid CNetPacket of the build this layout was
+        /// read from, and data must remain valid until Steam has consumed the
+        /// packet.
+        pub unsafe fn set_data(&self, packet: *mut c_void, data: *mut u8, size: u32) {
+            // SAFETY: the caller guarantees the packet; `new` checked alignment.
+            unsafe {
+                self.data_slot(packet).write(data);
+                self.size_slot(packet).write(size);
+            }
         }
     }
 }
@@ -678,36 +685,38 @@ mod tests {
     }
 
     #[test]
-    fn cnet_packet_offsets_match_steam_layout() {
-        #[cfg(target_pointer_width = "32")]
-        {
-            assert_eq!(cnet_packet::DATA_OFFSET, 0x04);
-            assert_eq!(cnet_packet::SIZE_OFFSET, 0x08);
-            assert_eq!(cnet_packet::REFS_OFFSET, 0x0c);
-            assert_eq!(cnet_packet::OWNED_DATA_OFFSET, 0x10);
-            assert_eq!(mem::size_of::<cnet_packet::CNetPacketPrefix>(), 0x20);
-        }
-        #[cfg(target_pointer_width = "64")]
-        {
-            assert_eq!(cnet_packet::DATA_OFFSET, 0x08);
-            assert_eq!(cnet_packet::SIZE_OFFSET, 0x10);
-            assert_eq!(cnet_packet::REFS_OFFSET, 0x14);
-            assert_eq!(cnet_packet::OWNED_DATA_OFFSET, 0x18);
-            assert_eq!(mem::size_of::<cnet_packet::CNetPacketPrefix>(), 0x30);
-        }
+    fn cnet_packet_layout_rejects_unsafe_offsets() {
+        let pointer = mem::size_of::<*mut u8>();
+        assert!(cnet_packet::Layout::new(0, pointer, 2 * pointer, 3 * pointer).is_some());
+        // Misaligned data pointer.
+        assert!(
+            cnet_packet::Layout::new(0, pointer + pointer / 2, 3 * pointer, 4 * pointer).is_none()
+        );
+        // Size overlapping the data pointer.
+        assert!(cnet_packet::Layout::new(0, pointer, pointer, 3 * pointer).is_none());
     }
 
     #[test]
-    fn cnet_packet_accessors_address_expected_slots() {
-        let mut packet = [0u8; 32];
+    fn cnet_packet_accessors_address_the_layout_slots() {
+        let mut packet = [0usize; 8];
         let base = packet.as_mut_ptr() as usize;
         let packet_ptr = packet.as_mut_ptr().cast::<c_void>();
-        // SAFETY: packet is a stack buffer large enough for the tested slots.
-        let data_slot = unsafe { cnet_packet::data_slot(packet_ptr) } as usize;
-        // SAFETY: packet is a stack buffer large enough for the tested slots.
-        let size_slot = unsafe { cnet_packet::size_slot(packet_ptr) } as usize;
-        assert_eq!(data_slot, base + cnet_packet::DATA_OFFSET);
-        assert_eq!(size_slot, base + cnet_packet::SIZE_OFFSET);
+        let pointer = mem::size_of::<*mut u8>();
+        let layout = cnet_packet::Layout::new(0, 2 * pointer, 3 * pointer, 4 * pointer).unwrap();
+        let mut body = [1u8, 2, 3];
+        // SAFETY: packet is a stack buffer that spans every slot of this layout.
+        unsafe { layout.set_data(packet_ptr, body.as_mut_ptr(), 3) };
+        // SAFETY: as above.
+        let data_slot = unsafe { layout.data_slot(packet_ptr) } as usize;
+        // SAFETY: as above.
+        let size_slot = unsafe { layout.size_slot(packet_ptr) } as usize;
+        assert_eq!(data_slot, base + 2 * pointer);
+        assert_eq!(size_slot, base + 3 * pointer);
+        assert_eq!(packet[2], body.as_mut_ptr() as usize);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *layout.size_slot(packet_ptr) }, 3);
+        // SAFETY: as above.
+        assert_eq!(unsafe { layout.conn_id(packet_ptr) }, 0);
     }
 
     #[test]

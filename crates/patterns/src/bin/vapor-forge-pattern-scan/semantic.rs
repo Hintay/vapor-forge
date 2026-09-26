@@ -1926,13 +1926,15 @@ fn semantic_failure_evidence(
         }
         (SemanticArch::X86, "CCMConnection::RecvPkt") => ccm_recv_pkt32_evidence(code, offset),
         (SemanticArch::X86_64, "CCMConnection::RecvPkt") => ccm_recv_pkt64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Alloc") => cnet_packet_alloc32_evidence(code, offset),
-        (SemanticArch::X86_64, "CNetPacket::Alloc") => cnet_packet_alloc64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Init") => cnet_packet_init32_evidence(code, offset),
-        (SemanticArch::X86_64, "CNetPacket::Init") => cnet_packet_init64_evidence(code, offset),
-        (SemanticArch::X86, "CNetPacket::Release") => cnet_packet_release32_evidence(code, offset),
+        (SemanticArch::X86, "CNetPacket::Alloc") => cnet_packet_alloc_evidence(32, code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Alloc") => cnet_packet_alloc_evidence(64, code, offset),
+        (SemanticArch::X86, "CNetPacket::Init") => cnet_packet_init_evidence(32, code, offset),
+        (SemanticArch::X86_64, "CNetPacket::Init") => cnet_packet_init_evidence(64, code, offset),
+        (SemanticArch::X86, "CNetPacket::Release") => {
+            cnet_packet_release_evidence(32, code, offset)
+        }
         (SemanticArch::X86_64, "CNetPacket::Release") => {
-            cnet_packet_release64_evidence(code, offset)
+            cnet_packet_release_evidence(64, code, offset)
         }
         (SemanticArch::X86, "CWorkThreadPool::AddWorkItem") => {
             work_thread_pool_add_work_item32_evidence(code, offset)
@@ -3181,194 +3183,72 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
 }
 
 fn validate_cnet_packet_alloc32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_alloc32_evidence(code, offset),
-        "Steam allocator packet",
-    )
-}
-
-fn cnet_packet_alloc32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
-    Some(Evidence::required([
-        (
-            "packet allocation size 0x20",
-            has_asm32(bytes, |a| a.push(0x20)),
-        ),
-        ("allocator tag line", has_asm32(bytes, |a| a.push(0x7BF))),
-        (
-            "allocator allocation vtable slot",
-            has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14))),
-        ),
-        (
-            "packet clear/init helper",
-            has_asm32_call_after(bytes, |a| a.push(eax), 0x10),
-        ),
-    ]))
+    validate_cnet_packet_alloc(32, code, offset)
 }
 
 fn validate_cnet_packet_alloc64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_alloc64_evidence(code, offset),
-        "Steam allocator packet",
-    )
+    validate_cnet_packet_alloc(64, code, offset)
 }
 
-fn cnet_packet_alloc64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x80)?;
-    Some(Evidence::required([
-        (
-            "packet allocation size 0x30",
-            has_asm64(bytes, |a| a.mov(esi, 0x30)),
-        ),
-        (
-            "allocator tag line",
-            has_asm64(bytes, |a| a.mov(ecx, 0x7BF)),
-        ),
-        (
-            "allocator allocation vtable slot",
-            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28))),
-        ),
-        (
-            "packet clear/init helper",
-            has_asm64_call_after(bytes, |a| a.mov(rdi, rax), 0x10),
-        ),
-    ]))
+fn validate_cnet_packet_alloc(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_alloc(bitness, code, offset)
+        .ok()
+        .map(|_| "allocator call + constructed packet")
+}
+
+fn cnet_packet_alloc_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_alloc(bitness, code, offset),
+    ))
 }
 
 fn validate_cnet_packet_init32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_init32_evidence(code, offset),
-        "packet fields + refcount",
-    )
-}
-
-fn cnet_packet_init32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    Some(Evidence::required([
-        (
-            "packet argument",
-            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
-        ),
-        (
-            "packet type/data/size/owned stores",
-            has_seq(
-                bytes,
-                &[
-                    0x89, 0x06, 0x8b, 0x45, 0x10, 0x89, 0x46, 0x04, 0x8b, 0x45, 0x14, 0x89, 0x46,
-                    0x08, 0x8b, 0x45, 0x18, 0x89, 0x46, 0x10,
-                ],
-            ) || has_seq(
-                bytes,
-                &[
-                    0x89, 0x4E, 0x10, 0xC7, 0x46, 0x18, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x1C,
-                    0x00, 0x00, 0x00, 0x00, 0x89, 0x06, 0x8B, 0x45,
-                ],
-            ),
-        ),
-        (
-            "tail fields zeroed",
-            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x18), 0))
-                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x1C), 0)),
-        ),
-        (
-            "initial refcount",
-            has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x0C), 1)),
-        ),
-        (
-            "copy-on-write allocation path",
-            has_asm32(bytes, |a| a.push(0x45))
-                && has_asm32(bytes, |a| a.call(dword_ptr(edx + 0x14)))
-                && has_asm32(bytes, |a| a.mov(dword_ptr(esi + 0x10), eax)),
-        ),
-    ]))
+    validate_cnet_packet_init(32, code, offset)
 }
 
 fn validate_cnet_packet_init64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_init64_evidence(code, offset),
-        "packet fields + refcount",
-    )
+    validate_cnet_packet_init(64, code, offset)
 }
 
-fn cnet_packet_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x180)?;
-    Some(Evidence::required([
-        (
-            "packet type/data/size/owned stores",
-            has_asm64(bytes, |a| a.mov(dword_ptr(rbx), r15d))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x08), r12))
-                && has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x10), ebp))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), r14)),
-        ),
-        (
-            "tail fields zeroed",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x28), 0)),
-        ),
-        (
-            "initial refcount",
-            has_asm64(bytes, |a| a.mov(dword_ptr(rbx + 0x14), 1)),
-        ),
-        (
-            "copy-on-write allocation path",
-            has_asm64(bytes, |a| a.mov(ecx, 0x45))
-                && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28)))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rbx + 0x18), rax)),
-        ),
-    ]))
+fn validate_cnet_packet_init(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_init(bitness, code, offset)
+        .ok()
+        .map(|_| "argument stores into packet fields")
+}
+
+fn cnet_packet_init_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_init(bitness, code, offset),
+    ))
 }
 
 fn validate_cnet_packet_release32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_release32_evidence(code, offset),
-        "refcount release + delayed free list",
-    )
-}
-
-fn cnet_packet_release32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x140)?;
-    Some(Evidence::required([
-        (
-            "packet argument",
-            has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x40)))
-                || has_asm32(bytes, |a| a.mov(edi, dword_ptr(esp + 0x50))),
-        ),
-        (
-            "refcount decrement",
-            has_asm32(bytes, |a| a.sub(dword_ptr(edi + 0x0C), 1)),
-        ),
-        (
-            "zero-ref delayed free-list path",
-            has_asm32(bytes, |a| a.mov(dword_ptr(eax), edi))
-                && (has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm0))
-                    || has_asm32(bytes, |a| a.movq(qword_ptr(eax + 0x04), xmm1))),
-        ),
-    ]))
+    validate_cnet_packet_release(32, code, offset)
 }
 
 fn validate_cnet_packet_release64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        cnet_packet_release64_evidence(code, offset),
-        "refcount release + delayed free list",
-    )
+    validate_cnet_packet_release(64, code, offset)
 }
 
-fn cnet_packet_release64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x140)?;
-    Some(Evidence::required([
-        (
-            "refcount decrement",
-            has_asm64(bytes, |a| a.sub(dword_ptr(rdi + 0x14), 1)),
-        ),
-        (
-            "zero-ref packet saved",
-            has_asm64(bytes, |a| a.mov(rbx, rdi))
-                && has_asm64(bytes, |a| a.mov(qword_ptr(rax), rbx)),
-        ),
-        (
-            "delayed free-list timestamp saved",
-            has_asm64(bytes, |a| a.mov(qword_ptr(rax + 0x08), r13)),
-        ),
-    ]))
+fn validate_cnet_packet_release(bitness: u32, code: &[u8], offset: usize) -> Option<&'static str> {
+    vapor_forge_patterns::cnet_packet::decode_release(bitness, code, offset)
+        .ok()
+        .map(|_| "refcount decrement")
+}
+
+fn cnet_packet_release_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    Some(decoded_evidence(
+        vapor_forge_patterns::cnet_packet::decode_release(bitness, code, offset),
+    ))
+}
+
+/// Evidence for a decoder that reports the first thing it could not find.
+fn decoded_evidence<T>(result: Result<T, &'static str>) -> Evidence {
+    let mut evidence = Evidence::default();
+    if let Err(missing) = result {
+        evidence.require(missing, false);
+    }
+    evidence
 }
 
 fn validate_work_thread_pool_add_work_item32(code: &[u8], offset: usize) -> Option<&'static str> {
@@ -4733,6 +4613,7 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         STEAMCLIENT64_SEMANTIC_CHECKS,
         SemanticArch::X86_64,
     );
+    failed |= scan_cnet_packet_layout(code, vaddr, resolved, 64);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4781,6 +4662,7 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         STEAMCLIENT32_SEMANTIC_CHECKS,
         SemanticArch::X86,
     );
+    failed |= scan_cnet_packet_layout(code, vaddr, resolved, 32);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4818,6 +4700,47 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     }
 
     failed
+}
+
+/// Decode the CNetPacket layout exactly as the runtime does, and report it.
+fn scan_cnet_packet_layout(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    let (Some(&alloc), Some(&init), Some(&release)) = (
+        resolved.get("CNetPacket::Alloc"),
+        resolved.get("CNetPacket::Init"),
+        resolved.get("CNetPacket::Release"),
+    ) else {
+        // Each unresolved function is already reported on its own line.
+        return false;
+    };
+    match vapor_forge_patterns::cnet_packet::decode_api(bitness, code, alloc, init, release) {
+        Ok(api) => {
+            println!(
+                "  OK   {:<58} conn_id=0x{:x} data=0x{:x} size=0x{:x} owned=0x{:x} refs=0x{:x} object=0x{:x}",
+                "CNetPacket layout",
+                api.fields.conn_id,
+                api.fields.data,
+                api.fields.size,
+                api.fields.owned_data,
+                api.refcount,
+                api.object_size
+            );
+            false
+        }
+        Err(missing) => {
+            print_evidence_failure(
+                "CNetPacket layout",
+                vaddr + init as u64,
+                Some(&decoded_evidence::<()>(Err(missing))),
+                "layout discovery failed",
+            );
+            true
+        }
+    }
 }
 
 fn ticket_ext_data_mode4_thunk32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {

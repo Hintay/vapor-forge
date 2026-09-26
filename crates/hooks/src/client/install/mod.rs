@@ -1218,6 +1218,11 @@ fn do_install() {
         &[
             (hook_results[18].name, hook_results[18].installed),
             (hook_results[19].name, hook_results[19].installed),
+            // RecvPkt reads and rewrites the packet through this layout.
+            (
+                "CNetPacket layout",
+                super::network::packet_layout().is_some(),
+            ),
         ],
     );
     crate::capability::set_from_requirements(

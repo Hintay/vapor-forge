@@ -7,6 +7,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_patterns::registry::PatternRegistry;
+use vapor_forge_steam_native_abi::cnet_packet;
 
 use crate::netpacket::SendFrameDecision;
 use crate::pattern_resolver::CodeRegion;
@@ -36,6 +37,8 @@ static PACKET_ALLOC_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PACKET_INIT_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PACKET_RELEASE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static ADD_WORK_ITEM_ADDR: AtomicUsize = AtomicUsize::new(0);
+// CNetPacket field offsets, read from this build's CNetPacket::Init.
+static PACKET_LAYOUT: OnceLock<cnet_packet::Layout> = OnceLock::new();
 
 // Production native-dispatch state. Fabricated responses queue here and are
 // dispatched on CNet's frame thread through a custom CWorkItem.
@@ -82,14 +85,34 @@ pub(crate) fn resolve_native_packet_functions(registry: &PatternRegistry, code: 
         "CWorkThreadPool::AddWorkItem",
     );
 
-    if let Some(addr) = packet_alloc {
-        PACKET_ALLOC_ADDR.store(addr, Ordering::Release);
+    if let Some(layout) = packet_init.and_then(|init| decode_packet_layout(code, init)) {
+        let _ = PACKET_LAYOUT.set(layout);
     }
-    if let Some(addr) = packet_init {
-        PACKET_INIT_ADDR.store(addr, Ordering::Release);
-    }
-    if let Some(addr) = packet_release {
-        PACKET_RELEASE_ADDR.store(addr, Ordering::Release);
+    // Injection allocates, fills and frees its own packets, so Alloc and Release
+    // must describe the same object Init fills in before any of them is used.
+    if let (Some(alloc), Some(init), Some(release)) = (packet_alloc, packet_init, packet_release) {
+        match vapor_forge_patterns::cnet_packet::decode_api(
+            usize::BITS,
+            code.bytes,
+            alloc - code.base,
+            init - code.base,
+            release - code.base,
+        ) {
+            Ok(api) => {
+                info!(
+                    refcount = format_args!("0x{:x}", api.refcount),
+                    object_size = format_args!("0x{:x}", api.object_size),
+                    "native-packet: CNetPacket functions agree"
+                );
+                PACKET_ALLOC_ADDR.store(alloc, Ordering::Release);
+                PACKET_INIT_ADDR.store(init, Ordering::Release);
+                PACKET_RELEASE_ADDR.store(release, Ordering::Release);
+            }
+            Err(missing) => warn!(
+                missing,
+                "native-packet: CNetPacket functions disagree, native injection stays off"
+            ),
+        }
     }
     if let Some(addr) = add_work_item {
         ADD_WORK_ITEM_ADDR.store(addr, Ordering::Release);
@@ -103,6 +126,43 @@ pub(crate) fn resolve_native_packet_functions(registry: &PatternRegistry, code: 
         add_work_item = %format_resolved_addr(add_work_item),
         "native-packet: Steam CNetPacket and work-item functions resolved"
     );
+}
+
+/// Read the packet field offsets from `CNetPacket::Init`, the one place this
+/// build states them.
+fn decode_packet_layout(code: &CodeRegion, init: usize) -> Option<cnet_packet::Layout> {
+    let fields = match vapor_forge_patterns::cnet_packet::decode_init(
+        usize::BITS,
+        code.bytes,
+        init - code.base,
+    ) {
+        Ok(fields) => fields,
+        Err(missing) => {
+            warn!(missing, "native-packet: CNetPacket::Init did not decode");
+            return None;
+        }
+    };
+    let layout =
+        cnet_packet::Layout::new(fields.conn_id, fields.data, fields.size, fields.owned_data);
+    match layout {
+        Some(_) => info!(
+            conn_id = format_args!("0x{:x}", fields.conn_id),
+            data = format_args!("0x{:x}", fields.data),
+            size = format_args!("0x{:x}", fields.size),
+            owned_data = format_args!("0x{:x}", fields.owned_data),
+            "native-packet: CNetPacket layout"
+        ),
+        None => warn!(
+            ?fields,
+            "native-packet: CNetPacket layout is not addressable"
+        ),
+    }
+    layout
+}
+
+/// The CNetPacket layout of this build, once `CNetPacket::Init` has decoded.
+pub(crate) fn packet_layout() -> Option<cnet_packet::Layout> {
+    PACKET_LAYOUT.get().copied()
 }
 
 pub(crate) fn native_packet_functions_ready() -> bool {
@@ -243,18 +303,20 @@ pub(crate) unsafe extern "C" fn hk_send_frame(
 pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_void) {
     // SAFETY: RECV_PKT_DETOUR is initialized before this replacement is enabled.
     let original = detour_or_return!("RecvPkt", RECV_PKT_DETOUR);
-    if !crate::capability::is_ready(crate::capability::Capability::CmInterception) {
+    let layout = packet_layout()
+        .filter(|_| crate::capability::is_ready(crate::capability::Capability::CmInterception));
+    let Some(layout) = layout else {
         // SAFETY: forwards the untouched packet to Steam.
         unsafe { original(this, packet) };
         return;
-    }
+    };
     // One-shot capture of the receiver / conn id for native dispatch (worker_this
     // comes from the post-item hook).
-    let context_captured = capture_dispatch_context(this, packet);
+    let context_captured = capture_dispatch_context(this, packet, layout);
     let captured_generation = injection_generation();
     maybe_warmup_flush();
-    capture_last_inbound_body(packet);
-    maybe_fire_armed_selftest(packet);
+    capture_last_inbound_body(packet, layout);
+    maybe_fire_armed_selftest(packet, layout);
 
     // Injection is driven per-source (each fabricated response dispatches itself
     // the moment it is ready); no sweep is needed on the inbound path.
@@ -263,7 +325,7 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // original call, then restore Steam's owned payload before its caller
     // releases the CNetPacket.
     // SAFETY: packet is the live CNetPacket supplied by Steam's caller.
-    let prepared = unsafe { crate::netpacket::prepare_recv_packet(packet) };
+    let prepared = unsafe { crate::netpacket::prepare_recv_packet(packet, layout) };
     let delivered = match prepared.decision {
         crate::netpacket::PreparedRecvDecision::Pass => {
             // SAFETY: forwarding this callback's unchanged object and packet pointers.
@@ -283,7 +345,7 @@ pub(crate) unsafe extern "C" fn hk_recv_pkt(this: *mut c_void, packet: *mut c_vo
     // Packet routing can discover an account transition and invalidate the
     // context above. This same real packet is authoritative for the new context.
     if !context_captured || injection_generation() != captured_generation {
-        capture_dispatch_context(this, packet);
+        capture_dispatch_context(this, packet, layout);
         maybe_warmup_flush();
     }
 }
@@ -740,13 +802,17 @@ fn next_injection_generation(generation: u64) -> u64 {
 }
 
 /// Refresh the native dispatch context from a real inbound packet.
-pub(crate) fn capture_dispatch_context(this: *mut c_void, packet: *mut c_void) -> bool {
+pub(crate) fn capture_dispatch_context(
+    this: *mut c_void,
+    packet: *mut c_void,
+    layout: cnet_packet::Layout,
+) -> bool {
     if this.is_null() || packet.is_null() {
         return false;
     }
     let observed_generation = injection_generation();
-    // SAFETY: packet is the live CNetPacket; its first field is the conn id.
-    let conn_id = unsafe { *(packet as *const u32) };
+    // SAFETY: packet is the live CNetPacket of the build the layout was read from.
+    let conn_id = unsafe { layout.conn_id(packet) };
     let pthread = current_pthread();
     let outcome = DISPATCH.capture(
         DispatchContext {
@@ -1248,10 +1314,8 @@ fn drain_injections(generation: u64, pthread: usize) -> DrainResult {
         }
         // SAFETY: the lease keeps this context valid through the synchronous call.
         unsafe { recv_pkt(context.receiver as *mut c_void, packet) };
-        let owned_after = read_word_at(
-            packet,
-            vapor_forge_steam_native_abi::cnet_packet::OWNED_DATA_OFFSET,
-        );
+        let owned_after =
+            packet_layout().and_then(|layout| read_word_at(packet, layout.owned_data_offset()));
         info!(
             conn_id = format_args!("0x{:x}", context.conn_id),
             len,
@@ -1277,14 +1341,14 @@ pub(crate) fn arm_native_inject_selftest() -> bool {
 
 /// If armed and dispatch is ready, replay this inbound packet's body once through
 /// the production dispatch, then disarm. Arch-generic (reads the CNetPacket slots).
-fn maybe_fire_armed_selftest(packet: *mut c_void) {
+fn maybe_fire_armed_selftest(packet: *mut c_void, layout: cnet_packet::Layout) {
     if !NATIVE_INJECT_ARMED.load(Ordering::Acquire) || packet.is_null() || !dispatch_ready() {
         return;
     }
     // SAFETY: packet is the live CNetPacket supplied to the RecvPkt hook.
-    let data = unsafe { *vapor_forge_steam_native_abi::cnet_packet::data_slot(packet) };
+    let data = unsafe { *layout.data_slot(packet) };
     // SAFETY: same live CNetPacket.
-    let size = unsafe { *vapor_forge_steam_native_abi::cnet_packet::size_slot(packet) };
+    let size = unsafe { *layout.size_slot(packet) };
     if data.is_null() || size == 0 || size as usize > 1024 * 1024 {
         // Stay armed until a packet with a usable body arrives.
         return;
@@ -1307,14 +1371,14 @@ fn maybe_fire_armed_selftest(packet: *mut c_void) {
 
 /// Capture one real inbound body (once) for the own-thread dispatch test. Gated
 /// by an atomic so the hot RecvPkt path pays only a load after the first capture.
-fn capture_last_inbound_body(packet: *mut c_void) {
+fn capture_last_inbound_body(packet: *mut c_void, layout: cnet_packet::Layout) {
     if LAST_INBOUND_CAPTURED.load(Ordering::Acquire) || packet.is_null() {
         return;
     }
     // SAFETY: packet is the live CNetPacket supplied to the RecvPkt hook.
-    let data = unsafe { *vapor_forge_steam_native_abi::cnet_packet::data_slot(packet) };
+    let data = unsafe { *layout.data_slot(packet) };
     // SAFETY: same live CNetPacket.
-    let size = unsafe { *vapor_forge_steam_native_abi::cnet_packet::size_slot(packet) };
+    let size = unsafe { *layout.size_slot(packet) };
     if data.is_null() || size == 0 || size as usize > 1024 * 1024 {
         return;
     }

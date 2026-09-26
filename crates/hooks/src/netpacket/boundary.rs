@@ -120,16 +120,20 @@ pub(crate) fn queue_playtime_notification(
 /// fields when synchronous RecvPkt dispatch returns.
 ///
 /// # Safety
-/// `packet` must be null or a valid `CNetPacket` pointer, and the guard must be
-/// dropped before the packet can be released.
-pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> PreparedRecvPacket {
+/// `packet` must be null or a valid `CNetPacket` pointer of the build `layout`
+/// was read from, and the guard must be dropped before the packet can be
+/// released.
+pub(crate) unsafe fn prepare_recv_packet(
+    packet: *mut c_void,
+    layout: cnet_packet::Layout,
+) -> PreparedRecvPacket {
     if packet.is_null() {
         return PreparedRecvPacket::pass();
     }
     // SAFETY: packet is the non-null CNetPacket supplied by Steam.
-    let p_data = unsafe { cnet_packet::data_slot(packet) };
+    let p_data = unsafe { layout.data_slot(packet) };
     // SAFETY: packet is the same validated CNetPacket.
-    let p_size = unsafe { cnet_packet::size_slot(packet) };
+    let p_size = unsafe { layout.size_slot(packet) };
     // SAFETY: both slots point into the live CNetPacket.
     let data = unsafe { *p_data };
     // SAFETY: both slots point into the live CNetPacket.
@@ -146,7 +150,9 @@ pub(crate) unsafe fn prepare_recv_packet(packet: *mut c_void) -> PreparedRecvPac
         RecvFrameDecision::Drop => PreparedRecvDecision::Drop,
         RecvFrameDecision::Rewrite(replacement) => {
             // SAFETY: caller guarantees packet remains live for the guard lifetime.
-            PreparedRecvDecision::Rewrite(unsafe { PacketSwapGuard::new(packet, replacement) })
+            PreparedRecvDecision::Rewrite(unsafe {
+                PacketSwapGuard::new(packet, layout, replacement)
+            })
         }
     };
     PreparedRecvPacket {
@@ -195,12 +201,13 @@ pub(crate) struct PacketSwapGuard {
 
 impl PacketSwapGuard {
     /// # Safety
-    /// `packet` must be a valid `CNetPacket` pointer.
-    unsafe fn new(packet: *mut c_void, response: Vec<u8>) -> Self {
+    /// `packet` must be a valid `CNetPacket` pointer of the build `layout` was
+    /// read from.
+    unsafe fn new(packet: *mut c_void, layout: cnet_packet::Layout, response: Vec<u8>) -> Self {
         // SAFETY: caller guarantees packet is a valid CNetPacket.
-        let p_data = unsafe { cnet_packet::data_slot(packet) };
+        let p_data = unsafe { layout.data_slot(packet) };
         // SAFETY: caller guarantees packet is a valid CNetPacket.
-        let p_size = unsafe { cnet_packet::size_slot(packet) };
+        let p_size = unsafe { layout.size_slot(packet) };
         // SAFETY: both slots point into the live packet.
         let orig_data = unsafe { *p_data };
         // SAFETY: both slots point into the live packet.
@@ -240,18 +247,20 @@ mod tests {
     fn packet_swap_guard_restores_steam_fields() {
         let mut packet_storage = [0usize; 8];
         let packet = packet_storage.as_mut_ptr().cast::<c_void>();
+        let pointer = std::mem::size_of::<usize>();
+        // Offsets away from the start, as some builds place them.
+        let layout = cnet_packet::Layout::new(0, 2 * pointer, 3 * pointer, 4 * pointer).unwrap();
         let mut original = [1u8, 2, 3];
-        // SAFETY: packet_storage is aligned and large enough for the native
-        // CNetPacket slots used by these accessors.
-        unsafe { cnet_packet::set_data(packet, original.as_mut_ptr(), original.len() as u32) };
+        // SAFETY: packet_storage is aligned and spans every slot of the layout.
+        unsafe { layout.set_data(packet, original.as_mut_ptr(), original.len() as u32) };
 
         {
             // SAFETY: packet_storage remains live until the guard is dropped.
-            let _guard = unsafe { PacketSwapGuard::new(packet, vec![9, 8]) };
+            let _guard = unsafe { PacketSwapGuard::new(packet, layout, vec![9, 8]) };
             // SAFETY: packet points to the same live test storage.
-            let data = unsafe { *cnet_packet::data_slot(packet) };
+            let data = unsafe { *layout.data_slot(packet) };
             // SAFETY: packet points to the same live test storage.
-            let size = unsafe { *cnet_packet::size_slot(packet) };
+            let size = unsafe { *layout.size_slot(packet) };
             assert_eq!(size, 2);
             // SAFETY: the guard owns two initialized replacement bytes.
             assert_eq!(unsafe { std::slice::from_raw_parts(data, 2) }, [9, 8]);
@@ -259,10 +268,12 @@ mod tests {
 
         assert_eq!(
             // SAFETY: packet points to the same live test storage.
-            unsafe { *cnet_packet::data_slot(packet) },
+            unsafe { *layout.data_slot(packet) },
             original.as_mut_ptr()
         );
         // SAFETY: packet points to the same live test storage.
-        assert_eq!(unsafe { *cnet_packet::size_slot(packet) }, 3);
+        assert_eq!(unsafe { *layout.size_slot(packet) }, 3);
+        // Nothing outside the layout's slots was written.
+        assert_eq!(packet_storage[1], 0);
     }
 }

@@ -85,26 +85,21 @@ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89
 [[steamclient."CCMConnection::RecvPkt".variants]]
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 8B 45 08 89 45 D4 8B 45 0C 89 FB 89 45 D0 89 C1 65 A1 14 00 00 00"
 
+# CCMConnection splits a multi-message into sub-packets with Alloc, Init, a
+# receiver dispatch and Release. That loop keeps its shape across builds whose
+# CNetPacket bodies and layout differ, so all three are followed from its
+# calls, and the field offsets are read from Init itself.
 [steamclient."CNetPacket::Alloc"]
-follow = "upward"
-prologue = "53 56"
-pattern = "68 BF 07 00 00 51 6A 20 50 FF 52 14"
+follow = "relative"
+pattern = "E8 ? ? ? ? 83 EC 08 6A 01 89 C7 6A 00 55 56 01 EE FF 74 24 ? 50 E8 ? ? ? ? 8B 44 24 ? 83 C4 18 8B 00 57 FF 74 24 ? FF 50 0C 89 3C 24 E8"
 
 [steamclient."CNetPacket::Init"]
-follow = "none"
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 2C 8B 45 1C 8B 5D 10"
-
-# steamrt stack-canary implementation shape.
-[[steamclient."CNetPacket::Init".variants]]
-pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 2C 8B 45 10 8B 75 08 8B 4D 18 89 45 ? 65 8B 15 14 00 00 00"
+follow = "relative"
+pattern = "E8 ? ? ? ? 8B 44 24 ? 83 C4 18 8B 00 57 FF 74 24 ? FF 50 0C 89 3C 24 E8"
 
 [steamclient."CNetPacket::Release"]
-follow = "none"
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 7C 24 40 83 6F 0C 01 74"
-
-# steamrt stack-canary implementation shape.
-[[steamclient."CNetPacket::Release".variants]]
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 3C 8B 7C 24 50 83 6F 0C 01 74"
+follow = "relative"
+pattern = "E8 ? ? ? ? 8B 4C 24 ? 83 C4 10 29 E9 75 ? 83 C4 1C 5B 5E 5F 5D"
 
 [steamclient."CWorkThreadPool::AddWorkItem"]
 follow = "none"
