@@ -1520,16 +1520,70 @@ fn discover_app_overview_change64_layout(
     })
 }
 
+/// The app map's offset inside `CSteamUIAppController`, which differs between
+/// builds.
+const APP_MAP_OFFSETS32: [i32; 2] = [0x9E0, 0xC38];
+const APP_MAP_OFFSETS64: [i32; 2] = [0xB58, 0xF80];
+
+fn has_app_map_load32(bytes: &[u8]) -> bool {
+    APP_MAP_OFFSETS32
+        .iter()
+        .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset))))
+}
+
+fn has_app_map_load64(bytes: &[u8]) -> bool {
+    APP_MAP_OFFSETS64
+        .iter()
+        .any(|&offset| has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax + offset))))
+}
+
+/// `mov byte ptr [reg + disp], imm` on any base register.
+fn has_byte_store_imm32(bytes: &[u8], disp: u8, imm: u8) -> bool {
+    bytes.windows(4).any(|window| {
+        window[0] == 0xc6
+            && (0x40..=0x47).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+            && window[3] == imm
+    })
+}
+
+/// `or dword ptr [reg + disp], imm8` on any base register.
+fn has_or_dword_imm32(bytes: &[u8], disp: u8, imm: u8) -> bool {
+    bytes.windows(4).any(|window| {
+        window[0] == 0x83
+            && (0x48..=0x4f).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+            && window[3] == imm
+    })
+}
+
+/// The change pointer stepped on by `disp`, as `add reg, disp` or
+/// `lea reg, [reg + disp]`. Builds differ in which of the two they emit.
+fn has_pointer_step32(bytes: &[u8], disp: u8) -> bool {
+    let added = bytes
+        .windows(3)
+        .any(|window| window[0] == 0x83 && (0xc0..=0xc7).contains(&window[1]) && window[2] == disp);
+    let leaed = bytes.windows(3).any(|window| {
+        window[0] == 0x8d
+            && (0x40..=0x7f).contains(&window[1])
+            && window[1] & 0x07 != 0x04
+            && window[2] == disp
+    });
+    added || leaed
+}
+
 fn discover_app_overview_change32_layout(
     code: &[u8],
     build_complete_offset: usize,
 ) -> Option<AppOverviewChangeLayout> {
     let bytes = bounded_tail(code, build_complete_offset, 0x120)?;
-    if !bytes.windows(3).any(|w| w == [0x83, 0xc2, 0x10]) {
-        return None;
-    }
-    if !bytes.windows(4).any(|w| w == [0xc6, 0x42, 0x2c, 0x01])
-        || !bytes.windows(4).any(|w| w == [0x83, 0x4a, 0x08, 0x01])
+    // Register-agnostic: the layout returned below is unchanged across builds,
+    // but which register holds the change object is not.
+    if !has_pointer_step32(bytes, 0x10)
+        || !has_byte_store_imm32(bytes, 0x2c, 1)
+        || !has_or_dword_imm32(bytes, 0x08, 1)
     {
         return None;
     }
@@ -4393,8 +4447,9 @@ fn steamui_run_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidence> 
         ("frame time store", has_x86_fstp_esp_disp8(bytes, 0x0C)),
         (
             "app controller state load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0xB30)))
-                || has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0xB70))),
+            [0xB30i32, 0xB3C, 0xB70]
+                .iter()
+                .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset)))),
         ),
     ]))
 }
@@ -4607,7 +4662,7 @@ fn get_app_by_id32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         ),
         (
             "app map load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x9E0))),
+            has_app_map_load32(bytes),
         ),
     ]))
 }
@@ -4643,7 +4698,7 @@ fn mark_app_change32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     Some(Evidence::required([
         (
             "library app map load",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + 0x9E0))),
+            has_app_map_load32(bytes),
         ),
         (
             "change flag materialization",
@@ -4665,7 +4720,7 @@ fn mark_app_change64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         ("change kind filter", has_asm64(bytes, |a| a.cmp(edi, 7))),
         (
             "library app map load",
-            has_asm64(bytes, |a| a.mov(rdi, qword_ptr(rax + 0xB58))),
+            has_app_map_load64(bytes),
         ),
         ("app object save", has_asm64(bytes, |a| a.mov(r12, rax))),
     ]))

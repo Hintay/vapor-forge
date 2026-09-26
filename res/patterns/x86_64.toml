@@ -160,10 +160,12 @@ pattern = "41 57 49 89 FF 41 56 41 55 41 54 41 89 CC 55 48 89 D5 53 48 89 F3 48 
 follow = "none"
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 5D ? 48 89 FB E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? 48 C7 85 ? ? ? ? 00 00 00 00 48 C7 85 ? ? ? ? 00 00 00 00"
 
+# The vtable slot, the app map offset and the overview flag byte differ between
+# builds while the sequence around them is identical, so each is a wildcard.
 [steamui."CSteamUIAppController::FillInAppOverview"]
 follow = "upward"
 prologue = "53 55 54 41 55 41 56 41 57 41"
-pattern = "48 8B 45 00 48 89 EF 48 8D 0D ? ? ? ? 48 8B 90 B0 00 00 00 48 39 CA 0F 85 ? ? ? ? FF 50 68 83 E0 01 84 C0 74 ? 81 4B 10 00 00 10 00 C6 83 ED 00 00 00 01"
+pattern = "48 8B 45 00 48 89 EF 48 8D 0D ? ? ? ? 48 8B 90 ? ? 00 00 48 39 CA 0F 85 ? ? ? ? FF 50 ? 83 E0 01 84 C0 74 ? 81 4B 10 00 00 10 00 C6 83 ? 00 00 00 01"
 
 [steamui."CSteamApp::IsVisibleInGamesList"]
 follow = "none"
@@ -184,4 +186,4 @@ pattern = "41 57 41 56 49 89 FE 41 55 41 54 55 53 48 83 EC ? 89 74 24 ? 89 54 24
 [steamui."CUpdateManager::MarkAppChange"]
 follow = "upward"
 prologue = "53 FD 89 48 55 54 41 55 41 56 41 F7 89 41 57 41"
-pattern = "48 83 45 68 01 41 83 FF 07 0F 84 ? ? ? ? E8 ? ? ? ? 48 8B B8 58 0B 00 00 31 D2 44 89 FE E8 ? ? ? ? 48 85 C0 49 89 C4 74 ?"
+pattern = "48 83 45 68 01 41 83 FF 07 0F 84 ? ? ? ? E8 ? ? ? ? 48 8B B8 ? ? 00 00 31 D2 44 89 FE E8 ? ? ? ? 48 85 C0 49 89 C4 74 ?"
