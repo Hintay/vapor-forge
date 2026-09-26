@@ -12,6 +12,8 @@ pub mod cnet_packet;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cuser_adapter;
 pub mod elf;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;
 pub mod semantic;

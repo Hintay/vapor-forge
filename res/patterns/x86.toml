@@ -185,6 +185,15 @@ pic_entry = true
 [[steamclient."SetEnvString".variants]]
 pattern = "8B 45 D4 8B 40 78 85 C0 0F 84 ? ? ? ? 83 EC 0C FF 75 0C 8B 7D D0 89 FB E8 ? ? ? ? 83 C4 10 6A 01 68 17 04 00 00 50 FF 75 0C E8"
 
+# The writer that also takes a mode flag and a separator. A real calling
+# convention change, so the ordinary family needs both shapes: this one matches
+# the entry directly, so it follows neither the prologue nor the PIC entry.
+[[steamclient."SetEnvString".variants]]
+steamrt = false
+follow = "none"
+pic_entry = false
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC ? 8B 75 0C 8B 7D 08 89 45 ? 8B 45 18 89 45 ? 85 F6 0F 84 ? ? ? ? 83 7D 14 01"
+
 # ---------------------------------------------------------------------------
 # steamui.so — library UI management
 # ---------------------------------------------------------------------------

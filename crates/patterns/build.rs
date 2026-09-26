@@ -76,7 +76,7 @@ fn main() {
 
         code.push_str(&format!(
             "    crate::registry::PatternDef {{ name: {:?}, pattern: {:?}, follow: crate::registry::FollowMode::{}, prologue: {}, callee_pattern: {}, pic_entry: {}, steamrt_variant: {}, module: {:?} }},\n",
-            entry.name, entry.pattern, follow, prologue, callee_pattern, entry.pic_entry, entry.ordinal != 0, entry.module
+            entry.name, entry.pattern, follow, prologue, callee_pattern, entry.pic_entry, entry.steamrt, entry.module
         ));
     }
 
@@ -119,6 +119,10 @@ struct TomlVariant {
     prologue: Option<String>,
     callee_pattern: Option<String>,
     pic_entry: Option<bool>,
+    /// A variant is a steamrt shape unless it says otherwise. `false` makes it
+    /// an additional ordinary shape, which is only for a genuine ABI change:
+    /// two shapes of one function that the ordinary family must choose between.
+    steamrt: Option<bool>,
 }
 
 struct GeneratedEntry {
@@ -130,6 +134,7 @@ struct GeneratedEntry {
     prologue: Option<String>,
     callee_pattern: Option<String>,
     pic_entry: bool,
+    steamrt: bool,
 }
 
 fn push_generated_entries(
@@ -147,6 +152,7 @@ fn push_generated_entries(
         prologue: entry.prologue.clone(),
         callee_pattern: entry.callee_pattern.clone(),
         pic_entry: entry.pic_entry.unwrap_or(false),
+        steamrt: false,
     });
 
     for (idx, variant) in entry.variants.as_deref().unwrap_or(&[]).iter().enumerate() {
@@ -164,6 +170,7 @@ fn push_generated_entries(
             pic_entry: variant
                 .pic_entry
                 .unwrap_or_else(|| entry.pic_entry.unwrap_or(false)),
+            steamrt: variant.steamrt.unwrap_or(true),
         });
     }
 }

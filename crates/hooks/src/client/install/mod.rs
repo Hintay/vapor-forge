@@ -884,17 +884,39 @@ fn do_install() {
 
     // Resolve SetEnvString as a raw fn pointer for library injection, and as a
     // detour so LD_PRELOAD writes made by Steam can be merged with ours.
-    let d_set_env_string = if env_hooks_supported() {
+    // The writer's convention decides which replacement can be installed: a
+    // three-argument detour in front of a five-parameter callee would forward a
+    // short argument list.
+    if env_hooks_supported() {
         super::env::resolve_set_env_string(&registry, &code);
+    }
+    let env_writer_abi = super::env::set_env_string_abi();
+    let d_set_env_string = matches!(
+        env_writer_abi,
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValue)
+    )
+    .then(|| {
         resolve_from_registry(
             &registry,
             &code,
             "SetEnvString",
             super::env::hk_set_env_string as super::env::SetEnvStringFn,
         )
-    } else {
-        None
-    };
+    })
+    .flatten();
+    let d_set_env_string_sep = matches!(
+        env_writer_abi,
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValueSeparator)
+    )
+    .then(|| {
+        resolve_from_registry(
+            &registry,
+            &code,
+            "SetEnvString",
+            super::env::hk_set_env_string_sep as super::env::SetEnvStringSepFn,
+        )
+    })
+    .flatten();
 
     let callback_group_resolved = d_set_api_call_result.is_some()
         && d_register_internal_callback.is_some()
@@ -1021,7 +1043,20 @@ fn do_install() {
             super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_NAME,
             d_is_cloud_enabled_for_account
         ),
-        hr!("SetEnvString", d_set_env_string),
+        // Either convention may be the one pending, so report whichever is.
+        HookResult {
+            name: "SetEnvString",
+            installed: d_set_env_string.is_some() || d_set_env_string_sep.is_some(),
+            addr: d_set_env_string
+                .as_ref()
+                .map(|pending| pending.callee_addr)
+                .or_else(|| {
+                    d_set_env_string_sep
+                        .as_ref()
+                        .map(|pending| pending.callee_addr)
+                })
+                .unwrap_or(0),
+        },
     ];
 
     macro_rules! finalize {
@@ -1197,14 +1232,22 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::cloud::IS_CLOUD_ENABLED_FOR_ACCOUNT_DETOUR),
         d_is_cloud_enabled_for_account
     );
-    // Optional: without it native .so entries still reach the map, but Steam's
-    // own LD_PRELOAD write replaces them (see hk_set_env_string).
-    finalize!(
+    // Without it native .so entries still reach the map, but Steam's own
+    // LD_PRELOAD write replaces them (see hk_set_env_string). Exactly one of the
+    // two conventions can be pending, so the results are folded together.
+    let set_env_installed = finalize!(
         27,
         "SetEnvString",
         std::ptr::addr_of_mut!(super::env::SET_ENV_STRING_DETOUR),
         d_set_env_string
     );
+    let set_env_sep_installed = finalize!(
+        27,
+        "SetEnvString",
+        std::ptr::addr_of_mut!(super::env::SET_ENV_STRING_SEP_DETOUR),
+        d_set_env_string_sep
+    );
+    hook_results[27].installed = set_env_installed || set_env_sep_installed;
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
         (hook_results[1].name, hook_results[1].installed),

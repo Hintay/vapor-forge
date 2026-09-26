@@ -145,6 +145,11 @@ pattern = "41 57 41 56 41 55 41 54 ? ? ? 55 ? ? ? 53 48 83 EC ? 48 85 F6 48 89 5
 [[steamclient."SetEnvString".variants]]
 pattern = "41 57 49 89 FF 41 56 41 55 41 54 55 53 48 89 F3 48 83 EC ? 48 85 F6 64 4C 8B 2C 25 28 00 00 00 ? ? ? ? ? 49 89 D5 0F 84 ? ? ? ? 4D 85 ED 0F 84 ? ? ? ? 41 8B 87 A4 00 00 00"
 
+# The writer that also takes a mode flag and a separator. A real calling
+# convention change, so this shape has to sit alongside the one above.
+[[steamclient."SetEnvString".variants]]
+pattern = "41 57 49 89 FF 41 56 41 55 41 54 41 89 CC 55 48 89 D5 53 48 89 F3 48 83 EC ? 48 85 F6 64 4C 8B 2C 25 28 00 00 00 4C 89 6C 24 ? 45 89 C5 0F 84 ? ? ? ? 48 85 ED 75 ? 41 83 FC 01"
+
 # steamui.so patterns.
 
 [steamui."CSteamUIAppController::RunFrame"]

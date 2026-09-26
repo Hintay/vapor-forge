@@ -4168,21 +4168,32 @@ fn validate_set_env_string32(code: &[u8], offset: usize) -> Option<&'static str>
     evidence_result(set_env_string32_evidence(code, offset), "env map insertion")
 }
 
+/// `mov <r32>, [ebp + disp]`, whichever register the build happened to pick.
+fn has_x86_ebp_arg_load(bytes: &[u8], disp: u8) -> bool {
+    bytes
+        .windows(3)
+        .any(|window| window[0] == 0x8b && window[1] & 0xc7 == 0x45 && window[2] == disp)
+}
+
 fn set_env_string32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
+    // The map, key and value, in whichever registers the build chose. Three
+    // builds pick three different sets, so only the stack slots are pinned.
+    let writer_args = has_x86_ebp_arg_load(bytes, 0x08)
+        && has_x86_ebp_arg_load(bytes, 0x0C)
+        && has_x86_ebp_arg_load(bytes, 0x10);
+    let key_value_map = has_x86_mov_from_any_disp8(bytes, 0x78);
+    let key_value_insert = has_asm32(bytes, |a| a.push(0x417)) && has_asm32(bytes, |a| a.push(1));
+    // `(envMap, key, value, flag, separator)`, which builds the entry on its own
+    // stack and walks the map here instead of in a helper.
+    let separator_map = has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
+        && has_asm32(bytes, |a| a.mov(edx, dword_ptr(edi + 0x30)));
+    let separator_insert = has_asm32(bytes, |a| a.cmp(dword_ptr(ebp + 0x14), 1));
+
     Some(Evidence::required([
-        (
-            "three cdecl arguments",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
-                && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
-                && has_asm32(bytes, |a| a.test(eax, eax)),
-        ),
-        (
-            "environment map load",
-            has_x86_mov_from_any_disp8(bytes, 0x78),
-        ),
-        ("setenv key hash", has_asm32(bytes, |a| a.push(0x417))),
-        ("insert mode argument", has_asm32(bytes, |a| a.push(1))),
+        ("writer arguments", writer_args),
+        ("environment map fields", key_value_map || separator_map),
+        ("insert mode", key_value_insert || separator_insert),
     ]))
 }
 
@@ -4204,20 +4215,29 @@ fn set_env_string64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
         && has_asm64(bytes, |a| a.test(r13, r13));
     let ordinary_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(rbp + 0xA4)));
     let steamrt_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0xA4)));
+    let key_value_insert =
+        has_asm64(bytes, |a| a.mov(edx, 0x417)) && has_asm64(bytes, |a| a.mov(ecx, 1));
+    // `(envMap, key, value, flag, separator)`, which builds the entry on its own
+    // stack and walks the map here instead of in a helper.
+    let separator_arguments = has_asm64(bytes, |a| a.mov(r15, rdi))
+        && has_asm64(bytes, |a| a.mov(rbx, rsi))
+        && has_asm64(bytes, |a| a.mov(rbp, rdx))
+        && has_asm64(bytes, |a| a.mov(r12d, ecx))
+        && has_asm64(bytes, |a| a.mov(r13d, r8d));
+    let separator_map = has_asm64(bytes, |a| a.mov(eax, dword_ptr(r15 + 0x10)))
+        && has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x44)));
+    let separator_insert = has_asm64(bytes, |a| a.cmp(r12d, 1));
+
     Some(Evidence::required([
         (
-            "three SysV arguments",
-            ordinary_arguments || steamrt_arguments,
+            "writer arguments",
+            ordinary_arguments || steamrt_arguments || separator_arguments,
         ),
         (
-            "environment map load",
-            ordinary_map || steamrt_map,
+            "environment map fields",
+            ordinary_map || steamrt_map || separator_map,
         ),
-        (
-            "setenv key hash",
-            has_asm64(bytes, |a| a.mov(edx, 0x417)),
-        ),
-        ("insert mode argument", has_asm64(bytes, |a| a.mov(ecx, 1))),
+        ("insert mode", key_value_insert || separator_insert),
     ]))
 }
 

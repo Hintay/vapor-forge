@@ -587,6 +587,7 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
     let mut current_name: Option<String> = None;
     let mut current_module: Option<String> = None;
     let mut current_is_variant = false;
+    let mut current_steamrt: Option<bool> = None;
     let mut current_start_line = 0usize;
     let mut current_pattern: Option<String> = None;
     let mut current_follow: Option<FollowMode> = None;
@@ -604,7 +605,8 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
                  follow: Option<FollowMode>,
                  prologue: Option<Vec<u8>>,
                  callee_pattern: Option<String>,
-                 pic_entry: Option<bool>|
+                 pic_entry: Option<bool>,
+                 steamrt: Option<bool>|
      -> Result<(), String> {
         let Some(name) = name else {
             return Ok(());
@@ -630,7 +632,9 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
             callee_pattern: callee_pattern
                 .or_else(|| inherited.and_then(|entry| entry.callee_pattern.clone())),
             pic_entry: pic_entry.unwrap_or_else(|| inherited.is_some_and(|entry| entry.pic_entry)),
-            steamrt_variant: is_variant,
+            // A variant is a steamrt shape unless it says otherwise; see the
+            // `steamrt` key in res/patterns.
+            steamrt_variant: is_variant && steamrt.unwrap_or(true),
             module: module.clone(),
         };
         if !is_variant
@@ -668,11 +672,13 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
                 current_prologue.take(),
                 current_callee_pattern.take(),
                 current_pic_entry,
+                current_steamrt,
             )?;
             current_follow = None;
             current_prologue = None;
             current_callee_pattern = None;
             current_pic_entry = None;
+            current_steamrt = None;
             current_module = Some(module);
             current_name = Some(name);
             current_is_variant = is_variant;
@@ -708,6 +714,12 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
                     current_callee_pattern = Some(parse_quoted_string(value, line_no, key)?)
                 }
                 "pic_entry" => current_pic_entry = Some(parse_bool(value, line_no, key)?),
+                "steamrt" if current_is_variant => {
+                    current_steamrt = Some(parse_bool(value, line_no, key)?)
+                }
+                "steamrt" => {
+                    return Err(format!("line {line_no}: steamrt applies only to a variant"));
+                }
                 _ => return Err(format!("line {line_no}: unknown key {key:?}")),
             }
         } else {
@@ -730,6 +742,7 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
         current_prologue,
         current_callee_pattern,
         current_pic_entry,
+        current_steamrt,
     )?;
 
     Ok(result)
@@ -960,6 +973,69 @@ pattern = "E9 ? ? ? ?"
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].pattern, "E9 ? ? ? ?");
         assert_eq!(entries[1].follow, FollowMode::Relative);
+    }
+
+    #[test]
+    fn ordinary_variant_is_selected_with_the_primary() {
+        let toml = r#"
+[steamclient."SetEnvString"]
+pattern = "AA ? CC"
+
+[[steamclient."SetEnvString".variants]]
+pattern = "DD ? FF"
+
+[[steamclient."SetEnvString".variants]]
+steamrt = false
+follow = "entry"
+pattern = "11 ? 33"
+"#;
+        let entries: Vec<RuntimePatternEntry> = parse_toml_patterns(toml)
+            .unwrap()
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect();
+        assert_eq!(entries[2].follow, FollowMode::Entry);
+        let target = |binary_family| {
+            Some(PatternTarget {
+                architecture: PatternArchitecture::X86,
+                binary_family,
+            })
+        };
+        let patterns = |selected: Vec<&RuntimePatternEntry>| {
+            selected
+                .into_iter()
+                .map(|entry| entry.pattern.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            patterns(select_runtime_variants(
+                &entries,
+                target(SteamBinaryFamily::Ordinary)
+            )),
+            ["AA ? CC", "11 ? 33"]
+        );
+        assert_eq!(
+            patterns(select_runtime_variants(
+                &entries,
+                target(SteamBinaryFamily::SteamRt)
+            )),
+            ["DD ? FF"]
+        );
+    }
+
+    #[test]
+    fn steamrt_key_is_rejected_on_a_primary() {
+        let toml = r#"
+[steamclient."SetEnvString"]
+steamrt = false
+pattern = "AA ? CC"
+"#;
+        let error = parse_toml_patterns(toml).err().unwrap();
+        assert!(
+            error.contains("steamrt applies only to a variant"),
+            "{error}"
+        );
     }
 
     #[test]

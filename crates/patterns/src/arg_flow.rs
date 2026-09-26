@@ -94,6 +94,22 @@ pub struct Trace {
     pub calls: Vec<Call>,
     /// The return register at the first `ret`, if the walk reached one.
     pub returned: Option<Value>,
+    /// Argument positions whose incoming value the body consumes, ascending and
+    /// deduplicated. A function that consumes an argument the caller never
+    /// passes would be reading the caller's stack or a stale register, so the
+    /// positions here are ones its callers pass.
+    pub arguments_read: Vec<u8>,
+}
+
+impl Trace {
+    fn note_read(&mut self, value: Option<Value>) {
+        if let Some(Value::Arg(position)) = value {
+            if !self.arguments_read.contains(&position) {
+                self.arguments_read.push(position);
+                self.arguments_read.sort_unstable();
+            }
+        }
+    }
 }
 
 /// Walk at most `limit` bytes of the function at `offset` in `code`.
@@ -214,6 +230,30 @@ impl State {
         factory: &mut InstructionInfoFactory,
         trace: &mut Trace,
     ) {
+        // Every operand the instruction reads is inspected before it is
+        // modelled, so an argument read in something the model ignores still
+        // counts. A destination that is only written, `lea`'s address operand
+        // and the `xor r, r` zeroing idiom consume no incoming value.
+        let zeroing = matches!(instruction.mnemonic(), Mnemonic::Xor | Mnemonic::Sub)
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.op1_register();
+        if !zeroing {
+            let mut read = [false; 5];
+            let info = factory.info(instruction);
+            for (operand, slot) in read
+                .iter_mut()
+                .enumerate()
+                .take(instruction.op_count() as usize)
+            {
+                *slot = is_read(info.op_access(operand as u32));
+            }
+            for (operand, _) in read.iter().enumerate().filter(|(_, &read)| read) {
+                let value = self.operand(instruction, operand as u32);
+                trace.note_read(value);
+            }
+        }
+
         let op0 = instruction.op0_kind();
         match instruction.mnemonic() {
             Mnemonic::Mov if op0 == OpKind::Register => {
@@ -426,6 +466,13 @@ impl State {
             .get(&base)
             .map(|&object| Location::Object(object, displacement))
     }
+}
+
+fn is_read(access: OpAccess) -> bool {
+    matches!(
+        access,
+        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
 }
 
 fn is_write(access: OpAccess) -> bool {

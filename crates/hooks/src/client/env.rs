@@ -28,9 +28,14 @@ pub(crate) type BuildSpawnEnvBlockFn = unsafe extern "C" fn(
     *mut c_void, // pContext
 ) -> i32;
 
-// SetEnvString(pEnvMap, key, value): 3-param cdecl helper used to write into
-// the env map built by BuildSpawnEnvBlock.
+// SetEnvString(pEnvMap, key, value): the helper that writes into the env map
+// built by BuildSpawnEnvBlock.
 pub(crate) type SetEnvStringFn = unsafe extern "C" fn(*mut c_void, *const i8, *const i8);
+
+// Builds from 1790380355 on take two more: a mode flag, and the separator used
+// when the flag asks to append. Steam passes 0 and ':' at every call site.
+pub(crate) type SetEnvStringSepFn =
+    unsafe extern "C" fn(*mut c_void, *const i8, *const i8, u32, u32);
 
 // CUser::SpawnProcess: launches a game. On x86_64 SysV, this/exe/command/dir/
 // CGameID/extra are register args and later flags stay on the native ABI stack.
@@ -56,26 +61,71 @@ pub(crate) type SpawnProcessFn = unsafe extern "C" fn(
 pub(crate) static mut BUILD_SPAWN_ENV_DETOUR: Option<Detour<BuildSpawnEnvBlockFn>> = None;
 pub(crate) static mut SPAWN_PROCESS_DETOUR: Option<Detour<SpawnProcessFn>> = None;
 pub(crate) static mut SET_ENV_STRING_FN: Option<SetEnvStringFn> = None;
+pub(crate) static mut SET_ENV_STRING_SEP_FN: Option<SetEnvStringSepFn> = None;
 pub(crate) static mut SET_ENV_STRING_DETOUR: Option<Detour<SetEnvStringFn>> = None;
+pub(crate) static mut SET_ENV_STRING_SEP_DETOUR: Option<Detour<SetEnvStringSepFn>> = None;
 
 // Native libraries to merge into the LD_PRELOAD value Steam writes while the
 // tagged env map's BuildSpawnEnvBlock call is active.
 static PENDING_PRELOAD: std::sync::Mutex<Option<(usize, Vec<String>)>> =
     std::sync::Mutex::new(None);
 
-/// Writer for the env map: the SetEnvString trampoline when the detour is
-/// installed, the raw resolved function otherwise.
-fn env_writer() -> Option<SetEnvStringFn> {
-    // SAFETY: installation publishes both slots before any hook can run.
+/// The env-map writer in whichever calling convention this build uses.
+#[derive(Clone, Copy)]
+pub(crate) enum EnvWriter {
+    KeyValue(SetEnvStringFn),
+    KeyValueSeparator(SetEnvStringSepFn),
+}
+
+impl EnvWriter {
+    /// Write one entry.
+    ///
+    /// # Safety
+    /// `map` must be Steam's live env map and both strings NUL-terminated for
+    /// the duration of the call.
+    unsafe fn write(self, map: *mut c_void, key: *const i8, value: *const i8) {
+        match self {
+            // SAFETY: the caller's contract.
+            Self::KeyValue(write) => unsafe { write(map, key, value) },
+            // SAFETY: the caller's contract. The trailing pair mirrors Steam's
+            // own call sites, which all ask for a plain write with the path
+            // separator.
+            Self::KeyValueSeparator(write) => unsafe {
+                write(
+                    map,
+                    key,
+                    value,
+                    0,
+                    vapor_forge_patterns::env_writer::PATH_SEPARATOR,
+                )
+            },
+        }
+    }
+}
+
+/// Writer for the env map: the trampoline when the detour is installed, the raw
+/// resolved function otherwise.
+fn env_writer() -> Option<EnvWriter> {
+    // SAFETY: installation publishes every slot before any hook can run.
     unsafe {
         if (*std::ptr::addr_of!(SET_ENV_STRING_DETOUR)).is_some() {
-            vapor_forge_hook_engine::original::original_detour(
+            return vapor_forge_hook_engine::original::original_detour(
                 "SetEnvString",
                 std::ptr::addr_of!(SET_ENV_STRING_DETOUR),
             )
-        } else {
-            *std::ptr::addr_of!(SET_ENV_STRING_FN)
+            .map(EnvWriter::KeyValue);
         }
+        if (*std::ptr::addr_of!(SET_ENV_STRING_SEP_DETOUR)).is_some() {
+            return vapor_forge_hook_engine::original::original_detour(
+                "SetEnvString",
+                std::ptr::addr_of!(SET_ENV_STRING_SEP_DETOUR),
+            )
+            .map(EnvWriter::KeyValueSeparator);
+        }
+        if let Some(write) = *std::ptr::addr_of!(SET_ENV_STRING_FN) {
+            return Some(EnvWriter::KeyValue(write));
+        }
+        (*std::ptr::addr_of!(SET_ENV_STRING_SEP_FN)).map(EnvWriter::KeyValueSeparator)
     }
 }
 
@@ -86,40 +136,74 @@ fn env_writer() -> Option<SetEnvStringFn> {
 /// Steam composes the child's LD_PRELOAD from its own environment plus the
 /// overlay renderers and writes it after the launch hooks ran, which discards
 /// anything stored in the map earlier. Prepend the pending native libraries.
+/// The value Steam should write instead, when this write is the LD_PRELOAD one
+/// for a launch that has native libraries pending.
+///
+/// # Safety
+/// `key` and `value` must be null or NUL-terminated for the duration of the call.
+unsafe fn merged_preload(
+    env_map: *mut c_void,
+    key: *const i8,
+    value: *const i8,
+) -> Option<std::ffi::CString> {
+    if key.is_null() || value.is_null() {
+        return None;
+    }
+    // SAFETY: Steam passes NUL-terminated strings for the duration of the call.
+    let is_preload = unsafe { std::ffi::CStr::from_ptr(key) }.to_bytes() == b"LD_PRELOAD";
+    if !is_preload {
+        return None;
+    }
+    let (map, libs) = PENDING_PRELOAD
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(None)?;
+    if map != env_map as usize {
+        return None;
+    }
+    // SAFETY: value is a live NUL-terminated string from Steam.
+    let steam_value = unsafe { std::ffi::CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned();
+    let merged = vapor_forge_features::library_inject::merge_ld_preload(&libs, &steam_value);
+    let merged = std::ffi::CString::new(merged).ok()?;
+    info!(value = %merged.to_string_lossy(), "library_inject: LD_PRELOAD merged with Steam's");
+    Some(merged)
+}
+
 pub(crate) unsafe extern "C" fn hk_set_env_string(
     env_map: *mut c_void,
     key: *const i8,
     value: *const i8,
 ) {
     let original = detour_or_return!("SetEnvString", SET_ENV_STRING_DETOUR);
-    if !key.is_null() && !value.is_null() {
-        // SAFETY: Steam passes NUL-terminated strings for the duration of the call.
-        let is_preload = unsafe { std::ffi::CStr::from_ptr(key) }.to_bytes() == b"LD_PRELOAD";
-        if is_preload {
-            let pending = PENDING_PRELOAD
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or(None);
-            if let Some((map, libs)) = pending {
-                if map == env_map as usize {
-                    // SAFETY: value is a live NUL-terminated string from Steam.
-                    let steam_value = unsafe { std::ffi::CStr::from_ptr(value) }
-                        .to_string_lossy()
-                        .into_owned();
-                    let merged =
-                        vapor_forge_features::library_inject::merge_ld_preload(&libs, &steam_value);
-                    if let Ok(merged_c) = std::ffi::CString::new(merged.as_str()) {
-                        info!(value = %merged, "library_inject: LD_PRELOAD merged with Steam's");
-                        // SAFETY: forwards Steam's map and key with our merged value.
-                        unsafe { original(env_map, key, merged_c.as_ptr()) };
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    // SAFETY: forwards Steam's untouched arguments.
+    // SAFETY: Steam's strings stay valid for this call.
+    let merged = unsafe { merged_preload(env_map, key, value) };
+    let value = merged.as_ref().map_or(value, |merged| merged.as_ptr());
+    // SAFETY: forwards Steam's map and key, with our value when one was built.
     unsafe { original(env_map, key, value) }
+}
+
+/// The same merge for builds whose writer takes the mode flag and separator.
+pub(crate) unsafe extern "C" fn hk_set_env_string_sep(
+    env_map: *mut c_void,
+    key: *const i8,
+    value: *const i8,
+    flag: u32,
+    separator: u32,
+) {
+    let original = detour_or_return!("SetEnvString", SET_ENV_STRING_SEP_DETOUR);
+    // Steam writes LD_PRELOAD with the plain mode (flag 0). The other mode's
+    // meaning is unknown, so it is forwarded untouched.
+    let merged = if flag == 0 {
+        // SAFETY: Steam's strings stay valid for this call.
+        unsafe { merged_preload(env_map, key, value) }
+    } else {
+        None
+    };
+    let value = merged.as_ref().map_or(value, |merged| merged.as_ptr());
+    // SAFETY: forwards Steam's arguments, with our value when one was built.
+    unsafe { original(env_map, key, value, flag, separator) }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +295,7 @@ unsafe fn inject_spawn_environment(
             let ld_preload = inj.native_libs.join(":");
             if let Ok(value) = std::ffi::CString::new(ld_preload.as_str()) {
                 /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                unsafe { set_env(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr()) };
+                unsafe { set_env.write(env_map, c"LD_PRELOAD".as_ptr(), value.as_ptr()) };
                 info!(app = app_id.0, paths = %ld_preload, "library_inject: LD_PRELOAD set");
                 native_libs = Some(inj.native_libs.clone());
             }
@@ -228,13 +312,13 @@ unsafe fn inject_spawn_environment(
     // themselves, so only add it here when neither of them will.
     if injection.as_ref().is_some_and(|i| i.loader_fix) {
         /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-        unsafe { set_env(env_map, c"VAPOR_FORGE_LOADER_FIX".as_ptr(), c"1".as_ptr()) };
+        unsafe { set_env.write(env_map, c"VAPOR_FORGE_LOADER_FIX".as_ptr(), c"1".as_ptr()) };
         if !has_proton_dll && ipc_server.is_none() {
             match resolve_helper_path(&cfg.library_inject.helper_path) {
                 Some(path) => {
                     if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
                         /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                        unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
+                        unsafe { set_env.write(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
                         info!(app = app_id.0, helper = %path, "library_inject: loader fix armed");
                     }
                 }
@@ -257,14 +341,14 @@ unsafe fn inject_spawn_environment(
                 std::ffi::CString::new(hex.as_str()),
             ) {
                 /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                unsafe { set_env(env_map, key.as_ptr(), val.as_ptr()) };
+                unsafe { set_env.write(env_map, key.as_ptr(), val.as_ptr()) };
             }
             if let (Ok(key), Ok(val)) = (
                 std::ffi::CString::new(vapor_forge_game_bridge::ENV_GAME_BRIDGE_SOCK),
                 std::ffi::CString::new(server.socket_path()),
             ) {
                 /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                unsafe { set_env(env_map, key.as_ptr(), val.as_ptr()) };
+                unsafe { set_env.write(env_map, key.as_ptr(), val.as_ptr()) };
             }
             debug!(app = app_id.0, "library_inject: IPC token injected");
         }
@@ -275,7 +359,7 @@ unsafe fn inject_spawn_environment(
             if let Some(path) = resolve_helper_path(&cfg.library_inject.helper_path) {
                 if let Ok(audit_val) = std::ffi::CString::new(path.as_str()) {
                     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                    unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
+                    unsafe { set_env.write(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
                     debug!(app = app_id.0, helper = %path, "library_inject: helper loaded for IPC only");
                 }
             }
@@ -293,10 +377,10 @@ unsafe fn inject_spawn_environment(
                         std::ffi::CString::new(dll_path.as_str()),
                     ) {
                         /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-                        unsafe { set_env(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
+                        unsafe { set_env.write(env_map, c"LD_AUDIT".as_ptr(), audit_val.as_ptr()) };
                         /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
                         unsafe {
-                            set_env(
+                            set_env.write(
                                 env_map,
                                 c"VAPOR_FORGE_INJECT_DLL".as_ptr(),
                                 dll_val.as_ptr(),
@@ -492,17 +576,55 @@ pub(crate) fn resolve_set_env_string(registry: &PatternRegistry, code: &CodeRegi
     ) {
         return;
     }
-    // SAFETY: call_addr is a validated code address.
-    let f: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
-    // SAFETY: hook installation is single-threaded and publishes this slot once.
-    unsafe { std::ptr::addr_of_mut!(SET_ENV_STRING_FN).write(Some(f)) };
+    let Some(offset) = call_addr.checked_sub(code.base) else {
+        warn!("SetEnvString resolved outside the module");
+        return;
+    };
+    // Builds differ in whether the writer takes a mode flag and a separator,
+    // so the convention is read from the function itself. Calling it with the wrong one would hand a
+    // five-parameter callee three arguments.
+    let abi = vapor_forge_patterns::env_writer::decode_abi(usize::BITS, code.bytes, offset);
+    match abi {
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValue) => {
+            // SAFETY: call_addr is a validated code address of this convention.
+            let write: SetEnvStringFn = unsafe { std::mem::transmute(call_addr) };
+            // SAFETY: installation is single-threaded and publishes this slot once.
+            unsafe { std::ptr::addr_of_mut!(SET_ENV_STRING_FN).write(Some(write)) };
+        }
+        Some(vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValueSeparator) => {
+            // SAFETY: call_addr is a validated code address of this convention.
+            let write: SetEnvStringSepFn = unsafe { std::mem::transmute(call_addr) };
+            // SAFETY: installation is single-threaded and publishes this slot once.
+            unsafe { std::ptr::addr_of_mut!(SET_ENV_STRING_SEP_FN).write(Some(write)) };
+        }
+        None => {
+            warn!(
+                addr = format_args!("0x{:x}", call_addr),
+                "SetEnvString convention is unrecognised, library injection stays off"
+            );
+            return;
+        }
+    }
     debug!(
         addr = format_args!("0x{:x}", call_addr),
+        ?abi,
         "SetEnvString resolved"
     );
 }
 
+/// Which convention the resolved writer uses, once it has been resolved.
+pub(crate) fn set_env_string_abi() -> Option<vapor_forge_patterns::env_writer::EnvWriterAbi> {
+    use vapor_forge_patterns::env_writer::EnvWriterAbi;
+    // SAFETY: installation is the only writer and publishes the slots before this read.
+    unsafe {
+        if (*std::ptr::addr_of!(SET_ENV_STRING_FN)).is_some() {
+            Some(EnvWriterAbi::KeyValue)
+        } else {
+            (*std::ptr::addr_of!(SET_ENV_STRING_SEP_FN)).map(|_| EnvWriterAbi::KeyValueSeparator)
+        }
+    }
+}
+
 pub(crate) fn set_env_string_ready() -> bool {
-    // SAFETY: installation is the only writer and publishes the slot before this read.
-    unsafe { (*std::ptr::addr_of!(SET_ENV_STRING_FN)).is_some() }
+    set_env_string_abi().is_some()
 }
