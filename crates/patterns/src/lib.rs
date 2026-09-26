@@ -234,6 +234,62 @@ impl Pattern {
 ///         check haystack[body_offset - i - j] == prologue[j]
 ///     if all match: return body_offset - i - prologue.len() + 1
 /// ```
+/// Bytes scanned back from a body match while looking for the entry's pushes.
+/// A prologue saves at most a handful of registers, so this only has to cover
+/// their encodings.
+const ENTRY_PUSH_SCAN: usize = 0x20;
+
+/// Walk back from `body_offset` over the register saves a function entry begins
+/// with, and return the entry.
+///
+/// `body_offset` must be the first byte after those saves. Unlike
+/// `find_prologue_upwards` this does not pin how many registers are saved, so
+/// one pattern covers builds whose entry saves a different number of them: the
+/// same code then resolves to the real entry instead of two bytes into it.
+///
+/// Only `push r32`/`push r64` encodings are crossed, which keeps the stop
+/// condition unambiguous. The bytes ahead of a function are padding or a
+/// terminator, neither of which decodes as a push.
+///
+/// `bitness` is 32 or 64. Bytes 0x40..=0x4f are REX prefixes only in 64-bit
+/// code; in 32-bit code they are one-byte `inc`/`dec`, which must stop the walk
+/// rather than be read as part of a push.
+pub fn find_entry_pushes(
+    haystack: &[u8],
+    body_offset: usize,
+    bitness: u32,
+) -> Result<usize, PatternError> {
+    if body_offset > haystack.len() {
+        return Err(PatternError::NoMatch);
+    }
+    let limit = ENTRY_PUSH_SCAN.min(body_offset);
+    let mut entry = body_offset;
+    loop {
+        let consumed = body_offset - entry;
+        // A REX-prefixed push spans two bytes, so prefer it when the byte ahead
+        // of a bare push is a REX prefix.
+        let two = (bitness == 64 && entry >= 2 && consumed + 2 <= limit)
+            .then(|| &haystack[entry - 2..entry])
+            .filter(|window| (0x40..=0x4f).contains(&window[0]) && is_push_opcode(window[1]));
+        let one = (entry >= 1 && consumed < limit)
+            .then(|| haystack[entry - 1])
+            .filter(|&byte| is_push_opcode(byte));
+        entry -= match (two, one) {
+            (Some(_), _) => 2,
+            (None, Some(_)) => 1,
+            (None, None) => break,
+        };
+    }
+    if entry == body_offset {
+        return Err(PatternError::NoMatch);
+    }
+    Ok(entry)
+}
+
+fn is_push_opcode(byte: u8) -> bool {
+    (0x50..=0x57).contains(&byte)
+}
+
 pub fn find_prologue_upwards(
     haystack: &[u8],
     body_offset: usize,
@@ -335,8 +391,8 @@ pub mod scan;
 #[cfg(test)]
 mod tests {
     use super::{
-        find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
-        PatternError, PatternToken, MACHINE_CODE_BYTE_RANK,
+        find_entry_pushes, find_prologue_upwards, follow_last_call_before_ret,
+        follow_relative_call, Pattern, PatternError, PatternToken, MACHINE_CODE_BYTE_RANK,
     };
 
     #[test]
@@ -409,6 +465,60 @@ mod tests {
         assert_eq!(
             wildcard.find_unique(&haystack),
             Err(PatternError::Ambiguous(2))
+        );
+    }
+
+    /// `push r14; push r13; push r12; push rbp; push rbx`, the five-register
+    /// save, behind int3 padding.
+    const FIVE_SAVES: &[u8] = &[
+        0xcc, 0xcc, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xec, 0x20,
+    ];
+    /// The same entry with one register fewer.
+    const FOUR_SAVES: &[u8] = &[
+        0xcc, 0xcc, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xec, 0x28,
+    ];
+
+    #[test]
+    fn entry_push_scan_spans_either_register_save_count() {
+        // The body offset is the frame setup in both, and the entry is the
+        // first push, wherever that is.
+        assert_eq!(find_entry_pushes(FIVE_SAVES, 10, 64), Ok(2));
+        assert_eq!(find_entry_pushes(FOUR_SAVES, 8, 64), Ok(2));
+    }
+
+    #[test]
+    fn entry_push_scan_prefers_the_rex_prefixed_push() {
+        // Read one byte at a time, `41 55` would look like `push rbp` at the
+        // 0x55 and leave the 0x41 behind, landing two bytes into the function.
+        assert_eq!(find_entry_pushes(&[0xcc, 0x41, 0x55, 0x90], 3, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_reads_rex_bytes_as_instructions_in_32_bit_code() {
+        // `dec ebx; push ebx; push ebp`: in 32-bit code 0x4b is its own
+        // instruction, so the entry is the first push, not the dec.
+        let code = [0xcc, 0x4b, 0x53, 0x55, 0x90];
+        assert_eq!(find_entry_pushes(&code, 4, 32), Ok(2));
+        // The same bytes in 64-bit code are `push r11; push rbp`.
+        assert_eq!(find_entry_pushes(&code, 4, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_stops_at_a_terminator() {
+        // `ret` then two pushes: the scan must not cross the ret.
+        let code = [0xc3, 0x55, 0x53, 0x90];
+        assert_eq!(find_entry_pushes(&code, 3, 64), Ok(1));
+    }
+
+    #[test]
+    fn entry_push_scan_rejects_a_body_with_no_saves() {
+        assert_eq!(
+            find_entry_pushes(&[0xcc, 0xcc, 0x90, 0x90], 3, 64),
+            Err(PatternError::NoMatch)
+        );
+        assert_eq!(
+            find_entry_pushes(&[0x55], 5, 64),
+            Err(PatternError::NoMatch)
         );
     }
 

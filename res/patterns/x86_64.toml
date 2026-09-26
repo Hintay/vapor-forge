@@ -90,9 +90,12 @@ pattern = "83 6F 14 01 74 0A C3 66 0F 1F 84 00 00 00 00 00 41 57 41 56"
 follow = "none"
 pattern = "41 56 41 55 41 54 55 48 89 F5 53 48 83 EC 10 44 0F B6 A7 34 01 00 00 45 84 E4 0F 85"
 
-# steamrt stack-canary implementation shape.
+# steamrt stack-canary implementation shape. Matched from the frame setup, past
+# the register saves, because builds differ in how many registers they save;
+# `entry` then walks back over those pushes to the real entry.
 [[steamclient."CWorkThreadPool::AddWorkItem".variants]]
-pattern = "41 56 41 55 41 54 55 53 48 83 EC 20 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 87 34 01 00 00 84 C0 0F 85"
+follow = "entry"
+pattern = "48 83 EC ? 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 87 ? ? 00 00 84 C0 0F 85"
 
 # Read, not hooked: source of the CNet pool global and work-item timer vtable.
 [steamclient."CWebSocketConnection::PostDelayedCloseWorkItem"]

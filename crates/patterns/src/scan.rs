@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use crate::elf::{ElfImage, ExecutableSegment};
 use crate::registry::{FollowMode, PatternDef, RuntimePatternEntry};
-use crate::{find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern};
+use crate::{
+    find_entry_pushes, find_prologue_upwards, follow_last_call_before_ret, follow_relative_call,
+    Pattern,
+};
 
 const FOLLOW_CALL_SCAN_BYTES: usize = 256;
 const UPWARD_SCAN_BYTES: usize = 0x10000;
@@ -151,7 +154,10 @@ pub fn scan_module(
     let variants = select_variants_for_library_path(&variants, path);
     let entries = group_variants(&variants)
         .into_iter()
-        .map(|group| scan_entry_group(segment.bytes, &group, accept))
+        .map(|group| {
+            let bitness = u32::from(segment.elf_class.bits());
+            scan_entry_group(segment.bytes, bitness, &group, accept)
+        })
         .collect();
 
     Ok(ModuleScanReport {
@@ -214,11 +220,12 @@ pub fn group_variants<'a>(entries: &[PatternRef<'a>]) -> Vec<Vec<PatternRef<'a>>
 
 fn scan_entry_group(
     haystack: &[u8],
+    bitness: u32,
     entries: &[PatternRef<'_>],
     accept: Option<CandidateCheck<'_>>,
 ) -> PatternScanEntry {
     let entry = entries[0];
-    match resolve_entry_group_with(haystack, entries, accept) {
+    match resolve_entry_group_with(haystack, bitness, entries, accept) {
         Ok(result) => PatternScanEntry {
             name: entry.name.to_owned(),
             status: PatternScanStatus::Ok,
@@ -261,22 +268,24 @@ pub struct VariantTarget {
 /// Resolve every variant of one pattern group and require them to agree.
 pub fn resolve_entry_group(
     haystack: &[u8],
+    bitness: u32,
     entries: &[PatternRef<'_>],
 ) -> Result<ResolveResult, ResolveError> {
-    resolve_entry_group_with(haystack, entries, None)
+    resolve_entry_group_with(haystack, bitness, entries, None)
 }
 
 /// [`resolve_entry_group`] with a candidate check that settles patterns
 /// matching more than once.
 pub fn resolve_entry_group_with(
     haystack: &[u8],
+    bitness: u32,
     entries: &[PatternRef<'_>],
     accept: Option<CandidateCheck<'_>>,
 ) -> Result<ResolveResult, ResolveError> {
     let mut best_error = None;
     let mut successes = Vec::new();
     for (variant_index, entry) in entries.iter().enumerate() {
-        match resolve_entry(haystack, entry, accept) {
+        match resolve_entry(haystack, bitness, entry, accept) {
             Ok(mut result) => {
                 result.variant_index = variant_index;
                 successes.push(result);
@@ -402,6 +411,7 @@ impl fmt::Display for ResolveError {
 
 fn resolve_entry(
     haystack: &[u8],
+    bitness: u32,
     entry: &PatternRef<'_>,
     accept: Option<CandidateCheck<'_>>,
 ) -> Result<ResolveResult, ResolveError> {
@@ -434,6 +444,11 @@ fn resolve_entry(
                 .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?
         }
         FollowMode::Call => resolve_call_target(haystack, entry, &matches)?,
+        FollowMode::Entry => {
+            let offset = select_match(haystack, entry, &matches, accept)?;
+            find_entry_pushes(haystack, offset, bitness)
+                .map_err(|error| ResolveError::Follow(error.to_string(), match_count))?
+        }
     };
 
     let target_offset = if entry.pic_entry {
@@ -582,23 +597,24 @@ mod tests {
         let haystack = [0xAA, 0xBB, 0x90, 0xAA, 0xBB];
         let entries = [PatternRef::from(&AMBIGUOUS)];
         assert!(matches!(
-            resolve_entry_group(&haystack, &entries),
+            resolve_entry_group(&haystack, 64, &entries),
             Err(ResolveError::Ambiguous(2))
         ));
 
         let accept_second =
             |_: &[u8], name: &str, offset: usize| name == "Test::Ambiguous" && offset == 3;
-        let result = resolve_entry_group_with(&haystack, &entries, Some(&accept_second)).unwrap();
+        let result =
+            resolve_entry_group_with(&haystack, 64, &entries, Some(&accept_second)).unwrap();
         assert_eq!((result.target_offset, result.match_count), (3, 2));
 
         // Equivalent candidates: the first accepted match wins.
         let accept_all = |_: &[u8], _: &str, _: usize| true;
-        let result = resolve_entry_group_with(&haystack, &entries, Some(&accept_all)).unwrap();
+        let result = resolve_entry_group_with(&haystack, 64, &entries, Some(&accept_all)).unwrap();
         assert_eq!((result.target_offset, result.match_count), (0, 2));
 
         let reject_all = |_: &[u8], _: &str, _: usize| false;
         assert!(matches!(
-            resolve_entry_group_with(&haystack, &entries, Some(&reject_all)),
+            resolve_entry_group_with(&haystack, 64, &entries, Some(&reject_all)),
             Err(ResolveError::Ambiguous(2))
         ));
     }
@@ -608,7 +624,7 @@ mod tests {
         let haystack = [0xAA, 0xBB, 0x90, 0xCC, 0xDD];
         let entries = [PatternRef::from(&VARIANT_A), PatternRef::from(&VARIANT_B)];
 
-        match resolve_entry_group(&haystack, &entries) {
+        match resolve_entry_group(&haystack, 64, &entries) {
             Err(error @ ResolveError::VariantConflict(_)) => {
                 let ResolveError::VariantConflict(targets) = &error else {
                     unreachable!()

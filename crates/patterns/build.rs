@@ -59,6 +59,7 @@ fn main() {
             "relative" => "Relative",
             "upward" => "Upward",
             "call" => "Call",
+            "entry" => "Entry",
             other => panic!(
                 "unknown follow mode {:?} for pattern {:?}",
                 other, entry.name

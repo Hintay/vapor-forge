@@ -73,12 +73,46 @@ fn resolve_pattern_variant(
             resolve_prologue_upwards(code, name, entry.pattern(), prologue)?
         }
         FollowMode::Call => resolve_follow_call(code, name, entry)?,
+        FollowMode::Entry => resolve_entry_pushes(code, name, entry.pattern())?,
     };
 
     if entry.pic_entry() {
         find_pic_entry(code, addr)
     } else {
         Some(addr)
+    }
+}
+
+/// Resolve a body match, then walk back over the entry's register saves.
+fn resolve_entry_pushes(code: &CodeRegion, name: &str, pattern_str: &str) -> Option<usize> {
+    let pattern = match Pattern::parse(pattern_str) {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            error!(hook = name, %error, "pattern parse failed");
+            return None;
+        }
+    };
+    let offset = match pattern.find_unique(code.bytes) {
+        Ok(offset) => offset,
+        Err(error) => {
+            warn!(hook = name, %error, "pattern match failed");
+            return None;
+        }
+    };
+    match vapor_forge_patterns::find_entry_pushes(code.bytes, offset, usize::BITS) {
+        Ok(entry) => {
+            let addr = code.base + entry;
+            debug!(
+                hook = name,
+                addr = format_args!("0x{addr:x}"),
+                "entry resolved from register saves"
+            );
+            Some(addr)
+        }
+        Err(error) => {
+            warn!(hook = name, %error, "entry push scan failed");
+            None
+        }
     }
 }
 

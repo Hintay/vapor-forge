@@ -280,7 +280,8 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     };
     for group in group_variants(&variants) {
         let entry = group[0];
-        let resolution = resolve_entry_group_with(segment.bytes, &group, Some(&accept));
+        let bitness = u32::from(segment.elf_class.bits());
+        let resolution = resolve_entry_group_with(segment.bytes, bitness, &group, Some(&accept));
         match resolution {
             Ok(result) => {
                 if group.len() == 1 {

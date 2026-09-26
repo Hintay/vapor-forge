@@ -86,6 +86,10 @@ pub enum FollowMode {
     /// before a RET (C3) and follow it. Used when the target function is
     /// called from a unique context but its own body is not unique.
     Call,
+    /// Pattern matches the first byte after the entry's register saves; scan
+    /// back over those pushes for the entry. Use where builds differ in how
+    /// many registers the entry saves.
+    Entry,
 }
 
 /// A single pattern definition (compile-time or runtime).
@@ -688,6 +692,7 @@ fn parse_toml_entries(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, 
                             "relative" => FollowMode::Relative,
                             "upward" => FollowMode::Upward,
                             "call" => FollowMode::Call,
+                            "entry" => FollowMode::Entry,
                             other => {
                                 return Err(format!(
                                     "line {line_no}: unknown follow mode {other:?}"
