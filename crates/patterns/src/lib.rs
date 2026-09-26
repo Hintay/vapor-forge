@@ -39,6 +39,37 @@ pub enum PatternError {
     NoCallTarget,
 }
 
+/// Frequency rank of each byte in x86 and x86_64 machine code, 255 for the most
+/// common. Counted over the `.text` of an i686 and an x86_64 steamclient.so.
+///
+/// The substring search prefilters on the anchor's two rarest bytes. Its
+/// built-in ranking is tuned for text, where it rates bytes such as `0x48` and
+/// `0x89` as rare, so on code it picks bytes that occur everywhere and checks
+/// far more candidates than it needs to.
+const MACHINE_CODE_BYTE_RANK: [u8; 256] = [
+    255, 245, 221, 203, 239, 193, 171, 190, 242, 133, 119, 96, 226, 112, 55, 249, 241, 114, 91, 62,
+    205, 130, 60, 66, 219, 72, 39, 36, 191, 44, 46, 216, 214, 51, 31, 27, 248, 131, 202, 33, 200,
+    122, 23, 126, 146, 56, 79, 22, 182, 210, 35, 43, 144, 123, 17, 26, 174, 197, 24, 163, 153, 137,
+    21, 58, 224, 228, 115, 181, 237, 233, 185, 173, 253, 218, 85, 61, 231, 167, 92, 63, 230, 127,
+    151, 208, 199, 213, 198, 194, 159, 81, 97, 201, 192, 207, 175, 161, 124, 4, 47, 125, 147, 90,
+    222, 19, 149, 49, 188, 57, 142, 32, 99, 108, 157, 30, 71, 107, 240, 225, 145, 83, 162, 34, 29,
+    100, 177, 150, 148, 140, 196, 168, 50, 250, 234, 243, 165, 128, 180, 252, 13, 251, 88, 247, 89,
+    74, 217, 18, 25, 73, 101, 129, 45, 28, 110, 5, 1, 7, 77, 82, 9, 16, 109, 2, 3, 11, 80, 10, 0,
+    6, 170, 12, 15, 41, 84, 14, 20, 40, 113, 8, 42, 48, 187, 166, 184, 65, 158, 94, 135, 64, 105,
+    143, 154, 87, 235, 209, 186, 223, 236, 141, 211, 232, 155, 156, 102, 37, 244, 53, 59, 52, 189,
+    104, 183, 69, 121, 54, 103, 68, 152, 120, 67, 106, 86, 70, 78, 164, 195, 76, 132, 38, 139, 95,
+    111, 134, 246, 229, 117, 212, 227, 118, 116, 172, 176, 75, 93, 179, 136, 98, 215, 160, 204,
+    138, 169, 178, 206, 220, 238, 254,
+];
+
+struct MachineCodeRank;
+
+impl memchr::arch::all::packedpair::HeuristicFrequencyRank for MachineCodeRank {
+    fn rank(&self, byte: u8) -> u8 {
+        MACHINE_CODE_BYTE_RANK[usize::from(byte)]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pattern {
     tokens: Vec<PatternToken>,
@@ -120,7 +151,8 @@ impl Pattern {
         };
 
         let mut matches = Vec::with_capacity(max_matches.min(16));
-        let finder = memchr::memmem::Finder::new(&anchor_bytes);
+        let finder = memchr::memmem::FinderBuilder::new()
+            .build_forward_with_ranker(MachineCodeRank, &anchor_bytes);
         let mut search_from = 0usize;
         while let Some(relative) = finder.find(&haystack[search_from..]) {
             let anchor_offset = search_from + relative;
@@ -304,7 +336,7 @@ pub mod scan;
 mod tests {
     use super::{
         find_prologue_upwards, follow_last_call_before_ret, follow_relative_call, Pattern,
-        PatternError, PatternToken,
+        PatternError, PatternToken, MACHINE_CODE_BYTE_RANK,
     };
 
     #[test]
@@ -378,6 +410,19 @@ mod tests {
             wildcard.find_unique(&haystack),
             Err(PatternError::Ambiguous(2))
         );
+    }
+
+    #[test]
+    fn machine_code_rank_is_a_permutation() {
+        let mut seen = [false; 256];
+        for &rank in &MACHINE_CODE_BYTE_RANK {
+            assert!(!seen[usize::from(rank)]);
+            seen[usize::from(rank)] = true;
+        }
+        // Padding, REX.W and mov are among the most common bytes in code.
+        for byte in [0x00, 0x48, 0x89] {
+            assert!(MACHINE_CODE_BYTE_RANK[byte] > 240);
+        }
     }
 
     #[test]
