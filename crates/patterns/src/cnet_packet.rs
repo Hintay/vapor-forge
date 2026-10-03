@@ -191,11 +191,16 @@ mod tests {
     use super::*;
     use iced_x86::code_asm::*;
 
-    /// Each fixture holds `Alloc`, `Init` and `Release` cut from one client
-    /// build, at these offsets.
+    /// Each region holds `Alloc`, `Init` and `Release` at these offsets.
     const ALLOC: usize = 0x00;
     const INIT: usize = 0x80;
     const RELEASE: usize = 0x180;
+
+    /// Calls that leave the region: allocator lock, constructor, PIC thunk.
+    const EXTERNAL: u64 = 0x0100_0000;
+    /// Displacements off the i686 PIC base; any full imm32 will do.
+    const PIC_ADD: i32 = 0x003b_eb35;
+    const GLOBAL: i32 = 0x08cc;
 
     const fn api(
         [conn_id, data, size, owned_data]: [usize; 4],
@@ -214,76 +219,301 @@ mod tests {
         }
     }
 
-    /// Frame-pointer i686, frame-pointer-free i686, the steamrt i686 build that
-    /// spills the data argument to the stack before storing it, and x86_64
-    /// either side of the layout change.
-    const BUILDS: [(&str, u32, &[u8], PacketApi); 5] = [
-        (
-            "x86 1788652215",
-            32,
-            include_bytes!("testdata/cnet_packet/x86_1788652215.bin"),
-            api([0x00, 0x04, 0x08, 0x10], 0x0c, 0x20),
-        ),
-        (
-            "x86 1790380355",
-            32,
-            include_bytes!("testdata/cnet_packet/x86_1790380355.bin"),
-            api([0x00, 0x0c, 0x10, 0x18], 0x14, 0x38),
-        ),
-        (
-            "x86 steamrt 1788652215",
-            32,
-            include_bytes!("testdata/cnet_packet/x86_steamrt_1788652215.bin"),
-            api([0x00, 0x04, 0x08, 0x10], 0x0c, 0x20),
-        ),
-        (
-            "x86_64 1788652215",
-            64,
-            include_bytes!("testdata/cnet_packet/x86_64_1788652215.bin"),
-            api([0x00, 0x08, 0x10, 0x18], 0x14, 0x30),
-        ),
-        (
-            "x86_64 1790380355",
-            64,
-            include_bytes!("testdata/cnet_packet/x86_64_1790380355.bin"),
-            api([0x00, 0x10, 0x18, 0x20], 0x1c, 0x58),
-        ),
-    ];
+    /// The layouts either side of client build 1790380355.
+    const X86_LAYOUT: PacketApi = api([0x00, 0x04, 0x08, 0x10], 0x0c, 0x20);
+    const X86_GROWN_LAYOUT: PacketApi = api([0x00, 0x0c, 0x10, 0x18], 0x14, 0x38);
+    const X64_LAYOUT: PacketApi = api([0x00, 0x08, 0x10, 0x18], 0x14, 0x30);
+    const X64_GROWN_LAYOUT: PacketApi = api([0x00, 0x10, 0x18, 0x20], 0x1c, 0x58);
+
+    fn displacement(offset: usize) -> i32 {
+        offset as i32
+    }
+
+    /// `Alloc` through Steam's allocator interface, with the source line as a
+    /// second constant argument that must not be taken for the size.
+    fn x86_alloc(layout: &PacketApi) -> Vec<u8> {
+        assemble(32, |a| {
+            a.push(esi)?;
+            a.push(ebx)?;
+            a.call(EXTERNAL)?;
+            a.add(ebx, PIC_ADD)?;
+            a.sub(esp, 8)?;
+            a.mov(eax, dword_ptr(ebx + GLOBAL))?;
+            a.mov(eax, dword_ptr(eax))?;
+            a.lea(ecx, ptr(ebx - 0x0010_0000))?;
+            a.mov(edx, dword_ptr(eax))?;
+            a.push(1)?;
+            a.push(0)?;
+            a.push(0x7bf)?;
+            a.push(ecx)?;
+            a.push(layout.object_size as i32)?;
+            a.push(eax)?;
+            a.call(dword_ptr(edx + 0x14))?;
+            a.add(esp, 0x18)?;
+            a.sub(esp, 0x0c)?;
+            a.push(eax)?;
+            a.mov(esi, eax)?;
+            a.call(EXTERNAL)?;
+            a.add(esp, 0x18)?;
+            a.mov(eax, esi)?;
+            a.pop(ebx)?;
+            a.pop(esi)?;
+            a.ret()
+        })
+    }
+
+    fn x64_alloc(layout: &PacketApi) -> Vec<u8> {
+        assemble(64, |a| {
+            a.push(rbx)?;
+            a.mov(rax, qword_ptr(rbx + GLOBAL))?;
+            a.mov(r9d, 1)?;
+            a.xor(r8d, r8d)?;
+            a.mov(ecx, 0x7bf)?;
+            a.mov(esi, layout.object_size as u32)?;
+            a.mov(rdi, qword_ptr(rax))?;
+            a.mov(rax, qword_ptr(rdi))?;
+            a.call(qword_ptr(rax + 0x28))?;
+            a.mov(rbx, rax)?;
+            a.mov(rdi, rax)?;
+            a.call(EXTERNAL)?;
+            a.mov(rax, rbx)?;
+            a.pop(rbx)?;
+            a.ret()
+        })
+    }
+
+    /// i686 `Init` with a frame pointer: arguments read through ebp and
+    /// relayed through eax. `spill_data` is the steamrt build, which parks the
+    /// data argument in a local first and stores it from there.
+    fn x86_frame_init(layout: &PacketApi, spill_data: bool) -> Vec<u8> {
+        let fields = layout.fields;
+        let arg = |index: i32| ebp + (8 + 4 * index);
+        assemble(32, |a| {
+            let mut out = a.create_label();
+            a.push(ebp)?;
+            a.mov(ebp, esp)?;
+            a.push(edi)?;
+            a.call(EXTERNAL)?;
+            a.add(edi, PIC_ADD)?;
+            a.push(esi)?;
+            a.push(ebx)?;
+            a.sub(esp, 0x2c)?;
+            // add_ref, or the data pointer on steamrt, kept in a local.
+            a.mov(eax, dword_ptr(arg(if spill_data { 2 } else { 5 })))?;
+            a.mov(esi, dword_ptr(arg(0)))?;
+            a.mov(dword_ptr(ebp - 0x2c), eax)?;
+            a.test(eax, eax)?;
+            a.je(out)?;
+            a.mov(ecx, dword_ptr(arg(3)))?;
+            a.test(ecx, ecx)?;
+            a.je(out)?;
+            a.mov(eax, dword_ptr(arg(1)))?;
+            a.mov(dword_ptr(esi + displacement(layout.object_size - 4)), 0)?;
+            a.mov(dword_ptr(esi + displacement(fields.conn_id)), eax)?;
+            if spill_data {
+                a.mov(eax, dword_ptr(ebp - 0x2c))?;
+            } else {
+                a.mov(eax, dword_ptr(arg(2)))?;
+            }
+            a.mov(dword_ptr(esi + displacement(fields.data)), eax)?;
+            a.mov(eax, dword_ptr(arg(3)))?;
+            a.mov(dword_ptr(esi + displacement(fields.size)), eax)?;
+            a.mov(eax, dword_ptr(arg(4)))?;
+            a.mov(dword_ptr(esi + displacement(fields.owned_data)), eax)?;
+            a.set_label(&mut out)?;
+            a.lea(esp, ptr(ebp - 0x0c))?;
+            a.pop(ebx)?;
+            a.pop(esi)?;
+            a.pop(edi)?;
+            a.pop(ebp)?;
+            a.ret()
+        })
+    }
+
+    /// i686 `Init` without a frame pointer: arguments read through esp once
+    /// the frame is set up, and stored straight from the registers holding them.
+    fn x86_frameless_init(layout: &PacketApi) -> Vec<u8> {
+        let fields = layout.fields;
+        // Four pushes, the frame, and the return address.
+        let arg = |index: i32| esp + (0x1c + 0x10 + 4 + 4 * index);
+        assemble(32, |a| {
+            let mut out = a.create_label();
+            a.push(ebp)?;
+            a.push(edi)?;
+            a.push(esi)?;
+            a.push(ebx)?;
+            a.call(EXTERNAL)?;
+            a.add(ebx, PIC_ADD)?;
+            a.sub(esp, 0x1c)?;
+            a.mov(eax, dword_ptr(arg(5)))?;
+            a.mov(ebp, dword_ptr(arg(2)))?;
+            a.mov(esi, dword_ptr(arg(0)))?;
+            a.mov(ecx, dword_ptr(arg(1)))?;
+            a.mov(edi, dword_ptr(arg(3)))?;
+            a.mov(dword_ptr(esp + 4), eax)?;
+            a.mov(edx, dword_ptr(arg(4)))?;
+            a.test(ebp, ebp)?;
+            a.je(out)?;
+            a.test(edi, edi)?;
+            a.je(out)?;
+            a.mov(dword_ptr(esi + displacement(fields.conn_id)), ecx)?;
+            a.mov(dword_ptr(esi + displacement(fields.owned_data)), edx)?;
+            a.mov(dword_ptr(esi + displacement(fields.data)), ebp)?;
+            a.mov(dword_ptr(esi + displacement(fields.size)), edi)?;
+            a.mov(dword_ptr(esi + displacement(layout.object_size - 4)), 0)?;
+            a.set_label(&mut out)?;
+            a.add(esp, 0x1c)?;
+            a.pop(ebx)?;
+            a.pop(esi)?;
+            a.pop(edi)?;
+            a.pop(ebp)?;
+            a.ret()
+        })
+    }
+
+    /// x86_64 `Init`: arguments parked in callee-saved registers, one of which
+    /// first holds the stack guard, with a computed value stored beside them.
+    fn x64_init(layout: &PacketApi) -> Vec<u8> {
+        let fields = layout.fields;
+        assemble(64, |a| {
+            let mut out = a.create_label();
+            a.push(r15)?;
+            a.mov(r15d, esi)?;
+            a.push(r14)?;
+            a.mov(r14, r8)?;
+            a.push(r13)?;
+            a.push(r12)?;
+            a.mov(r12, rdx)?;
+            a.push(rbp)?;
+            a.mov(ebp, ecx)?;
+            a.push(rbx)?;
+            a.mov(rbx, rdi)?;
+            a.sub(rsp, 0x18)?;
+            a.test(rdx, rdx)?;
+            a.mov(r13, qword_ptr(0x28).fs())?;
+            a.mov(qword_ptr(rsp + 8), r13)?;
+            a.mov(r13d, r9d)?;
+            a.je(out)?;
+            a.test(ebp, ebp)?;
+            a.je(out)?;
+            a.mov(dword_ptr(rbx + displacement(fields.conn_id)), r15d)?;
+            a.mov(qword_ptr(rbx + displacement(fields.data)), r12)?;
+            a.mov(dword_ptr(rbx + displacement(fields.size)), ebp)?;
+            a.mov(qword_ptr(rbx + displacement(fields.owned_data)), r14)?;
+            a.mov(qword_ptr(rbx + displacement(layout.object_size - 8)), 0)?;
+            a.movzx(eax, byte_ptr(r12))?;
+            a.mov(dword_ptr(rbx + displacement(fields.conn_id + 4)), eax)?;
+            a.set_label(&mut out)?;
+            a.add(rsp, 0x18)?;
+            a.pop(rbx)?;
+            a.pop(rbp)?;
+            a.pop(r12)?;
+            a.pop(r13)?;
+            a.pop(r14)?;
+            a.pop(r15)?;
+            a.ret()
+        })
+    }
+
+    /// i686 `Release` behind a full prologue, so `this` is read off the stack.
+    fn x86_release(layout: &PacketApi) -> Vec<u8> {
+        assemble(32, |a| {
+            let mut free = a.create_label();
+            a.push(ebp)?;
+            a.push(edi)?;
+            a.push(esi)?;
+            a.push(ebx)?;
+            a.call(EXTERNAL)?;
+            a.add(ebx, PIC_ADD)?;
+            a.sub(esp, 0x2c)?;
+            a.mov(edi, dword_ptr(esp + 0x40))?;
+            a.sub(dword_ptr(edi + displacement(layout.refcount)), 1)?;
+            a.je(free)?;
+            a.add(esp, 0x2c)?;
+            a.pop(ebx)?;
+            a.pop(esi)?;
+            a.pop(edi)?;
+            a.pop(ebp)?;
+            a.ret()?;
+            a.set_label(&mut free)?;
+            a.ud2()
+        })
+    }
+
+    /// The compiler shapes seen across client builds, each with the layout it
+    /// was observed with.
+    fn shapes() -> [(&'static str, u32, Vec<u8>, PacketApi); 5] {
+        let x86 = |init: fn(&PacketApi) -> Vec<u8>, layout: PacketApi| {
+            region(&x86_alloc(&layout), &init(&layout), &x86_release(&layout))
+        };
+        let x64 = |layout: PacketApi| {
+            region(
+                &x64_alloc(&layout),
+                &x64_init(&layout),
+                &synthetic_release(displacement(layout.refcount)),
+            )
+        };
+        [
+            (
+                "i686 with a frame pointer",
+                32,
+                x86(|layout| x86_frame_init(layout, false), X86_LAYOUT),
+                X86_LAYOUT,
+            ),
+            (
+                "i686 steamrt, data argument spilled",
+                32,
+                x86(|layout| x86_frame_init(layout, true), X86_LAYOUT),
+                X86_LAYOUT,
+            ),
+            (
+                "i686 without a frame pointer",
+                32,
+                x86(x86_frameless_init, X86_GROWN_LAYOUT),
+                X86_GROWN_LAYOUT,
+            ),
+            ("x86_64", 64, x64(X64_LAYOUT), X64_LAYOUT),
+            ("x86_64 grown", 64, x64(X64_GROWN_LAYOUT), X64_GROWN_LAYOUT),
+        ]
+    }
 
     #[test]
-    fn decodes_every_captured_build() {
-        for (build, bitness, code, expected) in BUILDS {
+    fn decodes_every_compiler_shape() {
+        for (shape, bitness, code, expected) in shapes() {
             assert_eq!(
-                decode_api(bitness, code, ALLOC, INIT, RELEASE),
+                decode_api(bitness, &code, ALLOC, INIT, RELEASE),
                 Ok(expected),
-                "{build}"
+                "{shape}"
             );
         }
     }
 
     #[test]
     fn rejects_each_function_in_another_role() {
-        for (build, bitness, code, _) in BUILDS {
+        for (shape, bitness, code, _) in shapes() {
             for offset in [ALLOC, RELEASE] {
-                assert!(decode_init(bitness, code, offset).is_err(), "{build}");
+                assert!(decode_init(bitness, &code, offset).is_err(), "{shape}");
             }
             for offset in [ALLOC, INIT] {
-                assert!(decode_release(bitness, code, offset).is_err(), "{build}");
+                assert!(decode_release(bitness, &code, offset).is_err(), "{shape}");
             }
             for offset in [INIT, RELEASE] {
-                assert!(decode_alloc(bitness, code, offset).is_err(), "{build}");
+                assert!(decode_alloc(bitness, &code, offset).is_err(), "{shape}");
             }
         }
     }
 
-    fn assemble(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
-        let mut assembler = CodeAssembler::new(64).unwrap();
+    fn assemble(
+        bitness: u32,
+        build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>,
+    ) -> Vec<u8> {
+        let mut assembler = CodeAssembler::new(bitness).unwrap();
         build(&mut assembler).unwrap();
         assembler.assemble(0).unwrap()
     }
 
     fn synthetic_alloc(size: u32) -> Vec<u8> {
-        assemble(|a| {
+        assemble(64, |a| {
             let mut constructor = a.create_label();
             a.push(rbx)?;
             a.mov(esi, size)?;
@@ -300,7 +530,7 @@ mod tests {
     }
 
     fn synthetic_init(extra: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> Vec<u8> {
-        assemble(|a| {
+        assemble(64, |a| {
             a.mov(dword_ptr(rdi), esi)?;
             a.mov(qword_ptr(rdi + 0x08), rdx)?;
             a.mov(dword_ptr(rdi + 0x10), ecx)?;
@@ -311,13 +541,13 @@ mod tests {
     }
 
     fn synthetic_release(refcount: i32) -> Vec<u8> {
-        assemble(|a| {
+        assemble(64, |a| {
             a.sub(dword_ptr(rdi + refcount), 1)?;
             a.ret()
         })
     }
 
-    /// Lay the three functions out at the fixture offsets.
+    /// Lay the three functions out at the region offsets.
     fn region(alloc: &[u8], init: &[u8], release: &[u8]) -> Vec<u8> {
         let mut code = vec![0xcc; RELEASE + 0x40];
         code[ALLOC..ALLOC + alloc.len()].copy_from_slice(alloc);
