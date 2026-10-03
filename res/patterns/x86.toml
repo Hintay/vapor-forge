@@ -7,6 +7,17 @@
 #   "upward": pattern matches function body; scan upward for prologue bytes
 #   "call": pattern matches a context; scan forward to the last CALL before RET
 #           and optionally validate the callee with callee_pattern
+#   "entry": pattern matches the first byte after the entry's register saves;
+#            scan back over those pushes to the entry
+#
+# The default runtime.patterns_url serves this file as the online hotfix. The
+# [hotfix] block names the architecture it is for and declares no binary family:
+# ordinary and steamrt shapes both live here as variants. It carries no
+# revision: a client compares the commit it was built from with the
+# repository's, and takes this file only when the repository is ahead.
+[hotfix]
+format = 1
+architecture = "x86"
 
 [steamclient."CUser::CheckAppOwnership"]
 follow = "relative"

@@ -1,4 +1,13 @@
 # Pattern definitions for 64-bit Linux steamclient.so and steamui.so, baseline Steam public manifest 1782866176.
+#
+# The default runtime.patterns_url serves this file as the online hotfix. The
+# [hotfix] block names the architecture it is for and declares no binary family:
+# ordinary and steamrt shapes both live here as variants. It carries no
+# revision: a client compares the commit it was built from with the
+# repository's, and takes this file only when the repository is ahead.
+[hotfix]
+format = 1
+architecture = "x86_64"
 
 [steamclient."CUser::CheckAppOwnership"]
 follow = "none"

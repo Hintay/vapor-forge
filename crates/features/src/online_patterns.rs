@@ -5,6 +5,13 @@
 //! module.
 //! Removing `patterns_url` stops downloads and candidate promotion but does not
 //! deactivate a validated target-specific cache.
+//!
+//! A download is cached only when it is newer than the pattern set compiled into
+//! this build. For a file served from GitHub that is decided by commit: GitHub
+//! has to report the served branch ahead of the commit this build was made
+//! from. Any other source is trusted, and an optional `revision` in its
+//! `[hotfix]` block orders its own copies. A source with nothing newer drops the
+//! hotfixes cached for the target, so the build's own set is used again.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,11 +20,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
-use vapor_forge_patterns::registry::{PatternRegistry, PatternTarget};
+use vapor_forge_patterns::registry::{
+    PatternRegistry, PatternTarget, EMBEDDED_COMMIT, EMBEDDED_SOURCE,
+};
 
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const TOTAL_TIMEOUT_MS: u64 = 8000;
 const MAX_HOTFIX_BYTES: u64 = 1024 * 1024;
+/// A comparison lists the changed files with their patches, so it can run to a
+/// few megabytes when the branch is far ahead.
+const MAX_COMPARE_BYTES: u64 = 16 * 1024 * 1024;
+const GITHUB_RAW_HOST: &str = "https://raw.githubusercontent.com/";
+const GITHUB_API: &str = "https://api.github.com";
+const MODULES: [&str; 2] = ["steamclient", "steamui"];
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Result of an online pattern fetch attempt.
@@ -25,6 +40,9 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub enum FetchResult {
     Updated(PathBuf),
     AlreadyCurrent,
+    /// The source has nothing newer than this build, for the given reason; the
+    /// hotfixes cached for the target were dropped.
+    NotNewer(String),
     Failed(String),
 }
 
@@ -49,6 +67,23 @@ pub fn fetch_and_cache(url: &str, target: PatternTarget) -> FetchResult {
         Ok(b) => b,
         Err(e) => return FetchResult::Failed(e),
     };
+    if let Err(error) = hotfix_revision(body.as_bytes(), target, "downloaded candidate") {
+        return FetchResult::Failed(error);
+    }
+    let this_build = Build {
+        source: EMBEDDED_SOURCE,
+        commit: EMBEDDED_COMMIT,
+    };
+    match freshness(url, body.as_bytes(), this_build, compare_on_github) {
+        Ok(Freshness::Newer) => {}
+        Ok(Freshness::NotNewer(reason)) => {
+            return match discard_cached_hotfixes(target, url) {
+                Ok(()) => FetchResult::NotNewer(reason),
+                Err(error) => FetchResult::Failed(error),
+            };
+        }
+        Err(error) => return FetchResult::Failed(format!("freshness check failed: {error}")),
+    }
 
     match cache_candidate(&candidate_path, body.as_bytes(), target) {
         Ok(false) => {
@@ -85,6 +120,13 @@ pub fn spawn_fetch(url_template: String, target: PatternTarget) {
                 FetchResult::AlreadyCurrent => {
                     debug!("online-patterns: candidate is current");
                 }
+                FetchResult::NotNewer(reason) => {
+                    info!(
+                        reason,
+                        commit = EMBEDDED_COMMIT.unwrap_or("unknown"),
+                        "online-patterns: nothing newer than this build, cached hotfixes dropped"
+                    );
+                }
                 FetchResult::Failed(e) => {
                     warn!(error = %e, "online-patterns: fetch failed");
                 }
@@ -93,6 +135,155 @@ pub fn spawn_fetch(url_template: String, target: PatternTarget) {
     if let Err(error) = result {
         warn!(%error, "online-patterns: fetch thread could not be started");
     }
+}
+
+/// The pattern set compiled into a build.
+#[derive(Clone, Copy)]
+struct Build {
+    source: &'static str,
+    commit: Option<&'static str>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Freshness {
+    Newer,
+    /// The build already carries this set or a newer one.
+    NotNewer(String),
+}
+
+/// A file served from a GitHub repository.
+#[derive(Debug, Eq, PartialEq)]
+struct GithubSource {
+    owner: String,
+    repo: String,
+    /// The branch, tag or commit the file is served from.
+    reference: String,
+}
+
+/// Where the served branch stands relative to a build's commit.
+#[derive(Debug, Eq, PartialEq)]
+enum Ancestry {
+    Ahead,
+    /// `behind`, `identical` or `diverged`.
+    NotAhead(String),
+    /// The repository does not have the build's commit.
+    UnknownCommit,
+}
+
+/// Decide whether `body`, downloaded from `url`, is newer than `build`.
+fn freshness(
+    url: &str,
+    body: &[u8],
+    build: Build,
+    compare: impl FnOnce(&GithubSource, &str) -> Result<Ancestry, String>,
+) -> Result<Freshness, String> {
+    if body == build.source.as_bytes() {
+        return Ok(Freshness::NotNewer(
+            "the source serves this build's patterns".to_owned(),
+        ));
+    }
+    let Some(source) = github_source(url) else {
+        return Ok(Freshness::Newer);
+    };
+    // A build that cannot name its commit is a development build, which is at
+    // least as new as anything published.
+    let Some(commit) = build.commit else {
+        return Ok(Freshness::NotNewer(
+            "this build's commit is unknown".to_owned(),
+        ));
+    };
+    Ok(match compare(&source, commit)? {
+        Ancestry::Ahead => Freshness::Newer,
+        Ancestry::NotAhead(status) => Freshness::NotNewer(format!(
+            "{} is {status} relative to this build",
+            source.reference
+        )),
+        Ancestry::UnknownCommit => {
+            Freshness::NotNewer("this build's commit is not in the repository".to_owned())
+        }
+    })
+}
+
+/// `https://raw.githubusercontent.com/{owner}/{repo}/{reference}/{path}`, where
+/// the reference is one segment or `refs/heads/...` / `refs/tags/...`.
+fn github_source(url: &str) -> Option<GithubSource> {
+    let path = url.strip_prefix(GITHUB_RAW_HOST)?;
+    let segments: Vec<&str> = path.split('/').collect();
+    let (reference, rest) = match segments.get(2..)? {
+        ["refs", kind @ ("heads" | "tags"), name, rest @ ..] => {
+            (format!("refs/{kind}/{name}"), rest)
+        }
+        [reference, rest @ ..] => ((*reference).to_owned(), rest),
+        [] => return None,
+    };
+    let valid = |segment: &str| !segment.is_empty();
+    (valid(segments[0]) && valid(segments[1]) && valid(&reference) && !rest.is_empty()).then(|| {
+        GithubSource {
+            owner: segments[0].to_owned(),
+            repo: segments[1].to_owned(),
+            reference,
+        }
+    })
+}
+
+/// Ask GitHub where `source`'s reference stands relative to `commit`.
+fn compare_on_github(source: &GithubSource, commit: &str) -> Result<Ancestry, String> {
+    #[derive(serde::Deserialize)]
+    struct Comparison {
+        status: String,
+    }
+
+    let url = format!(
+        "{GITHUB_API}/repos/{}/{}/compare/{commit}...{}?per_page=1",
+        source.owner, source.repo, source.reference
+    );
+    let response = fetch_agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "vapor-forge")
+        .call();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Ok(Ancestry::UnknownCommit),
+        Err(error) => return Err(format!("GitHub comparison failed: {error}")),
+    };
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_COMPARE_BYTES)
+        .read_to_string()
+        .map_err(|error| format!("GitHub comparison read failed: {error}"))?;
+    let comparison: Comparison = serde_json::from_str(&body)
+        .map_err(|error| format!("GitHub comparison is malformed: {error}"))?;
+    Ok(match comparison.status.as_str() {
+        "ahead" => Ancestry::Ahead,
+        _ => Ancestry::NotAhead(comparison.status),
+    })
+}
+
+/// Remove the candidate cached from `expanded_url` and every active hotfix for
+/// `target`.
+fn discard_cached_hotfixes(target: PatternTarget, expanded_url: &str) -> Result<(), String> {
+    let candidate = pattern_candidate_path(target, expanded_url)
+        .ok_or_else(|| "candidate path is unavailable".to_owned())?;
+    let actives = MODULES
+        .iter()
+        .filter_map(|module| pattern_cache_path(target, module));
+    for path in std::iter::once(candidate).chain(actives) {
+        remove_cached(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_cached(path: &std::path::Path) -> Result<(), String> {
+    with_path_lock(path, || match std::fs::remove_file(path) {
+        Ok(()) => {
+            info!(path = %path.display(), "online-patterns: dropped cached hotfix");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{} could not be removed: {error}", path.display())),
+    })
 }
 
 fn do_fetch(url: &str) -> Result<String, String> {
@@ -228,21 +419,11 @@ fn cache_candidate(
             }
         };
         if let Some(current) = current {
+            if current == content {
+                return Ok(false);
+            }
             match hotfix_revision(&current, target, "cached candidate") {
-                Ok(current_revision) if incoming_revision < current_revision => {
-                    return Err(format!(
-                        "candidate revision {incoming_revision} is older than cached revision {current_revision}"
-                    ));
-                }
-                Ok(current_revision) if incoming_revision == current_revision => {
-                    if current == content {
-                        return Ok(false);
-                    }
-                    return Err(format!(
-                        "candidate revision {incoming_revision} has different cached content"
-                    ));
-                }
-                Ok(_) => {}
+                Ok(current_revision) => check_order(incoming_revision, current_revision, "cached")?,
                 Err(error) => {
                     warn!(path = %path.display(), %error, "online-patterns: replacing invalid candidate");
                 }
@@ -285,21 +466,13 @@ fn validate_and_promote_candidate_at(
                 }
             };
             if let Some(active) = active {
+                if active == content {
+                    return Ok(PromotionResult::AlreadyActive(active_path.to_path_buf()));
+                }
                 match hotfix_revision(&active, target, "active cache") {
-                    Ok(active_revision) if candidate_revision < active_revision => {
-                        return Err(format!(
-                            "candidate revision {candidate_revision} is older than active revision {active_revision}"
-                        ));
+                    Ok(active_revision) => {
+                        check_order(candidate_revision, active_revision, "active")?
                     }
-                    Ok(active_revision) if candidate_revision == active_revision => {
-                        if active == content {
-                            return Ok(PromotionResult::AlreadyActive(active_path.to_path_buf()));
-                        }
-                        return Err(format!(
-                            "candidate revision {candidate_revision} has different active content"
-                        ));
-                    }
-                    Ok(_) => {}
                     Err(error) => {
                         warn!(path = %active_path.display(), %error, "online-patterns: replacing invalid active cache");
                     }
@@ -312,17 +485,32 @@ fn validate_and_promote_candidate_at(
     })
 }
 
+/// Refuse to replace a different copy unless the incoming one is newer. Copies
+/// without a revision are not ordered: the latest download is the newest.
+fn check_order(incoming: Option<u64>, existing: Option<u64>, kind: &str) -> Result<(), String> {
+    match (incoming, existing) {
+        (Some(incoming), Some(existing)) if incoming < existing => Err(format!(
+            "candidate revision {incoming} is older than {kind} revision {existing}"
+        )),
+        (Some(incoming), Some(existing)) if incoming == existing => Err(format!(
+            "candidate revision {incoming} has different {kind} content"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Validate `content` as a hotfix for `target` and return its revision, if it
+/// declares one.
 fn hotfix_revision(
     content: &[u8],
     target: PatternTarget,
     description: &str,
-) -> Result<u64, String> {
+) -> Result<Option<u64>, String> {
     let text = std::str::from_utf8(content)
         .map_err(|error| format!("{description} is not UTF-8: {error}"))?;
-    PatternRegistry::from_hotfix_text(text, target)
+    Ok(PatternRegistry::from_hotfix_text(text, target)
         .map_err(|error| format!("invalid {description}: {error}"))?
-        .hotfix_revision()
-        .ok_or_else(|| format!("{description} has no revision"))
+        .hotfix_revision())
 }
 
 fn with_path_lock<T>(
@@ -421,6 +609,148 @@ mod tests {
 
     const SOURCE_A: &str = "https://patterns-a.example/x86_64/steamrt.toml";
     const SOURCE_B: &str = "https://patterns-b.example/x86_64/steamrt.toml";
+
+    /// A hotfix without a revision, as the official repository serves them.
+    fn unrevisioned(pattern: &str) -> Vec<u8> {
+        format!(
+            r#"[hotfix]
+format = 1
+architecture = "x86_64"
+
+[steamclient."CUser::CheckAppOwnership"]
+pattern = "{pattern}"
+"#
+        )
+        .into_bytes()
+    }
+
+    const OFFICIAL: &str =
+        "https://raw.githubusercontent.com/Hintay/vapor-forge/main/res/patterns/x86_64.toml";
+    const BUILD_COMMIT: &str = "652c8078575296823da813ccac1ca9d7cd60aae2";
+
+    fn build(source: &'static str) -> Build {
+        Build {
+            source,
+            commit: Some(BUILD_COMMIT),
+        }
+    }
+
+    fn no_comparison(_: &GithubSource, _: &str) -> Result<Ancestry, String> {
+        panic!("no comparison expected")
+    }
+
+    #[test]
+    fn github_raw_urls_name_their_repository_and_reference() {
+        assert_eq!(
+            github_source(OFFICIAL),
+            Some(GithubSource {
+                owner: "Hintay".to_owned(),
+                repo: "vapor-forge".to_owned(),
+                reference: "main".to_owned(),
+            })
+        );
+        assert_eq!(
+            github_source(
+                "https://raw.githubusercontent.com/a/b/refs/heads/next/res/patterns/x86.toml"
+            )
+            .map(|source| source.reference),
+            Some("refs/heads/next".to_owned())
+        );
+        assert_eq!(
+            github_source("https://raw.githubusercontent.com/a/b/main"),
+            None
+        );
+        assert_eq!(github_source("https://patterns.example/x86_64.toml"), None);
+    }
+
+    #[test]
+    fn the_shipped_default_is_judged_by_commit() {
+        let default_url = vapor_forge_config::RuntimeConfig::default()
+            .runtime
+            .patterns_url;
+        let expanded = expand_source_url(&default_url, TARGET).unwrap();
+        assert!(github_source(&expanded).is_some(), "{expanded}");
+    }
+
+    #[test]
+    fn a_copy_of_the_build_own_patterns_is_not_newer() {
+        for url in [OFFICIAL, SOURCE_A] {
+            let freshness = freshness(url, b"same", build("same"), no_comparison).unwrap();
+            assert!(matches!(freshness, Freshness::NotNewer(_)), "{url}");
+        }
+    }
+
+    #[test]
+    fn other_sources_are_trusted_without_a_comparison() {
+        assert_eq!(
+            freshness(SOURCE_A, b"published", build("built"), no_comparison),
+            Ok(Freshness::Newer)
+        );
+    }
+
+    #[test]
+    fn the_official_copy_is_taken_only_when_its_branch_is_ahead() {
+        let judge = |ancestry: fn() -> Result<Ancestry, String>| {
+            freshness(OFFICIAL, b"published", build("built"), |source, commit| {
+                assert_eq!(source.reference, "main");
+                assert_eq!(commit, BUILD_COMMIT);
+                ancestry()
+            })
+        };
+        assert_eq!(judge(|| Ok(Ancestry::Ahead)), Ok(Freshness::Newer));
+        for ancestry in [
+            || Ok(Ancestry::NotAhead("behind".to_owned())),
+            || Ok(Ancestry::NotAhead("diverged".to_owned())),
+            || Ok(Ancestry::UnknownCommit),
+        ] {
+            assert!(matches!(judge(ancestry), Ok(Freshness::NotNewer(_))));
+        }
+        // An unanswered comparison decides nothing, so caches stay as they are.
+        assert!(judge(|| Err("rate limited".to_owned())).is_err());
+    }
+
+    #[test]
+    fn a_build_without_a_commit_takes_no_official_copy() {
+        let development = Build {
+            source: "built",
+            commit: None,
+        };
+        assert!(matches!(
+            freshness(OFFICIAL, b"published", development, no_comparison),
+            Ok(Freshness::NotNewer(_))
+        ));
+    }
+
+    #[test]
+    fn unrevisioned_copies_follow_the_latest_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join("candidate.toml");
+        let active = directory.path().join("active.toml");
+        let first = unrevisioned("AA BB CC");
+        let second = unrevisioned("11 22 33");
+
+        assert!(cache_candidate(&candidate, &first, TARGET).unwrap());
+        assert!(!cache_candidate(&candidate, &first, TARGET).unwrap());
+        validate_and_promote_candidate_at(&candidate, &active, TARGET, |_| Ok(())).unwrap();
+
+        assert!(cache_candidate(&candidate, &second, TARGET).unwrap());
+        assert_eq!(
+            validate_and_promote_candidate_at(&candidate, &active, TARGET, |_| Ok(())).unwrap(),
+            PromotionResult::Published(active.clone())
+        );
+        assert_eq!(std::fs::read(active).unwrap(), second);
+    }
+
+    #[test]
+    fn removing_cached_hotfixes_tolerates_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let cached = directory.path().join("patterns.toml");
+        std::fs::write(&cached, unrevisioned("AA BB CC")).unwrap();
+
+        remove_cached(&cached).unwrap();
+        assert!(!cached.exists());
+        remove_cached(&cached).unwrap();
+    }
 
     fn hotfix(revision: u64, pattern: &str) -> Vec<u8> {
         format!(

@@ -153,22 +153,29 @@ impl PatternRegistry {
         Self::from_hotfix_text(&text, expected)
     }
 
+    /// Load a hotfix for `expected`. A hotfix that declares no binary family
+    /// carries both families as in-file variants and serves either one.
     pub fn from_hotfix_text(text: &str, expected: PatternTarget) -> Result<Self, String> {
         let parsed = parse_hotfix(text)?;
-        if parsed.target != expected {
+        let family_matches = parsed
+            .binary_family
+            .is_none_or(|family| family == expected.binary_family);
+        if parsed.architecture != expected.architecture || !family_matches {
+            let declared = match parsed.binary_family {
+                Some(family) => format!("{}/{}", parsed.architecture.as_str(), family.as_str()),
+                None => parsed.architecture.as_str().to_owned(),
+            };
             return Err(format!(
-                "hotfix target is {}/{}, expected {}/{}",
-                parsed.target.architecture.as_str(),
-                parsed.target.binary_family.as_str(),
+                "hotfix target is {declared}, expected {}/{}",
                 expected.architecture.as_str(),
                 expected.binary_family.as_str()
             ));
         }
-        validate_hotfix_entries(&parsed.overrides, expected)?;
+        validate_hotfix_entries(&parsed.overrides, expected, parsed.binary_family)?;
         Ok(Self {
             overrides: parsed.overrides,
             target: Some(expected),
-            hotfix_revision: Some(parsed.revision),
+            hotfix_revision: parsed.revision,
         })
     }
 
@@ -242,8 +249,10 @@ impl PatternRegistry {
 }
 
 /// Parse a complete TOML pattern file (same format as res/patterns/x86.toml).
+/// A leading `[hotfix]` block is read past; only the patterns are returned.
 pub fn parse_toml_patterns(text: &str) -> Result<Vec<(String, RuntimePatternEntry)>, String> {
-    parse_toml_entries(text)
+    let (_, patterns) = split_hotfix(text)?;
+    parse_toml_entries(&patterns)
 }
 
 /// A looked-up pattern group from either embedded or runtime data.
@@ -346,17 +355,28 @@ fn parse_toml_overrides(text: &str) -> Result<HashMap<String, Vec<RuntimePattern
 }
 
 struct ParsedHotfix {
-    target: PatternTarget,
-    revision: u64,
+    architecture: PatternArchitecture,
+    /// `None` for a file that serves both families through its variants.
+    binary_family: Option<SteamBinaryFamily>,
+    /// Orders copies from a source that publishes one; optional.
+    revision: Option<u64>,
     overrides: HashMap<String, Vec<RuntimePatternEntry>>,
 }
 
-fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
-    let mut format = None;
-    let mut revision = None;
-    let mut architecture = None;
-    let mut binary_family = None;
-    let mut metadata_seen = false;
+/// The `[hotfix]` block that heads a pattern file served as a hotfix.
+#[derive(Default)]
+struct HotfixEnvelope {
+    format: Option<u32>,
+    revision: Option<u64>,
+    architecture: Option<PatternArchitecture>,
+    binary_family: Option<SteamBinaryFamily>,
+}
+
+/// Split a pattern file into its `[hotfix]` block, if it has one, and the
+/// pattern text. Envelope lines become blank lines in the pattern text so line
+/// numbers in later errors still point into the file.
+fn split_hotfix(text: &str) -> Result<(Option<HotfixEnvelope>, String), String> {
+    let mut envelope: Option<HotfixEnvelope> = None;
     let mut in_metadata = false;
     let mut patterns_started = false;
     let mut patterns = String::new();
@@ -366,23 +386,22 @@ fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
         let line = strip_inline_comment(original_line).trim();
         if line.starts_with('[') {
             if line == "[hotfix]" {
-                if metadata_seen || patterns_started {
+                if envelope.is_some() || patterns_started {
                     return Err(format!(
                         "line {line_no}: hotfix metadata must be the first and only metadata section"
                     ));
                 }
-                metadata_seen = true;
+                envelope = Some(HotfixEnvelope::default());
                 in_metadata = true;
+                patterns.push('\n');
                 continue;
-            }
-            if !metadata_seen {
-                return Err(format!("line {line_no}: missing hotfix metadata"));
             }
             in_metadata = false;
             patterns_started = true;
         }
 
-        if in_metadata {
+        if let Some(envelope) = envelope.as_mut().filter(|_| in_metadata) {
+            patterns.push('\n');
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -396,7 +415,7 @@ fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
                     let parsed = value
                         .parse::<u32>()
                         .map_err(|_| format!("line {line_no}: format must be an integer"))?;
-                    if format.replace(parsed).is_some() {
+                    if envelope.format.replace(parsed).is_some() {
                         return Err(format!("line {line_no}: duplicate format"));
                     }
                 }
@@ -407,21 +426,21 @@ fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
                     if parsed == 0 {
                         return Err(format!("line {line_no}: revision must be non-zero"));
                     }
-                    if revision.replace(parsed).is_some() {
+                    if envelope.revision.replace(parsed).is_some() {
                         return Err(format!("line {line_no}: duplicate revision"));
                     }
                 }
                 "architecture" => {
                     let value = parse_quoted_string(value, line_no, key)?;
                     let parsed = PatternArchitecture::parse(&value)?;
-                    if architecture.replace(parsed).is_some() {
+                    if envelope.architecture.replace(parsed).is_some() {
                         return Err(format!("line {line_no}: duplicate architecture"));
                     }
                 }
                 "binary_family" => {
                     let value = parse_quoted_string(value, line_no, key)?;
                     let parsed = SteamBinaryFamily::parse(&value)?;
-                    if binary_family.replace(parsed).is_some() {
+                    if envelope.binary_family.replace(parsed).is_some() {
                         return Err(format!("line {line_no}: duplicate binary_family"));
                     }
                 }
@@ -433,22 +452,24 @@ fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
         patterns.push_str(original_line);
         patterns.push('\n');
     }
+    Ok((envelope, patterns))
+}
 
-    if !metadata_seen {
-        return Err("missing [hotfix] metadata".to_owned());
-    }
-    let format = format.ok_or_else(|| "missing hotfix format".to_owned())?;
+fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
+    let (envelope, patterns) = split_hotfix(text)?;
+    let envelope = envelope.ok_or_else(|| "missing [hotfix] metadata".to_owned())?;
+    let format = envelope
+        .format
+        .ok_or_else(|| "missing hotfix format".to_owned())?;
     if format != HOTFIX_FORMAT {
         return Err(format!("unsupported hotfix format {format}"));
     }
-    let revision = revision.ok_or_else(|| "missing hotfix revision".to_owned())?;
-    let target = PatternTarget {
-        architecture: architecture.ok_or_else(|| "missing hotfix architecture".to_owned())?,
-        binary_family: binary_family.ok_or_else(|| "missing hotfix binary_family".to_owned())?,
-    };
     Ok(ParsedHotfix {
-        target,
-        revision,
+        architecture: envelope
+            .architecture
+            .ok_or_else(|| "missing hotfix architecture".to_owned())?,
+        binary_family: envelope.binary_family,
+        revision: envelope.revision,
         overrides: parse_toml_overrides(&patterns)?,
     })
 }
@@ -456,6 +477,7 @@ fn parse_hotfix(text: &str) -> Result<ParsedHotfix, String> {
 fn validate_hotfix_entries(
     overrides: &HashMap<String, Vec<RuntimePatternEntry>>,
     target: PatternTarget,
+    declared_family: Option<SteamBinaryFamily>,
 ) -> Result<(), String> {
     if overrides.is_empty() {
         return Err("hotfix contains no pattern entries".to_owned());
@@ -492,7 +514,9 @@ fn validate_hotfix_entries(
                     first.module
                 )
             })?;
-        if target.binary_family == SteamBinaryFamily::Ordinary {
+        // A hotfix written for ordinary builds alone gets the strict shape; a
+        // file serving both families carries steamrt variants by design.
+        if declared_family == Some(SteamBinaryFamily::Ordinary) {
             if entries.iter().any(|entry| entry.steamrt_variant) {
                 return Err(format!(
                     "ordinary hotfix pattern {name:?} must use one wildcarded primary entry"
@@ -1038,6 +1062,73 @@ pattern = "AA ? CC"
         );
     }
 
+    /// The default `patterns_url` serves these files as they are, so each must
+    /// load as a hotfix for every family of its architecture.
+    #[test]
+    fn shipped_pattern_files_load_as_hotfixes() {
+        let shipped = [
+            (
+                PatternArchitecture::X86,
+                include_str!("../../../res/patterns/x86.toml"),
+            ),
+            (
+                PatternArchitecture::X86_64,
+                include_str!("../../../res/patterns/x86_64.toml"),
+            ),
+        ];
+        for (architecture, text) in shipped {
+            for binary_family in [SteamBinaryFamily::Ordinary, SteamBinaryFamily::SteamRt] {
+                let target = PatternTarget {
+                    architecture,
+                    binary_family,
+                };
+                if let Err(error) = PatternRegistry::from_hotfix_text(text, target) {
+                    panic!(
+                        "{}/{}: {error}",
+                        architecture.as_str(),
+                        binary_family.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn family_neutral_hotfix_serves_both_families_of_its_architecture() {
+        // No binary_family: the steamrt variant and the literal primary are what
+        // a full pattern file carries, not mistakes in a targeted hotfix.
+        let text = r#"
+[hotfix]
+format = 1
+architecture = "x86_64"
+
+[steamclient."CUser::CheckAppOwnership"]
+pattern = "AA BB CC"
+
+[[steamclient."CUser::CheckAppOwnership".variants]]
+pattern = "DD ? FF"
+"#;
+        for binary_family in [SteamBinaryFamily::Ordinary, SteamBinaryFamily::SteamRt] {
+            let target = PatternTarget {
+                architecture: PatternArchitecture::X86_64,
+                binary_family,
+            };
+            let registry = PatternRegistry::from_hotfix_text(text, target).unwrap();
+            assert_eq!(registry.hotfix_revision(), None);
+        }
+        let other_architecture = PatternTarget {
+            architecture: PatternArchitecture::X86,
+            binary_family: SteamBinaryFamily::Ordinary,
+        };
+        let error = PatternRegistry::from_hotfix_text(text, other_architecture)
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("hotfix target is x86_64, expected x86/ordinary"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn hotfix_requires_an_exact_target() {
         let text = r#"
@@ -1076,13 +1167,12 @@ pattern = "AA ? CC"
     }
 
     #[test]
-    fn hotfix_requires_a_nonzero_revision() {
+    fn hotfix_revision_when_present_is_a_nonzero_integer() {
         let target = PatternTarget {
             architecture: PatternArchitecture::X86_64,
             binary_family: SteamBinaryFamily::Ordinary,
         };
         for (revision, expected) in [
-            ("", "missing hotfix revision"),
             ("revision = 0", "revision must be non-zero"),
             ("revision = invalid", "revision must be an integer"),
         ] {
