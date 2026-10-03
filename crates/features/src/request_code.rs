@@ -261,19 +261,39 @@ const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 /// for the rest of the Steam session.
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(300);
 /// Applied when a provider itself is unhealthy (transport error, 5xx, a
-/// Cloudflare block). Steam asks for one code per depot, so without this a
-/// dead source costs a wasted round trip on every single gid.
+/// Cloudflare block), once another provider has served the same gid. Steam
+/// asks for one code per depot, so without this a dead source costs a wasted
+/// round trip on every single gid.
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Instants before which a rate-limited provider must not be contacted again.
+/// How long a served code keeps its provider at the back of the chain for the
+/// same gid.
 ///
-/// Steam resolves several depot manifests back to back. Without this, one 429
-/// would be re-earned on every following gid: a wasted round trip each time,
-/// and more load on a provider that just asked us to back off.
-static PROVIDER_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+/// Steam asks for a gid's code again only when it needs that manifest again.
+/// Within minutes that means the CDN refused the code: Steam logs the 401 as
+/// "No Connection" and retries the whole update. Every provider hands out a
+/// refused code now and then, and asking the same one again tends to repeat
+/// it, so a quick re-request goes to the others first.
+const REREQUEST_WINDOW: Duration = Duration::from_secs(600);
 
-fn provider_cooldowns() -> &'static Mutex<HashMap<String, Instant>> {
-    PROVIDER_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Provider bookkeeping shared by every fetch thread.
+#[derive(Default)]
+struct ProviderState {
+    /// Instants before which a provider must not be contacted again.
+    ///
+    /// Steam resolves several depot manifests back to back. Without this, one
+    /// 429 would be re-earned on every following gid: a wasted round trip each
+    /// time, and more load on a provider that just asked us to back off.
+    cooldowns: Mutex<HashMap<String, Instant>>,
+    /// Providers that served a code within [`REREQUEST_WINDOW`], per gid,
+    /// least recent first.
+    served: Mutex<HashMap<u64, Vec<(String, Instant)>>>,
+}
+
+static PROVIDER_STATE: OnceLock<ProviderState> = OnceLock::new();
+
+fn provider_state() -> &'static ProviderState {
+    PROVIDER_STATE.get_or_init(ProviderState::default)
 }
 
 /// When each provider was last contacted, for the self-imposed pacing.
@@ -379,18 +399,83 @@ fn start_cooldown_in(
     capped
 }
 
-fn cooldown_remaining(name: &str) -> Option<Duration> {
-    let mut cooldowns = provider_cooldowns()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    cooldown_remaining_in(&mut cooldowns, name, Instant::now())
+/// Providers that served `gid` within [`REREQUEST_WINDOW`], least recent first.
+/// Entries past the window are dropped for every gid, so the table only holds
+/// the codes of the current update.
+fn served_by_in(
+    served: &mut HashMap<u64, Vec<(String, Instant)>>,
+    gid: u64,
+    now: Instant,
+) -> Vec<String> {
+    served.retain(|_, entries| {
+        entries.retain(|(_, at)| now.saturating_duration_since(*at) < REREQUEST_WINDOW);
+        !entries.is_empty()
+    });
+    served
+        .get(&gid)
+        .map(|entries| entries.iter().map(|(name, _)| name.clone()).collect())
+        .unwrap_or_default()
 }
 
-fn start_cooldown(name: &str, retry_after: Duration) -> Duration {
-    let mut cooldowns = provider_cooldowns()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    start_cooldown_in(&mut cooldowns, name, Instant::now(), retry_after)
+fn record_served_in(
+    served: &mut HashMap<u64, Vec<(String, Instant)>>,
+    gid: u64,
+    name: &str,
+    now: Instant,
+) {
+    let entries = served.entry(gid).or_default();
+    entries.retain(|(served_name, _)| served_name != name);
+    entries.push((name.to_owned(), now));
+}
+
+/// Chain order for one gid: providers that have not served it recently keep
+/// their configured order, the ones that have go last, least recent first.
+fn order_providers<'a>(
+    providers: &'a [ManifestSource],
+    served: &[String],
+) -> Vec<&'a ManifestSource> {
+    let mut ordered: Vec<_> = providers
+        .iter()
+        .filter(|provider| !served.iter().any(|name| name == provider.name()))
+        .collect();
+    for name in served {
+        ordered.extend(providers.iter().filter(|provider| provider.name() == name));
+    }
+    ordered
+}
+
+impl ProviderState {
+    fn cooldown_remaining(&self, name: &str) -> Option<Duration> {
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cooldown_remaining_in(&mut cooldowns, name, Instant::now())
+    }
+
+    fn start_cooldown(&self, name: &str, retry_after: Duration) -> Duration {
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        start_cooldown_in(&mut cooldowns, name, Instant::now(), retry_after)
+    }
+
+    fn served_by(&self, gid: u64) -> Vec<String> {
+        let mut served = self
+            .served
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        served_by_in(&mut served, gid, Instant::now())
+    }
+
+    fn record_served(&self, gid: u64, name: &str) {
+        let mut served = self
+            .served
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        record_served_in(&mut served, gid, name, Instant::now());
+    }
 }
 
 /// `Retry-After` in its delta-seconds form. The HTTP-date form is not accepted:
@@ -414,7 +499,40 @@ fn fetch_manifest_code(
         gid,
     } = context;
 
-    for provider in providers {
+    run_provider_chain(provider_state(), context, providers, |provider| {
+        let url = provider.resolve_url(app_id, depot_id, gid);
+        // Pace before the request, not after a 429: these are small shared
+        // services and the cooldown only reacts once the damage is done.
+        wait_for_slot(provider.name(), provider.min_interval(min_interval_ms));
+        fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms)
+    })
+}
+
+fn run_provider_chain(
+    state: &ProviderState,
+    context: FetchContext,
+    providers: &[ManifestSource],
+    mut attempt: impl FnMut(&ManifestSource) -> ProviderOutcome,
+) -> Option<u64> {
+    let FetchContext { depot_id, gid, .. } = context;
+
+    let served = state.served_by(gid);
+    if !served.is_empty() {
+        info!(
+            gid,
+            depot_id,
+            served = ?served,
+            "request_code: gid requested again, trying other providers first"
+        );
+    }
+
+    // A failure only says something about the provider once another one has
+    // answered the same gid. When the whole chain fails, the gid is the likelier
+    // cause, and cooling every provider down would turn the following gids of
+    // the same update into instant failures.
+    let mut failed = Vec::new();
+
+    for provider in order_providers(providers, &served) {
         let name = provider.name();
 
         // A user-defined entry can be malformed; skip it and keep the rest of
@@ -424,39 +542,44 @@ fn fetch_manifest_code(
             continue;
         }
 
-        if let Some(remaining) = cooldown_remaining(name) {
+        if let Some(remaining) = state.cooldown_remaining(name) {
             debug!(
                 provider = name,
                 gid,
                 remaining_ms = remaining.as_millis() as u64,
-                "request_code: provider rate limited, skipping"
+                "request_code: provider cooling down, skipping"
             );
             continue;
         }
 
-        let url = provider.resolve_url(app_id, depot_id, gid);
         debug!(
             provider = name,
             gid, depot_id, "request_code: trying provider"
         );
 
-        // Pace before the request, not after a 429: these are small shared
-        // services and the cooldown only reacts once the damage is done.
-        wait_for_slot(name, provider.min_interval(min_interval_ms));
-
-        match fetch_from_provider(provider, &url, timeout_connect_ms, timeout_ms) {
+        match attempt(provider) {
             ProviderOutcome::Code(code) if code > 0 => {
                 info!(
                     provider = name,
                     gid, code, "request_code: manifest code obtained"
                 );
+                state.record_served(gid, name);
+                for failed_name in failed {
+                    let cooldown = state.start_cooldown(failed_name, FAILURE_COOLDOWN);
+                    warn!(
+                        provider = failed_name,
+                        gid,
+                        cooldown_ms = cooldown.as_millis() as u64,
+                        "request_code: backing off failed provider"
+                    );
+                }
                 return Some(code);
             }
             ProviderOutcome::Code(_) => {
                 warn!(provider = name, gid, "request_code: provider returned zero")
             }
             ProviderOutcome::RateLimited(retry_after) => {
-                let cooldown = start_cooldown(name, retry_after);
+                let cooldown = state.start_cooldown(name, retry_after);
                 warn!(
                     provider = name,
                     gid,
@@ -472,18 +595,20 @@ fn fetch_manifest_code(
                 );
             }
             ProviderOutcome::Failed(error) => {
-                let cooldown = start_cooldown(name, FAILURE_COOLDOWN);
-                warn!(
-                    provider = name,
-                    gid,
-                    %error,
-                    cooldown_ms = cooldown.as_millis() as u64,
-                    "request_code: provider failed, backing off"
-                );
+                warn!(provider = name, gid, %error, "request_code: provider failed");
+                failed.push(name);
             }
         }
     }
 
+    if !failed.is_empty() {
+        warn!(
+            gid,
+            depot_id,
+            failed = ?failed,
+            "request_code: no provider served this gid, failures not backed off"
+        );
+    }
     None
 }
 
@@ -1152,5 +1277,137 @@ mod tests {
             cooldown_remaining_in(&mut cooldowns, "manifestdex", now),
             Some(MAX_RATE_LIMIT_COOLDOWN)
         );
+    }
+
+    fn chain(names: &[&str]) -> Vec<ManifestSource> {
+        names
+            .iter()
+            .map(|name| custom(name, ManifestResponseFormat::Plain, None))
+            .collect()
+    }
+
+    fn context(gid: u64) -> FetchContext {
+        FetchContext {
+            app_id: 10,
+            depot_id: 11,
+            gid,
+        }
+    }
+
+    /// Run the chain with scripted outcomes and return the code plus the order
+    /// in which providers were asked.
+    fn run_scripted(
+        state: &ProviderState,
+        gid: u64,
+        providers: &[ManifestSource],
+        outcome: impl Fn(&str) -> ProviderOutcome,
+    ) -> (Option<u64>, Vec<String>) {
+        let mut asked = Vec::new();
+        let code = run_provider_chain(state, context(gid), providers, |provider| {
+            asked.push(provider.name().to_owned());
+            outcome(provider.name())
+        });
+        (code, asked)
+    }
+
+    #[test]
+    fn a_rerequested_gid_goes_to_other_providers_first() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b", "c"]);
+        let serve = |_: &str| ProviderOutcome::Code(7);
+
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["b"]);
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["c"]);
+        // Every provider has served it: the least recent one comes back first.
+        assert_eq!(run_scripted(&state, 1, &providers, serve).1, ["a"]);
+        // Another gid keeps the configured order.
+        assert_eq!(run_scripted(&state, 2, &providers, serve).1, ["a"]);
+    }
+
+    #[test]
+    fn a_rerequested_gid_still_reaches_the_previous_provider() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        run_scripted(&state, 1, &providers, |_| ProviderOutcome::Code(7));
+        let (code, asked) = run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::Code(8),
+            _ => ProviderOutcome::Denied(401),
+        });
+
+        assert_eq!(code, Some(8));
+        assert_eq!(asked, ["b", "a"]);
+    }
+
+    #[test]
+    fn served_entries_expire_after_the_rerequest_window() {
+        let mut served = HashMap::new();
+        let now = Instant::now();
+        record_served_in(&mut served, 1, "a", now);
+        record_served_in(&mut served, 1, "b", now + Duration::from_secs(1));
+        record_served_in(&mut served, 1, "a", now + Duration::from_secs(2));
+
+        assert_eq!(served_by_in(&mut served, 1, now), ["b", "a"]);
+        assert!(served_by_in(
+            &mut served,
+            1,
+            now + REREQUEST_WINDOW + Duration::from_secs(2)
+        )
+        .is_empty());
+        assert!(served.is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_backed_off_once_another_provider_serves_the_gid() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (code, _) = run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::Failed("http status 503".to_owned()),
+            _ => ProviderOutcome::Code(7),
+        });
+
+        assert_eq!(code, Some(7));
+        assert!(state.cooldown_remaining("a").is_some());
+        assert!(state.cooldown_remaining("b").is_none());
+        assert_eq!(
+            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)).1,
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn a_gid_no_provider_serves_backs_nobody_off() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        let (code, asked) = run_scripted(&state, 1, &providers, |_| {
+            ProviderOutcome::Failed("http status 502".to_owned())
+        });
+
+        assert_eq!(code, None);
+        assert_eq!(asked, ["a", "b"]);
+        assert!(state.cooldown_remaining("a").is_none());
+        assert!(state.cooldown_remaining("b").is_none());
+        // The next gid of the same update is still asked everywhere.
+        assert_eq!(
+            run_scripted(&state, 2, &providers, |_| ProviderOutcome::Code(9)),
+            (Some(9), vec!["a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_backed_off_even_when_the_chain_fails() {
+        let state = ProviderState::default();
+        let providers = chain(&["a", "b"]);
+
+        run_scripted(&state, 1, &providers, |name| match name {
+            "a" => ProviderOutcome::RateLimited(Duration::from_secs(30)),
+            _ => ProviderOutcome::Failed("timeout".to_owned()),
+        });
+
+        assert!(state.cooldown_remaining("a").is_some());
+        assert!(state.cooldown_remaining("b").is_none());
     }
 }
