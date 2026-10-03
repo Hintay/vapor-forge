@@ -18,6 +18,8 @@ pub mod env_writer;
 pub mod full_semantic;
 pub mod semantic;
 pub mod vtable_scan;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod work_item_site;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternToken {

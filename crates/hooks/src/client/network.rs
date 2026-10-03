@@ -7,11 +7,11 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use tracing::{info, warn};
 use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_patterns::registry::PatternRegistry;
+use vapor_forge_patterns::work_item_site::WorkItemSite;
 use vapor_forge_steam_native_abi::cnet_packet;
 
 use crate::netpacket::SendFrameDecision;
 use crate::pattern_resolver::CodeRegion;
-use crate::work_item_site::WorkItemSite;
 use vapor_forge_hook_engine::original::detour_or_return;
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -189,7 +189,12 @@ fn resolve_work_item_site(
         warn!("native-inject: work item post site is unresolved, dispatch stays off");
         return;
     };
-    let decoded = match crate::work_item_site::decode(usize::BITS, code.base, code.bytes, site) {
+    let decoded = match vapor_forge_patterns::work_item_site::decode(
+        usize::BITS,
+        code.base,
+        code.bytes,
+        site,
+    ) {
         Ok(decoded) => decoded,
         Err(error) => {
             warn!(error, "native-inject: work item post site did not decode");

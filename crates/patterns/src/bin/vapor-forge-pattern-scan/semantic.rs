@@ -4831,6 +4831,8 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         SemanticArch::X86_64,
     );
     failed |= scan_cnet_packet_layout(code, vaddr, resolved, 64);
+    failed |= scan_work_item_site(code, vaddr, resolved, 64);
+    failed |= scan_env_writer_abi(code, vaddr, resolved, 64);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4880,6 +4882,8 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
         SemanticArch::X86,
     );
     failed |= scan_cnet_packet_layout(code, vaddr, resolved, 32);
+    failed |= scan_work_item_site(code, vaddr, resolved, 32);
+    failed |= scan_env_writer_abi(code, vaddr, resolved, 32);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
         let ownership_calls_lookup = resolved
@@ -4917,6 +4921,91 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     }
 
     failed
+}
+
+/// Decode the bare work-item post site exactly as the runtime does, and check
+/// its enqueue call against the separately resolved `AddWorkItem`.
+fn scan_work_item_site(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    const LABEL: &str = "CWebSocketConnection::PostDelayedCloseWorkItem item";
+    let (Some(&site), Some(&add_work_item)) = (
+        resolved.get("CWebSocketConnection::PostDelayedCloseWorkItem"),
+        resolved.get("CWorkThreadPool::AddWorkItem"),
+    ) else {
+        // Each unresolved function is already reported on its own line.
+        return false;
+    };
+    let base = vaddr as usize;
+    let decoded = vapor_forge_patterns::work_item_site::decode(bitness, base, code, base + site)
+        .and_then(|decoded| {
+            if decoded.add_work_item == base + add_work_item {
+                Ok(decoded)
+            } else {
+                Err("enqueue call to the resolved AddWorkItem")
+            }
+        });
+    match decoded {
+        Ok(decoded) => {
+            println!(
+                "  OK   {:<58} pool=0x{:x} timer_vtable=0x{:x} size=0x{:x} vptrs={:x?} refs=0x{:x} sentinels={:x?}",
+                LABEL,
+                decoded.pool_slot,
+                decoded.timer_vtable,
+                decoded.item_size,
+                decoded.timer_vptr_offsets,
+                decoded.refcount_offset,
+                decoded.sentinel_offsets
+            );
+            false
+        }
+        Err(missing) => {
+            print_evidence_failure(
+                LABEL,
+                vaddr + site as u64,
+                Some(&decoded_evidence::<()>(Err(missing))),
+                "site decode failed",
+            );
+            true
+        }
+    }
+}
+
+/// Classify `SetEnvString`'s parameter count exactly as the runtime does.
+fn scan_env_writer_abi(
+    code: &[u8],
+    vaddr: u64,
+    resolved: &HashMap<&str, usize>,
+    bitness: u32,
+) -> bool {
+    const LABEL: &str = "SetEnvString parameters";
+    let Some(&offset) = resolved.get("SetEnvString") else {
+        return false;
+    };
+    match vapor_forge_patterns::env_writer::decode_abi(bitness, code, offset) {
+        Some(abi) => {
+            let form = match abi {
+                vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValue => "(envMap, key, value)",
+                vapor_forge_patterns::env_writer::EnvWriterAbi::KeyValueSeparator => {
+                    "(envMap, key, value, flag, separator)"
+                }
+            };
+            println!("  OK   {LABEL:<58} {form}");
+            false
+        }
+        None => {
+            print_evidence_failure(
+                LABEL,
+                vaddr + offset as u64,
+                None,
+                "neither three nor five parameters",
+            );
+            true
+        }
+    }
 }
 
 /// Decode the CNetPacket layout exactly as the runtime does, and report it.

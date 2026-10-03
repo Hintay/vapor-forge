@@ -44,8 +44,6 @@ pub(crate) mod ui;
 pub(crate) mod vtable_scan;
 #[cfg(target_os = "linux")]
 pub(crate) mod watcher;
-#[cfg(any(target_os = "linux", test))]
-pub(crate) mod work_item_site;
 
 #[cfg(target_os = "linux")]
 pub use client::install::{

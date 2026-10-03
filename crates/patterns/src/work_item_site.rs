@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Runtime decode of Steam's own bare-`CWorkItem` post site.
 //!
 //! `CWebSocketConnection::PostDelayedCloseWorkItem` is the shortest place where
@@ -19,7 +17,8 @@
 //! Every value is fail-closed: a decode that does not produce all of them leaves
 //! native dispatch disabled rather than posting a half-formed item.
 //!
-//! Kept out of `client` so it compiles, and is tested, on non-Linux hosts too.
+//! The runtime and the offline scan both decode through here, so what the scan
+//! reports is what the hooks will use.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,27 +40,27 @@ const MAX_ITEM_SIZE: usize = 0x1000;
 const MIN_TIMER_VPTRS: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WorkItemSite {
+pub struct WorkItemSite {
     /// Pointer slot holding the CNet `CWorkThreadPool`. Dereferenced at post
     /// time, not here: the pool is published after this decode runs.
-    pub(crate) pool_slot: usize,
+    pub pool_slot: usize,
     /// `CFastTimerCumulativeTimer` vtable shared by the item's embedded timers.
-    pub(crate) timer_vtable: usize,
+    pub timer_vtable: usize,
     /// Bytes Steam allocates for one item.
-    pub(crate) item_size: usize,
+    pub item_size: usize,
     /// Offsets the timer vtable is written to, ascending.
-    pub(crate) timer_vptr_offsets: Vec<usize>,
+    pub timer_vptr_offsets: Vec<usize>,
     /// The refcount, the one field the constructor initialises to 1. A caller
     /// reference is owned until the item's completion callback releases it.
-    pub(crate) refcount_offset: usize,
+    pub refcount_offset: usize,
     /// Offsets and widths, at most 8, of the "no value" sentinels set to -1.
-    pub(crate) sentinel_offsets: Vec<(usize, usize)>,
+    pub sentinel_offsets: Vec<(usize, usize)>,
     /// `CWorkThreadPool::AddWorkItem`, taken from this site's own call. Compared
     /// against the pattern-resolved address so a mis-scan of either is caught.
-    pub(crate) add_work_item: usize,
+    pub add_work_item: usize,
 }
 
-pub(crate) fn decode(
+pub fn decode(
     bitness: u32,
     code_base: usize,
     code: &[u8],
