@@ -10,6 +10,8 @@ pub mod arg_flow;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cnet_packet;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod current_app;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cuser_adapter;
 pub mod elf;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]

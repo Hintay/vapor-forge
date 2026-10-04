@@ -834,7 +834,47 @@ fn scan_cuser_stats_adapters(
             failed = true;
         }
     }
+    failed |= scan_current_app_resolver(code, text_vaddr, service, progress_slot, arch);
     failed
+}
+
+/// The progress adapter's fallback to the calling pipe's AppID locates the
+/// engine slot and lookup helper behind `current_app` at runtime.
+fn scan_current_app_resolver(
+    code: &[u8],
+    text_vaddr: u64,
+    service: &vtable_scan::Interface,
+    progress_slot: usize,
+    arch: SemanticArch,
+) -> bool {
+    let name = "CUserStats current IPC AppID resolver";
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
+    let site = service
+        .methods
+        .get(progress_slot)
+        .and_then(|method| method.func_va.checked_sub(text_vaddr))
+        .and_then(|offset| usize::try_from(offset).ok())
+        .and_then(|offset| {
+            vapor_forge_patterns::current_app::resolve(code, text_vaddr, offset, bitness)
+        });
+    match site {
+        Some(site) => {
+            println!(
+                "  OK   {:<58} engine-slot=0x{:x} helper=0x{:x}",
+                name,
+                site.engine_slot,
+                text_vaddr + site.helper as u64
+            );
+            false
+        }
+        None => {
+            println!("  FAIL {:<58} required (no unique validated helper site)", name);
+            true
+        }
+    }
 }
 
 fn print_missing_user_stats_slot(name: &str) -> bool {
