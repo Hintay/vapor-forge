@@ -891,6 +891,7 @@ enum CUserAdapterKind {
     UpdateTicket,
     IsSubscribedInTicket,
     RequiresLegacyCdKey,
+    GetSteamId,
 }
 
 fn scan_cuser_adapters(
@@ -944,6 +945,7 @@ fn scan_cuser_adapters(
             CUserAdapterKind::IsSubscribedInTicket,
         ),
         ("RequiresLegacyCDKey", CUserAdapterKind::RequiresLegacyCdKey),
+        ("GetSteamID", CUserAdapterKind::GetSteamId),
     ];
 
     let mut failed = false;
@@ -979,8 +981,13 @@ fn scan_cuser_adapters(
                     let offset = method.func_va.checked_sub(text_vaddr)? as usize;
                     let implementation = resolve_cuser_adapter_implementation(
                         code, text_vaddr, offset, kind, arch, resolved,
-                    )
-                    .unwrap_or(offset);
+                    );
+                    // The GetSteamID hook depends on the validated return
+                    // convention, so an unvalidated entry is not a match.
+                    let implementation = match kind {
+                        CUserAdapterKind::GetSteamId => implementation?,
+                        _ => implementation.unwrap_or(offset),
+                    };
                     Some((
                         method.func_va,
                         vtable.offset_to_top,
@@ -1034,12 +1041,17 @@ fn resolve_cuser_adapter_implementation(
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
 ) -> Option<usize> {
+    let bitness = match arch {
+        SemanticArch::X86 => 32,
+        SemanticArch::X86_64 => 64,
+    };
     if matches!(kind, CUserAdapterKind::RequiresLegacyCdKey) {
-        let bitness = match arch {
-            SemanticArch::X86 => 32,
-            SemanticArch::X86_64 => 64,
-        };
         return vapor_forge_patterns::cuser_adapter::resolve_requires_legacy_cdkey_implementation(
+            code, text_vaddr, offset, bitness,
+        );
+    }
+    if matches!(kind, CUserAdapterKind::GetSteamId) {
+        return vapor_forge_patterns::cuser_adapter::resolve_get_steam_id_implementation(
             code, text_vaddr, offset, bitness,
         );
     }
@@ -1166,7 +1178,7 @@ fn validate_cuser_adapter(
             is_user_subscribed_app_in_ticket64_evidence(code, offset)
         }
         // Resolved and validated by the shared cuser_adapter resolver instead.
-        (_, CUserAdapterKind::RequiresLegacyCdKey) => None,
+        (_, CUserAdapterKind::RequiresLegacyCdKey | CUserAdapterKind::GetSteamId) => None,
     };
     evidence.is_some_and(|evidence| evidence.is_complete())
 }

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
@@ -238,9 +237,9 @@ const DELEGATE_WINDOW_SIZE: u32 = 2;
 /// Per-AppId count of ticket requests seen so far in delegate mode.
 static DELEGATE_COUNTS: Mutex<Option<HashMap<AppId, u32>>> = Mutex::new(None);
 
-/// SteamID to return from GetSteamID while a delegate window is active.
-/// Zero means no delegate window is active.
-static DELEGATE_STEAMID: AtomicU64 = AtomicU64::new(0);
+/// Per-AppId SteamID that GetSteamID reports to that app while its delegate
+/// window is active.
+static DELEGATE_STEAMIDS: Mutex<Option<HashMap<AppId, u64>>> = Mutex::new(None);
 
 /// Check if we're still in the delegate window for this app.
 ///
@@ -256,8 +255,9 @@ pub fn in_delegate_window(app_id: AppId) -> bool {
     let count = counts.entry(app_id).or_insert(0);
     *count += 1;
     let in_window = *count <= DELEGATE_WINDOW_SIZE;
+    drop(guard);
     if !in_window {
-        clear_delegate_steamid();
+        clear_delegate_steamid(app_id);
     }
     in_window
 }
@@ -273,22 +273,39 @@ pub fn reset_delegate_window(app_id: AppId) {
     {
         counts.remove(&app_id);
     }
-    clear_delegate_steamid();
+    clear_delegate_steamid(app_id);
 }
 
-/// Set the SteamID to return from GetSteamID while a delegate window is active.
-pub fn set_delegate_steamid(steamid: u64) {
-    DELEGATE_STEAMID.store(steamid, Ordering::Release);
+/// Set the SteamID that GetSteamID reports to `app_id` while its delegate
+/// window is active.
+pub fn set_delegate_steamid(app_id: AppId, steamid: u64) {
+    DELEGATE_STEAMIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(app_id, steamid);
 }
 
-/// Get the delegate SteamID (0 = no delegate active).
-pub fn delegate_steamid() -> u64 {
-    DELEGATE_STEAMID.load(Ordering::Acquire)
+/// Get the delegate SteamID for `app_id` (0 = no delegate active).
+pub fn delegate_steamid(app_id: AppId) -> u64 {
+    DELEGATE_STEAMIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|ids| ids.get(&app_id).copied())
+        .unwrap_or(0)
 }
 
-/// Clear the delegate SteamID (called when the window closes or the game exits).
-pub fn clear_delegate_steamid() {
-    DELEGATE_STEAMID.store(0, Ordering::Release);
+/// Clear the delegate SteamID for `app_id` (called when its window closes or
+/// the game exits).
+pub fn clear_delegate_steamid(app_id: AppId) {
+    if let Some(ids) = DELEGATE_STEAMIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        ids.remove(&app_id);
+    }
 }
 
 /// Ticket forging: create a ticket for a target app from a source ticket (appId 7).
@@ -529,10 +546,34 @@ mod tests {
     #[test]
     fn delegate_steamid_set_get_clear() {
         let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
-        set_delegate_steamid(76561198000000001);
-        assert_eq!(delegate_steamid(), 76561198000000001);
-        clear_delegate_steamid();
-        assert_eq!(delegate_steamid(), 0);
+        let app = AppId(100_006);
+        set_delegate_steamid(app, 76561198000000001);
+        assert_eq!(delegate_steamid(app), 76561198000000001);
+        clear_delegate_steamid(app);
+        assert_eq!(delegate_steamid(app), 0);
+    }
+
+    #[test]
+    fn delegate_steamid_is_independent_per_app() {
+        let _guard = DELEGATE_TEST_LOCK.lock().unwrap();
+        let app_a = AppId(100_007);
+        let app_b = AppId(100_008);
+        reset_delegate_window(app_a);
+        reset_delegate_window(app_b);
+        set_delegate_steamid(app_a, 76561198000000003);
+        set_delegate_steamid(app_b, 76561198000000004);
+        assert_eq!(delegate_steamid(app_a), 76561198000000003);
+        assert_eq!(delegate_steamid(app_b), 76561198000000004);
+
+        // Closing one app's window leaves the other app's identity in place.
+        assert!(in_delegate_window(app_a));
+        assert!(in_delegate_window(app_a));
+        assert!(!in_delegate_window(app_a));
+        assert_eq!(delegate_steamid(app_a), 0);
+        assert_eq!(delegate_steamid(app_b), 76561198000000004);
+
+        reset_delegate_window(app_b);
+        assert_eq!(delegate_steamid(app_b), 0);
     }
 
     #[test]
@@ -542,11 +583,11 @@ mod tests {
         reset_delegate_window(app);
         assert!(in_delegate_window(app));
         assert!(in_delegate_window(app));
-        set_delegate_steamid(76561198000000002);
+        set_delegate_steamid(app, 76561198000000002);
         // Window closes → GetSteamID must fall back to the real user, so the
         // delegate SteamID gets cleared (mirrors OpenSteamTool's DenuvoAuth
         // `IsAuthorizedPipe` returning false past the window).
         assert!(!in_delegate_window(app));
-        assert_eq!(delegate_steamid(), 0);
+        assert_eq!(delegate_steamid(app), 0);
     }
 }

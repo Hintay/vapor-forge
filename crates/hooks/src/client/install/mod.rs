@@ -81,6 +81,7 @@ const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
     crate::capability::Capability::CloudHttp,
     crate::capability::Capability::LaunchEnvironment,
     crate::capability::Capability::LegacyCdKeyControl,
+    crate::capability::Capability::SteamIdOverride,
 ];
 
 const STEAMUI_CAPABILITIES: &[crate::capability::Capability] = &[
@@ -805,6 +806,24 @@ fn do_install() {
         check_ownership,
         super::legacy_cdkey::hk_requires_legacy_cdkey as super::legacy_cdkey::RequiresLegacyCdKeyFn,
     );
+    let d_cuser_get_steam_id = resolve_cuser_adapter(
+        &code,
+        super::user::CUSER_GET_STEAM_ID_NAME,
+        "GetSteamID",
+        check_ownership,
+        super::user::hk_cuser_get_steam_id as super::user::CUserGetSteamIdFn,
+    )
+    .filter(|pending| {
+        let valid = super::user::validate_cuser_get_steam_id(&code, pending.callee_addr);
+        if !valid {
+            error!(
+                hook = super::user::CUSER_GET_STEAM_ID_NAME,
+                target = format_args!("0x{:x}", pending.callee_addr),
+                "CUser adapter is not the expected member read"
+            );
+        }
+        valid
+    });
     let mut d_build_depot = resolve_from_registry(
         &registry,
         &code,
@@ -1057,6 +1076,7 @@ fn do_install() {
                 })
                 .unwrap_or(0),
         },
+        hr!(super::user::CUSER_GET_STEAM_ID_NAME, d_cuser_get_steam_id),
     ];
 
     macro_rules! finalize {
@@ -1248,6 +1268,12 @@ fn do_install() {
         d_set_env_string_sep
     );
     hook_results[27].installed = set_env_installed || set_env_sep_installed;
+    finalize!(
+        28,
+        super::user::CUSER_GET_STEAM_ID_NAME,
+        std::ptr::addr_of_mut!(super::user::CUSER_GET_STEAM_ID_DETOUR),
+        d_cuser_get_steam_id
+    );
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
         (hook_results[1].name, hook_results[1].installed),
@@ -1322,6 +1348,13 @@ fn do_install() {
     crate::capability::set_from_requirements(
         crate::capability::Capability::LegacyCdKeyControl,
         &[(hook_results[25].name, hook_results[25].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::SteamIdOverride,
+        &[
+            (hook_results[28].name, hook_results[28].installed),
+            ("current IPC AppID", super::current_app::is_ready()),
+        ],
     );
     crate::capability::set_from_requirements(
         crate::capability::Capability::DlcOverrides,

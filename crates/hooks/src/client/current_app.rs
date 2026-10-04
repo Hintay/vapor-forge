@@ -63,6 +63,10 @@ pub(crate) fn resolve(code: &CodeRegion) {
     }
 }
 
+pub(crate) fn is_ready() -> bool {
+    RESOLVER.get().is_some()
+}
+
 pub(crate) fn get() -> Option<u32> {
     let resolver = RESOLVER.get()?;
     // SAFETY: engine_slot is a validated steamclient data slot.

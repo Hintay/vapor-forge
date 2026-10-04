@@ -30,10 +30,11 @@ pub(crate) enum Capability {
     LibrarySnapshot,
     ConflictUiBridge,
     LegacyCdKeyControl,
+    SteamIdOverride,
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::CallbackEvents,
         Self::Ownership,
         Self::PackageInjection,
@@ -51,6 +52,7 @@ impl Capability {
         Self::LibrarySnapshot,
         Self::ConflictUiBridge,
         Self::LegacyCdKeyControl,
+        Self::SteamIdOverride,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -72,6 +74,7 @@ impl Capability {
             Self::LibrarySnapshot => "library-snapshot",
             Self::ConflictUiBridge => "conflict-ui-bridge",
             Self::LegacyCdKeyControl => "legacy-cdkey-control",
+            Self::SteamIdOverride => "steam-id-override",
         }
     }
 

@@ -866,6 +866,7 @@ fn track_games_played(body_bytes: &[u8], runtime: &crate::client::install::Runti
     });
 
     reset_stopped_delegate_windows(&app_ids, &runtime.config);
+    crate::client::user::forget_stopped_overrides(&app_ids);
 }
 
 /// Reset the ticket-delegate window for any controlled app that has stopped

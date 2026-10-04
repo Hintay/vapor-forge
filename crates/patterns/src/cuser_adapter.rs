@@ -126,9 +126,120 @@ pub fn resolve_requires_legacy_cdkey_implementation(
     validate_requires_legacy_cdkey(code, target, bitness).then_some(target)
 }
 
+/// `CUser::GetSteamID` returns the account's CSteamID member and nothing else:
+/// `mov rax, qword [rdi + disp]; ret` on x86_64. On x86 the result is written
+/// through the hidden return pointer as two dword copies from adjacent
+/// members, and `ret 4` pops that pointer. The hook relies on this shape for
+/// its return convention and for the absence of side effects.
+pub fn validate_get_steam_id(code: &[u8], offset: usize, bitness: u32) -> bool {
+    let Some(bytes) = bounded(code, offset, THUNK_SCAN) else {
+        return false;
+    };
+    let mut decoder = Decoder::with_ip(bitness, bytes, offset as u64, DecoderOptions::NONE);
+    match bitness {
+        64 => validate_get_steam_id64(&mut decoder),
+        32 => validate_get_steam_id32(&mut decoder),
+        _ => false,
+    }
+}
+
+fn validate_get_steam_id64(decoder: &mut Decoder<'_>) -> bool {
+    let load = decoder.decode();
+    let loads_member = !load.is_invalid()
+        && load.mnemonic() == Mnemonic::Mov
+        && load.op0_kind() == OpKind::Register
+        && load.op0_register() == Register::RAX
+        && load.op1_kind() == OpKind::Memory
+        && load.memory_size() == MemorySize::UInt64
+        && load.memory_base() == Register::RDI
+        && load.memory_index() == Register::None;
+    let ret = decoder.decode();
+    loads_member && !ret.is_invalid() && ret.mnemonic() == Mnemonic::Ret && ret.op_count() == 0
+}
+
+fn validate_get_steam_id32(decoder: &mut Decoder<'_>) -> bool {
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            return false;
+        }
+        match instruction.flow_control() {
+            FlowControl::Return => {
+                let pops_result_pointer = instruction.op_count() == 1
+                    && instruction.op0_kind() == OpKind::Immediate16
+                    && instruction.immediate16() == 4;
+                return pops_result_pointer && copies_steam_id32(&loads, &stores);
+            }
+            FlowControl::Next => {}
+            _ => return false,
+        }
+        if instruction.mnemonic() != Mnemonic::Mov {
+            continue;
+        }
+        let member = |base: Register| !matches!(base, Register::None | Register::ESP);
+        if instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_size() == MemorySize::UInt32
+            && member(instruction.memory_base())
+            && instruction.memory_index() == Register::None
+        {
+            loads.push((
+                instruction.memory_base(),
+                instruction.memory_displacement32(),
+            ));
+        } else if instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_size() == MemorySize::UInt32
+            && member(instruction.memory_base())
+            && instruction.memory_index() == Register::None
+        {
+            stores.push((
+                instruction.memory_base(),
+                instruction.memory_displacement32(),
+            ));
+        }
+    }
+    false
+}
+
+/// Two loads from adjacent dwords of one object, stored to offsets 0 and 4 of
+/// the result.
+fn copies_steam_id32(loads: &[(Register, u32)], stores: &[(Register, u32)]) -> bool {
+    let [(load_base_a, member_a), (load_base_b, member_b)] = loads else {
+        return false;
+    };
+    let [(store_base_a, out_a), (store_base_b, out_b)] = stores else {
+        return false;
+    };
+    let adjacent = member_a.wrapping_sub(*member_b) == 4 || member_b.wrapping_sub(*member_a) == 4;
+    load_base_a == load_base_b
+        && adjacent
+        && store_base_a == store_base_b
+        && store_base_a != load_base_a
+        && (*out_a).min(*out_b) == 0
+        && (*out_a).max(*out_b) == 4
+}
+
+/// Resolve the `CUser::GetSteamID` implementation behind the IClientUser
+/// vtable entry at `offset`. Current builds read the member straight through
+/// the adjusted `this`, so the entry is usually the implementation itself.
+pub fn resolve_get_steam_id_implementation(
+    code: &[u8],
+    text_vaddr: u64,
+    offset: usize,
+    bitness: u32,
+) -> Option<usize> {
+    let target = adapter_thunk_target(code, text_vaddr, offset, bitness).unwrap_or(offset);
+    validate_get_steam_id(code, target, bitness).then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_requires_legacy_cdkey_implementation;
+    use super::{
+        resolve_get_steam_id_implementation, resolve_requires_legacy_cdkey_implementation,
+    };
+    use iced_x86::code_asm::*;
+    use iced_x86::BlockEncoderOptions;
 
     const TEXT_VADDR: u64 = 0x10_0000;
     const IMPL_OFFSET: usize = 0x40;
@@ -213,6 +324,129 @@ mod tests {
         let code = thunk_image(ADJUST_THIS_X86, UNRELATED_X86);
         assert_eq!(
             resolve_requires_legacy_cdkey_implementation(&code, TEXT_VADDR, 0, 32),
+            None
+        );
+    }
+
+    fn assemble(
+        bitness: u32,
+        build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>,
+    ) -> Vec<u8> {
+        let mut assembler = CodeAssembler::new(bitness).unwrap();
+        build(&mut assembler).unwrap();
+        assembler.assemble(TEXT_VADDR).unwrap()
+    }
+
+    /// x86_64 secondary-base entry reading the member through the adjusted
+    /// `this`.
+    fn steam_id_member_read64() -> Vec<u8> {
+        assemble(64, |a| {
+            a.mov(rax, qword_ptr(rdi - 0x1d56))?;
+            a.ret()
+        })
+    }
+
+    /// i686 entry copying the member through the hidden result pointer.
+    fn steam_id_sret_copy32(result_pop: u32, high: i32) -> Vec<u8> {
+        assemble(32, |a| {
+            a.push(ebx)?;
+            a.mov(edx, dword_ptr(esp + 0x0c))?;
+            a.mov(eax, dword_ptr(esp + 0x08))?;
+            a.mov(ebx, dword_ptr(edx + high))?;
+            a.mov(ecx, dword_ptr(edx - 0x1752))?;
+            a.mov(dword_ptr(eax + 4), ebx)?;
+            a.mov(dword_ptr(eax), ecx)?;
+            a.pop(ebx)?;
+            if result_pop == 0 {
+                a.ret()
+            } else {
+                a.ret_1(result_pop)
+            }
+        })
+    }
+
+    #[test]
+    fn get_steam_id_accepts_direct_member_read() {
+        assert_eq!(
+            resolve_get_steam_id_implementation(&steam_id_member_read64(), TEXT_VADDR, 0, 64),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_get_steam_id_implementation(
+                &steam_id_sret_copy32(4, -0x174e),
+                TEXT_VADDR,
+                0,
+                32
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn get_steam_id_follows_this_adjusting_thunk() {
+        let implementation;
+        let code = {
+            let mut assembler = CodeAssembler::new(64).unwrap();
+            let mut target = assembler.create_label();
+            assembler.sub(rdi, 0x1fd0).unwrap();
+            assembler.jmp(target).unwrap();
+            assembler.int3().unwrap();
+            assembler.set_label(&mut target).unwrap();
+            assembler.mov(rax, qword_ptr(rdi + 0x27a)).unwrap();
+            assembler.ret().unwrap();
+            let result = assembler
+                .assemble_options(
+                    TEXT_VADDR,
+                    BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+                )
+                .unwrap();
+            implementation = (result.label_ip(&target).unwrap() - TEXT_VADDR) as usize;
+            result.inner.code_buffer
+        };
+        assert_ne!(implementation, 0);
+        assert_eq!(
+            resolve_get_steam_id_implementation(&code, TEXT_VADDR, 0, 64),
+            Some(implementation)
+        );
+    }
+
+    #[test]
+    fn get_steam_id_rejects_other_shapes() {
+        let narrow_read = assemble(64, |a| {
+            a.mov(eax, dword_ptr(rdi + 0x27a))?;
+            a.ret()
+        });
+        let side_effect = assemble(64, |a| {
+            a.mov(rax, qword_ptr(rdi + 0x27a))?;
+            a.mov(qword_ptr(rdi + 0x280), rax)?;
+            a.ret()
+        });
+        assert_eq!(
+            resolve_get_steam_id_implementation(&narrow_read, TEXT_VADDR, 0, 64),
+            None
+        );
+        assert_eq!(
+            resolve_get_steam_id_implementation(&side_effect, TEXT_VADDR, 0, 64),
+            None
+        );
+        // Plain `ret` would leave the hidden result pointer on the stack.
+        assert_eq!(
+            resolve_get_steam_id_implementation(
+                &steam_id_sret_copy32(0, -0x174e),
+                TEXT_VADDR,
+                0,
+                32
+            ),
+            None
+        );
+        // The two halves must come from adjacent dwords.
+        assert_eq!(
+            resolve_get_steam_id_implementation(
+                &steam_id_sret_copy32(4, -0x1740),
+                TEXT_VADDR,
+                0,
+                32
+            ),
             None
         );
     }

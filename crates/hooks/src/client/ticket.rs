@@ -51,6 +51,9 @@ pub(crate) fn resolve_adapter_implementation(
     if name == super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME {
         return super::legacy_cdkey::resolve_implementation(code, entry);
     }
+    if name == super::user::CUSER_GET_STEAM_ID_NAME {
+        return super::user::resolve_cuser_implementation(code, entry);
+    }
     if name != IS_SUBSCRIBED_IN_TICKET_NAME
         && validate_direct_adapter_entry(code, name, entry, check_ownership)
     {
@@ -701,7 +704,7 @@ fn provide_local_ticket(
         if vapor_forge_features::ticket::in_delegate_window(AppId(app_id)) {
             if let Some(ticket) = TICKET_CACHE.get_app_ticket(AppId(app_id), &ss.app_tickets) {
                 if let Some(steamid) = extract_steamid_from_ticket(&ticket) {
-                    vapor_forge_features::ticket::set_delegate_steamid(steamid);
+                    vapor_forge_features::ticket::set_delegate_steamid(AppId(app_id), steamid);
                 }
                 let Some(layout) = cached_ticket_layout(&ticket) else {
                     return 0;
@@ -727,9 +730,9 @@ unsafe { copy_ticket_to_buffer(
             );
         } else {
             // Window closed: stop overriding GetSteamID so the rest of the
-            // Steam session runs under the real user (matches OpenSteamTool's
+            // game session runs under the real user (matches OpenSteamTool's
             // DenuvoAuth `IsAuthorizedPipe` returning false past the window).
-            vapor_forge_features::ticket::clear_delegate_steamid();
+            vapor_forge_features::ticket::clear_delegate_steamid(AppId(app_id));
         }
     }
 
