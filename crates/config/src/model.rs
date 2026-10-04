@@ -31,6 +31,8 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub app_avatar: AppAvatarSection,
     #[serde(default)]
+    pub steam_id: SteamIdSection,
+    #[serde(default)]
     pub library_inject: LibraryInjectSection,
 }
 
@@ -356,6 +358,81 @@ impl<'de> serde::Deserialize<'de> for AppAvatarSection {
         }
 
         deserializer.deserialize_map(AppAvatarVisitor)
+    }
+}
+
+/// Per-app SteamID reported by `ISteamUser::GetSteamID`.
+///
+/// Keys are AppIDs and values are individual SteamID64s. Only the listed
+/// app sees the replacement; Steam and other apps keep the real account.
+/// Executables wrapped by Steam DRM or Denuvo compare the ownership ticket
+/// with this SteamID and refuse to start.
+///
+/// ```toml
+/// [steam_id]
+/// 480 = 76561202255233023
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct SteamIdSection {
+    overrides: HashMap<AppId, u64>,
+}
+
+impl SteamIdSection {
+    pub fn get(&self, app_id: AppId) -> Option<u64> {
+        self.overrides.get(&app_id).copied()
+    }
+}
+
+/// Individual account in a non-zero universe with a non-zero account number.
+fn is_individual_steam_id(steam_id64: u64) -> bool {
+    const ACCOUNT_TYPE_INDIVIDUAL: u64 = 1;
+    let account_id = steam_id64 & 0xffff_ffff;
+    let account_type = (steam_id64 >> 52) & 0xf;
+    let universe = steam_id64 >> 56;
+    account_id != 0 && account_type == ACCOUNT_TYPE_INDIVIDUAL && universe != 0
+}
+
+impl<'de> serde::Deserialize<'de> for SteamIdSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use std::fmt;
+
+        struct SteamIdVisitor;
+
+        impl<'de> Visitor<'de> for SteamIdVisitor {
+            type Value = SteamIdSection;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("steam_id table mapping AppIDs to SteamID64 values")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut overrides = HashMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let Some(app_id) = key.parse::<u32>().ok().filter(|id| *id != 0) else {
+                        return Err(serde::de::Error::unknown_field(
+                            &key,
+                            &["a non-zero unsigned 32-bit AppID"],
+                        ));
+                    };
+                    let steam_id64: u64 = map.next_value()?;
+                    if !is_individual_steam_id(steam_id64) {
+                        return Err(serde::de::Error::custom(format!(
+                            "steam_id.{app_id}: {steam_id64} is not an individual SteamID64"
+                        )));
+                    }
+                    overrides.insert(AppId(app_id), steam_id64);
+                }
+                Ok(SteamIdSection { overrides })
+            }
+        }
+
+        deserializer.deserialize_map(SteamIdVisitor)
     }
 }
 

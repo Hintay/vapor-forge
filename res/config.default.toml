@@ -121,6 +121,13 @@ paths = []
 # apps = [480]
 # exclude = [730]
 
+# Report another SteamID64 to one game through ISteamUser::GetSteamID, for
+# saves bound to an account. Auth tickets and networking keep the real account,
+# so only use it for offline play. Executables wrapped by Steam DRM or Denuvo
+# compare the ownership ticket with this SteamID and refuse to start.
+# [steam_id]
+# 480 = 76561202255233023     # placeholder, not a real account
+
 # Inject a native library into matching launched games through LD_PRELOAD.
 # [[library_inject.libs]]
 # path = "/home/user/mylib.so"

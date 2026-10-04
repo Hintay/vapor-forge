@@ -27,6 +27,8 @@ pub(crate) const TEMPLATE_EXAMPLES: &[&str] = &[
     "app_avatar.rules[].avatar",
     "app_avatar.rules[].apps",
     "app_avatar.rules[].exclude",
+    "[steam_id]",
+    "steam_id.480",
     "[[library_inject.libs]]",
     "library_inject.libs[].path",
     "library_inject.libs[].flag",

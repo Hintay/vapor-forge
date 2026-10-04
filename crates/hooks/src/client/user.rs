@@ -140,20 +140,33 @@ fn presented_steam_id(this: *mut c_void) -> u64 {
     let Some(app_id) = super::current_app::get().map(AppId) else {
         return real;
     };
-    // A delegate ticket's owner is reported while its window is open, so the
-    // SteamID matches the ticket the app was just given.
-    if !crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
-        return real;
+    let delegate = if crate::capability::is_ready(crate::capability::Capability::TicketOverrides) {
+        vapor_forge_features::ticket::delegate_steamid(app_id)
+    } else {
+        0
+    };
+    let configured = super::install::runtime_snapshot()
+        .config
+        .steam_id
+        .get(app_id);
+    let presented = select_steam_id(real, delegate, configured);
+    if presented != real {
+        log_override(app_id, presented, delegate != 0);
     }
-    let delegate = vapor_forge_features::ticket::delegate_steamid(app_id);
-    if delegate == 0 {
-        return real;
-    }
-    log_override(app_id, delegate);
-    delegate
+    presented
 }
 
-fn log_override(app_id: AppId, steam_id: u64) {
+/// A delegate ticket's owner wins while its window is open, so the SteamID
+/// matches the ticket the app was just given.
+fn select_steam_id(real: u64, delegate: u64, configured: Option<u64>) -> u64 {
+    if delegate != 0 {
+        delegate
+    } else {
+        configured.unwrap_or(real)
+    }
+}
+
+fn log_override(app_id: AppId, steam_id: u64, delegate: bool) {
     let mut logged = LOGGED_OVERRIDES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -166,7 +179,9 @@ fn log_override(app_id: AppId, steam_id: u64) {
     }
     info!(
         app_id = app_id.0,
-        steam_id, "GetSteamID reporting delegate SteamID"
+        steam_id,
+        source = if delegate { "delegate" } else { "config" },
+        "GetSteamID reporting replacement SteamID"
     );
 }
 
@@ -207,5 +222,30 @@ const fn bitness() -> u32 {
         64
     } else {
         32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_steam_id;
+
+    const REAL: u64 = 76561198000000001;
+    const DELEGATE: u64 = 76561198000000002;
+    const CONFIGURED: u64 = 76561198000000003;
+
+    #[test]
+    fn real_steam_id_is_kept_without_overrides() {
+        assert_eq!(select_steam_id(REAL, 0, None), REAL);
+    }
+
+    #[test]
+    fn configured_steam_id_replaces_real_account() {
+        assert_eq!(select_steam_id(REAL, 0, Some(CONFIGURED)), CONFIGURED);
+    }
+
+    #[test]
+    fn delegate_window_takes_precedence_over_configuration() {
+        assert_eq!(select_steam_id(REAL, DELEGATE, Some(CONFIGURED)), DELEGATE);
+        assert_eq!(select_steam_id(REAL, DELEGATE, None), DELEGATE);
     }
 }

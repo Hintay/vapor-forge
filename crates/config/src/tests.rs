@@ -65,6 +65,41 @@ fn app_avatar_rejects_non_app_id_keys() {
 }
 
 #[test]
+fn steam_id_maps_app_ids_to_individual_steam_ids() {
+    let config: RuntimeConfig =
+        toml::from_str("[steam_id]\n480 = 76561202255233023\n").expect("steam_id should parse");
+
+    assert_eq!(config.steam_id.get(AppId(480)), Some(76561202255233023));
+    assert_eq!(config.steam_id.get(AppId(730)), None);
+}
+
+#[test]
+fn steam_id_rejects_invalid_keys_and_values() {
+    let cases = [
+        (
+            "[steam_id]\nname = 76561202255233023",
+            "unknown field `name`",
+        ),
+        ("[steam_id]\n0 = 76561202255233023", "unknown field `0`"),
+        ("[steam_id]\n480 = 0", "not an individual SteamID64"),
+        // Clan account type in the public universe.
+        (
+            "[steam_id]\n480 = 103582791429521412",
+            "not an individual SteamID64",
+        ),
+        ("[steam_id]\n480 = \"76561202255233023\"", "invalid type"),
+    ];
+    for (text, expected) in cases {
+        let error = toml::from_str::<RuntimeConfig>(text)
+            .expect_err(&format!("{text:?} should be rejected"));
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error for {text:?}: {error}"
+        );
+    }
+}
+
+#[test]
 fn template_parses_and_keeps_safe_defaults() {
     let config: RuntimeConfig = toml::from_str(CONFIG_TEMPLATE).expect("template should parse");
     assert_eq!(config.runtime.log_level, "info");
