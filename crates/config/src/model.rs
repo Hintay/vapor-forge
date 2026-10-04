@@ -386,12 +386,15 @@ pub struct LibraryInjectSection {
     pub loader_fix: LoaderFixSection,
 }
 
-/// Duplicate-module loader fix, applied by the Proton helper.
+/// Loader fixes for third-party loaders, applied by the Proton helper.
 ///
 /// The helper disables thread callouts on any extra loader entry that shares
 /// a loaded module's name and entry point, as some third-party loaders register for
 /// user32, which otherwise makes wine run that DllMain twice per thread attach
-/// and exit. It is only applied where asked for:
+/// and exit. It also keeps NtSuspendThread from stopping a thread while that
+/// thread holds Wine's PEB lock or loader lock, which deadlocks code that
+/// suspends every other thread and then opens files or loads modules. Both are
+/// only applied where asked for:
 ///
 /// ```toml
 /// [library_inject.loader_fix]

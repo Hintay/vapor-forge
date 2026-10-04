@@ -25,6 +25,8 @@ mod nt_types;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod pe;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod suspend_guard;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod trigger;
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]

@@ -17,15 +17,14 @@ use vapor_forge_config::{AppId, LibraryInjectEntry, LibraryInjectSection};
 pub struct PendingInjection {
     pub native_libs: Vec<String>,   // .so paths for LD_PRELOAD
     pub proton_dll: Option<String>, // .dll path for Proton helper
-    /// Load the Proton helper so it can disable thread callouts on duplicate
-    /// module loader entries (see `LoaderFixSection`).
+    /// Load the Proton helper with its loader fixes (see `LoaderFixSection`).
     pub loader_fix: bool,
 }
 
 static PENDING: Mutex<Option<HashMap<AppId, PendingInjection>>> = Mutex::new(None);
 
-/// Whether the section asks for the duplicate-module loader fix on this
-/// launch: listed in `apps` or carrying `flag`, and not excluded.
+/// Whether the section asks for the loader fixes on this launch: listed in
+/// `apps` or carrying `flag`, and not excluded.
 pub fn loader_fix_requested(
     section: &LibraryInjectSection,
     app_id: AppId,

@@ -72,6 +72,10 @@ pub fn install_trigger() -> bool {
 
     log("LdrLoadDll detour installed");
 
+    if crate::loader_fix::enabled() {
+        crate::suspend_guard::install(pe_base, &pe_bytes);
+    }
+
     // Check if trigger DLL was already loaded before the detour
     if trigger::trigger_already_loaded(&maps) {
         mark_pending();
@@ -242,7 +246,46 @@ unsafe extern "win64" fn hook_ldr_load_dll(
     status
 }
 
+/// Fixed-size formatting target that truncates instead of allocating.
+struct StackText<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackText<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackText<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let take = s.len().min(N - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// Log formatted text without heap allocation, truncated to 256 bytes.
+pub(crate) fn log_args(args: std::fmt::Arguments<'_>) {
+    let mut text = StackText::<256>::new();
+    let _ = std::fmt::Write::write_fmt(&mut text, args);
+    log_bytes(text.as_bytes());
+}
+
 pub(crate) fn log(msg: &str) {
+    log_bytes(msg.as_bytes());
+}
+
+fn log_bytes(msg: &[u8]) {
     static PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
     let path = PATH.get_or_init(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -271,14 +314,12 @@ pub(crate) fn log(msg: &str) {
             libc::lseek(fd, 0, libc::SEEK_SET);
         }
         let pid = libc::getpid();
-        let mut header = [0u8; 48];
-        let header_len = {
-            let s = format!("[vapor-forge-proton-inject][{pid}] ");
-            let len = s.len().min(header.len());
-            header[..len].copy_from_slice(&s.as_bytes()[..len]);
-            len
-        };
-        libc::write(fd, header.as_ptr() as *const _, header_len);
+        let mut header = StackText::<48>::new();
+        let _ = std::fmt::Write::write_fmt(
+            &mut header,
+            format_args!("[vapor-forge-proton-inject][{pid}] "),
+        );
+        libc::write(fd, header.as_bytes().as_ptr() as *const _, header.len);
         libc::write(fd, msg.as_ptr() as *const _, msg.len());
         libc::write(fd, b"\n".as_ptr() as *const _, 1);
         libc::close(fd);
