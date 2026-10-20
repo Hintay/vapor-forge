@@ -549,15 +549,23 @@ fn resolve_cuser_adapter<F: vapor_forge_hook_engine::detour::HookFn>(
         .copied()
         .filter(|candidate| candidate.slot == public_slot)
         .filter(|candidate| vtable_slot_count(&candidates, candidate.vtable_va) == iface_slot_count)
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let implementation = super::ticket::resolve_adapter_implementation(
                 code,
                 name,
                 candidate.func_va,
                 check_ownership,
-            )
-            .unwrap_or(candidate.func_va);
-            (candidate, implementation)
+                candidate.offset_to_top.unsigned_abs(),
+            );
+            // The IsUserSubscribedAppInTicket wrapper takes fewer arguments
+            // than the implementation the hook is typed for, so the wrapper
+            // itself is never a fallback target.
+            let implementation = match implementation {
+                Some(implementation) => implementation,
+                None if name == super::ticket::IS_SUBSCRIBED_IN_TICKET_NAME => return None,
+                None => candidate.func_va,
+            };
+            Some((candidate, implementation))
         })
         .collect::<Vec<_>>();
     by_slot.sort_by_key(|(_, implementation)| *implementation);

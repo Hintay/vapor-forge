@@ -980,12 +980,22 @@ fn scan_cuser_adapters(
                     }
                     let offset = method.func_va.checked_sub(text_vaddr)? as usize;
                     let implementation = resolve_cuser_adapter_implementation(
-                        code, text_vaddr, offset, kind, arch, resolved,
+                        code,
+                        text_vaddr,
+                        offset,
+                        kind,
+                        arch,
+                        resolved,
+                        vtable.offset_to_top.unsigned_abs(),
                     );
                     // The GetSteamID hook depends on the validated return
-                    // convention, so an unvalidated entry is not a match.
+                    // convention, and the IsUserSubscribedAppInTicket wrapper
+                    // has a different ABI from the implementation it calls, so
+                    // an unvalidated entry is not a match for either.
+                    if implementation.is_none() { eprintln!("PROBE unvalidated {name} 0x{:x}", method.func_va); }
                     let implementation = match kind {
-                        CUserAdapterKind::GetSteamId => implementation?,
+                        CUserAdapterKind::GetSteamId
+                        | CUserAdapterKind::IsSubscribedInTicket => implementation?,
                         _ => implementation.unwrap_or(offset),
                     };
                     Some((
@@ -1033,6 +1043,9 @@ fn scan_cuser_adapters(
     failed
 }
 
+/// `this_adjust` is the IClientUser base offset inside `CUser`, the negated
+/// offset-to-top of the vtable the entry came from. Builds move that base, so
+/// the adapter checks take it from the vtable instead of a fixed list.
 fn resolve_cuser_adapter_implementation(
     code: &[u8],
     text_vaddr: u64,
@@ -1040,6 +1053,7 @@ fn resolve_cuser_adapter_implementation(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> Option<usize> {
     let bitness = match arch {
         SemanticArch::X86 => 32,
@@ -1056,19 +1070,35 @@ fn resolve_cuser_adapter_implementation(
         );
     }
     if matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
-        && !validate_is_subscribed_wrapper_abi(code, offset, arch)
+        && !validate_is_subscribed_wrapper_abi(code, offset, arch, this_adjust)
     {
         return None;
     }
     if !matches!(kind, CUserAdapterKind::IsSubscribedInTicket)
-        && validate_cuser_adapter_direct(code, text_vaddr, offset, kind, arch, resolved)
+        && validate_cuser_adapter_direct(
+            code,
+            text_vaddr,
+            offset,
+            kind,
+            arch,
+            resolved,
+            this_adjust,
+        )
     {
         return Some(offset);
     }
     let mut targets = direct_branch_target_offsets(code, text_vaddr, offset, 0x180, arch)
         .into_iter()
         .filter(|&target| {
-            validate_cuser_adapter_direct(code, text_vaddr, target, kind, arch, resolved)
+            validate_cuser_adapter_direct(
+                code,
+                text_vaddr,
+                target,
+                kind,
+                arch,
+                resolved,
+                this_adjust,
+            )
         })
         .collect::<Vec<_>>();
     targets.sort_unstable();
@@ -1080,16 +1110,22 @@ fn resolve_cuser_adapter_implementation(
     }
 }
 
-fn validate_is_subscribed_wrapper_abi(code: &[u8], offset: usize, arch: SemanticArch) -> bool {
+fn validate_is_subscribed_wrapper_abi(
+    code: &[u8],
+    offset: usize,
+    arch: SemanticArch,
+    this_adjust: u64,
+) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 
     let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x180))) else {
         return false;
     };
     if arch == SemanticArch::X86 {
-        let adjusts_this = has_seq(bytes, &[0x81, 0xee, 0xd4, 0x18, 0x00, 0x00])
-            || has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
-            || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00]);
+        let imm = (this_adjust as u32).to_le_bytes();
+        // sub esi, this_adjust | sub eax, this_adjust
+        let adjusts_this = has_seq(bytes, &[&[0x81, 0xee][..], &imm].concat())
+            || has_seq(bytes, &[&[0x2d][..], &imm].concat());
         return adjusts_this
             && bytes
                 .windows(4)
@@ -1130,7 +1166,7 @@ fn validate_is_subscribed_wrapper_abi(code: &[u8], offset: usize, arch: Semantic
         }
         if instruction.mnemonic() == Mnemonic::Lea
             && instruction.op0_register() == Register::RDI
-            && instruction.memory_displacement64() as i64 == -0x1fd0
+            && instruction.memory_displacement64() as i64 == -(this_adjust as i64)
         {
             adjusts_this = true;
         }
@@ -1145,10 +1181,11 @@ fn validate_cuser_adapter_direct(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> bool {
-    validate_cuser_adapter(code, offset, kind, arch, resolved)
+    validate_cuser_adapter(code, offset, kind, arch, resolved, this_adjust)
         && (!matches!(kind, CUserAdapterKind::TicketExtendedData)
-            || ticket_ext_semantics_are_reachable(code, text_vaddr, offset, arch))
+            || ticket_ext_semantics_are_reachable(code, text_vaddr, offset, arch, this_adjust))
 }
 
 fn validate_cuser_adapter(
@@ -1157,17 +1194,18 @@ fn validate_cuser_adapter(
     kind: CUserAdapterKind,
     arch: SemanticArch,
     resolved: &HashMap<&str, usize>,
+    this_adjust: u64,
 ) -> bool {
     let evidence = match (arch, kind) {
         (SemanticArch::X86, CUserAdapterKind::TicketExtendedData) => {
-            ticket_ext_data_mode4_thunk32_evidence(code, offset)
+            ticket_ext_data_mode4_thunk32_evidence(code, offset, this_adjust)
         }
         (SemanticArch::X86_64, CUserAdapterKind::TicketExtendedData) => {
-            ticket_ext_data_mode4_thunk64_evidence(code, offset)
+            ticket_ext_data_mode4_thunk64_evidence(code, offset, this_adjust)
         }
         (SemanticArch::X86, CUserAdapterKind::UpdateTicket) => resolved
             .get("CUser::CheckAppOwnership")
-            .and_then(|check| update_ticket32_evidence(code, offset, *check)),
+            .and_then(|check| update_ticket32_evidence(code, offset, *check, this_adjust)),
         (SemanticArch::X86_64, CUserAdapterKind::UpdateTicket) => resolved
             .get("CUser::CheckAppOwnership")
             .and_then(|check| update_ticket64_evidence(code, offset, *check)),
@@ -1239,20 +1277,21 @@ fn ticket_ext_semantics_are_reachable(
     text_vaddr: u64,
     offset: usize,
     arch: SemanticArch,
+    this_adjust: u64,
 ) -> bool {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 
     let Some(bytes) = code.get(offset..code.len().min(offset.saturating_add(0x160))) else {
         return false;
     };
-    let adjustments: &[&[u8]] = match arch {
-        SemanticArch::X86 => &[
-            &[0x2d, 0xd4, 0x18, 0x00, 0x00],
-            &[0x2d, 0xd8, 0x18, 0x00, 0x00],
-        ],
-        SemanticArch::X86_64 => &[
-            &[0x49, 0x8d, 0xbc, 0x24, 0x30, 0xe0, 0xff, 0xff],
-            &[0x48, 0x8d, 0xbb, 0x30, 0xe0, 0xff, 0xff],
+    let imm = (this_adjust as u32).to_le_bytes();
+    let disp = (this_adjust as u32).wrapping_neg().to_le_bytes();
+    // sub eax, this_adjust | lea rdi, [r12 - this_adjust] | lea rdi, [rbx - this_adjust]
+    let adjustments: Vec<Vec<u8>> = match arch {
+        SemanticArch::X86 => vec![[&[0x2d][..], &imm].concat()],
+        SemanticArch::X86_64 => vec![
+            [&[0x49, 0x8d, 0xbc, 0x24][..], &disp].concat(),
+            [&[0x48, 0x8d, 0xbb][..], &disp].concat(),
         ],
     };
     let reachable = reachable_instruction_offsets(
@@ -1267,7 +1306,7 @@ fn ticket_ext_semantics_are_reachable(
         bytes
             .windows(needle.len())
             .enumerate()
-            .any(|(index, window)| window == *needle && reachable.contains(&index))
+            .any(|(index, window)| window == needle.as_slice() && reachable.contains(&index))
     });
     let bitness = match arch {
         SemanticArch::X86 => 32,
@@ -1794,13 +1833,6 @@ fn find_x86_sub_eax_imm32_matching(
 
 fn has_x86_test_ebp_disp8_imm8(bytes: &[u8], disp: u8, imm: u8) -> bool {
     has_seq(bytes, &[0xf6, 0x45, disp, imm])
-}
-
-fn has_x86_cmp_rm32_imm8(bytes: &[u8], disp: u32, imm: u8) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(7)
-        .any(|w| w[0] == 0x83 && matches!(w[1], 0xb8..=0xbf) && w[2..6] == disp && w[6] == imm)
 }
 
 fn has_x86_rm32_disp32_load(bytes: &[u8], disp: u32) -> bool {
@@ -5105,12 +5137,16 @@ fn scan_cnet_packet_layout(
     }
 }
 
-fn ticket_ext_data_mode4_thunk32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+fn ticket_ext_data_mode4_thunk32_evidence(
+    code: &[u8],
+    offset: usize,
+    this_adjust: u64,
+) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x160)?;
 
     let has_mode4 = has_asm32(bytes, |a| a.push(4));
     let adjusts_this_to_cuser =
-        find_x86_sub_eax_imm32_matching(bytes, |imm| matches!(imm, 0x18d4 | 0x18d8)).is_some();
+        find_x86_sub_eax_imm32_matching(bytes, |imm| u64::from(imm) == this_adjust).is_some();
     let calls_shared_builder_after_mode = has_call_after_mode4_push(bytes);
 
     let mut evidence = Evidence::default();
@@ -5123,12 +5159,17 @@ fn ticket_ext_data_mode4_thunk32_evidence(code: &[u8], offset: usize) -> Option<
     Some(evidence)
 }
 
-fn ticket_ext_data_mode4_thunk64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+fn ticket_ext_data_mode4_thunk64_evidence(
+    code: &[u8],
+    offset: usize,
+    this_adjust: u64,
+) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x100)?;
 
     let has_mode4 = has_asm64(bytes, |a| a.push(4));
-    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 - 0x1FD0)))
-        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx - 0x1FD0)));
+    let adjust = -(this_adjust as i32);
+    let adjusts_this_to_cuser = has_asm64(bytes, |a| a.lea(rdi, qword_ptr(r12 + adjust)))
+        || has_asm64(bytes, |a| a.lea(rdi, qword_ptr(rbx + adjust)));
     let calls_shared_builder_after_mode = has_call_after_mode4_push(bytes);
 
     let mut evidence = Evidence::default();
@@ -5145,6 +5186,7 @@ fn update_ticket32_evidence(
     code: &[u8],
     offset: usize,
     check_ownership_offset: usize,
+    this_adjust: u64,
 ) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x280)?;
     let has_force_arg_branch = has_asm32(bytes, |a| a.cmp(byte_ptr(ebp + 0x10), 0));
@@ -5154,7 +5196,7 @@ fn update_ticket32_evidence(
             .any(|w| w[0] == 0xc7 && w[1] == 0x45 && w[3..7] == [0xff, 0xff, 0xff, 0xff]);
     let calls_check_ownership =
         has_relative_call_to(code, offset, bytes.len(), check_ownership_offset);
-    let receiver_is_valid = update_ticket32_has_valid_receiver(bytes);
+    let receiver_is_valid = update_ticket32_has_valid_receiver(bytes, this_adjust);
 
     let mut evidence = Evidence::default();
     evidence.require("force argument branch", has_force_arg_branch);
@@ -5164,18 +5206,31 @@ fn update_ticket32_evidence(
     Some(evidence)
 }
 
-fn update_ticket32_has_valid_receiver(bytes: &[u8]) -> bool {
+/// The receiver is the IClientUser pointer: the body moves it into `CUser`
+/// and compares a low `CUser` field (0xf8, 0xdc on later builds) with 4
+/// through the unadjusted pointer.
+fn update_ticket32_has_valid_receiver(bytes: &[u8], this_adjust: u64) -> bool {
     let receiver_adjust_window = &bytes[..bytes.len().min(0x100)];
-    if find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| {
-        matches!(imm, 0x18d4 | 0x18d8)
-            && has_x86_cmp_rm32_imm8(bytes, 0u32.wrapping_sub(imm - 0xf8), 0x04)
-    })
-    .is_some()
-    {
+    let adjusts_this =
+        find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| u64::from(imm) == this_adjust)
+            .is_some();
+    if adjusts_this && has_x86_cmp_cuser_field_imm8(bytes, this_adjust as u32, 0x04) {
         return true;
     }
 
     has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0xF8), 4))
+}
+
+/// `cmp dword [reg - this_adjust + field], imm` for a field in the first 0x200
+/// bytes of `CUser`.
+fn has_x86_cmp_cuser_field_imm8(bytes: &[u8], this_adjust: u32, imm: u8) -> bool {
+    bytes.windows(7).any(|w| {
+        let disp = u32::from_le_bytes([w[2], w[3], w[4], w[5]]);
+        w[0] == 0x83
+            && matches!(w[1], 0xb8..=0xbf)
+            && w[6] == imm
+            && this_adjust.wrapping_add(disp) < 0x200
+    })
 }
 
 fn update_ticket64_evidence(

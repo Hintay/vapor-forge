@@ -36,17 +36,24 @@ pub(crate) type IsSubscribedInTicketFn =
     unsafe extern "C" fn(*mut c_void, u64, *const u64, u32) -> i32;
 const USER_HAS_LICENSE_FOR_APP_RESULT_HAS_LICENSE: i32 = 0;
 
+/// `this_adjust` is the IClientUser secondary base offset inside `CUser`, the
+/// negated offset-to-top of the vtable the entry came from. Builds move that
+/// base (0x18d8, 0x18d4 and 0x18b0 on x86; 0x1fd0 and 0x1f88 on x86_64), so the
+/// adapter checks take it from the vtable instead of a fixed list.
 pub(crate) fn resolve_adapter_implementation(
     code: &crate::pattern_resolver::CodeRegion,
     name: &str,
     entry: usize,
     check_ownership: Option<usize>,
+    this_adjust: usize,
 ) -> Option<usize> {
-    if name == IS_SUBSCRIBED_IN_TICKET_NAME && !validate_is_subscribed_wrapper_abi(code, entry) {
+    if name == IS_SUBSCRIBED_IN_TICKET_NAME
+        && !validate_is_subscribed_wrapper_abi(code, entry, this_adjust)
+    {
         return None;
     }
     if name == super::eticket::GET_ENCRYPTED_NAME {
-        return resolve_get_enc_implementation(code, entry);
+        return resolve_get_enc_implementation(code, entry, this_adjust);
     }
     if name == super::legacy_cdkey::REQUIRES_LEGACY_CDKEY_NAME {
         return super::legacy_cdkey::resolve_implementation(code, entry);
@@ -55,13 +62,15 @@ pub(crate) fn resolve_adapter_implementation(
         return super::user::resolve_cuser_implementation(code, entry);
     }
     if name != IS_SUBSCRIBED_IN_TICKET_NAME
-        && validate_direct_adapter_entry(code, name, entry, check_ownership)
+        && validate_direct_adapter_entry(code, name, entry, check_ownership, this_adjust)
     {
         return Some(entry);
     }
     let mut targets = direct_branch_targets(code, entry, 0x180)
         .into_iter()
-        .filter(|&target| validate_direct_adapter_entry(code, name, target, check_ownership))
+        .filter(|&target| {
+            validate_direct_adapter_entry(code, name, target, check_ownership, this_adjust)
+        })
         .collect::<Vec<_>>();
     targets.sort_unstable();
     targets.dedup();
@@ -72,22 +81,62 @@ pub(crate) fn resolve_adapter_implementation(
     }
 }
 
-fn resolve_get_enc_implementation(code: &CodeRegion, entry: usize) -> Option<usize> {
-    let target = get_enc_thunk_target(code, entry)?;
+fn resolve_get_enc_implementation(
+    code: &CodeRegion,
+    entry: usize,
+    this_adjust: usize,
+) -> Option<usize> {
+    let target = get_enc_thunk_target(code, entry, this_adjust)?;
     let offset = target.checked_sub(code.base)?;
     validate_get_enc(code.bytes, offset).then_some(target)
 }
 
+/// Little-endian `this_adjust`, as the immediate of a `sub`.
+fn adjust_imm(this_adjust: usize) -> [u8; 4] {
+    (this_adjust as u32).to_le_bytes()
+}
+
+/// Little-endian `-this_adjust`, as the displacement of a `lea`.
+#[cfg(target_pointer_width = "64")]
+fn adjust_disp(this_adjust: usize) -> [u8; 4] {
+    (this_adjust as u32).wrapping_neg().to_le_bytes()
+}
+
+/// `sub eax, this_adjust` (x86) or `lea rdi, [r12/rbx - this_adjust]`
+/// (x86_64): the adapter rewriting the IClientUser pointer into `CUser`.
+fn this_adjustments(this_adjust: usize) -> Vec<Vec<u8>> {
+    #[cfg(target_pointer_width = "32")]
+    {
+        vec![[&[0x2d][..], &adjust_imm(this_adjust)].concat()]
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let disp = adjust_disp(this_adjust);
+        vec![
+            [&[0x49, 0x8d, 0xbc, 0x24][..], &disp].concat(),
+            [&[0x48, 0x8d, 0xbb][..], &disp].concat(),
+        ]
+    }
+}
+
+fn has_this_adjustment(bytes: &[u8], this_adjust: usize) -> bool {
+    this_adjustments(this_adjust)
+        .iter()
+        .any(|needle| has_seq(bytes, needle))
+}
+
 #[cfg(target_pointer_width = "32")]
-fn get_enc_thunk_target(code: &CodeRegion, entry: usize) -> Option<usize> {
-    const ADJUST_THIS: &[u8] = &[0x81, 0x6c, 0x24, 0x04, 0xd4, 0x18, 0x00, 0x00];
-    relative_tail_jump_after(code, entry, ADJUST_THIS)
+fn get_enc_thunk_target(code: &CodeRegion, entry: usize, this_adjust: usize) -> Option<usize> {
+    // sub dword [esp + 4], this_adjust
+    let adjust_this = [&[0x81, 0x6c, 0x24, 0x04][..], &adjust_imm(this_adjust)].concat();
+    relative_tail_jump_after(code, entry, &adjust_this)
 }
 
 #[cfg(target_pointer_width = "64")]
-fn get_enc_thunk_target(code: &CodeRegion, entry: usize) -> Option<usize> {
-    const ADJUST_THIS: &[u8] = &[0x48, 0x81, 0xef, 0xd0, 0x1f, 0x00, 0x00];
-    relative_tail_jump_after(code, entry, ADJUST_THIS)
+fn get_enc_thunk_target(code: &CodeRegion, entry: usize, this_adjust: usize) -> Option<usize> {
+    // sub rdi, this_adjust
+    let adjust_this = [&[0x48, 0x81, 0xef][..], &adjust_imm(this_adjust)].concat();
+    relative_tail_jump_after(code, entry, &adjust_this)
 }
 
 fn relative_tail_jump_after(code: &CodeRegion, entry: usize, prefix: &[u8]) -> Option<usize> {
@@ -110,7 +159,7 @@ fn relative_tail_jump_after(code: &CodeRegion, entry: usize, prefix: &[u8]) -> O
 }
 
 #[cfg(target_pointer_width = "32")]
-fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
+fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize, this_adjust: usize) -> bool {
     let Some(offset) = entry.checked_sub(code.base) else {
         return false;
     };
@@ -120,16 +169,16 @@ fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
     else {
         return false;
     };
-    (has_seq(bytes, &[0x81, 0xee, 0xd4, 0x18, 0x00, 0x00])
-        || has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
-        || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00]))
+    // sub esi, this_adjust | sub eax, this_adjust
+    let sub_esi = [&[0x81, 0xee][..], &adjust_imm(this_adjust)].concat();
+    (has_seq(bytes, &sub_esi) || has_this_adjustment(bytes, this_adjust))
         && bytes
             .windows(4)
             .any(|window| window[0..3] == [0x8d, 0x44, 0x24])
 }
 
 #[cfg(target_pointer_width = "64")]
-fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
+fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize, this_adjust: usize) -> bool {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 
     let Some(offset) = entry.checked_sub(code.base) else {
@@ -175,7 +224,7 @@ fn validate_is_subscribed_wrapper_abi(code: &CodeRegion, entry: usize) -> bool {
         }
         if instruction.mnemonic() == Mnemonic::Lea
             && instruction.op0_register() == Register::RDI
-            && instruction.memory_displacement64() as i64 == -0x1fd0
+            && instruction.memory_displacement64() as i64 == -(this_adjust as i64)
         {
             adjusts_this = true;
         }
@@ -188,36 +237,30 @@ pub(crate) fn validate_direct_adapter_entry(
     name: &str,
     target: usize,
     check_ownership: Option<usize>,
+    this_adjust: usize,
 ) -> bool {
     let Some(offset) = target.checked_sub(code.base) else {
         return false;
     };
     match name {
         TICKET_EXT_DATA_NAME => {
-            validate_ticket_ext_data(code.bytes, offset)
-                && ticket_ext_semantics_are_reachable(code, target)
+            validate_ticket_ext_data(code.bytes, offset, this_adjust)
+                && ticket_ext_semantics_are_reachable(code, target, this_adjust)
         }
         UPDATE_TICKET_NAME => check_ownership
             .and_then(|address| address.checked_sub(code.base))
-            .is_some_and(|check| validate_update_ticket(code.bytes, offset, check)),
+            .is_some_and(|check| validate_update_ticket(code.bytes, offset, check, this_adjust)),
         IS_SUBSCRIBED_IN_TICKET_NAME => validate_is_subscribed(code.bytes, offset),
         _ => false,
     }
 }
 
-fn ticket_ext_semantics_are_reachable(code: &CodeRegion, target: usize) -> bool {
+fn ticket_ext_semantics_are_reachable(
+    code: &CodeRegion,
+    target: usize,
+    this_adjust: usize,
+) -> bool {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
-
-    #[cfg(target_pointer_width = "32")]
-    const ADJUSTMENTS: &[&[u8]] = &[
-        &[0x2d, 0xd4, 0x18, 0x00, 0x00],
-        &[0x2d, 0xd8, 0x18, 0x00, 0x00],
-    ];
-    #[cfg(target_pointer_width = "64")]
-    const ADJUSTMENTS: &[&[u8]] = &[
-        &[0x49, 0x8d, 0xbc, 0x24, 0x30, 0xe0, 0xff, 0xff],
-        &[0x48, 0x8d, 0xbb, 0x30, 0xe0, 0xff, 0xff],
-    ];
 
     let Some(offset) = target.checked_sub(code.base) else {
         return false;
@@ -229,11 +272,11 @@ fn ticket_ext_semantics_are_reachable(code: &CodeRegion, target: usize) -> bool 
         return false;
     };
     let reachable = reachable_instruction_offsets(bytes, target);
-    let has_adjustment = ADJUSTMENTS.iter().any(|needle| {
+    let has_adjustment = this_adjustments(this_adjust).iter().any(|needle| {
         bytes
             .windows(needle.len())
             .enumerate()
-            .any(|(index, window)| window == *needle && reachable.contains(&index))
+            .any(|(index, window)| window == needle.as_slice() && reachable.contains(&index))
     });
     let bitness = if cfg!(target_pointer_width = "64") {
         64
@@ -378,34 +421,31 @@ fn direct_branch_targets(code: &CodeRegion, entry: usize, max_len: usize) -> Vec
     targets
 }
 
-#[cfg(target_pointer_width = "32")]
-fn validate_ticket_ext_data(code: &[u8], offset: usize) -> bool {
-    let Some(bytes) = bounded_tail(code, offset, 0x160) else {
+fn validate_ticket_ext_data(code: &[u8], offset: usize, this_adjust: usize) -> bool {
+    let window = if cfg!(target_pointer_width = "64") {
+        0x100
+    } else {
+        0x160
+    };
+    let Some(bytes) = bounded_tail(code, offset, window) else {
         return false;
     };
     has_seq(bytes, &[0x6a, 0x04])
-        && (has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
-            || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00]))
+        && has_this_adjustment(bytes, this_adjust)
         && has_call_after_mode4_push(bytes)
 }
 
-#[cfg(target_pointer_width = "64")]
-fn validate_ticket_ext_data(code: &[u8], offset: usize) -> bool {
-    let Some(bytes) = bounded_tail(code, offset, 0x100) else {
-        return false;
-    };
-    let adjusts_this = has_seq(bytes, &[0x49, 0x8d, 0xbc, 0x24, 0x30, 0xe0, 0xff, 0xff])
-        || has_seq(bytes, &[0x48, 0x8d, 0xbb, 0x30, 0xe0, 0xff, 0xff]);
-    has_seq(bytes, &[0x6a, 0x04]) && adjusts_this && has_call_after_mode4_push(bytes)
-}
-
 #[cfg(target_pointer_width = "32")]
-fn validate_update_ticket(code: &[u8], offset: usize, check_ownership: usize) -> bool {
+fn validate_update_ticket(
+    code: &[u8],
+    offset: usize,
+    check_ownership: usize,
+    this_adjust: usize,
+) -> bool {
     let Some(bytes) = bounded_tail(code, offset, 0x280) else {
         return false;
     };
-    let receiver = has_seq(bytes, &[0x2d, 0xd4, 0x18, 0x00, 0x00])
-        || has_seq(bytes, &[0x2d, 0xd8, 0x18, 0x00, 0x00])
+    let receiver = has_this_adjustment(bytes, this_adjust)
         || has_seq(bytes, &[0x83, 0xb8, 0xf8, 0x00, 0x00, 0x00, 0x04]);
     has_seq(bytes, &[0x80, 0x7d, 0x10, 0x00])
         && bytes
@@ -416,7 +456,12 @@ fn validate_update_ticket(code: &[u8], offset: usize, check_ownership: usize) ->
 }
 
 #[cfg(target_pointer_width = "64")]
-fn validate_update_ticket(code: &[u8], offset: usize, check_ownership: usize) -> bool {
+fn validate_update_ticket(
+    code: &[u8],
+    offset: usize,
+    check_ownership: usize,
+    _this_adjust: usize,
+) -> bool {
     let Some(bytes) = bounded_tail(code, offset, 0x330) else {
         return false;
     };
@@ -466,24 +511,16 @@ fn validate_get_enc(code: &[u8], offset: usize) -> bool {
     let Some(bytes) = bounded_tail(code, offset, 0x160) else {
         return false;
     };
-    [
-        (
-            &[0x8b, 0x97, 0x50, 0x49, 0x00, 0x00][..],
-            &[0x8b, 0x8f, 0x64, 0x49, 0x00, 0x00][..],
-        ),
-        (
-            &[0x8b, 0x97, 0x14, 0x48, 0x00, 0x00][..],
-            &[0x8b, 0x8f, 0x28, 0x48, 0x00, 0x00][..],
-        ),
-    ]
-    .into_iter()
-    .any(|(root, storage)| {
-        ordered_reachable_sequences(
-            bytes,
-            offset,
-            &[root, storage, &[0x6b, 0xd2, 0x44], &[0x8d, 0x7a, 0x18]],
-        )
-    })
+    // mov edx, [edi + root]; mov ecx, [edi + root + 0x14]
+    ticket_map_reads(bytes, &[0x8b, 0x97], &[0x8b, 0x8f], 0x14)
+        .iter()
+        .any(|(root, storage)| {
+            ordered_reachable_sequences(
+                bytes,
+                offset,
+                &[root, storage, &[0x6b, 0xd2, 0x44], &[0x8d, 0x7a, 0x18]],
+            )
+        })
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -491,29 +528,53 @@ fn validate_get_enc(code: &[u8], offset: usize) -> bool {
     let Some(bytes) = bounded_tail(code, offset, 0x160) else {
         return false;
     };
-    [
-        (
-            &[0x49, 0x63, 0x95, 0xd0, 0x62, 0x00, 0x00][..],
-            &[0x49, 0x8b, 0x8d, 0xe8, 0x62, 0x00, 0x00][..],
-        ),
-        (
-            &[0x49, 0x63, 0x95, 0x40, 0x61, 0x00, 0x00][..],
-            &[0x49, 0x8b, 0x8d, 0x58, 0x61, 0x00, 0x00][..],
-        ),
-    ]
-    .into_iter()
-    .any(|(root, storage)| {
-        ordered_reachable_sequences(
-            bytes,
-            offset,
-            &[
-                root,
-                storage,
-                &[0x48, 0x8d, 0x14, 0x52, 0x48, 0xc1, 0xe2, 0x05],
-                &[0x4c, 0x8d, 0x6a, 0x20],
-            ],
-        )
-    })
+    // movsxd rdx, [r13 + root]; mov rcx, [r13 + root + 0x18]
+    ticket_map_reads(bytes, &[0x49, 0x63, 0x95], &[0x49, 0x8b, 0x8d], 0x18)
+        .iter()
+        .any(|(root, storage)| {
+            ordered_reachable_sequences(
+                bytes,
+                offset,
+                &[
+                    root,
+                    storage,
+                    &[0x48, 0x8d, 0x14, 0x52, 0x48, 0xc1, 0xe2, 0x05],
+                    &[0x4c, 0x8d, 0x6a, 0x20],
+                ],
+            )
+        })
+}
+
+/// The encrypted-ticket map's root and storage reads, `distance` apart. Builds
+/// move the map inside `CUser` (x86 0x4814, 0x4950, 0x49b0; x86_64 0x6140,
+/// 0x62d0, 0x6370 so far) but keep that distance, so each root read found in
+/// the body yields the storage read that has to follow it.
+fn ticket_map_reads(
+    bytes: &[u8],
+    root_prefix: &[u8],
+    storage_prefix: &[u8],
+    distance: u32,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let width = root_prefix.len() + 4;
+    let mut roots = bytes
+        .windows(width)
+        .filter(|window| window.starts_with(root_prefix))
+        .filter_map(|window| {
+            let root = u32::from_le_bytes(window[root_prefix.len()..].try_into().ok()?);
+            (0x1000..0x10000).contains(&root).then_some(root)
+        })
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|root| {
+            (
+                [root_prefix, &root.to_le_bytes()].concat(),
+                [storage_prefix, &(root + distance).to_le_bytes()].concat(),
+            )
+        })
+        .collect()
 }
 
 fn ordered_reachable_sequences(bytes: &[u8], ip: usize, needles: &[&[u8]]) -> bool {
@@ -1272,6 +1333,7 @@ mod eticket_lowering_tests {
         const NODE_STRIDE: &[u8] = &[0x48, 0x8d, 0x14, 0x52, 0x48, 0xc1, 0xe2, 0x05];
         const TICKET_PAYLOAD: &[u8] = &[0x4c, 0x8d, 0x6a, 0x20];
         const GET_THUNK_ADJUST: &[u8] = &[0x48, 0x81, 0xef, 0xd0, 0x1f, 0x00, 0x00];
+        const GET_THUNK_THIS_ADJUST: usize = 0x1fd0;
 
         fn public_get_body() -> Vec<u8> {
             body(&[
@@ -1293,6 +1355,17 @@ mod eticket_lowering_tests {
             ]);
             assert!(validate_get_enc(&public, 0));
             assert!(validate_get_enc(&publicbeta, 0));
+        }
+
+        #[test]
+        fn get_enc_follows_a_moved_map() {
+            let moved = body(&[
+                &[0x49, 0x63, 0x95, 0x70, 0x63, 0x00, 0x00],
+                &[0x49, 0x8b, 0x8d, 0x88, 0x63, 0x00, 0x00],
+                NODE_STRIDE,
+                TICKET_PAYLOAD,
+            ]);
+            assert!(validate_get_enc(&moved, 0));
         }
 
         #[test]
@@ -1338,6 +1411,7 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 Some(BASE + IMPL_OFFSET)
             );
@@ -1347,6 +1421,7 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE + 0x20,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 Some(BASE + IMPL_OFFSET)
             );
@@ -1358,9 +1433,30 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 None
             );
+        }
+
+        #[test]
+        fn get_resolver_follows_the_vtable_adjustment() {
+            // A build that moved the IClientUser base; the thunk subtracts the
+            // vtable's offset-to-top, whatever it is.
+            let implementation = public_get_body();
+            let code =
+                get_thunk_region(&[0x48, 0x81, 0xef, 0x88, 0x1f, 0x00, 0x00], &implementation);
+            let resolve = |this_adjust| {
+                resolve_adapter_implementation(
+                    &code,
+                    super::super::super::eticket::GET_ENCRYPTED_NAME,
+                    BASE,
+                    None,
+                    this_adjust,
+                )
+            };
+            assert_eq!(resolve(0x1f88), Some(BASE + IMPL_OFFSET));
+            assert_eq!(resolve(GET_THUNK_THIS_ADJUST), None);
         }
     }
 
@@ -1374,6 +1470,7 @@ mod eticket_lowering_tests {
         const NODE_STRIDE: &[u8] = &[0x6b, 0xd2, 0x44];
         const TICKET_PAYLOAD: &[u8] = &[0x8d, 0x7a, 0x18];
         const GET_THUNK_ADJUST: &[u8] = &[0x81, 0x6c, 0x24, 0x04, 0xd4, 0x18, 0x00, 0x00];
+        const GET_THUNK_THIS_ADJUST: usize = 0x18d4;
 
         fn public_get_body() -> Vec<u8> {
             body(&[
@@ -1395,6 +1492,17 @@ mod eticket_lowering_tests {
             ]);
             assert!(validate_get_enc(&public, 0));
             assert!(validate_get_enc(&publicbeta, 0));
+        }
+
+        #[test]
+        fn get_enc_follows_a_moved_map() {
+            let moved = body(&[
+                &[0x8b, 0x97, 0xb0, 0x49, 0x00, 0x00],
+                &[0x8b, 0x8f, 0xc4, 0x49, 0x00, 0x00],
+                NODE_STRIDE,
+                TICKET_PAYLOAD,
+            ]);
+            assert!(validate_get_enc(&moved, 0));
         }
 
         #[test]
@@ -1439,6 +1547,7 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 Some(BASE + IMPL_OFFSET)
             );
@@ -1448,6 +1557,7 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE + 0x20,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 Some(BASE + IMPL_OFFSET)
             );
@@ -1459,9 +1569,32 @@ mod eticket_lowering_tests {
                     super::super::super::eticket::GET_ENCRYPTED_NAME,
                     BASE,
                     None,
+                    GET_THUNK_THIS_ADJUST,
                 ),
                 None
             );
+        }
+
+        #[test]
+        fn get_resolver_follows_the_vtable_adjustment() {
+            // A build that moved the IClientUser base; the thunk subtracts the
+            // vtable's offset-to-top, whatever it is.
+            let implementation = public_get_body();
+            let code = get_thunk_region(
+                &[0x81, 0x6c, 0x24, 0x04, 0xb0, 0x18, 0x00, 0x00],
+                &implementation,
+            );
+            let resolve = |this_adjust| {
+                resolve_adapter_implementation(
+                    &code,
+                    super::super::super::eticket::GET_ENCRYPTED_NAME,
+                    BASE,
+                    None,
+                    this_adjust,
+                )
+            };
+            assert_eq!(resolve(0x18b0), Some(BASE + IMPL_OFFSET));
+            assert_eq!(resolve(GET_THUNK_THIS_ADJUST), None);
         }
     }
 }

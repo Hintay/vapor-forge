@@ -1329,6 +1329,36 @@ mod tests {
     }
 
     #[test]
+    fn update_ticket32_receiver_follows_the_vtable_adjustment() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0x10, |a| a.cmp(dword_ptr(ecx - 0x17d4), 4));
+        place_asm32(&mut code, 0x30, |a| a.sub(eax, 0x18b0));
+
+        assert!(update_ticket32_has_valid_receiver(&code, 0x18b0));
+        assert!(!update_ticket32_has_valid_receiver(&code, 0x18d8));
+    }
+
+    #[test]
+    fn is_subscribed_wrapper32_follows_the_vtable_adjustment() {
+        let mut code = vec![0x90; 0x80];
+        place_asm32(&mut code, 0x10, |a| a.lea(eax, dword_ptr(esp + 0x10)));
+        place_asm32(&mut code, 0x20, |a| a.sub(eax, 0x18b0));
+
+        assert!(validate_is_subscribed_wrapper_abi(
+            &code,
+            0,
+            SemanticArch::X86,
+            0x18b0
+        ));
+        assert!(!validate_is_subscribed_wrapper_abi(
+            &code,
+            0,
+            SemanticArch::X86,
+            0x18d8
+        ));
+    }
+
+    #[test]
     fn license_vector_base32_must_be_the_license_block() {
         let mut code = vec![0x90; 0x40];
         place_asm32(&mut code, 0x10, |a| a.lea(eax, dword_ptr(esi + 0x1af8)));
@@ -1349,6 +1379,7 @@ mod tests {
                 CUserAdapterKind::IsSubscribedInTicket,
                 SemanticArch::X86_64,
                 &HashMap::new(),
+                0x1fd0,
             ),
             None
         );
@@ -1386,8 +1417,23 @@ mod tests {
                 CUserAdapterKind::IsSubscribedInTicket,
                 SemanticArch::X86_64,
                 &HashMap::new(),
+                0x1fd0,
             ),
             Some(implementation)
+        );
+        // The wrapper adjusts by 0x1fd0, so a vtable at another offset is not
+        // its owner.
+        assert_eq!(
+            resolve_cuser_adapter_implementation(
+                &code,
+                0,
+                wrapper,
+                CUserAdapterKind::IsSubscribedInTicket,
+                SemanticArch::X86_64,
+                &HashMap::new(),
+                0x1f88,
+            ),
+            None
         );
     }
 }
