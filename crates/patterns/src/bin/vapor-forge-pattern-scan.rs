@@ -1329,6 +1329,16 @@ mod tests {
     }
 
     #[test]
+    fn license_vector_base32_must_be_the_license_block() {
+        let mut code = vec![0x90; 0x40];
+        place_asm32(&mut code, 0x10, |a| a.lea(eax, dword_ptr(esi + 0x1af8)));
+
+        assert!(has_x86_license_vector_base32(&code, Some(0x1af8)));
+        assert!(!has_x86_license_vector_base32(&code, Some(0x1ae8)));
+        assert!(!has_x86_license_vector_base32(&code, None));
+    }
+
+    #[test]
     fn cuser_adapter_resolution_rejects_missing_implementation() {
         let code = vec![0x90; 0x200];
         assert_eq!(

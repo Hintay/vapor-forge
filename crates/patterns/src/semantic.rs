@@ -43,14 +43,7 @@ fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<SetApiCa
         api_call_argument: frame_handle
             || stack_handle
             || has_seq(bytes, &[0xf3, 0x0f, 0x7e, 0x45, 0x10]),
-        api_result_map: (has_x86_rm32_disp32_load(bytes, 0x14ac)
-            && has_x86_rm32_disp32_load(bytes, 0x14c0))
-            || (has_seq(bytes, &[0x05, 0x98, 0x14, 0x00, 0x00])
-                && has_x86_rm32_disp32_operand(bytes, 0x14c0))
-            // Builds that place the map block 0x338 further into CSteamEngine.
-            || (has_x86_rm32_disp32_operand(bytes, 0x17f8)
-                && (has_x86_rm32_disp32_operand(bytes, 0x17e4)
-                    || has_x86_rm32_disp32_operand(bytes, 0x17d0))),
+        api_result_map: has_x86_api_result_map(bytes),
         result_record_stride: (has_seq(bytes, &[0x8d, 0x0c, 0x7f])
             && has_seq(bytes, &[0xc1, 0xe1, 0x04]))
             || (has_seq(bytes, &[0x8d, 0x34, 0x40]) && has_seq(bytes, &[0xc1, 0xe6, 0x04])),
@@ -110,20 +103,43 @@ fn has_seq(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
 
-fn has_x86_rm32_disp32_load(bytes: &[u8], displacement: u32) -> bool {
-    let displacement = displacement.to_le_bytes();
-    bytes.windows(6).any(|window| {
-        window[0] == 0x8b && matches!(window[1], 0x80..=0xbf) && window[2..6] == displacement
+/// The CSteamEngine API-result map block: the map base, its bucket array 0x14
+/// on and its record vector 0x28 on. Builds move the whole block (0x1498,
+/// 0x17d0, 0x17d4 so far) but keep these distances, so the check pins only
+/// the distances. The records are always read; the base shows up either as
+/// the bucket load or as the `add eax, base` / `lea` that forms `this->map`.
+fn has_x86_api_result_map(bytes: &[u8]) -> bool {
+    const BUCKETS: u32 = 0x14;
+    const RECORDS: u32 = 0x28;
+
+    let operands = x86_rm32_disp32_operands(bytes);
+    operands.iter().any(|&records| {
+        let Some(base) = records.checked_sub(RECORDS) else {
+            return false;
+        };
+        (0x400..0x8000).contains(&base)
+            && (operands.contains(&(base + BUCKETS))
+                || operands.contains(&base)
+                || has_x86_add_eax_imm32(bytes, base))
     })
 }
 
-fn has_x86_rm32_disp32_operand(bytes: &[u8], displacement: u32) -> bool {
-    let displacement = displacement.to_le_bytes();
-    bytes.windows(6).any(|window| {
-        matches!(window[0], 0x03 | 0x8b | 0x8d)
-            && matches!(window[1], 0x80..=0xbf)
-            && window[2..6] == displacement
-    })
+/// Displacements of `add`/`mov`/`lea r32, [reg + disp32]` operands.
+fn x86_rm32_disp32_operands(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .windows(6)
+        .filter(|window| {
+            matches!(window[0], 0x03 | 0x8b | 0x8d) && matches!(window[1], 0x80..=0xbf)
+        })
+        .map(|window| u32::from_le_bytes([window[2], window[3], window[4], window[5]]))
+        .collect()
+}
+
+fn has_x86_add_eax_imm32(bytes: &[u8], value: u32) -> bool {
+    let value = value.to_le_bytes();
+    bytes
+        .windows(5)
+        .any(|window| window[0] == 0x05 && window[1..5] == value)
 }
 
 fn has_x64_rm32_disp32_load(bytes: &[u8], displacement: u32) -> bool {
@@ -179,5 +195,39 @@ mod tests {
         assert!(!set_api_call_result_evidence(&code, 0, 8)
             .unwrap()
             .is_complete());
+    }
+
+    /// `mov edi, [eax + base + 0x14]; mov edx, [eax + base + 0x28]`: the bucket
+    /// and record reads of a result map block at `base`.
+    fn result_map_reads(base: u32, buckets: u32) -> Vec<u8> {
+        let mut code = vec![0x8b, 0xb8];
+        code.extend_from_slice(&(base + buckets).to_le_bytes());
+        code.extend_from_slice(&[0x8b, 0x90]);
+        code.extend_from_slice(&(base + 0x28).to_le_bytes());
+        code
+    }
+
+    #[test]
+    fn x86_result_map_follows_the_block() {
+        for base in [0x1498, 0x17d0, 0x17d4] {
+            assert!(has_x86_api_result_map(&result_map_reads(base, 0x14)));
+        }
+    }
+
+    #[test]
+    fn x86_result_map_accepts_the_formed_base() {
+        // add eax, 0x17d4; mov edx, [ecx + 0x17fc]
+        let mut code = vec![0x05];
+        code.extend_from_slice(&0x17d4u32.to_le_bytes());
+        code.extend_from_slice(&[0x8b, 0x91]);
+        code.extend_from_slice(&0x17fcu32.to_le_bytes());
+        assert!(has_x86_api_result_map(&code));
+    }
+
+    #[test]
+    fn x86_result_map_rejects_other_distances() {
+        assert!(!has_x86_api_result_map(&result_map_reads(0x17d4, 0x18)));
+        // A block too close to the object start is not CSteamEngine's map.
+        assert!(!has_x86_api_result_map(&result_map_reads(0x40, 0x14)));
     }
 }

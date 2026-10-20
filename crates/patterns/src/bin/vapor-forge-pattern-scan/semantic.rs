@@ -1745,8 +1745,11 @@ fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool
 }
 
 
-fn has_x86_license_vector_base32(bytes: &[u8]) -> bool {
-    has_x86_lea_eax_from_esi_disp32(bytes, &[0x1AE0, 0x1AE4, 0x1AE8])
+/// `lea eax, [esi + base]` on the license block found by `find_field_group`,
+/// so the check follows the block wherever a build places it in `CUser`.
+fn has_x86_license_vector_base32(bytes: &[u8], base: Option<u64>) -> bool {
+    base.and_then(|base| u32::try_from(base).ok())
+        .is_some_and(|base| has_x86_lea_eax_from_esi_disp32(bytes, &[base]))
 }
 
 fn has_x86_shl_rm32_by_2(bytes: &[u8]) -> bool {
@@ -3934,18 +3937,19 @@ fn validate_mark_license_changed32(code: &[u8], offset: usize) -> Option<&'stati
 
 fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    // The license state block: base, count 0xc on, and the hash table fields
+    // 0x20, 0x30 and 0x40 on.
+    let license_block = find_field_group(32, bytes, &[0xc, 0x20, 0x30, 0x40]);
     Some(Evidence::required([
-        (
-            "license vector load",
-            // The license state block: base, count 0xc on, and the hash table
-            // fields 0x20, 0x30 and 0x40 on.
-            find_field_group(32, bytes, &[0xc, 0x20, 0x30, 0x40]).is_some(),
-        ),
+        ("license vector load", license_block.is_some()),
         (
             "dirty flag write",
             has_asm32(bytes, |a| a.mov(byte_ptr(esp + 0x1C), al)),
         ),
-        ("license vector base", has_x86_license_vector_base32(bytes)),
+        (
+            "license vector base",
+            has_x86_license_vector_base32(bytes, license_block),
+        ),
         (
             "license id hash",
             has_asm32(bytes, |a| a.imul_3(edi, edi, 0x85EBCA6Bu32))
