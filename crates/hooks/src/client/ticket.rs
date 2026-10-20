@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
 use vapor_forge_config::AppId;
@@ -592,8 +592,8 @@ fn x86_has_stack_return_code(bytes: &[u8], value: u8) -> bool {
 pub(crate) static mut TICKET_EXT_DATA_DETOUR: Option<Detour<TicketExtDataFn>> = None;
 pub(crate) static mut UPDATE_TICKET_DETOUR: Option<Detour<UpdateTicketFn>> = None;
 pub(crate) static mut IS_SUBSCRIBED_IN_TICKET_DETOUR: Option<Detour<IsSubscribedInTicketFn>> = None;
-/// Source ticket from appId 7, lazily acquired on first derivation attempt.
-pub(crate) static SOURCE_TICKET_7: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+/// Forge source ticket, kept once Steam has returned one.
+pub(crate) static SOURCE_TICKET: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: GetAppOwnershipTicketExtendedData (ticket forge)
@@ -756,8 +756,8 @@ unsafe { copy_ticket_to_buffer(
         ) };
     }
 
-    // Forge from appId 7 source ticket. The forged ticket embeds the source
-    // ticket's SteamID (usually the current user's, since appId 7 is owned by
+    // Forge from the source app's ticket. The forged ticket embeds the source
+    // ticket's SteamID (usually the current user's, since the source app is owned by
     // whoever's logged in), so `GetSteamID` returning the real SteamID already
     // matches. Don't stamp `delegate_steamid` here — OpenSteamTool's
     // `IsAuthorizedPipe` is false past the DenuvoAuth window and its
@@ -899,24 +899,70 @@ pub(crate) unsafe fn copy_ticket_to_buffer(
     layout.reported_size
 }
 
-/// Try to forge a ticket for `target_app_id` from the appId 7 source ticket.
+/// Try to forge a ticket for `target_app_id` from the source app's ticket.
 pub(crate) fn try_forge_ticket(
     this: *mut c_void,
     target_app_id: u32,
 ) -> Option<vapor_forge_features::ticket::forge::ForgedTicket> {
     use vapor_forge_features::ticket::forge;
 
-    let source = SOURCE_TICKET_7.get_or_init(|| acquire_source_ticket(this));
-
-    let source_data = source.as_ref()?;
-    let forged = forge::forge_from_source(source_data, target_app_id);
+    let Some(source_data) = source_ticket(this) else {
+        warn!(
+            source_app_id = forge::SOURCE_APP_ID,
+            "ticket: failed to acquire source ticket"
+        );
+        request_source_ticket(this);
+        return None;
+    };
+    let forged = forge::forge_from_source(&source_data, target_app_id);
     if forged.is_some() {
-        info!(target_app_id, "ticket: derived from appId 7 source");
+        info!(target_app_id, "ticket: derived from source ticket");
     }
     forged
 }
 
-/// Acquire the source ticket (appId 7) by calling the original function directly.
+/// Return the forge source ticket, reading Steam's ticket cache until it
+/// holds one.
+fn source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
+    if let Some(ticket) = SOURCE_TICKET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Some(ticket);
+    }
+    let ticket = acquire_source_ticket(this)?;
+    *SOURCE_TICKET.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticket.clone());
+    Some(ticket)
+}
+
+/// Ask Steam to fetch the source app's ticket. Steam does not always cache it on
+/// its own, and `GetAppOwnershipTicketExtendedData` only reads the cache.
+fn request_source_ticket(this: *mut c_void) {
+    // SAFETY: UPDATE_TICKET_DETOUR is set before the hook is enabled.
+    let Some(original) = (unsafe {
+        vapor_forge_hook_engine::original::original_detour(
+            "BUpdateAppOwnershipTicket",
+            std::ptr::addr_of!(UPDATE_TICKET_DETOUR),
+        )
+    }) else {
+        return;
+    };
+    // SAFETY: `this` is the same CUser adapter both ticket hooks receive.
+    let requested = unsafe {
+        original(
+            this,
+            vapor_forge_features::ticket::forge::SOURCE_APP_ID,
+            false,
+        )
+    };
+    info!(
+        source_app_id = vapor_forge_features::ticket::forge::SOURCE_APP_ID,
+        requested, "ticket: requested source ticket"
+    );
+}
+
+/// Acquire the source app's ticket by calling the original function directly.
 pub(crate) fn acquire_source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
     const BUF_SIZE: u32 = 4096;
     let mut buf = vec![0u8; BUF_SIZE as usize];
@@ -947,12 +993,14 @@ pub(crate) fn acquire_source_ticket(this: *mut c_void) -> Option<Vec<u8>> {
     };
 
     if size == 0 {
-        warn!("ticket: failed to acquire source ticket (appId 7)");
         return None;
     }
 
     buf.truncate(size as usize);
-    info!(size, "ticket: acquired source ticket from appId 7");
+    info!(
+        source_app_id = vapor_forge_features::ticket::forge::SOURCE_APP_ID,
+        size, "ticket: acquired source ticket"
+    );
     Some(buf)
 }
 
@@ -973,12 +1021,15 @@ pub(crate) unsafe extern "C" fn hk_update_ticket(
         return unsafe { original(this, app_id, only_update_if_stale) };
     }
     // Always forward to the trampoline so Steam's internal ticket cache and
-    // the appId 7 source ticket both stay warm. For controlled apps that
+    // the forge source ticket both stay warm. For controlled apps that
     // don't have a cached ticket yet, clear `bOnlyUpdateIfStale` so the
     // trampoline actually re-fetches instead of no-oping.
     let cfg = config();
     let controlled =
         vapor_forge_features::apps::classify_app(&cfg, AppId(app_id)).requires_injected_ownership();
+    if controlled && source_ticket(this).is_none() {
+        request_source_ticket(this);
+    }
     let only_update_if_stale = if controlled && !TICKET_CACHE.has_app_ticket(AppId(app_id)) {
         debug!(
             app_id,

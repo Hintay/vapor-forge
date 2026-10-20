@@ -8,7 +8,7 @@ use vapor_forge_config::AppId;
 
 /// Thread-safe ticket cache.
 ///
-/// - Forge source tickets (appId 7): always memory-only.
+/// - Forge source tickets: always memory-only.
 /// - Delegate captured tickets: always persisted to disk.
 /// - Other tickets: controlled by `persist` flag at store time.
 pub struct TicketCache {
@@ -308,10 +308,11 @@ pub fn clear_delegate_steamid(app_id: AppId) {
     }
 }
 
-/// Ticket forging: create a ticket for a target app from a source ticket (appId 7).
+/// Ticket forging: create a ticket for a target app from a source app's ticket.
 pub mod forge {
-    /// The source app whose ticket we clone from.
-    pub const SOURCE_APP_ID: u32 = 7;
+    /// The source app whose ticket we clone from: Steamworks Common
+    /// Redistributables, which every account owns.
+    pub const SOURCE_APP_ID: u32 = 228980;
 
     /// Offset of the SteamID within a standard ownership ticket.
     const TICKET_STEAMID_OFFSET: usize = 8;

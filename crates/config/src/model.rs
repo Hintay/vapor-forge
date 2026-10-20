@@ -98,7 +98,7 @@ pub struct InjectApp {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TicketMode {
-    /// Default: derive tickets from appId 7 source with current user's SteamID.
+    /// Default: derive tickets from the source app's ticket with current user's SteamID.
     #[default]
     Forge,
     /// Delegate to cached ticket from previous owner session. During the
@@ -504,7 +504,7 @@ pub struct LibraryInjectEntry {
 
 /// Ticket configuration.
 ///
-/// - Forge source tickets (appId 7): always memory-only.
+/// - Forge source tickets: always memory-only.
 /// - Delegate captured tickets: always persisted to disk.
 /// - Other tickets (Lua-provided, real intercepted): controlled by `cache`.
 #[derive(Clone, Debug, Default, Deserialize)]
