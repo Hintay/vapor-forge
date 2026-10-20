@@ -148,13 +148,13 @@
         if (typeof exp !== 'function') return false;
         var text = '';
         try { text = String(exp); } catch (_) {}
-        if (hasAll(text, ['RequestModalMeasure', 'bNeverPopOut', 'bForcePopOut'])) {
+        if (hasAll(text, ['Conflicting popout options', 'bNeverPopOut', 'bForcePopOut'])) {
           found = exp;
           return true;
         }
         return false;
       }, function(text) {
-        return hasAll(text, ['RequestModalMeasure', 'ShowLegacyPopupModal', 'bHideMainWindowForPopouts']);
+        return hasAll(text, ['Conflicting popout options', 'bNeverPopOut', 'bForcePopOut']);
       });
       return found;
     }
