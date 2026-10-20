@@ -142,12 +142,13 @@ mod linux_audit {
     }
 
     fn clear_audit_env_for_steam() {
-        // SAFETY: AT_EXECFN points to a loader-owned NUL-terminated string for
-        // the lifetime of the process.
-        let executable = unsafe {
-            bounded_cstr_to_string(libc::getauxval(libc::AT_EXECFN) as *const c_char, 4096)
+        // Steam's launcher scripts are also named `steam`, and a script's
+        // AT_EXECFN is the script path. The executed image is the interpreter,
+        // so only the client binary itself clears the variable.
+        let Ok(executable) = std::fs::read_link("/proc/self/exe") else {
+            return;
         };
-        if !executable.as_deref().is_some_and(is_steam_executable_path) {
+        if !executable.to_str().is_some_and(is_steam_executable_path) {
             return;
         }
 
