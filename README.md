@@ -39,14 +39,34 @@ Published artifacts are cross-linked with Zig against glibc 2.17. Local builds u
 
 ## Install
 
-Vapor Forge loads through the `LD_AUDIT` mechanism. Add it to your Steam launch environment. Use the library whose target architecture matches the Steam process:
-
-- 32-bit Steam: `target/i686-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
-- 64-bit Steam: `target/x86_64-unknown-linux-gnu/{debug,release}/libvapor_forge.so`
+Download `vapor-forge-<version>-linux.tar.gz` from [Releases](https://github.com/Hintay/vapor-forge/releases), extract it, and run the installer as your normal user:
 
 ```sh
-LD_AUDIT=/path/to/libvapor_forge.so
+tar -xzf vapor-forge-<version>-linux.tar.gz
+cd vapor-forge-<version>
+./install.sh
 ```
+
+Then restart Steam. On a Steam Deck, run these commands in Konsole in Desktop Mode, then reboot.
+
+The installer only writes to your home directory, so it needs no root access and survives SteamOS updates. It:
+
+- copies the libraries to `~/.local/share/vapor-forge/{i686,x86_64}/`
+- adds a systemd user drop-in that sets `LD_AUDIT` for `steam-launcher.service` (Steam Deck Gaming Mode) and for `app-steam@autostart.service` (Steam started at login in a desktop session)
+- if `~/.env.steam` exists (for example from the Decky Env Editor plugin), adds the libraries to its `LD_AUDIT` line, because that file overrides the drop-in. Other entries on the line are kept.
+- writes `~/.local/share/applications/steam.desktop`, a copy of the system Steam launcher with `LD_AUDIT` added, so Steam started from the application menu loads Vapor Forge too. If you already have this file, the installer leaves it unchanged.
+
+To update, run `./install.sh` from a newer release. `./install.sh uninstall` removes the libraries, the drop-ins, and the launcher, and keeps your configuration in `~/.config/vapor-forge/`. The installer covers the native Steam client; Flatpak Steam is not supported.
+
+### Manual setup
+
+Vapor Forge loads through the `LD_AUDIT` mechanism. List both libraries: the dynamic loader skips the one whose architecture does not match the process, so the same value works for the 32-bit and the 64-bit Steam client.
+
+```sh
+LD_AUDIT=/path/to/i686/libvapor_forge.so:/path/to/x86_64/libvapor_forge.so steam
+```
+
+Local builds place the libraries in `target/{i686,x86_64}-unknown-linux-gnu/{debug,release}/`. The 64-bit Proton helper `libvapor_forge_proton_inject.so` is looked up next to the loaded library, then in `/usr/lib` and `/usr/lib64`. Releases ship it in both architecture directories. If you keep it elsewhere, set `[library_inject] helper_path`.
 
 The 64-bit audit loader initializes configuration, scripting, diagnostics, debug IPC, SteamClient hooks, SteamUI hooks, VMT-scanner hooks, and launch-environment injection. pkg0 PackageInfo field offsets are verified for the current 64-bit Steam baseline (`PackageId` at `+0x00`, `status` at `+0x18`, `m_vecAppIDs` at `+0x40`). The 64-bit `CPackageInfo::GetPackageInfo` hook captures the package-store object and calls Steam's token-map lookup with pkg0's known access token.
 

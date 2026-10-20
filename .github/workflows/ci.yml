@@ -203,11 +203,11 @@ jobs:
       - name: Stage artifacts
         run: |
           set -eux
-          mkdir -p dist/i686-unknown-linux-gnu dist/x86_64-unknown-linux-gnu
-          cp target/i686-unknown-linux-gnu/release/libvapor_forge.so dist/i686-unknown-linux-gnu/
-          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge.so dist/x86_64-unknown-linux-gnu/
-          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so dist/x86_64-unknown-linux-gnu/
-          cp LICENSE README.md dist/
+          mkdir -p dist/i686 dist/x86_64
+          cp target/i686-unknown-linux-gnu/release/libvapor_forge.so dist/i686/
+          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge.so dist/x86_64/
+          cp target/x86_64-unknown-linux-gnu/release/libvapor_forge_proton_inject.so dist/x86_64/
+          cp LICENSE README.md scripts/install.sh dist/
 
       - name: Compute artifact name
         id: meta
@@ -234,13 +234,17 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Artifact uploads drop symlinks and file modes, so both are restored here.
+      # The 32-bit library finds the 64-bit Proton helper in its own directory.
       - name: Package
         run: |
           set -eux
-          VERSION="${GITHUB_REF_NAME}"
-          mkdir -p bundle
-          cp -R artifacts/. bundle/
-          tar -C bundle -czf "vapor-forge-${VERSION}-linux.tar.gz" .
+          root="vapor-forge-${GITHUB_REF_NAME}"
+          mkdir -p "bundle/${root}"
+          cp -R artifacts/. "bundle/${root}/"
+          chmod 755 "bundle/${root}/install.sh"
+          ln -s ../x86_64/libvapor_forge_proton_inject.so "bundle/${root}/i686/libvapor_forge_proton_inject.so"
+          tar -C bundle -czf "${root}-linux.tar.gz" "${root}"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
