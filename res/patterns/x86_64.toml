@@ -107,6 +107,11 @@ pattern = "48 83 EC ? 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 8
 follow = "none"
 pattern = "83 7F ? 02 0F 85 ? ? ? ? 80 BF ? ? 00 00 00 0F 85 ? ? ? ? 48 8D 05 ? ? ? ? BF ? ? 00 00"
 
+# steamrt reorders the connection save and pool load around the state gates.
+# The body validator verifies the pool load and complete work-item allocation.
+[[steamclient."CWebSocketConnection::PostDelayedCloseWorkItem".variants]]
+pattern = "83 7F ? 02"
+
 # CHTTPRequestJob start boundary. The local-cloud hook first uses this as an
 # observation point; x64 request layout is validated before transfer bypass.
 [steamclient."CHTTPRequestJob::Start"]
@@ -150,6 +155,14 @@ pattern = "55 48 89 E5 41 57 ? ? ? ? ? 41 55 41 54 ? ? ? ? 48 ? ? ? ? ? ? ? ? ? 
 [steamclient."CUser::BuildSpawnEnvBlock"]
 follow = "none"
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
+
+# Some steamrt builds use the same frame-pointer entry.
+[[steamclient."CUser::BuildSpawnEnvBlock".variants]]
+pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
+
+# steamrt addresses saved arguments and local buffers through RSP.
+[[steamclient."CUser::BuildSpawnEnvBlock".variants]]
+pattern = "41 57 41 56 41 55 41 54 55 53 48 81 EC ? 31 00 00 48 8B 84 24 ? 32 00 00 48 89 74 24 ? 48 89 4C 24"
 
 [steamclient."SetEnvString"]
 follow = "none"

@@ -4435,8 +4435,16 @@ fn build_spawn_env_block64_evidence(code: &[u8], offset: usize) -> Option<Eviden
         && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31A8), rsi))
         && has_asm64(bytes, |a| a.mov(qword_ptr(rbp - 0x31A0), rcx))
         && has_asm64(bytes, |a| a.mov(byte_ptr(rbp - 0x3040), 0));
+    let frameless_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x3230)))
+        && has_asm64(bytes, |a| a.mov(r14, qword_ptr(rsp + 0x3238)))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp + 0x28), rsi))
+        && has_asm64(bytes, |a| a.mov(qword_ptr(rsp + 0x20), rcx))
+        && has_asm64(bytes, |a| a.mov(byte_ptr(rsp + 0x21E0), 0));
     Some(Evidence::required([
-        ("known spawn environment layout", old_shape || current_shape),
+        (
+            "known spawn environment layout",
+            old_shape || current_shape || frameless_shape,
+        ),
         (
             "Steam launch id formatting",
             has_asm64(bytes, |a| a.mov(r8d, 0x2F)) && has_asm64(bytes, |a| a.mov(esi, 0x1000)),

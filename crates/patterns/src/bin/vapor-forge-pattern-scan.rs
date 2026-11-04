@@ -729,6 +729,28 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[test]
+    fn spawn_environment_validator_checks_frameless_output_arguments() {
+        for output_offset in [0x3230, 0x3228] {
+            let mut code = [0xcc; 0x240];
+            place_asm64(&mut code, 0, |a| {
+                a.mov(rax, qword_ptr(rsp + output_offset))?;
+                a.mov(r14, qword_ptr(rsp + 0x3238))?;
+                a.mov(qword_ptr(rsp + 0x28), rsi)?;
+                a.mov(qword_ptr(rsp + 0x20), rcx)?;
+                a.mov(byte_ptr(rsp + 0x21E0), 0)?;
+                a.mov(r8d, 0x2f)?;
+                a.mov(esi, 0x1000)?;
+                a.mov(edx, -1)?;
+                a.call(0x1000u64)
+            });
+            assert_eq!(
+                validate_build_spawn_env_block64(&code, 0).is_some(),
+                output_offset == 0x3230
+            );
+        }
+    }
+
     fn place_asm32(
         code: &mut [u8],
         offset: usize,
