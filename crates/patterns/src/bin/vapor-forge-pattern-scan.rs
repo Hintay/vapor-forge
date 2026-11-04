@@ -319,6 +319,7 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     }
 
     if module == "steamclient" {
+        failed |= scan_engine_work_item_layout(&data, &segment);
         failed |= scan_public_wrapper_collisions(path, segment.vaddr, &resolved);
         failed |= if is_elf64 {
             scan_steamclient64_layouts(segment.bytes, segment.vaddr, &resolved)
@@ -367,6 +368,51 @@ fn scan_module(module: &str, path: &Path, patterns: &PatternSet) -> Result<bool,
     println!();
 
     Ok(failed)
+}
+
+fn scan_engine_work_item_layout(data: &[u8], segment: &ExecutableSegment<'_>) -> bool {
+    let label = "CSteamEngine work-item queue and allocator";
+    let result = vapor_forge_patterns::engine_work_item_site::discover(
+        u32::from(segment.elf_class.bits()),
+        segment.vaddr as usize,
+        segment.bytes,
+    );
+    let discovered = match result {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            println!("  FAIL {label:<58} required ({error})");
+            return true;
+        }
+    };
+    let site = discovered.site;
+    let image = match ElfImage::parse(data) {
+        Ok(image) => image,
+        Err(error) => {
+            println!("  FAIL {label:<58} required ({error})");
+            return true;
+        }
+    };
+    if !image.in_module(site.engine_slot as u64)
+        || image.in_text(site.engine_slot as u64)
+        || !image.in_text(site.grow as u64)
+        || !image.in_text(site.allocate as u64)
+    {
+        println!(
+            "  FAIL {label:<58} required (decoded addresses have invalid segment permissions)"
+        );
+        return true;
+    }
+    println!(
+        "  OK   {label:<58} engine=0x{:x} mutex=0x{:x} queue=0x{:x} item_size={} allocate=0x{:x} grow=0x{:x} producers={}",
+        site.engine_slot,
+        site.mutex_offset,
+        site.queue_offset,
+        site.item_size,
+        site.allocate,
+        site.grow,
+        discovered.agreeing_producers
+    );
+    false
 }
 
 fn scan_public_wrapper_collisions(

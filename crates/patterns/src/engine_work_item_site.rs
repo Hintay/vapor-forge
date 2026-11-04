@@ -19,23 +19,25 @@ const MAX_ENGINE_FIELD: usize = 0x10000;
 const MIN_AGREEING_PRODUCERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct EngineWorkItemSite {
+pub struct EngineWorkItemSite {
     /// Pointer slot holding the process-lifetime `CSteamEngine` instance.
-    pub(crate) engine_slot: usize,
-    pub(crate) mutex_offset: usize,
-    pub(crate) queue_offset: usize,
+    pub engine_slot: usize,
+    pub mutex_offset: usize,
+    pub queue_offset: usize,
     /// `CUtlMemory<void *>::Grow(int)` used by the queue itself.
-    pub(crate) grow: usize,
-    pub(crate) item_size: usize,
+    pub grow: usize,
+    /// Native allocation entry called by the queue producer.
+    pub allocate: usize,
+    pub item_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DiscoveredEngineWorkItemSite {
-    pub(crate) site: EngineWorkItemSite,
-    pub(crate) agreeing_producers: usize,
+pub struct DiscoveredEngineWorkItemSite {
+    pub site: EngineWorkItemSite,
+    pub agreeing_producers: usize,
 }
 
-pub(crate) fn discover(
+pub fn discover(
     bitness: u32,
     code_base: usize,
     code: &[u8],
@@ -88,7 +90,7 @@ fn decode_producer(
         return None;
     }
     decoder.decode_out(&mut instruction);
-    direct_call_target(&instruction)?;
+    let allocate = direct_call_target(&instruction)?;
 
     let item_register = if bitness == 64 {
         Register::RAX
@@ -238,6 +240,7 @@ fn decode_producer(
         mutex_offset,
         queue_offset,
         grow,
+        allocate,
         item_size: pointer_size * 5,
     })
 }
@@ -461,4 +464,106 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         cursor = offset.saturating_add(1);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: usize = 0x1000;
+    const ALLOCATE: usize = 0x1700;
+    const GROW: usize = 0x1710;
+
+    fn call(bytes: &mut Vec<u8>, start: usize, target: usize) {
+        let next = BASE + start + bytes.len() + 5;
+        bytes.push(0xe8);
+        bytes.extend_from_slice(&((target as i64 - next as i64) as i32).to_le_bytes());
+    }
+
+    fn producer(bitness: u32, start: usize, allocate: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if bitness == 64 {
+            bytes.extend_from_slice(b"\x48\x8b\x2d");
+            bytes.extend_from_slice(&((0x9000 - (BASE + start + 7)) as u32).to_le_bytes());
+            bytes.extend_from_slice(b"\x48\x8d\x9d\xd0\x21\0\0\x48\x89\xdf");
+            call(&mut bytes, start, 0x1720);
+            bytes.extend_from_slice(b"\xbf\x28\0\0\0");
+            call(&mut bytes, start, allocate);
+            bytes.extend_from_slice(b"\x48\x89\x30\x48\x89\x50\x18\x48\x89\x48\x20");
+            bytes.extend_from_slice(b"\x48\x63\xb5\x10\x22\0\0");
+            bytes.extend_from_slice(b"\x48\x8b\x8d\0\x22\0\0\x3b\xb5\x08\x22\0\0");
+            bytes.extend_from_slice(b"\x48\x8d\xbd\0\x22\0\0");
+        } else {
+            call(&mut bytes, start, BASE + 0x700);
+            bytes.extend_from_slice(b"\x81\xc3");
+            bytes.extend_from_slice(&((0xa000 - (BASE + start + 5)) as u32).to_le_bytes());
+            bytes.extend_from_slice(b"\x8b\xb3\0\xf0\xff\xff");
+            bytes.extend_from_slice(b"\x8d\xbe\xd8\x1a\0\0\x57");
+            call(&mut bytes, start, 0x1720);
+            bytes.extend_from_slice(b"\xc7\x04\x24\x14\0\0\0");
+            call(&mut bytes, start, allocate);
+            bytes.extend_from_slice(b"\x89\x10\x89\x48\x0c\x89\x78\x10");
+            bytes.extend_from_slice(b"\x8b\x8e\xf4\x1a\0\0\x8b\x96\xf8\x1a\0\0");
+            bytes.extend_from_slice(b"\x8b\xae\0\x1b\0\0\x8d\xbe\xf4\x1a\0\0\x57");
+        }
+        call(&mut bytes, start, GROW);
+        bytes.push(0xc3);
+        bytes
+    }
+
+    fn image(bitness: u32, second_allocator: usize) -> Vec<u8> {
+        let mut code = vec![0xcc; 0x800];
+        for (start, allocate) in [(0x40, ALLOCATE), (0x240, second_allocator)] {
+            let bytes = producer(bitness, start, allocate);
+            code[start..start + bytes.len()].copy_from_slice(&bytes);
+        }
+        code[0x700..0x704].copy_from_slice(b"\x8b\x1c\x24\xc3");
+        code
+    }
+
+    #[test]
+    fn identifies_native_allocator_and_queue_on_both_architectures() {
+        for bitness in [64, 32] {
+            let found = discover(bitness, BASE, &image(bitness, ALLOCATE)).unwrap();
+            assert_eq!(found.agreeing_producers, 2);
+            assert_eq!(found.site.allocate, ALLOCATE);
+            assert_eq!(found.site.grow, GROW);
+            assert_eq!(found.site.engine_slot, 0x9000);
+            assert_eq!(found.site.item_size, bitness as usize / 8 * 5);
+            assert_eq!(
+                found.site.mutex_offset,
+                if bitness == 64 { 0x21d0 } else { 0x1ad8 }
+            );
+            assert_eq!(
+                found.site.queue_offset,
+                if bitness == 64 { 0x2200 } else { 0x1af4 }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_producers_that_disagree_on_allocator_ownership() {
+        for bitness in [64, 32] {
+            assert!(discover(bitness, BASE, &image(bitness, ALLOCATE + 0x30)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_a_single_producer_and_truncated_allocation_call() {
+        for bitness in [64, 32] {
+            let code = image(bitness, ALLOCATE);
+            assert!(discover(bitness, BASE, &code[..0x200]).is_err());
+            let anchor = if bitness == 64 {
+                &b"\xbf\x28\0\0\0"[..]
+            } else {
+                &b"\xc7\x04\x24\x14\0\0\0"[..]
+            };
+            let mut code = code;
+            for start in [0x40, 0x240] {
+                let call = start + find_bytes(&code[start..], anchor).unwrap() + anchor.len();
+                code[call] = 0x90;
+            }
+            assert!(discover(bitness, BASE, &code).is_err());
+        }
+    }
 }

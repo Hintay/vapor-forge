@@ -15,6 +15,8 @@ pub mod current_app;
 pub mod cuser_adapter;
 pub mod elf;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod engine_work_item_site;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;
