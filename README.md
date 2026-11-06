@@ -39,7 +39,15 @@ Published artifacts are cross-linked with Zig against glibc 2.17. Local builds u
 
 ## Install
 
-Download `vapor-forge-<version>-linux.tar.gz` from [Releases](https://github.com/Hintay/vapor-forge/releases), extract it, and run the installer as your normal user:
+Run this as your normal user to download the latest release and install it:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Hintay/vapor-forge/main/scripts/get.sh)" @ install
+```
+
+Add `--version v0.1.2` to install a specific release, or use `@ uninstall` to remove Vapor Forge. `@ help` lists the commands.
+
+To install by hand instead, download `vapor-forge-<version>-linux.tar.gz` from [Releases](https://github.com/Hintay/vapor-forge/releases), extract it, and run the installer:
 
 ```sh
 tar -xzf vapor-forge-<version>-linux.tar.gz
@@ -56,7 +64,7 @@ The installer only writes to your home directory, so it needs no root access and
 - if `~/.env.steam` exists (for example from the Decky Env Editor plugin), adds the libraries to its `LD_AUDIT` line, because that file overrides the drop-in. Other entries on the line are kept.
 - writes `~/.local/share/applications/steam.desktop`, a copy of the system Steam launcher with `LD_AUDIT` added, so Steam started from the application menu loads Vapor Forge too. If you already have this file, the installer leaves it unchanged.
 
-To update, run `./install.sh` from a newer release. `./install.sh uninstall` removes the libraries, the drop-ins, and the launcher, and keeps your configuration in `~/.config/vapor-forge/`. The installer covers the native Steam client; Flatpak Steam is not supported.
+To update, run the install command again, or `./install.sh` from a newer release. `@ uninstall` or `./install.sh uninstall` removes the libraries, the drop-ins, and the launcher, and keeps your configuration in `~/.config/vapor-forge/`. The installer covers the native Steam client; Flatpak Steam is not supported.
 
 ### Manual setup
 
