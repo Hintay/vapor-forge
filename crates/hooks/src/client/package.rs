@@ -11,6 +11,7 @@ use vapor_forge_steam_native_abi::{
     package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
     ProcessPendingLicenseUpdatesFn,
 };
+use vapor_forge_steam_protocol::LicensedPackage;
 
 use crate::pattern_resolver::CodeRegion;
 use vapor_forge_patterns::engine_work_item_site::EngineWorkItemSite;
@@ -548,24 +549,26 @@ pub fn queue_reload(controlled: Vec<AppId>) {
 // Genuine ownership from the account's license list
 // ---------------------------------------------------------------------------
 
-// Packages (id, access token) from the last CMsgClientLicenseList, kept until
-// every package's info is available and the controlled apps were re-evaluated.
+// Packages from the last CMsgClientLicenseList, kept until every package's
+// info is available and the controlled apps were re-evaluated.
 static PENDING_LICENSES: Mutex<Option<PendingLicenses>> = Mutex::new(None);
 const MAX_LICENSE_REFRESH_ATTEMPTS: u32 = 40;
 
 struct PendingLicenses {
-    packages: Vec<(u32, u64)>,
+    packages: Vec<LicensedPackage>,
+    self_account_id: u32,
     attempts: u32,
 }
 
 /// Remember the account's licenses; the next GetSubscribedApps call, which
 /// Steam makes after processing a license change, re-evaluates ownership.
-pub(crate) fn note_license_list(packages: Vec<(u32, u64)>) {
+pub(crate) fn note_license_list(packages: Vec<LicensedPackage>, self_account_id: u32) {
     let mut pending = PENDING_LICENSES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *pending = Some(PendingLicenses {
         packages,
+        self_account_id,
         attempts: 0,
     });
 }
@@ -597,19 +600,21 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             *guard = None;
             return;
         }
-        pending.packages.clone()
+        (pending.packages.clone(), pending.self_account_id)
     };
+    let (packages, self_account_id) = packages;
     // SAFETY: resolved once before hook installation and read-only afterward.
     let Some(get_pkg) = (unsafe { *std::ptr::addr_of!(FN_GET_PKG_INFO) }) else {
         return;
     };
     let this = CPKG_INFO_PTR.load(Ordering::Acquire) as *mut c_void;
     let mut owned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut family: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut missing = 0usize;
-    for &(package_id, access_token) in &packages {
+    for license in &packages {
         // SAFETY: the receiver was captured from Steam's own GetPackageInfo
         // call and the callable was validated against this ABI.
-        let pkg = unsafe { get_pkg(this, package_id, access_token) };
+        let pkg = unsafe { get_pkg(this, license.package_id, license.access_token) };
         if pkg.is_null() {
             missing += 1;
             continue;
@@ -625,7 +630,12 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
         let base = app_ids.m_memory.m_p_memory;
         if count > 0 && !base.is_null() {
             // SAFETY: Steam's vector header describes `count` live u32 elements.
-            owned.extend(unsafe { std::slice::from_raw_parts(base as *const u32, count) });
+            let apps = unsafe { std::slice::from_raw_parts(base as *const u32, count) };
+            if self_account_id != 0 && license.is_held_by_other_account(self_account_id) {
+                family.extend(apps);
+            } else {
+                owned.extend(apps);
+            }
         }
     }
     let runtime = crate::client::install::runtime_snapshot();
@@ -636,9 +646,12 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
     // in one of the missing ones. Downgrades wait for a complete picture.
     let complete = missing == 0;
     let mut changed = Vec::new();
+    let mut family_changed = Vec::new();
     let mut owned_controlled = 0usize;
-    for app_id in controlled {
-        let is_owned = owned.contains(&app_id.0);
+    for &app_id in &controlled {
+        let self_owned = owned.contains(&app_id.0);
+        let family_shared = !self_owned && family.contains(&app_id.0);
+        let is_owned = self_owned || family_shared;
         if is_owned {
             owned_controlled += 1;
         }
@@ -649,6 +662,11 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
         vapor_forge_features::apps::record_actual_ownership(app_id, is_owned);
         if before != vapor_forge_features::apps::actual_ownership(app_id) {
             changed.push(app_id.0);
+        }
+        if (family_shared || complete)
+            && vapor_forge_features::apps::record_family_shared(app_id, family_shared)
+        {
+            family_changed.push(app_id.0);
         }
     }
     let attempts = {
@@ -669,8 +687,14 @@ pub(crate) fn run_pending_ownership_refresh(config: &vapor_forge_config::Runtime
             owned_controlled,
             changed = changed.len(),
             changed_apps = ?changed.iter().take(16).collect::<Vec<_>>(),
+            family_changed_apps = ?family_changed.iter().take(16).collect::<Vec<_>>(),
             "package: ownership refreshed from license list"
         );
+    }
+    // Family-shared apps stay out of pkg0, so a change in that set changes
+    // what pkg0 has to carry.
+    if !family_changed.is_empty() && crate::client::install::PKG0_INJECTED.load(Ordering::Acquire) {
+        queue_reload(controlled);
     }
 }
 
@@ -730,6 +754,17 @@ fn try_post_update() {
     warn!(generation, "package: update work item could not be posted");
 }
 
+/// Controlled apps that pkg0 should carry. An app a family member's license
+/// already grants is left to Steam, which then presents it as borrowed from
+/// that member instead of as a license of this account.
+fn without_family_shared(controlled: &[AppId]) -> Vec<AppId> {
+    controlled
+        .iter()
+        .copied()
+        .filter(|&app_id| !vapor_forge_features::apps::is_family_shared(app_id))
+        .collect()
+}
+
 fn run_update_work_item(generation: u64) {
     let controlled = {
         let mut dispatch = UPDATE_DISPATCH
@@ -776,7 +811,7 @@ fn run_update_work_item(generation: u64) {
             if !super::ownership::snapshot_actual_ownership(cuser, &controlled) {
                 return false;
             }
-            let plan = package_state.compute_injection(&controlled);
+            let plan = package_state.compute_injection(&without_family_shared(&controlled));
             let injection = access.inject(&plan.app_ids);
             package_state.record_injected(&injection.appended);
             if !injection.complete {
@@ -794,10 +829,12 @@ fn run_update_work_item(generation: u64) {
         if !package_state.is_active() {
             return false;
         }
-        let diff = package_state.compute_hot_reload_diff(&controlled);
+        let diff = package_state.compute_hot_reload_diff(&without_family_shared(&controlled));
         if !super::ownership::snapshot_actual_ownership(cuser, &diff.additions) {
             return false;
         }
+        // The snapshot may have found family licenses for new additions.
+        let diff = package_state.compute_hot_reload_diff(&without_family_shared(&controlled));
         let applied = access.apply_reload_diff(&diff);
         package_state.apply_diff(&applied);
         info!(

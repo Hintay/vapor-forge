@@ -84,6 +84,16 @@ pattern = "E8 ? ? ? ? 81 C2 ? ? ? ? 55 89 E5 57 56 53 83 EC 6C 8B 45 08 8B 5D 10
 follow = "none"
 pattern = "57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 8B 83 ? ? ? ? 8B 40 44 85 C0 75 ?"
 
+# Returns the account that holds the family library lock on an app, or 0 when
+# the app is free, a lender is available, or the lock is held by this account.
+[steamclient."CFamilySharing::GetLockingAccount"]
+follow = "none"
+pattern = "56 53 8B 4C 24 0C 8B 54 24 10 8B 81 ? ? ? ? 83 F8 FF 74 ? 8B 99 ? ? ? ? EB ? ? ? ? 8B 00 83 F8 FF 74 ? 6B C0 2C 01 D8 39 50 10 77 ? 73 ? 8B 40 04 83 F8 FF 75 ? 31 D2"
+
+# steamrt keeps the family object in EBX and the app ID in ECX.
+[[steamclient."CFamilySharing::GetLockingAccount".variants]]
+pattern = "57 56 53 8B 5C 24 10 8B 4C 24 14 8B 83 ? ? ? ? 83 F8 FF 74 ? 8B B3 ? ? ? ? EB ? ? ? 8B 00 83 F8 FF 74 ? 6B C0 2C 01 F0 8B 50 10 39 D1 72 ? 39 CA 73 ? 8B 40 04 83 F8 FF 75 ? 31 FF"
+
 # Reaches past the frame setup to the two argument spills: another function
 # shares the prologue and the 0xac frame, and diverges only at which register
 # takes the connection argument. The spill displacements are wildcards because

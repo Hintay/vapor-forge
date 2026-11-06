@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -7,6 +7,9 @@ use vapor_forge_config::{AppCategory, AppId, RuntimeConfig};
 
 struct AccountState {
     actual_ownership: Option<HashMap<AppId, bool>>,
+    // Controlled apps whose entitlement comes only from another family
+    // member's license.
+    family_shared: Option<HashSet<AppId>>,
     license_sync_complete: bool,
 }
 
@@ -14,12 +17,14 @@ impl AccountState {
     const fn new() -> Self {
         Self {
             actual_ownership: None,
+            family_shared: None,
             license_sync_complete: false,
         }
     }
 
     fn reset(&mut self) {
         self.actual_ownership = None;
+        self.family_shared = None;
         self.license_sync_complete = false;
     }
 }
@@ -152,6 +157,29 @@ pub fn actual_ownership(app_id: AppId) -> OwnershipState {
     }
 }
 
+/// Record whether the app's entitlement comes only from a family member.
+/// Returns whether the recorded value changed.
+pub fn record_family_shared(app_id: AppId, shared: bool) -> bool {
+    let mut state = ACCOUNT_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let set = state.family_shared.get_or_insert_with(HashSet::new);
+    if shared {
+        set.insert(app_id)
+    } else {
+        set.remove(&app_id)
+    }
+}
+
+/// Whether the app is available to this account only through a family
+/// member's license. Such apps keep Steam's own family-sharing presentation.
+pub fn is_family_shared(app_id: AppId) -> bool {
+    ACCOUNT_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .family_shared
+        .as_ref()
+        .is_some_and(|set| set.contains(&app_id))
+}
+
 pub fn classify_app(config: &RuntimeConfig, app_id: AppId) -> AppAuthority {
     classify_app_with_ownership(config, app_id, actual_ownership)
 }
@@ -181,6 +209,15 @@ pub fn classify_app_with_ownership(
 /// successful result. Steam's license bit distinguishes a real entitlement.
 pub fn original_result_is_genuinely_owned(observation: OwnershipObservation) -> bool {
     observation.original_result && observation.owns_license
+}
+
+/// Record what Steam's original ownership path reported before pkg0 could
+/// influence it: genuine entitlement, and whether that entitlement is a
+/// family member's license.
+pub fn record_original_observation(app_id: AppId, observation: OwnershipObservation) {
+    let genuine = original_result_is_genuinely_owned(observation);
+    record_actual_ownership(app_id, genuine);
+    record_family_shared(app_id, genuine && observation.family_shared);
 }
 
 /// Record an ownership result obtained before the app is added to pkg0.
@@ -415,6 +452,37 @@ mod tests {
         record_actual_ownership(app_id, true);
         assert_eq!(actual_ownership(app_id), OwnershipState::Owned);
         assert!(!classify_app(&config, app_id).requires_injected_ownership());
+    }
+
+    #[test]
+    fn original_observation_records_family_license_as_shared_ownership() {
+        let app_id = AppId(246_813_590);
+        let mut observed = observation(true);
+        observed.family_shared = true;
+
+        record_original_observation(app_id, observed);
+        assert_eq!(actual_ownership(app_id), OwnershipState::Owned);
+        assert!(is_family_shared(app_id));
+
+        observed.family_shared = false;
+        record_original_observation(app_id, observed);
+        assert_eq!(actual_ownership(app_id), OwnershipState::Owned);
+        assert!(!is_family_shared(app_id));
+
+        observed.family_shared = true;
+        observed.owns_license = false;
+        record_original_observation(app_id, observed);
+        assert_eq!(actual_ownership(app_id), OwnershipState::Unowned);
+        assert!(!is_family_shared(app_id));
+    }
+
+    #[test]
+    fn family_shared_record_reports_changes() {
+        let app_id = AppId(246_813_591);
+        assert!(record_family_shared(app_id, true));
+        assert!(!record_family_shared(app_id, true));
+        assert!(record_family_shared(app_id, false));
+        assert!(!record_family_shared(app_id, false));
     }
 
     #[test]

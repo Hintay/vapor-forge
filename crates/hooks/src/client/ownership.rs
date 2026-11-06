@@ -56,10 +56,8 @@ unsafe { original(this, app_id, out) };
 
     if !pkg0_was_injected && !out.is_null() {
         // SAFETY: the original call populated `out` and it remains valid for this callback.
-        let genuine = vapor_forge_features::apps::original_result_is_genuinely_owned(
-            ownership_observation(result, unsafe { &*out }),
-        );
-        vapor_forge_features::apps::record_actual_ownership(AppId(app_id), genuine);
+        let observation = ownership_observation(result, unsafe { &*out });
+        vapor_forge_features::apps::record_original_observation(AppId(app_id), observation);
     }
 
     if out.is_null() {
@@ -112,10 +110,10 @@ fn snapshot_with_original(original: CheckAppOwnershipFn, this: *mut c_void, app_
         let mut info = CAppOwnershipInfo::zeroed();
         let result = // SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract.
 unsafe { original(this, app_id.0, &mut info) };
-        let genuine = vapor_forge_features::apps::original_result_is_genuinely_owned(
+        vapor_forge_features::apps::record_original_observation(
+            app_id,
             ownership_observation(result, &info),
         );
-        vapor_forge_features::apps::record_actual_ownership(app_id, genuine);
     }
 }
 

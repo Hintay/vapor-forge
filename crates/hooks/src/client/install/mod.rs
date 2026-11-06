@@ -74,6 +74,7 @@ const STEAMCLIENT_CAPABILITIES: &[crate::capability::Capability] = &[
     crate::capability::Capability::TicketOverrides,
     crate::capability::Capability::DepotInjection,
     crate::capability::Capability::ShaderCacheControl,
+    crate::capability::Capability::FamilyLockBypass,
     crate::capability::Capability::DlcOverrides,
     crate::capability::Capability::CmInterception,
     crate::capability::Capability::NativeResponseDelivery,
@@ -850,6 +851,12 @@ fn do_install() {
         super::shader::GET_SHADER_CACHE_DEPOT_NAME,
         super::shader::hk_get_shader_cache_depot as super::shader::GetShaderCacheDepotFn,
     );
+    let d_get_locking_account = resolve_from_registry(
+        &registry,
+        &code,
+        super::family_lock::GET_LOCKING_ACCOUNT_NAME,
+        super::family_lock::hk_get_locking_account as super::family_lock::GetLockingAccountFn,
+    );
     let mut d_send_frame = resolve_from_registry(
         &registry,
         &code,
@@ -1085,6 +1092,10 @@ fn do_install() {
                 .unwrap_or(0),
         },
         hr!(super::user::CUSER_GET_STEAM_ID_NAME, d_cuser_get_steam_id),
+        hr!(
+            super::family_lock::GET_LOCKING_ACCOUNT_NAME,
+            d_get_locking_account
+        ),
     ];
 
     macro_rules! finalize {
@@ -1282,6 +1293,12 @@ fn do_install() {
         std::ptr::addr_of_mut!(super::user::CUSER_GET_STEAM_ID_DETOUR),
         d_cuser_get_steam_id
     );
+    finalize!(
+        29,
+        super::family_lock::GET_LOCKING_ACCOUNT_NAME,
+        std::ptr::addr_of_mut!(super::family_lock::GET_LOCKING_ACCOUNT_DETOUR),
+        d_get_locking_account
+    );
     super::callback_notify::set_hooks_ready(&[
         (hook_results[0].name, hook_results[0].installed),
         (hook_results[1].name, hook_results[1].installed),
@@ -1352,6 +1369,10 @@ fn do_install() {
     crate::capability::set_from_requirements(
         crate::capability::Capability::ShaderCacheControl,
         &[(hook_results[24].name, hook_results[24].installed)],
+    );
+    crate::capability::set_from_requirements(
+        crate::capability::Capability::FamilyLockBypass,
+        &[(hook_results[29].name, hook_results[29].installed)],
     );
     crate::capability::set_from_requirements(
         crate::capability::Capability::LegacyCdKeyControl,

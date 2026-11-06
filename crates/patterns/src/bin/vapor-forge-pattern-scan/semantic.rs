@@ -107,6 +107,11 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_get_shader_cache_depot32,
     },
     SemanticCheck {
+        name: "CFamilySharing::GetLockingAccount",
+        label: "CFamilySharing::GetLockingAccount body",
+        validate: validate_get_locking_account32,
+    },
+    SemanticCheck {
         name: "CWebSocketConnection::BBuildAndAsyncSendFrame",
         label: "CWebSocketConnection::BBuildAndAsyncSendFrame body",
         validate: validate_websocket_send_frame32,
@@ -228,6 +233,11 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         name: "CShaderCacheManager::GetShaderCacheDepot",
         label: "CShaderCacheManager::GetShaderCacheDepot accessor",
         validate: validate_get_shader_cache_depot64,
+    },
+    SemanticCheck {
+        name: "CFamilySharing::GetLockingAccount",
+        label: "CFamilySharing::GetLockingAccount body",
+        validate: validate_get_locking_account64,
     },
     SemanticCheck {
         name: "CWebSocketConnection::BBuildAndAsyncSendFrame",
@@ -2030,6 +2040,12 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "CShaderCacheManager::GetShaderCacheDepot") => {
             get_shader_cache_depot64_evidence(code, offset)
         }
+        (SemanticArch::X86, "CFamilySharing::GetLockingAccount") => {
+            get_locking_account_evidence(32, code, offset)
+        }
+        (SemanticArch::X86_64, "CFamilySharing::GetLockingAccount") => {
+            get_locking_account_evidence(64, code, offset)
+        }
         (SemanticArch::X86, "CWebSocketConnection::BBuildAndAsyncSendFrame") => {
             websocket_send_frame32_evidence(code, offset)
         }
@@ -3237,6 +3253,86 @@ fn get_shader_cache_depot64_evidence(code: &[u8], offset: usize) -> Option<Evide
             "shader depot lookup",
             has_seq(bytes, &[0xBA, 0x07, 0x00, 0x00, 0x00]),
         ),
+    ]))
+}
+
+fn validate_get_locking_account32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        get_locking_account_evidence(32, code, offset),
+        "family library lock lookup",
+    )
+}
+
+fn validate_get_locking_account64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        get_locking_account_evidence(64, code, offset),
+        "family library lock lookup",
+    )
+}
+
+/// Checks the lock lookup past the tree search the pattern covers: the lender
+/// short circuit, the 16-byte player scan and the self-account comparison.
+fn get_locking_account_evidence(bitness: u32, code: &[u8], offset: usize) -> Option<Evidence> {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+    let bytes = bounded_tail(code, offset, 0x90)?;
+    let lender_off = if bitness == 64 { 0x1C } else { 0x18 };
+    let mut lender_register = None;
+    let mut lender_check = false;
+    let mut player_step = false;
+    let mut self_compare = false;
+    let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        let register_operand = |index| instruction.op_kind(index) == OpKind::Register;
+        if instruction.mnemonic() == Mnemonic::Test
+            && register_operand(0)
+            && instruction.op0_register() == instruction.op1_register()
+            && lender_register == Some(instruction.op0_register())
+        {
+            lender_check = true;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && register_operand(0)
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == lender_off
+            && instruction.memory_size().size() == 4
+        {
+            lender_register = Some(instruction.op0_register());
+        }
+        if instruction.mnemonic() == Mnemonic::Add
+            && register_operand(0)
+            && instruction.try_immediate(1).is_ok_and(|value| value == 0x10)
+        {
+            player_step = true;
+        }
+        let memory_operand = if instruction.op0_kind() == OpKind::Memory {
+            Some(1)
+        } else if instruction.op1_kind() == OpKind::Memory {
+            Some(0)
+        } else {
+            None
+        };
+        if instruction.mnemonic() == Mnemonic::Cmp
+            && memory_operand.is_some_and(register_operand)
+            && instruction.memory_index() == Register::None
+            && !matches!(
+                instruction.memory_base(),
+                Register::ESP | Register::EBP | Register::RSP | Register::RBP
+            )
+            && (0x100..0x1000).contains(&instruction.memory_displacement64())
+        {
+            self_compare = true;
+        }
+    }
+    Some(Evidence::required([
+        ("available lender check", lender_check),
+        ("player scan", player_step),
+        ("self account comparison", self_compare),
     ]))
 }
 

@@ -576,9 +576,14 @@ fn simulate_games_played(
     body_bytes: &[u8],
     context: &SimulationContext<'_>,
 ) -> SimulationResult {
+    let self_account_id = vapor_forge_steam_protocol::CMsgProtoBufHeader::decode(header_bytes)
+        .ok()
+        .and_then(|hdr| hdr.steamid)
+        .map_or(0, |steamid| steamid as u32);
     let Some(filtered) = valve_filter::filter_games_played_with_runtime(
         body_bytes,
         context.config,
+        self_account_id,
         |app_id| context.avatar(app_id),
         |app_id| context.ownership(app_id),
     ) else {

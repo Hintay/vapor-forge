@@ -19,6 +19,7 @@ pub(crate) enum Capability {
     TicketOverrides,
     DepotInjection,
     ShaderCacheControl,
+    FamilyLockBypass,
     DlcOverrides,
     CmInterception,
     NativeResponseDelivery,
@@ -34,13 +35,14 @@ pub(crate) enum Capability {
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::CallbackEvents,
         Self::Ownership,
         Self::PackageInjection,
         Self::TicketOverrides,
         Self::DepotInjection,
         Self::ShaderCacheControl,
+        Self::FamilyLockBypass,
         Self::DlcOverrides,
         Self::CmInterception,
         Self::NativeResponseDelivery,
@@ -63,6 +65,7 @@ impl Capability {
             Self::TicketOverrides => "ticket-overrides",
             Self::DepotInjection => "depot-injection",
             Self::ShaderCacheControl => "shader-cache-control",
+            Self::FamilyLockBypass => "family-lock-bypass",
             Self::DlcOverrides => "dlc-overrides",
             Self::CmInterception => "cm-interception",
             Self::NativeResponseDelivery => "native-response-delivery",

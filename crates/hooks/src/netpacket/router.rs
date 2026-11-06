@@ -29,8 +29,7 @@ use vapor_forge_steam_protocol::{
     EMSG_PICS_PRODUCT_INFO_REQUEST, EMSG_REQUEST_USERSTATS, EMSG_REQUEST_USERSTATS_RESPONSE,
     EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, EMSG_SERVICE_METHOD_RESPONSE,
     EMSG_SERVICE_METHOD_SEND_TO_CLIENT, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, ERESULT_OK,
-    FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB, K_MSG_HDR_PROTO_FLAG,
-    PLAYER_RECORD_DISCONNECTED_PLAYTIME_JOB_NAME,
+    K_MSG_HDR_PROTO_FLAG, PLAYER_RECORD_DISCONNECTED_PLAYTIME_JOB_NAME,
 };
 
 use vapor_forge_config::AppId;
@@ -576,9 +575,16 @@ pub fn decide_send_frame(data: &[u8]) -> SendFrameDecision {
         let runtime = crate::client::install::runtime_snapshot();
         track_games_played(body_bytes, &runtime);
 
-        if let Some(filtered) =
-            valve_filter::filter_games_played(body_bytes, &runtime.config, &runtime.avatar_map)
-        {
+        let self_account_id = CMsgProtoBufHeader::decode(header_bytes)
+            .ok()
+            .and_then(|hdr| hdr.steamid)
+            .map_or(0, |steamid| steamid as u32);
+        if let Some(filtered) = valve_filter::filter_games_played(
+            body_bytes,
+            &runtime.config,
+            &runtime.avatar_map,
+            self_account_id,
+        ) {
             BLOCKED_RICH_PRESENCE_APP.store(
                 filtered
                     .blocked_rich_presence_app
@@ -1016,11 +1022,17 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
     // every purchase, gift or refund. Ownership is re-derived from it.
     if emsg == EMSG_CLIENT_LICENSE_LIST {
         if let Some(packages) = vapor_forge_steam_protocol::licensed_packages(body_bytes) {
+            // The frame header carries this account's SteamID; its low 32 bits
+            // are the account ID licenses name as their owner.
+            let self_account_id = CMsgProtoBufHeader::decode(hdr_bytes)
+                .ok()
+                .and_then(|hdr| hdr.steamid)
+                .map_or(0, |steamid| steamid as u32);
             info!(
                 packages = packages.len(),
                 "netpacket: license list received"
             );
-            crate::client::package::note_license_list(packages);
+            crate::client::package::note_license_list(packages, self_account_id);
         }
     }
     let mut final_len = None;
@@ -1190,30 +1202,17 @@ pub(super) fn process_recv_frame(buf: &[u8]) -> RecvFrameDecision {
         }
     }
 
-    // SharedLibraryStopPlaying (9406): server tells the borrower to stop the
-    // family-shared app because the real owner just started playing. Blank
-    // the body so the client processes it as a no-op.
-    if emsg == EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING {
-        let rewritten = vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &[]);
-        info!("netpacket: cleared SharedLibraryStopPlaying body");
-        final_len = Some(rewritten.len());
-        replacement = Some(rewritten);
-        change = PacketChange::Rewritten;
-    }
-
-    // FamilyGroupsClient.NotifyRunningApps#1: server notifies the family group
-    // that the borrower is running an app; same suppression as above so the
-    // owner side never gets asked to kick us.
-    if emsg == EMSG_SERVICE_METHOD_RESPONSE {
-        if let Ok(hdr) = CMsgProtoBufHeader::decode(hdr_bytes) {
-            if hdr.target_job_name.as_deref() == Some(FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB) {
-                let rewritten = vapor_forge_steam_protocol::assemble_raw(emsg_raw, hdr_bytes, &[]);
-                info!("netpacket: cleared FamilyGroupsClient.NotifyRunningApps body");
-                final_len = Some(rewritten.len());
-                replacement = Some(rewritten);
-                change = PacketChange::Rewritten;
-            }
-        }
+    // SharedLibraryStopPlaying (9406): the CM counts down the seconds left on
+    // a family library copy and the client closes the app once the count runs
+    // out, whatever the body says. Drop the message when every app it stops
+    // bypasses the family library lock, so the client never starts that
+    // countdown.
+    if emsg == EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING
+        && valve_filter::drops_shared_library_stop(body_bytes, &crate::client::install::config())
+    {
+        info!("netpacket: dropped SharedLibraryStopPlaying");
+        crate::packet_capture::capture(PacketDirection::Recv, buf, PacketChange::Dropped, Some(0));
+        return RecvFrameDecision::Drop;
     }
 
     crate::packet_capture::capture(PacketDirection::Recv, buf, change, final_len);

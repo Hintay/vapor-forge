@@ -1528,8 +1528,28 @@ pub const EMSG_CLIENT_LICENSE_LIST: u32 = 780;
 pub struct ClientLicense {
     #[prost(uint32, optional, tag = "1")]
     pub package_id: Option<u32>,
+    /// Account ID of the license holder. Family members' licenses carry
+    /// their own account ID here.
+    #[prost(uint32, optional, tag = "12")]
+    pub owner_id: Option<u32>,
     #[prost(uint64, optional, tag = "17")]
     pub access_token: Option<u64>,
+}
+
+/// A package license as ownership refresh consumes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LicensedPackage {
+    pub package_id: u32,
+    pub access_token: u64,
+    pub owner_id: u32,
+}
+
+impl LicensedPackage {
+    /// Whether the license belongs to another account (a family member)
+    /// rather than to `self_account_id`.
+    pub fn is_held_by_other_account(&self, self_account_id: u32) -> bool {
+        self.owner_id != 0 && self.owner_id != self_account_id
+    }
 }
 
 /// CMsgClientLicenseList body.
@@ -1544,7 +1564,7 @@ pub struct ClientLicenseList {
 /// Package ids and access tokens of a CMsgClientLicenseList body, package 0
 /// excluded: it is granted to every account and carries vapor-forge's own
 /// injected apps, so it says nothing about genuine ownership.
-pub fn licensed_packages(body: &[u8]) -> Option<Vec<(u32, u64)>> {
+pub fn licensed_packages(body: &[u8]) -> Option<Vec<LicensedPackage>> {
     use prost::Message;
     let list = ClientLicenseList::decode(body).ok()?;
     Some(
@@ -1552,7 +1572,11 @@ pub fn licensed_packages(body: &[u8]) -> Option<Vec<(u32, u64)>> {
             .iter()
             .filter_map(|license| {
                 let package_id = license.package_id?;
-                (package_id != 0).then_some((package_id, license.access_token.unwrap_or(0)))
+                (package_id != 0).then_some(LicensedPackage {
+                    package_id,
+                    access_token: license.access_token.unwrap_or(0),
+                    owner_id: license.owner_id.unwrap_or(0),
+                })
             })
             .collect(),
     )
@@ -1703,9 +1727,24 @@ pub const EMSG_CLIENT_RICH_PRESENCE_UPLOAD: u32 = 7501;
 /// EMsg for CMsgClientSharedLibraryStopPlaying: server tells the client to
 /// stop the family-shared app because the real owner just started playing.
 pub const EMSG_CLIENT_SHARED_LIBRARY_STOP_PLAYING: u32 = 9406;
-/// Service-method target job name for `FamilyGroupsClient.NotifyRunningApps#1`
-/// (delivered inside an EMSG_SERVICE_METHOD_RESPONSE frame).
-pub const FAMILY_GROUPS_NOTIFY_RUNNING_APPS_JOB: &str = "FamilyGroupsClient.NotifyRunningApps#1";
+
+/// CMsgClientSharedLibraryStopPlaying.StopApp
+#[derive(Clone, prost::Message)]
+pub struct SharedLibraryStopApp {
+    #[prost(uint32, optional, tag = "1")]
+    pub app_id: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub owner_id: Option<u32>,
+}
+
+/// CMsgClientSharedLibraryStopPlaying
+#[derive(Clone, prost::Message)]
+pub struct CMsgClientSharedLibraryStopPlaying {
+    #[prost(int32, optional, tag = "1")]
+    pub seconds_left: Option<i32>,
+    #[prost(message, repeated, tag = "2")]
+    pub stop_apps: Vec<SharedLibraryStopApp>,
+}
 
 /// k_EClientPersonaStateFlagRichPresence: top-level status_flags bit meaning
 /// "this message carries rich presence field data".
@@ -1836,20 +1875,50 @@ mod tests {
             licenses: vec![
                 ClientLicense {
                     package_id: Some(0),
+                    owner_id: Some(7),
                     access_token: Some(1),
                 },
                 ClientLicense {
                     package_id: Some(342),
+                    owner_id: Some(7),
                     access_token: Some(0xdead_beef),
                 },
                 ClientLicense {
                     package_id: Some(451),
+                    owner_id: Some(9),
+                    access_token: None,
+                },
+                ClientLicense {
+                    package_id: Some(452),
+                    owner_id: None,
                     access_token: None,
                 },
             ],
         };
         let packages = licensed_packages(&list.encode_to_vec()).unwrap();
-        assert_eq!(packages, vec![(342, 0xdead_beef), (451, 0)]);
+        assert_eq!(
+            packages,
+            vec![
+                LicensedPackage {
+                    package_id: 342,
+                    access_token: 0xdead_beef,
+                    owner_id: 7,
+                },
+                LicensedPackage {
+                    package_id: 451,
+                    access_token: 0,
+                    owner_id: 9,
+                },
+                LicensedPackage {
+                    package_id: 452,
+                    access_token: 0,
+                    owner_id: 0,
+                },
+            ]
+        );
+        assert!(!packages[0].is_held_by_other_account(7));
+        assert!(packages[1].is_held_by_other_account(7));
+        assert!(!packages[2].is_held_by_other_account(7));
         assert!(licensed_packages(&[0xff, 0xff, 0xff]).is_none());
     }
 

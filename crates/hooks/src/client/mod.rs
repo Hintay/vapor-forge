@@ -12,6 +12,7 @@ pub(crate) mod depot;
 pub(crate) mod dlc;
 pub(crate) mod env;
 pub(crate) mod eticket;
+pub(crate) mod family_lock;
 pub(crate) mod internal_callbacks;
 pub(crate) mod legacy_cdkey;
 pub(crate) mod network;

@@ -8,14 +8,38 @@ use std::collections::HashMap;
 use vapor_forge_config::{AppId, RuntimeConfig};
 use vapor_forge_steam_protocol::{
     app_id_from_game_id, assemble_raw, legacy_store_user_stats_game_id, service_method_app_id,
-    CMsgClientGamesPlayed, CMsgProtoBufHeader, ClientStatsUpdated, ClientStoreUserStats2Request,
-    ClientStoreUserStatsResponse, EMSG_SERVICE_METHOD_RESPONSE, EMSG_STATS_UPDATED,
-    EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2, EMSG_STORE_USERSTATS_RESPONSE, ERESULT_OK,
-    K_MSG_HDR_PROTO_FLAG,
+    CMsgClientGamesPlayed, CMsgClientSharedLibraryStopPlaying, CMsgProtoBufHeader,
+    ClientStatsUpdated, ClientStoreUserStats2Request, ClientStoreUserStatsResponse,
+    EMSG_SERVICE_METHOD_RESPONSE, EMSG_STATS_UPDATED, EMSG_STORE_USERSTATS, EMSG_STORE_USERSTATS2,
+    EMSG_STORE_USERSTATS_RESPONSE, ERESULT_OK, K_MSG_HDR_PROTO_FLAG,
 };
 
 pub const APP_INTERFACE_METRICS: &str = "ClientMetrics.ClientAppInterfaceStatsReport#1";
 pub const CLOUD_SYNC_METRICS: &str = "ClientMetrics.ClientCloudAppSyncStats#1";
+
+/// License owner reported in GamesPlayed for controlled and sharing-bypassed
+/// apps. The CM checks the family library lock against this account; an ID
+/// that maps to no account gives it no copy to lock.
+pub const FAMILY_LOCK_FREE_OWNER_ID: u32 = 1;
+
+/// Whether the family library lock is ignored for an app: controlled apps and
+/// apps the `[apps.shared]` policy allows.
+pub fn bypasses_family_lock(config: &RuntimeConfig, app_id: AppId) -> bool {
+    config.is_controlled_app(app_id) || config.should_bypass_sharing(app_id)
+}
+
+/// Whether a SharedLibraryStopPlaying body only stops apps that bypass the
+/// family library lock, so the client should never see it.
+pub fn drops_shared_library_stop(body: &[u8], config: &RuntimeConfig) -> bool {
+    let Ok(message) = CMsgClientSharedLibraryStopPlaying::decode(body) else {
+        return false;
+    };
+    !message.stop_apps.is_empty()
+        && message.stop_apps.iter().all(|app| {
+            app.app_id
+                .is_some_and(|app_id| bypasses_family_lock(config, AppId(app_id)))
+        })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrivacyAction {
@@ -45,18 +69,23 @@ pub fn filter_games_played(
     body: &[u8],
     config: &RuntimeConfig,
     avatar_map: &HashMap<AppId, AppId>,
+    self_account_id: u32,
 ) -> Option<GamesPlayedFilter> {
     filter_games_played_with_runtime(
         body,
         config,
+        self_account_id,
         |app_id| crate::app_avatar::get_avatar(app_id, avatar_map),
         crate::apps::actual_ownership,
     )
 }
 
+/// `self_account_id` is the sending account's ID, or 0 when unknown; it tells
+/// a borrowed copy (owned by another account) from one of this account.
 pub fn filter_games_played_with_runtime(
     body: &[u8],
     config: &RuntimeConfig,
+    self_account_id: u32,
     mut avatar: impl FnMut(AppId) -> Option<AppId>,
     mut ownership: impl FnMut(AppId) -> crate::apps::OwnershipState,
 ) -> Option<GamesPlayedFilter> {
@@ -84,6 +113,16 @@ pub fn filter_games_played_with_runtime(
             blocked_rich_presence_app.get_or_insert(app_id);
             changed = true;
             continue;
+        }
+        let borrowed = self_account_id != 0
+            && game
+                .owner_id
+                .is_some_and(|owner| owner != 0 && owner != self_account_id);
+        if (config.is_controlled_app(app_id) || (borrowed && config.should_bypass_sharing(app_id)))
+            && game.owner_id != Some(FAMILY_LOCK_FREE_OWNER_ID)
+        {
+            game.owner_id = Some(FAMILY_LOCK_FREE_OWNER_ID);
+            changed = true;
         }
         filtered.push(game);
     }
@@ -448,7 +487,7 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        let result = filter_games_played(&body, &config(736_263), &HashMap::new()).unwrap();
+        let result = filter_games_played(&body, &config(736_263), &HashMap::new(), 0).unwrap();
         assert_eq!(result.blocked_rich_presence_app, Some(AppId(736_263)));
         let filtered = result.body.unwrap();
         assert!(CMsgClientGamesPlayed::decode(filtered.as_slice())
@@ -477,7 +516,7 @@ mod tests {
         }
         .encode_to_vec();
         let avatars = HashMap::from([(AppId(736_264), AppId(480))]);
-        let result = filter_games_played(&body, &config(736_264), &avatars).unwrap();
+        let result = filter_games_played(&body, &config(736_264), &avatars, 0).unwrap();
         assert_eq!(result.blocked_rich_presence_app, None);
         let rewritten = CMsgClientGamesPlayed::decode(result.body.unwrap().as_slice()).unwrap();
         assert_eq!(rewritten.games_played[0].game_id, Some(480));
@@ -493,5 +532,145 @@ mod tests {
         assert_eq!(rewritten.client_os_type, Some(20));
         assert_eq!(rewritten.cloud_gaming_platform, Some(3));
         assert_eq!(rewritten.recent_reauthentication, Some(true));
+    }
+
+    fn games_played_body(entries: &[(u64, u32)]) -> Vec<u8> {
+        CMsgClientGamesPlayed {
+            games_played: entries
+                .iter()
+                .map(
+                    |&(game_id, owner_id)| vapor_forge_steam_protocol::GamePlayed {
+                        game_id: Some(game_id),
+                        owner_id: Some(owner_id),
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    const SELF_ACCOUNT: u32 = 387_771_116;
+    const FAMILY_ACCOUNT: u32 = 145_913_399;
+
+    fn owners_after(body: &[u8], config: &RuntimeConfig) -> Option<Vec<Option<u32>>> {
+        let result = filter_games_played_with_runtime(
+            body,
+            config,
+            SELF_ACCOUNT,
+            |_| None,
+            |_| crate::apps::OwnershipState::Owned,
+        )
+        .unwrap();
+        assert_eq!(result.blocked_rich_presence_app, None);
+        result.body.map(|body| {
+            CMsgClientGamesPlayed::decode(body.as_slice())
+                .unwrap()
+                .games_played
+                .iter()
+                .map(|game| game.owner_id)
+                .collect()
+        })
+    }
+
+    fn sharing_config(include: &[u32]) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
+        config.apps.shared.enabled = true;
+        config.apps.shared.include = include.iter().copied().map(AppId).collect();
+        config
+    }
+
+    #[test]
+    fn games_played_reports_lock_free_owner_for_owned_controlled_app() {
+        let body = games_played_body(&[(489_830, SELF_ACCOUNT), (730, SELF_ACCOUNT)]);
+        assert_eq!(
+            owners_after(&body, &config(489_830)),
+            Some(vec![Some(FAMILY_LOCK_FREE_OWNER_ID), Some(SELF_ACCOUNT)])
+        );
+    }
+
+    #[test]
+    fn games_played_reports_lock_free_owner_for_borrowed_bypassed_app() {
+        let body = games_played_body(&[(570, FAMILY_ACCOUNT)]);
+        assert_eq!(
+            owners_after(&body, &sharing_config(&[570])),
+            Some(vec![Some(FAMILY_LOCK_FREE_OWNER_ID)])
+        );
+    }
+
+    #[test]
+    fn games_played_keeps_own_copy_of_bypassed_app() {
+        let body = games_played_body(&[(570, SELF_ACCOUNT)]);
+        assert_eq!(owners_after(&body, &sharing_config(&[570])), None);
+    }
+
+    #[test]
+    fn games_played_keeps_borrowed_app_outside_bypass_list() {
+        let body = games_played_body(&[(730, FAMILY_ACCOUNT)]);
+        assert_eq!(owners_after(&body, &sharing_config(&[570])), None);
+    }
+
+    fn stop_playing_body(app_ids: &[u32]) -> Vec<u8> {
+        CMsgClientSharedLibraryStopPlaying {
+            seconds_left: Some(179),
+            stop_apps: app_ids
+                .iter()
+                .map(|&app_id| vapor_forge_steam_protocol::SharedLibraryStopApp {
+                    app_id: Some(app_id),
+                    owner_id: Some(0),
+                })
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn stop_playing_for_controlled_app_is_dropped() {
+        assert!(drops_shared_library_stop(
+            &stop_playing_body(&[489_830]),
+            &config(489_830)
+        ));
+    }
+
+    #[test]
+    fn stop_playing_for_bypassed_app_is_dropped() {
+        assert!(drops_shared_library_stop(
+            &stop_playing_body(&[570]),
+            &sharing_config(&[570])
+        ));
+    }
+
+    fn controlled_only_config(app_id: u32) -> RuntimeConfig {
+        let mut config = config(app_id);
+        config.apps.shared.enabled = false;
+        config
+    }
+
+    #[test]
+    fn stop_playing_with_any_locked_app_reaches_client() {
+        assert!(!drops_shared_library_stop(
+            &stop_playing_body(&[489_830, 730]),
+            &controlled_only_config(489_830)
+        ));
+        assert!(!drops_shared_library_stop(
+            &stop_playing_body(&[]),
+            &controlled_only_config(489_830)
+        ));
+    }
+
+    #[test]
+    fn stop_playing_capture_body_decodes() {
+        let body = [
+            0x08, 0xB3, 0x01, 0x12, 0x06, 0x08, 0xE6, 0xF2, 0x1D, 0x10, 0x00,
+        ];
+        assert!(drops_shared_library_stop(
+            &body,
+            &controlled_only_config(489_830)
+        ));
+        assert!(!drops_shared_library_stop(
+            &body,
+            &controlled_only_config(730)
+        ));
     }
 }
