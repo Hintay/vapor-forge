@@ -278,13 +278,18 @@ fn validate_live_hotfix(
         let entry = registry
             .get(name)
             .ok_or_else(|| format!("hotfix entry {name:?} disappeared"))?;
-        let address =
-            if module == "steamui" && name == "google::protobuf::RepeatedField<uint32>::Add" {
+        // Several identical RepeatedField bodies match their patterns; the
+        // steamui resolvers pick the one that passes semantic validation.
+        let address = match (module, name) {
+            ("steamui", "google::protobuf::RepeatedField<uint32>::Add") => {
                 crate::ui::install::resolve_repeated_field_add_address(code, registry)
-            } else {
-                resolve_pattern_entry(code, name, &entry)
             }
-            .ok_or_else(|| format!("hotfix pattern {name:?} did not resolve uniquely"))?;
+            ("steamui", "google::protobuf::RepeatedField<uint32>::Reserve") => {
+                crate::ui::install::resolve_repeated_field_reserve_address(code, registry)
+            }
+            _ => resolve_pattern_entry(code, name, &entry),
+        }
+        .ok_or_else(|| format!("hotfix pattern {name:?} did not resolve uniquely"))?;
         let offset = address
             .checked_sub(code.base)
             .ok_or_else(|| format!("hotfix pattern {name:?} resolved outside the module"))?;

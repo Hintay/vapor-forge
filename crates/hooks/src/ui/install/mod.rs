@@ -391,6 +391,11 @@ pub fn install(
         &[
             (hook_results[2].name, hook_results[2].installed),
             (hook_results[6].name, hook_results[6].installed),
+            (
+                "RepeatedField::Reserve",
+                // SAFETY: single-threaded init reads the resolver slot after install attempt.
+                unsafe { (*std::ptr::addr_of!(REPEATED_FIELD_RESERVE)).is_some() },
+            ),
         ],
     );
     if library_ready {
@@ -437,8 +442,8 @@ fn resolve_repeated_field_add(
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let addr = resolve_repeated_field_add_address(steamui_code, registry)?;
-    {
-        let reserve = resolve_repeated_field_reserve_address(steamui_code, registry)?;
+    // Only the library snapshot needs Reserve; it is gated on this slot.
+    if let Some(reserve) = resolve_repeated_field_reserve_address(steamui_code, registry) {
         // SAFETY: reserve passed the live semantic validator for this ABI.
         let f: RepeatedFieldReserveFn = unsafe { std::mem::transmute(reserve) };
         // SAFETY: single-threaded init writes the resolver slot once.
@@ -529,7 +534,7 @@ pub(crate) fn resolve_repeated_field_add_address(
 
 /// Every 4-byte RepeatedField instantiation shares the Reserve body, so the
 /// first candidate that passes semantic validation is used.
-fn resolve_repeated_field_reserve_address(
+pub(crate) fn resolve_repeated_field_reserve_address(
     steamui_code: &CodeRegion,
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
