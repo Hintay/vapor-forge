@@ -54,10 +54,10 @@ pattern = "56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 04 8B 74 24 10 8B 06 85 C0 0F 85
 
 [steamclient."LoadDepotDecryptionKey"]
 follow = "none"
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 24 8B 44 24 44 8B 6C 24 38 8B 7C 24 3C 8B 74 24 40 89 44 24 10 8B 44 24 48 89 44 24 14"
+pattern = "57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC ? ? 00 00 65 A1 14 00 00 00 89 84 24 ? ? 00 00 31 C0 8B B4 24 ? ? 00 00 68 80 00 00 00"
 
 [[steamclient."LoadDepotDecryptionKey".variants]]
-pattern = "55 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 24 8B 44 24 44 8B 5C 24 38 8B 74 24 3C 8B 6C 24 40 89 44 24 10 8B 44 24 48 89 44 24 14 56 53 E8 ? ? ? ? 83 C4 10 84 C0 75 ? 31 C0 83 C4 1C 5B 5E 5F 5D C3"
+pattern = "57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC ? ? 00 00 65 8B 35 14 00 00 00 89 B4 24 ? ? 00 00 8B B4 24 ? ? 00 00 68 80 00 00 00"
 
 [steamclient."BuildDepotDependency"]
 follow = "none"

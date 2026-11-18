@@ -3181,48 +3181,28 @@ fn achievement_progress_adapter64_evidence(code: &[u8], offset: usize) -> Option
     ]))
 }
 
+/// `LoadDepotDecryptionKey`; see `vapor_forge_patterns::depot_key_loader` for
+/// the buffer calls the hook repeats.
 fn validate_load_depot_key32(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(
-        load_depot_key32_evidence(code, offset),
-        "args=depot/key output",
-    )
+    evidence_result(load_depot_key32_evidence(code, offset), "depot key loader")
 }
 
 fn load_depot_key32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x120)?;
-    Some(Evidence::required([
-        (
-            "depot id argument",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esp + 0x44))),
-        ),
-        (
-            "output buffer argument",
-            has_asm32(bytes, |a| a.mov(eax, dword_ptr(esp + 0x48))),
-        ),
-        (
-            "key loader call",
-            has_asm32_call_after(
-                bytes,
-                |a| {
-                    a.push(esi)?;
-                    a.push(ebx)
-                },
-                0x08,
-            ) || has_asm32_call_after(bytes, |a| a.push(dword_ptr(ebp + 0x0C)), 0x20),
-        ),
-    ]))
+    Some(Evidence::required([(
+        "key buffer reservation, config-store read and put-position calls",
+        vapor_forge_patterns::depot_key_loader::decode(32, 0, code, offset).is_ok(),
+    )]))
 }
 
 fn validate_load_depot_key64(code: &[u8], offset: usize) -> Option<&'static str> {
-    evidence_result(load_depot_key64_evidence(code, offset), "key-size=128")
+    evidence_result(load_depot_key64_evidence(code, offset), "depot key loader")
 }
 
 fn load_depot_key64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x100)?;
-    Some(Evidence::required([
-        ("key size 128", has_asm64(bytes, |a| a.mov(esi, 0x80))),
-        ("key buffer argument", has_asm64(bytes, |a| a.mov(rdi, rdx))),
-    ]))
+    Some(Evidence::required([(
+        "key buffer reservation, config-store read and put-position calls",
+        vapor_forge_patterns::depot_key_loader::decode(64, 0, code, offset).is_ok(),
+    )]))
 }
 
 /// `CShaderCacheManager::GetShaderCacheDepot`: reads game/shadercachedepot

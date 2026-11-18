@@ -15,6 +15,8 @@ pub mod cnet_packet;
 pub mod current_app;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cuser_adapter;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod depot_key_loader;
 pub mod elf;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod engine_work_item_site;

@@ -1,12 +1,17 @@
 use core::ffi::c_void;
 
-use tracing::info;
+use std::sync::OnceLock;
+
+use tracing::{info, warn};
 use vapor_forge_config::DepotId;
+use vapor_forge_features::depot_key::DEPOT_KEY_SIZE;
 use vapor_forge_hook_engine::detour::Detour;
+use vapor_forge_patterns::depot_key_loader::{KeyBufferCalls, KEY_CAPACITY, SEEK_HEAD};
 
 use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::install::script_state;
+use crate::pattern_resolver::CodeRegion;
 
 // ---------------------------------------------------------------------------
 // Function type aliases
@@ -23,8 +28,12 @@ pub(crate) type BuildDepotDependencyFn = unsafe extern "C" fn(
     *mut bool,
 ) -> bool;
 
+/// `LoadDepotDecryptionKey(_, depot_id, CUtlBuffer *out) -> bool`. The first
+/// argument is not used by Steam's implementation.
 pub(crate) type LoadDepotDecryptionKeyFn =
-    unsafe extern "C" fn(*mut c_void, u32, *const i8, *mut u8, u32) -> i32;
+    unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> bool;
+type EnsureCapacityFn = unsafe extern "C" fn(*mut c_void, i32);
+type SeekPutFn = unsafe extern "C" fn(*mut c_void, i32, i32);
 
 // ---------------------------------------------------------------------------
 // Static detour slots
@@ -32,6 +41,8 @@ pub(crate) type LoadDepotDecryptionKeyFn =
 
 pub(crate) static mut BUILD_DEPOT_DETOUR: Option<Detour<BuildDepotDependencyFn>> = None;
 pub(crate) static mut DEPOT_KEY_DETOUR: Option<Detour<LoadDepotDecryptionKeyFn>> = None;
+/// The loader's own `CUtlBuffer` calls, decoded from its body at install.
+static KEY_BUFFER_CALLS: OnceLock<KeyBufferCalls> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Hook replacement functions: BuildDepotDependency (manifest injection)
@@ -115,112 +126,97 @@ unsafe { original(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe extern "C" fn hk_load_depot_decryption_key(
-    this: *mut c_void,
-    unknown: u32,
-    key_name: *const i8,
-    key_buf: *mut u8,
-    key_size: u32,
-) -> i32 {
-    let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, 0);
-    if !crate::capability::is_ready(crate::capability::Capability::DepotInjection) {
-        // SAFETY: forwards Steam's untouched key query.
-        return unsafe { original(this, unknown, key_name, key_buf, key_size) };
+    unused: *mut c_void,
+    depot_id: u32,
+    out: *mut c_void,
+) -> bool {
+    let original = detour_or_return!("LoadDepotDecryptionKey", DEPOT_KEY_DETOUR, false);
+    if !crate::capability::is_ready(crate::capability::Capability::DepotInjection) || out.is_null()
+    {
+        // SAFETY: forwards Steam's untouched key request.
+        return unsafe { original(unused, depot_id, out) };
     }
-    if !key_name.is_null() && key_size >= 32 && !key_buf.is_null() {
-        if let Some(depot_id_raw) =
-            /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
-            unsafe { extract_depot_id_from_raw(key_name) }
-        {
-            let ss = script_state();
-            let served =
-                vapor_forge_features::depot_key::provide_key(DepotId(depot_id_raw), &ss.depot_keys);
-            #[cfg(debug_assertions)]
-            log_depot_key_request(depot_id_raw, served.is_some(), ss.depot_keys.len());
-            if let Some(key) = served {
-                // SAFETY: key_buf has key_size capacity >= 32, we write 32 bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(key.as_ptr(), key_buf, 32);
-                }
-                return 32;
-            }
-        } else {
-            #[cfg(debug_assertions)]
-            log_depot_key_unparsed(key_name);
+    let served = {
+        let ss = script_state();
+        let served =
+            vapor_forge_features::depot_key::provide_key(DepotId(depot_id), &ss.depot_keys);
+        log_depot_key_request(depot_id, served.is_some(), ss.depot_keys.len());
+        served
+    };
+    if let (Some(key), Some(calls)) = (served, KEY_BUFFER_CALLS.get()) {
+        // SAFETY: `out` is the loader's live CUtlBuffer argument, and both
+        // calls are the ones the loader itself makes on it.
+        if unsafe { write_key(out, calls, &key) } {
+            return true;
         }
     }
-
-    // SAFETY: forwards Steam's untouched key query.
-    unsafe { original(this, unknown, key_name, key_buf, key_size) }
+    // SAFETY: forwards Steam's untouched key request.
+    unsafe { original(unused, depot_id, out) }
 }
 
+/// Fill `out` the way the loader does after a successful config-store read:
+/// reserve the key capacity, copy into the buffer's memory, set the put
+/// position to the key length.
+///
 /// # Safety
-/// `key_name` must point to a readable NUL-terminated string of at most
-/// `MAX_SCAN` bytes.
-pub(crate) unsafe fn extract_depot_id_from_raw(key_name: *const i8) -> Option<u32> {
-    // Bounded scan for "\DecryptionKey" in the C string.
-    const MAX_SCAN: usize = 512;
-    const TAG: &[u8] = b"\\DecryptionKey";
+/// `out` must be a live `CUtlBuffer` and `calls` must be decoded from the
+/// loader running in this process.
+unsafe fn write_key(out: *mut c_void, calls: &KeyBufferCalls, key: &[u8; DEPOT_KEY_SIZE]) -> bool {
+    // SAFETY: the decoded targets are the loader's own buffer helpers.
+    let (ensure_capacity, seek_put) = unsafe {
+        (
+            std::mem::transmute::<usize, EnsureCapacityFn>(calls.ensure_capacity),
+            std::mem::transmute::<usize, SeekPutFn>(calls.seek_put),
+        )
+    };
+    // SAFETY: same call and argument the loader makes before reading.
+    unsafe { ensure_capacity(out, KEY_CAPACITY as i32) };
+    // SAFETY: CUtlBuffer's memory pointer is its first member; the loader
+    // reads it the same way to hand the config store its destination.
+    let base = unsafe { *out.cast::<*mut u8>() };
+    if base.is_null() {
+        return false;
+    }
+    // SAFETY: EnsureCapacity reserved KEY_CAPACITY >= DEPOT_KEY_SIZE bytes.
+    unsafe { std::ptr::copy_nonoverlapping(key.as_ptr(), base, DEPOT_KEY_SIZE) };
+    // SAFETY: same call the loader makes with the length it read.
+    unsafe { seek_put(out, SEEK_HEAD, DEPOT_KEY_SIZE as i32) };
+    true
+}
 
-    // SAFETY: bounded read of key_name up to MAX_SCAN bytes or NUL.
-    let mut len = 0;
-    while len < MAX_SCAN {
-        // SAFETY: caller supplied key_name and this scan is bounded to MAX_SCAN.
-        let byte = unsafe { *key_name.add(len) } as u8;
-        if byte == 0 {
-            break;
+/// Decode the loader's buffer calls; without them the key cannot be served,
+/// so the caller does not install the hook.
+pub(crate) fn resolve_key_buffer_calls(code: &CodeRegion, loader: usize) -> bool {
+    match vapor_forge_patterns::depot_key_loader::decode(usize::BITS, code.base, code.bytes, loader)
+    {
+        Ok(calls) => {
+            info!(
+                ensure_capacity = format_args!("0x{:x}", calls.ensure_capacity),
+                seek_put = format_args!("0x{:x}", calls.seek_put),
+                "depot: key loader buffer calls resolved"
+            );
+            let _ = KEY_BUFFER_CALLS.set(calls);
+            true
         }
-        len += 1;
+        Err(error) => {
+            warn!(error, "depot: key loader buffer calls did not decode");
+            false
+        }
     }
-    if len == 0 {
-        return None;
-    }
-
-    // SAFETY: we just verified [0..len) are readable non-NUL bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(key_name as *const u8, len) };
-
-    // Find "\DecryptionKey" tag
-    let tag_pos = bytes.windows(TAG.len()).position(|w| w == TAG)?;
-
-    // Extract depot ID: digits between the last '\' before tag and tag_pos
-    let before_tag = &bytes[..tag_pos];
-    let id_start = before_tag.iter().rposition(|&b| b == b'\\')? + 1;
-    let id_bytes = &before_tag[id_start..];
-    let id_str = std::str::from_utf8(id_bytes).ok()?;
-    id_str.parse().ok()
 }
 
 /// Report each depot key Steam asks for and whether the scripts could answer,
-/// once per depot. Nothing on this path logged before, so an unanswered request
-/// was indistinguishable from the hook never being reached at all.
-#[cfg(debug_assertions)]
+/// once per depot.
 fn log_depot_key_request(depot_id: u32, served: bool, configured: usize) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
     let first = SEEN
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_or_insert_with(HashSet::new)
         .insert(depot_id);
     if first {
         info!(depot_id, served, configured, "depot: key request");
     }
-}
-
-/// A key name whose depot id could not be parsed never reaches the script
-/// lookup, so it is worth seeing verbatim.
-#[cfg(debug_assertions)]
-fn log_depot_key_unparsed(key_name: *const i8) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if LOGGED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    // SAFETY: the caller checked the pointer is non-null, and Steam passes a
-    // NUL-terminated key name.
-    let name = unsafe { core::ffi::CStr::from_ptr(key_name) };
-    info!(
-        name = %name.to_string_lossy(),
-        "depot: key name did not yield a depot id"
-    );
 }

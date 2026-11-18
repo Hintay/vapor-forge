@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use tracing::info;
 use vapor_forge_config::{AppId, DepotId, RuntimeConfig};
 
-const DEPOT_KEY_SIZE: usize = 32;
+/// Length of a depot decryption key.
+pub const DEPOT_KEY_SIZE: usize = 32;
 
 pub fn has_key(depot_id: DepotId, keys: &HashMap<DepotId, Vec<u8>>) -> bool {
     keys.get(&depot_id)

@@ -845,6 +845,12 @@ fn do_install() {
         "LoadDepotDecryptionKey",
         super::depot::hk_load_depot_decryption_key as super::depot::LoadDepotDecryptionKeyFn,
     );
+    if d_depot_key
+        .as_ref()
+        .is_some_and(|pending| !super::depot::resolve_key_buffer_calls(&code, pending.callee_addr))
+    {
+        d_depot_key = None;
+    }
     let d_shader_cache_depot = resolve_from_registry(
         &registry,
         &code,
