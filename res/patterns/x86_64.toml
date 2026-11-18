@@ -140,9 +140,9 @@ pattern = "41 57 41 56 41 55 4C 8D ? ? ? 00 00 41 54 55 53 48 83 EC ? 88 54 24 ?
 [[steamclient."CUser::MarkLicenseAsChanged".variants]]
 pattern = "41 57 48 8D 87 ? ? 00 00 41 89 F7 41 56 41 55 41 54 55 53 48 83 EC ? 88 54 24 ? 8B 97 ? ? 00 00 89 74 24 ? 48 89 44 24 ? 85 D2"
 
-[steamclient."CUser::ProcessPendingLicenseUpdates"]
+[steamclient."CUser::RemoveSiteLicenses"]
 follow = "none"
-pattern = "41 57 48 89 F8 41 56 41 55 41 54 55 53 48 83 EC ?"
+pattern = "41 54 49 89 FC 55 53 8B 9F ? ? 00 00 83 EB 01 78 ? 48 63 C3 48 8D 2C 80 48 C1 E5 04 EB ? 90 83 EB 01 48 83 ED 50 83 FB FF 74 ? 49 8B 84 24 ? ? 00 00 48 01 E8 83 78 14 50"
 
 [steamclient."CUtlMemory::Grow"]
 follow = "relative"

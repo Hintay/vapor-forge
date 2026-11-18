@@ -462,7 +462,9 @@ pub struct DepotEntry {
 pub type GetPackageInfoFn = unsafe extern "C" fn(*mut c_void, u32, u64) -> *mut u8;
 pub type GetPackageInfoArchFn = GetPackageInfoFn;
 pub type MarkLicenseAsChangedFn = unsafe extern "C" fn(*mut c_void, u32, bool);
-pub type ProcessPendingLicenseUpdatesFn = unsafe extern "C" fn(*mut c_void) -> bool;
+/// Removes site licenses and, when any license is marked as changed, rebuilds
+/// the license cache and sends license update notices. Returns whether it did.
+pub type RemoveSiteLicensesFn = unsafe extern "C" fn(*mut c_void) -> bool;
 pub type CUtlMemoryGrowFn = unsafe extern "C" fn(*mut c_void, i32);
 
 /// Mirrors `EAppReleaseState` from `steamclientpublic.h`.

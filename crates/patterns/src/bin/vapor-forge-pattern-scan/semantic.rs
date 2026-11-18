@@ -157,9 +157,9 @@ const STEAMCLIENT32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_mark_license_changed32,
     },
     SemanticCheck {
-        name: "CUser::ProcessPendingLicenseUpdates",
-        label: "CUser::ProcessPendingLicenseUpdates body",
-        validate: validate_process_pending_license_updates32,
+        name: "CUser::RemoveSiteLicenses",
+        label: "CUser::RemoveSiteLicenses body",
+        validate: validate_remove_site_licenses32,
     },
     SemanticCheck {
         name: "CUtlMemory::Grow",
@@ -285,9 +285,9 @@ const STEAMCLIENT64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         validate: validate_mark_license_changed64,
     },
     SemanticCheck {
-        name: "CUser::ProcessPendingLicenseUpdates",
-        label: "CUser::ProcessPendingLicenseUpdates body",
-        validate: validate_process_pending_license_updates64,
+        name: "CUser::RemoveSiteLicenses",
+        label: "CUser::RemoveSiteLicenses body",
+        validate: validate_remove_site_licenses64,
     },
     SemanticCheck {
         name: "CUtlMemory::Grow",
@@ -2088,11 +2088,11 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "CUser::MarkLicenseAsChanged") => {
             mark_license_changed64_evidence(code, offset)
         }
-        (SemanticArch::X86, "CUser::ProcessPendingLicenseUpdates") => {
-            process_pending_license_updates32_evidence(code, offset)
+        (SemanticArch::X86, "CUser::RemoveSiteLicenses") => {
+            remove_site_licenses32_evidence(code, offset)
         }
-        (SemanticArch::X86_64, "CUser::ProcessPendingLicenseUpdates") => {
-            process_pending_license_updates64_evidence(code, offset)
+        (SemanticArch::X86_64, "CUser::RemoveSiteLicenses") => {
+            remove_site_licenses64_evidence(code, offset)
         }
         (SemanticArch::X86, "CUtlMemory::Grow") => cutl_memory_grow32_evidence(code, offset),
         (SemanticArch::X86_64, "CUtlMemory::Grow") => cutl_memory_grow64_evidence(code, offset),
@@ -4150,30 +4150,30 @@ fn mark_license_changed64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     ]))
 }
 
-fn validate_process_pending_license_updates32(code: &[u8], offset: usize) -> Option<&'static str> {
+fn validate_remove_site_licenses32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
-        process_pending_license_updates32_evidence(code, offset),
-        "pending-license loop",
+        remove_site_licenses32_evidence(code, offset),
+        "site-license removal",
     )
 }
 
-fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+fn remove_site_licenses32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
     Some(Evidence::required([
         (
-            "pending-license vector fields",
-            // The changed-license flag, then the vector base 0xb0 on and its
-            // count 0xbc on.
+            "license vector fields",
+            // The changed-license count, then the license vector base 0xb0 on
+            // and its count 0xbc on.
             find_field_group(32, bytes, &[0xb0, 0xbc]).is_some(),
         ),
         (
-            "pending-license entry stride",
+            "license entry stride",
             (has_asm32(bytes, |a| a.lea(ebx, dword_ptr(esi + esi * 8)))
                 || has_asm32(bytes, |a| a.lea(esi, dword_ptr(edi + edi * 8))))
                 && (has_asm32(bytes, |a| a.shl(ebx, 3)) || has_asm32(bytes, |a| a.shl(esi, 3))),
         ),
         (
-            "pending-license status filter",
+            "site-license payment filter",
             has_asm32(bytes, |a| a.cmp(dword_ptr(eax + 0x14), 0x50)),
         ),
         (
@@ -4190,52 +4190,81 @@ fn process_pending_license_updates32_evidence(code: &[u8], offset: usize) -> Opt
     ]))
 }
 
-fn validate_process_pending_license_updates64(code: &[u8], offset: usize) -> Option<&'static str> {
+fn validate_remove_site_licenses64(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
-        process_pending_license_updates64_evidence(code, offset),
-        "pending-license loop",
+        remove_site_licenses64_evidence(code, offset),
+        "site-license removal",
     )
 }
 
-fn process_pending_license_updates64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x220)?;
-    // The license count, and the pending-license count 0xd8 further on.
-    let pending_vector = find_field_group(64, bytes, &[0xd8]);
-    // The app-state sub-object's own offset in CUser, which differs between
-    // builds by its own amount rather than with the license block.
-    let package_block = has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0xF20)))
-        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0xF20)))
-        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rax + 0x1348)))
-        || has_asm64(bytes, |a| a.lea(r13, qword_ptr(rdi + 0x1348)));
-    let old_package_iteration = has_asm64(bytes, |a| a.mov(edx, dword_ptr(r15 + 0x50)))
-        && has_asm64(bytes, |a| a.mov(ebp, dword_ptr(rax + r14 * 4)))
-        && package_block;
-    let current_package_iteration = has_asm64(bytes, |a| a.mov(r8d, dword_ptr(r14 + 0x50)))
-        && has_asm64(bytes, |a| a.mov(r12d, dword_ptr(rax + r15 * 4)))
-        && package_block;
+fn remove_site_licenses64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    let bytes = bounded_tail(code, offset, 0x100)?;
+    let instructions: Vec<_> = decode_x64(bytes).collect();
+    // `mov rdi, this; call Rebuild; mov rdi, this; call Send; mov eax, 1`:
+    // once a license was marked, the cache is rebuilt and the change sent.
+    let rebuild_and_notify = instructions.windows(5).any(|window| {
+        let receiver = |instruction: &iced_x86::Instruction| {
+            instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_register() == Register::RDI
+                && instruction.op1_kind() == OpKind::Register
+        };
+        receiver(&window[0])
+            && window[1].mnemonic() == Mnemonic::Call
+            && window[1].op0_kind() == OpKind::NearBranch64
+            && receiver(&window[2])
+            && window[2].op1_register() == window[0].op1_register()
+            && window[3].mnemonic() == Mnemonic::Call
+            && window[3].op0_kind() == OpKind::NearBranch64
+            && window[1].near_branch64() != window[3].near_branch64()
+            && window[4].mnemonic() == Mnemonic::Mov
+            && window[4].op0_register() == Register::EAX
+            && window[4].op1_kind() == OpKind::Immediate32
+            && window[4].immediate32() == 1
+    });
     Some(Evidence::required([
-        ("pending-license vector fields", pending_vector.is_some()),
         (
-            "pending-license entry stride",
-            has_asm64(bytes, |a| a.lea(rax, qword_ptr(rbx + rbx * 4)))
-                && has_asm64(bytes, |a| a.shl(rax, 4)),
+            "license entry stride",
+            has_x64_self_scaled_lea(bytes, 4)
+                && instructions.iter().any(|instruction| {
+                    instruction.mnemonic() == Mnemonic::Shl
+                        && instruction.op1_kind() == OpKind::Immediate8
+                        && instruction.immediate8() == 4
+                }),
         ),
         (
-            "license id load",
+            "site-license payment filter",
+            has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x14), 0x50)),
+        ),
+        (
+            "license change mark call",
             has_asm64(bytes, |a| a.mov(esi, dword_ptr(rax)))
-                && has_asm64(bytes, |a| a.cmp(esi, -1)),
+                && has_asm64(bytes, |a| a.xor(edx, edx)),
         ),
-        (
-            "known package appid lookup layout",
-            old_package_iteration || current_package_iteration,
-        ),
-        (
-            "pending update state write",
-            // Two adjacent state bytes, cleared together; the pair sits wherever
-            // the rest of the block does.
-            find_field_group(64, bytes, &[0x1]).is_some(),
-        ),
+        ("rebuild and notify", rebuild_and_notify),
     ]))
+}
+
+fn decode_x64(bytes: &[u8]) -> impl Iterator<Item = iced_x86::Instruction> + '_ {
+    let mut decoder = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE);
+    std::iter::from_fn(move || {
+        decoder
+            .can_decode()
+            .then(|| decoder.decode())
+            .filter(|instruction| !instruction.is_invalid())
+    })
+}
+
+/// `lea r64, [x + x * (scale)]`, an index multiplied by `scale + 1`.
+fn has_x64_self_scaled_lea(bytes: &[u8], scale: u32) -> bool {
+    use iced_x86::{Mnemonic, Register};
+    decode_x64(bytes).any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Lea
+            && instruction.memory_base() != Register::None
+            && instruction.memory_base() == instruction.memory_index()
+            && instruction.memory_index_scale() == scale
+            && instruction.memory_displacement64() == 0
+    })
 }
 
 fn validate_cutl_memory_grow32(code: &[u8], offset: usize) -> Option<&'static str> {

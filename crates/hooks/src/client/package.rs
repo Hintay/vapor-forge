@@ -9,7 +9,7 @@ use vapor_forge_features::package::ReloadDiff;
 use vapor_forge_patterns::registry::PatternRegistry;
 use vapor_forge_steam_native_abi::{
     package_info, CUtlMemoryGrowFn, GetPackageInfoArchFn, MarkLicenseAsChangedFn,
-    ProcessPendingLicenseUpdatesFn,
+    RemoveSiteLicensesFn,
 };
 use vapor_forge_steam_protocol::LicensedPackage;
 
@@ -38,7 +38,7 @@ static WORK_ITEM_NAME: &[u8] = b"VaporPackageUpdate\0";
 // ---------------------------------------------------------------------------
 
 static mut FN_MARK_LICENSE: Option<MarkLicenseAsChangedFn> = None;
-static mut FN_PROCESS_UPDATES: Option<ProcessPendingLicenseUpdatesFn> = None;
+static mut FN_REMOVE_SITE_LICENSES: Option<RemoveSiteLicensesFn> = None;
 static mut FN_GROW: Option<CUtlMemoryGrowFn> = None;
 static mut FN_GET_PKG_INFO: Option<GetPackageInfoArchFn> = None;
 
@@ -132,7 +132,7 @@ pub(crate) struct SteamPackageAccess {
     pkg0: NonNull<u8>,
     cuser: NonNull<c_void>,
     mark_license: MarkLicenseAsChangedFn,
-    process_updates: ProcessPendingLicenseUpdatesFn,
+    remove_site_licenses: RemoveSiteLicensesFn,
     grow: CUtlMemoryGrowFn,
 }
 
@@ -145,10 +145,10 @@ impl SteamPackageAccess {
         }
         // SAFETY: initialization writes each slot before hooks are enabled and
         // never mutates it afterward.
-        let (mark_license, process_updates, grow) = unsafe {
+        let (mark_license, remove_site_licenses, grow) = unsafe {
             (
                 (*std::ptr::addr_of!(FN_MARK_LICENSE))?,
-                (*std::ptr::addr_of!(FN_PROCESS_UPDATES))?,
+                (*std::ptr::addr_of!(FN_REMOVE_SITE_LICENSES))?,
                 (*std::ptr::addr_of!(FN_GROW))?,
             )
         };
@@ -156,7 +156,7 @@ impl SteamPackageAccess {
             pkg0,
             cuser,
             mark_license,
-            process_updates,
+            remove_site_licenses,
             grow,
         })
     }
@@ -168,11 +168,19 @@ impl SteamPackageAccess {
     }
 
     fn publish_package_change(&self) {
+        // Marking pkg0 makes the changed-license set non-empty, so Steam's
+        // site-license sweep rebuilds the license cache and sends the license
+        // update notices without waiting for appinfo of every licensed ID.
         // SAFETY: the capability holds the current CUser and the
         // architecture-matched functions resolved before work is posted.
-        unsafe {
+        let rebuilt = unsafe {
             (self.mark_license)(self.cuser.as_ptr(), 0, true);
-            (self.process_updates)(self.cuser.as_ptr());
+            (self.remove_site_licenses)(self.cuser.as_ptr())
+        };
+        if rebuilt {
+            debug!("package: license cache rebuilt");
+        } else {
+            warn!("package: Steam did not rebuild the license cache");
         }
     }
 
@@ -293,13 +301,13 @@ pub unsafe fn resolve_functions(code: &CodeRegion, registry: &PatternRegistry) {
                 )));
         }
     }
-    if let Some(addr) = resolve_raw_address(registry, code, "CUser::ProcessPendingLicenseUpdates") {
+    if let Some(addr) = resolve_raw_address(registry, code, "CUser::RemoveSiteLicenses") {
         // SAFETY: the registry entry identifies this concrete Steam function ABI.
         unsafe {
-            std::ptr::addr_of_mut!(FN_PROCESS_UPDATES).write(Some(std::mem::transmute::<
-                usize,
-                ProcessPendingLicenseUpdatesFn,
-            >(addr)));
+            std::ptr::addr_of_mut!(FN_REMOVE_SITE_LICENSES)
+                .write(Some(std::mem::transmute::<usize, RemoveSiteLicensesFn>(
+                    addr,
+                )));
         }
     }
     // x86_64 resolves this through the CUtlVector<u32> append helper callsite used
@@ -447,7 +455,7 @@ pub fn all_functions_resolved() -> bool {
     // SAFETY: these are only written once during do_install, read-only after.
     unsafe {
         let common = (*std::ptr::addr_of!(FN_MARK_LICENSE)).is_some()
-            && (*std::ptr::addr_of!(FN_PROCESS_UPDATES)).is_some()
+            && (*std::ptr::addr_of!(FN_REMOVE_SITE_LICENSES)).is_some()
             && (*std::ptr::addr_of!(FN_GROW)).is_some()
             && ENGINE_WORK_ITEM_SITE.get().is_some();
 
