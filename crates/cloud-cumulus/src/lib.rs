@@ -64,9 +64,7 @@ impl CumulusClient {
         } else {
             request
         };
-        let response = request.send(encoded.as_slice())?;
-        ensure_success(response.status().as_u16())?;
-        Ok(response)
+        check_response(request.send(encoded.as_slice())?)
     }
 
     pub fn get_json<R: DeserializeOwned>(&self, path: &str) -> Result<R, CumulusError> {
@@ -75,8 +73,7 @@ impl CumulusClient {
             .get(&self.url(path))
             .header("Authorization", &self.authorization_header());
         let request = self.with_client_id(request);
-        let mut response = request.call()?;
-        ensure_success(response.status().as_u16())?;
+        let mut response = check_response(request.call()?)?;
         let body = response.body_mut().read_to_string()?;
         Ok(serde_json::from_str(&body)?)
     }
@@ -100,8 +97,7 @@ impl CumulusClient {
             .agent
             .post(&self.url(path))
             .header("Authorization", &self.authorization_header());
-        let response = self.with_client_id(request).send_empty()?;
-        ensure_success(response.status().as_u16())
+        check_response(self.with_client_id(request).send_empty()?).map(|_| ())
     }
 
     pub fn delete(&self, path: &str) -> Result<(), CumulusError> {
@@ -109,8 +105,7 @@ impl CumulusClient {
             .agent
             .delete(&self.url(path))
             .header("Authorization", &self.authorization_header());
-        let response = self.with_client_id(request).call()?;
-        ensure_success(response.status().as_u16())
+        check_response(self.with_client_id(request).call()?).map(|_| ())
     }
 
     pub fn delete_allow_not_found(&self, path: &str) -> Result<(), CumulusError> {
@@ -119,11 +114,10 @@ impl CumulusClient {
             .delete(&self.url(path))
             .header("Authorization", &self.authorization_header());
         let response = self.with_client_id(request).call()?;
-        let status = response.status().as_u16();
-        if status == 404 {
+        if response.status().as_u16() == 404 {
             Ok(())
         } else {
-            ensure_success(status)
+            check_response(response).map(|_| ())
         }
     }
 
@@ -155,9 +149,15 @@ struct DevicePrincipalResponse {
     principal_id: String,
 }
 
-pub fn principal_scope(settings: &CumulusSettings) -> Result<String, CumulusError> {
+/// Resolve the principal behind the configured credential. The device client
+/// id is sent when known, because a credential awaiting activation for one
+/// Steam device is refused without it.
+pub fn principal_scope(
+    settings: &CumulusSettings,
+    steam_client_id: Option<u64>,
+) -> Result<String, CumulusError> {
     let response: DevicePrincipalResponse =
-        CumulusClient::new(settings, None).get_json("/api/v1/device/principal")?;
+        CumulusClient::new(settings, steam_client_id).get_json("/api/v1/device/principal")?;
     Ok(scope_for_principal(
         &settings.server_url,
         &response.principal_id,
@@ -206,18 +206,60 @@ pub fn ensure_device_bound(
     Ok(())
 }
 
-pub fn ensure_success(status: u16) -> Result<(), CumulusError> {
+/// Upper bound on an error body read for its code. Error bodies are small JSON
+/// objects; anything larger is not one of them.
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
+
+/// Pass a successful response through, or turn a failed one into an error
+/// carrying the server's error code when the body names one.
+pub fn check_response(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, CumulusError> {
+    let status = response.status().as_u16();
     if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(CumulusError::HttpStatus(status))
+        return Ok(response);
     }
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_ERROR_BODY_BYTES)
+        .read_to_string()
+        .unwrap_or_default();
+    Err(CumulusError::from_status_body(status, &body))
 }
+
+#[derive(serde::Deserialize)]
+struct ApiErrorEnvelope {
+    error: ApiErrorBody,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiErrorBody {
+    code: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// Error codes after which retrying with the same credential and device cannot
+/// succeed. Configuration has to change first.
+const CREDENTIAL_BLOCKED_CODES: &[&str] = &[
+    "credential_bound",
+    "steam_account_owned",
+    "device_revoked",
+    "token_revoked",
+    "steam_client_id_mismatch",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CumulusError {
     #[error("Cumulus returned HTTP {0}")]
     HttpStatus(u16),
+    #[error("Cumulus returned HTTP {status} ({code}): {message}")]
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
     #[error("Cumulus transport failed: {0}")]
     Transport(#[from] ureq::Error),
     #[error("invalid Cumulus JSON: {0}")]
@@ -225,9 +267,47 @@ pub enum CumulusError {
 }
 
 impl CumulusError {
-    pub fn is_retryable(&self) -> bool {
+    /// Build the error for a failed response from its status and body.
+    pub fn from_status_body(status: u16, body: &str) -> Self {
+        match serde_json::from_str::<ApiErrorEnvelope>(body) {
+            Ok(envelope) if !envelope.error.code.is_empty() => Self::Api {
+                status,
+                code: envelope.error.code,
+                message: envelope.error.message,
+            },
+            _ => Self::HttpStatus(status),
+        }
+    }
+
+    pub fn status(&self) -> Option<u16> {
         match self {
-            Self::HttpStatus(status) => {
+            Self::HttpStatus(status) | Self::Api { status, .. } => Some(*status),
+            Self::Transport(_) | Self::Json(_) => None,
+        }
+    }
+
+    /// The server's error code, when the response carried one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    /// The credential or device was refused in a way only a configuration
+    /// change can fix. Such failures are not retryable, but they say nothing
+    /// about the payload, so queued data must be kept.
+    pub fn is_credential_blocked(&self) -> bool {
+        self.code()
+            .is_some_and(|code| CREDENTIAL_BLOCKED_CODES.contains(&code))
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        if self.is_credential_blocked() {
+            return false;
+        }
+        match self {
+            Self::HttpStatus(status) | Self::Api { status, .. } => {
                 matches!(*status, 401 | 403 | 408 | 409 | 429) || *status >= 500
             }
             Self::Transport(_) => true,
@@ -248,5 +328,83 @@ mod tests {
         for status in [400, 404, 413, 422] {
             assert!(!CumulusError::HttpStatus(status).is_retryable(), "{status}");
         }
+    }
+
+    fn api_error(status: u16, code: &str) -> CumulusError {
+        CumulusError::from_status_body(
+            status,
+            &format!(r#"{{"error":{{"code":"{code}","message":"refused"}}}}"#),
+        )
+    }
+
+    #[test]
+    fn credential_refusals_are_permanent_and_keep_their_code() {
+        for code in [
+            "credential_bound",
+            "steam_account_owned",
+            "device_revoked",
+            "token_revoked",
+            "steam_client_id_mismatch",
+        ] {
+            let error = api_error(403, code);
+            assert_eq!(error.code(), Some(code));
+            assert!(error.is_credential_blocked(), "{code}");
+            assert!(!error.is_retryable(), "{code}");
+        }
+    }
+
+    #[test]
+    fn pending_identity_requirements_stay_retryable() {
+        for code in ["device_identity_required", "steam_client_id_required"] {
+            let error = api_error(403, code);
+            assert!(!error.is_credential_blocked(), "{code}");
+            assert!(error.is_retryable(), "{code}");
+        }
+        assert!(api_error(409, "conflict").is_retryable());
+        assert!(!api_error(400, "bad_request").is_retryable());
+    }
+
+    #[test]
+    fn failed_responses_carry_the_server_error_code() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"error":{"code":"token_revoked","message":"token has been revoked"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let settings = CumulusSettings {
+            server_url: format!("http://{address}"),
+            token: "token".into(),
+            timeout_connect_ms: 1_000,
+            timeout_ms: 2_000,
+        };
+        let error = principal_scope(&settings, Some(7)).unwrap_err();
+        assert_eq!(error.status(), Some(403));
+        assert_eq!(error.code(), Some("token_revoked"));
+        assert!(error.is_credential_blocked());
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn unparseable_error_bodies_fall_back_to_the_status() {
+        let error = CumulusError::from_status_body(403, "<html>forbidden</html>");
+        assert!(matches!(error, CumulusError::HttpStatus(403)));
+        assert!(error.is_retryable());
+        assert_eq!(error.status(), Some(403));
     }
 }

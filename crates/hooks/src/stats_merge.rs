@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 
 use prost::Message;
-use vapor_forge_cloud_core::{AchievementSyncState, AppStatsResult, StatSyncState};
+use vapor_forge_cloud_core::{
+    AchievementSyncState, AppStatsResult, OfficialAchievementState, OfficialStatState,
+    StatSyncState,
+};
 use vapor_forge_steam_protocol::{
     app_id_from_game_id, parse_achievement_bit_mappings, parse_stat_mappings, stats_crc,
     AchievementBlock, ClientGetUserStatsRequest, ClientGetUserStatsResponse, LegacyStatsEntry,
@@ -101,6 +104,125 @@ pub(crate) fn merge_legacy_stats_response(
         Some(AppStatsResult::Uninitialized | AppStatsResult::SchemaMismatch { .. }) | None => {}
     }
     Some(donor.encode_to_vec())
+}
+
+/// Merge local values the backend refused into the backend's authoritative
+/// state, so the next upload neither loses them nor overwrites what other
+/// devices wrote in the meantime.
+///
+/// Stats and achievements whose wire stat id the refused commit marked dirty
+/// keep their local value. Everything else keeps the backend's value, except
+/// that a commit which did not name its dirty stats cannot tell an old unlock
+/// from a new one, so its local unlocks are kept as well. The backend's
+/// `crc_stats` is kept unchanged because the resubmission is built on it.
+///
+/// Returns `None` when `authority` carries no state or the schema cannot map
+/// the keys, in which case the merge has to wait for another attempt.
+pub(crate) fn merge_refused_stats(
+    authority: AppStatsResult,
+    full_schema: &[u8],
+    dirty_stat_ids: &[u32],
+    local_achievements: &[OfficialAchievementState],
+    local_stats: &[OfficialStatState],
+) -> Option<AppStatsResult> {
+    let AppStatsResult::Modified {
+        schema_version,
+        crc_stats,
+        mut achievements,
+        mut stats,
+    } = authority
+    else {
+        return None;
+    };
+    let achievement_ids = achievement_wire_ids(full_schema)?;
+    let stat_ids = stat_wire_ids(full_schema)?;
+    let app_id = achievements
+        .iter()
+        .map(|achievement| achievement.app_id)
+        .chain(stats.iter().map(|stat| stat.app_id))
+        .next();
+    let observed_at = achievements
+        .iter()
+        .map(|achievement| achievement.observed_at)
+        .chain(stats.iter().map(|stat| stat.observed_at))
+        .max()
+        .unwrap_or_default();
+    let dirty = |stat_id: Option<u32>| stat_id.is_some_and(|id| dirty_stat_ids.contains(&id));
+
+    for local in local_achievements {
+        let is_dirty = dirty(achievement_ids.get(&local.key).map(|wire| wire.stat_id));
+        let existing = achievements
+            .iter_mut()
+            .find(|achievement| achievement.achievement_key == local.key);
+        let keep_local = is_dirty || (dirty_stat_ids.is_empty() && local.unlocked);
+        if !keep_local {
+            continue;
+        }
+        match existing {
+            Some(existing) => {
+                if existing.unlocked && local.unlocked {
+                    // Both sides unlocked it; the earlier recorded time stands.
+                    if existing.unlocked_at.is_none() {
+                        existing.unlocked_at = local.unlocked_at;
+                    }
+                    continue;
+                }
+                existing.unlocked = local.unlocked;
+                existing.unlocked_at = local.unlocked_at;
+            }
+            None => {
+                let Some(app_id) = app_id.or_else(|| first_app_id(full_schema)) else {
+                    continue;
+                };
+                achievements.push(AchievementSyncState {
+                    app_id,
+                    achievement_key: local.key.clone(),
+                    unlocked: local.unlocked,
+                    progress_current: None,
+                    progress_max: None,
+                    observed_at,
+                    unlocked_at: local.unlocked_at,
+                });
+            }
+        }
+    }
+    for local in local_stats {
+        if !dirty(stat_ids.get(&local.key).copied()) {
+            continue;
+        }
+        match stats.iter_mut().find(|stat| stat.stat_key == local.key) {
+            Some(existing) => {
+                existing.value_type = local.value_type.clone();
+                existing.value = local.value.clone();
+            }
+            None => {
+                let Some(app_id) = app_id.or_else(|| first_app_id(full_schema)) else {
+                    continue;
+                };
+                stats.push(StatSyncState {
+                    app_id,
+                    stat_key: local.key.clone(),
+                    value_type: local.value_type.clone(),
+                    value: local.value.clone(),
+                    observed_at,
+                });
+            }
+        }
+    }
+    Some(AppStatsResult::Modified {
+        schema_version,
+        crc_stats,
+        achievements,
+        stats,
+    })
+}
+
+/// The app id a stats schema document is keyed by.
+fn first_app_id(schema: &[u8]) -> Option<u32> {
+    // A binary KeyValues document opens with one object whose name is the app id.
+    let rest = schema.strip_prefix(&[0])?;
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
 }
 
 fn achievement_wire_ids(schema: &[u8]) -> Option<HashMap<String, AchievementWireId>> {
@@ -420,6 +542,7 @@ mod tests {
                     kv_int(stat, "type", 1);
                 });
                 kv_object(stats, "12", |stat| {
+                    kv_int(stat, "type", 4);
                     kv_object(stat, "bits", |bits| {
                         kv_object(bits, "3", |achievement| {
                             kv_string(achievement, "name", "ACH_WIN");
@@ -460,6 +583,176 @@ mod tests {
                 observed_at: 20,
             }],
         }
+    }
+
+    fn local_achievement(unlocked: bool, unlocked_at: Option<i64>) -> OfficialAchievementState {
+        OfficialAchievementState {
+            key: "ACH_WIN".into(),
+            unlocked,
+            unlocked_at,
+        }
+    }
+
+    fn local_stat(value: &str) -> OfficialStatState {
+        OfficialStatState {
+            key: "STAT_SCORE".into(),
+            value_type: "int".into(),
+            value: value.into(),
+        }
+    }
+
+    fn merged_parts(result: AppStatsResult) -> (Option<u32>, AchievementSyncState, StatSyncState) {
+        let AppStatsResult::Modified {
+            crc_stats,
+            achievements,
+            stats,
+            ..
+        } = result
+        else {
+            panic!("a merge keeps the authoritative state");
+        };
+        (crc_stats, achievements[0].clone(), stats[0].clone())
+    }
+
+    #[test]
+    fn refused_dirty_values_override_the_authoritative_state() {
+        let merged = merge_refused_stats(
+            modified_result(false, None),
+            &schema(),
+            &[11, 12],
+            &[local_achievement(true, Some(50))],
+            &[local_stat("8")],
+        )
+        .unwrap();
+        let (crc, achievement, stat) = merged_parts(merged);
+        assert_eq!(crc, Some(CUMULUS_STATS_CRC));
+        assert!(achievement.unlocked);
+        assert_eq!(achievement.unlocked_at, Some(50));
+        assert_eq!(stat.value, "8");
+    }
+
+    #[test]
+    fn clean_values_keep_what_other_devices_wrote() {
+        // Only stat 11 changed locally. The achievement block (stat 12) is
+        // clean, so the backend's lock stands, and the score comes from this
+        // device.
+        let merged = merge_refused_stats(
+            modified_result(false, None),
+            &schema(),
+            &[11],
+            &[local_achievement(true, Some(50))],
+            &[local_stat("8")],
+        )
+        .unwrap();
+        let (_, achievement, stat) = merged_parts(merged);
+        assert!(!achievement.unlocked);
+        assert_eq!(stat.value, "8");
+
+        // Nothing local is dirty: the backend's values win entirely.
+        let merged = merge_refused_stats(
+            modified_result(true, Some(10)),
+            &schema(),
+            &[99],
+            &[local_achievement(true, Some(50))],
+            &[local_stat("8")],
+        )
+        .unwrap();
+        let (_, achievement, stat) = merged_parts(merged);
+        assert!(achievement.unlocked);
+        assert_eq!(achievement.unlocked_at, Some(10));
+        assert_eq!(stat.value, "3");
+    }
+
+    #[test]
+    fn an_unlock_on_both_sides_keeps_the_authoritative_time() {
+        let merged = merge_refused_stats(
+            modified_result(true, Some(10)),
+            &schema(),
+            &[12],
+            &[local_achievement(true, Some(50))],
+            &[],
+        )
+        .unwrap();
+        let (_, achievement, _) = merged_parts(merged);
+        assert!(achievement.unlocked);
+        assert_eq!(achievement.unlocked_at, Some(10));
+
+        let merged = merge_refused_stats(
+            modified_result(true, Some(10)),
+            &schema(),
+            &[12],
+            &[local_achievement(false, None)],
+            &[],
+        )
+        .unwrap();
+        let (_, achievement, _) = merged_parts(merged);
+        assert!(!achievement.unlocked, "a dirty local lock is kept");
+        assert_eq!(achievement.unlocked_at, None);
+    }
+
+    #[test]
+    fn commits_without_dirty_ids_keep_local_unlocks_only() {
+        let merged = merge_refused_stats(
+            modified_result(false, None),
+            &schema(),
+            &[],
+            &[local_achievement(true, Some(50))],
+            &[local_stat("8")],
+        )
+        .unwrap();
+        let (_, achievement, stat) = merged_parts(merged);
+        assert!(achievement.unlocked);
+        assert_eq!(achievement.unlocked_at, Some(50));
+        assert_eq!(stat.value, "3");
+
+        // A local lock without dirty ids does not undo another device's unlock.
+        let merged = merge_refused_stats(
+            modified_result(true, Some(10)),
+            &schema(),
+            &[],
+            &[local_achievement(false, None)],
+            &[],
+        )
+        .unwrap();
+        let (_, achievement, _) = merged_parts(merged);
+        assert!(achievement.unlocked);
+    }
+
+    #[test]
+    fn dirty_values_missing_from_the_authority_are_added() {
+        let merged = merge_refused_stats(
+            AppStatsResult::Modified {
+                schema_version: "010203".into(),
+                crc_stats: Some(CUMULUS_STATS_CRC),
+                achievements: Vec::new(),
+                stats: Vec::new(),
+            },
+            &schema(),
+            &[11, 12],
+            &[local_achievement(true, Some(50))],
+            &[local_stat("8")],
+        )
+        .unwrap();
+        let (_, achievement, stat) = merged_parts(merged);
+        assert_eq!(achievement.app_id, 480);
+        assert!(achievement.unlocked);
+        assert_eq!(stat.app_id, 480);
+        assert_eq!(stat.value, "8");
+    }
+
+    #[test]
+    fn a_merge_needs_authoritative_state() {
+        assert!(merge_refused_stats(unchanged_result(), &schema(), &[11], &[], &[]).is_none());
+        assert!(merge_refused_stats(
+            AppStatsResult::SchemaMismatch {
+                schema_version: None
+            },
+            &schema(),
+            &[11],
+            &[],
+            &[],
+        )
+        .is_none());
     }
 
     fn unchanged_result() -> AppStatsResult {

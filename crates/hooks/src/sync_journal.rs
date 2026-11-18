@@ -34,8 +34,12 @@ pub(crate) fn shared() -> Option<Arc<SyncJournal>> {
         .clone()
 }
 
-/// Resolve and persist a principal from a background worker.
-pub(crate) fn resolve_principal_scope(backend: &dyn CloudBackend) -> Result<String, BackendError> {
+/// Resolve and persist a principal from a background worker. `client_id`
+/// identifies this device to the backend when it is known.
+pub(crate) fn resolve_principal_scope(
+    backend: &dyn CloudBackend,
+    client_id: Option<u64>,
+) -> Result<String, BackendError> {
     let credential_fingerprint = backend.credential_fingerprint();
     if let Some(scope) = cached_principal_for_credential(&credential_fingerprint) {
         return Ok(scope);
@@ -58,7 +62,7 @@ pub(crate) fn resolve_principal_scope(backend: &dyn CloudBackend) -> Result<Stri
         Ok(None) => {}
         Err(error) => warn!(%error, "sync-journal: failed to read backend principal"),
     }
-    let scope = backend.principal_scope()?;
+    let scope = backend.principal_scope(client_id)?;
     journal
         .store_backend_principal_scope(&credential_fingerprint, &scope, unix_now())
         .map_err(|error| {

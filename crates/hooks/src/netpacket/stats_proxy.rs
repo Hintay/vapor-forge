@@ -417,7 +417,7 @@ fn process_backend_stats_request(request: BackendStatsRequest) {
         );
         return;
     }
-    let blocked = backend_query_blocked_by_pending_stats(context, &steam_id64, app_id);
+    let gate = pending_stats_gate(context, &steam_id64, app_id);
     if !backend_stats_context_still_current(context) {
         debug!(
             app_id,
@@ -432,24 +432,33 @@ fn process_backend_stats_request(request: BackendStatsRequest) {
         );
         return;
     }
-    let backend = if blocked {
-        None
-    } else {
-        let query = AppStatsQuery {
-            app_id,
-            client_crc_stats: request.kind.client_crc_stats(),
-            schema_version: request.schema_version.clone(),
-        };
-        match context
-            .backend
-            .pull_app_stats(context.client_id, &steam_id64, &query)
-        {
-            Ok(result) => Some(result),
-            Err(error) => {
-                warn!(%error, app_id, "netpacket: backend app stats pull failed");
-                None
+    let backend = match gate {
+        PendingStatsGate::Blocked => None,
+        PendingStatsGate::Open => {
+            let query = AppStatsQuery {
+                app_id,
+                client_crc_stats: request.kind.client_crc_stats(),
+                schema_version: request.schema_version.clone(),
+            };
+            match context
+                .backend
+                .pull_app_stats(context.client_id, &steam_id64, &query)
+            {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    warn!(%error, app_id, "netpacket: backend app stats pull failed");
+                    None
+                }
             }
         }
+        PendingStatsGate::Merge { owner_scope, merge } => merge_refused_stats(
+            context,
+            &steam_id64,
+            &owner_scope,
+            &merge,
+            &request.full_schema,
+            &request.schema_version,
+        ),
     };
     if !backend_stats_context_still_current(context) {
         debug!(
@@ -475,19 +484,112 @@ fn process_backend_stats_request(request: BackendStatsRequest) {
     );
 }
 
-fn backend_query_blocked_by_pending_stats(
+enum PendingStatsGate {
+    /// No local stats are owed to the backend, so its state can be applied.
+    Open,
+    /// Local stats are still owed. Applying the backend's state now would
+    /// overwrite them in Steam's cache, so Steam keeps its own values.
+    Blocked,
+    /// The backend refused local stats built on an outdated baseline. Its
+    /// state has to be fetched and merged with them before the commit is
+    /// rebuilt.
+    Merge {
+        owner_scope: String,
+        merge: vapor_forge_sync_journal::PendingStatsMerge,
+    },
+}
+
+fn pending_stats_gate(
     context: &BackendStatsContext,
     steam_id64: &str,
     app_id: u32,
-) -> bool {
-    let owner_scope = match crate::sync_journal::resolve_principal_scope(context.backend.as_ref()) {
+) -> PendingStatsGate {
+    let owner_scope = match crate::sync_journal::resolve_principal_scope(
+        context.backend.as_ref(),
+        Some(context.client_id),
+    ) {
         Ok(scope) => scope,
         Err(error) => {
             warn!(%error, app_id, "netpacket: backend principal unavailable for stats pull");
-            return true;
+            return PendingStatsGate::Blocked;
         }
     };
-    crate::achievement_worker::has_pending_stats(&owner_scope, steam_id64, app_id)
+    if let Some(merge) =
+        crate::achievement_worker::pending_stats_merge(&owner_scope, steam_id64, app_id)
+    {
+        return PendingStatsGate::Merge { owner_scope, merge };
+    }
+    if crate::achievement_worker::has_pending_stats(&owner_scope, steam_id64, app_id) {
+        PendingStatsGate::Blocked
+    } else {
+        PendingStatsGate::Open
+    }
+}
+
+/// Fetch the backend's full state for a refused commit and merge the refused
+/// values into it. The merge is settled in the journal before the result is
+/// handed to Steam, which lets the commit be rebuilt from the merged cache
+/// with the backend's baseline. Any failure leaves the merge pending and Steam
+/// keeps its own values.
+fn merge_refused_stats(
+    context: &BackendStatsContext,
+    steam_id64: &str,
+    owner_scope: &str,
+    merge: &vapor_forge_sync_journal::PendingStatsMerge,
+    full_schema: &[u8],
+    schema_version: &str,
+) -> Option<AppStatsResult> {
+    let app_id = merge.app_id;
+    // Without a client baseline the backend always answers with its full state.
+    let query = AppStatsQuery {
+        app_id,
+        client_crc_stats: None,
+        schema_version: schema_version.to_owned(),
+    };
+    let authority = match context
+        .backend
+        .pull_app_stats(context.client_id, steam_id64, &query)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(%error, app_id, "netpacket: backend state for refused stats unavailable");
+            return None;
+        }
+    };
+    let base_crc_stats = match &authority {
+        AppStatsResult::Modified { crc_stats, .. } => *crc_stats,
+        _ => {
+            warn!(
+                app_id,
+                "netpacket: backend returned no stats to merge refused stats into"
+            );
+            return None;
+        }
+    };
+    let merged = crate::stats_merge::merge_refused_stats(
+        authority,
+        full_schema,
+        &merge.dirty_stat_ids,
+        &merge.achievements,
+        &merge.stats,
+    )?;
+    if !backend_stats_context_still_current(context) {
+        return None;
+    }
+    if !crate::achievement_worker::settle_stats_merge(
+        owner_scope,
+        steam_id64,
+        app_id,
+        &merge.commit_id,
+        base_crc_stats,
+    ) {
+        return None;
+    }
+    info!(
+        app_id,
+        "netpacket: merged refused stats into the backend state"
+    );
+    Some(merged)
 }
 
 fn inject_merged_stats_response(
@@ -974,12 +1076,18 @@ fn backend_stats_context_still_current(context: &BackendStatsContext) -> bool {
         && Arc::ptr_eq(&crate::client::install::config(), &context.config)
 }
 
-fn register_stats_schema(app_id: u32, schema_version: Option<String>, schema: Vec<u8>) {
-    if let Some(version) = schema_version.clone() {
+/// Register a donor schema locally and queue it for the backend.
+///
+/// The upload names the schema by the same version later stats queries use,
+/// because the backend matches the two. Returns that version.
+fn register_stats_schema(app_id: u32, valve_version: Option<String>, schema: Vec<u8>) -> String {
+    if let Some(version) = valve_version {
         remember_schema_version(app_id, version);
     }
+    let schema_version = schema_version_for(app_id, &schema);
     crate::client::achievement::register_packet_schema(app_id, &schema);
-    crate::achievement_worker::queue_schema(app_id, schema_version, schema);
+    crate::achievement_worker::queue_schema(app_id, Some(schema_version.clone()), schema);
+    schema_version
 }
 
 /// Schema versions Valve supplied, kept per app for the life of the process.
@@ -1191,7 +1299,7 @@ pub(super) fn handle_proxy_legacy_stats_response(
         );
         return Some(RecvFrameDecision::Drop);
     };
-    register_stats_schema(app_id, None, full_schema.clone());
+    let schema_version = register_stats_schema(app_id, None, full_schema.clone());
     // Both response shapes use the same backend merge worker.
     let Some(context) = context else {
         inject_schema_only_stats_response(
@@ -1214,7 +1322,6 @@ pub(super) fn handle_proxy_legacy_stats_response(
         );
         return Some(RecvFrameDecision::Drop);
     }
-    let schema_version = schema_version_for(app_id, &full_schema);
     let backend_request = BackendStatsRequest {
         app_id,
         context,

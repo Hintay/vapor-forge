@@ -33,6 +33,9 @@ impl CumulusBackend {
 
 impl From<CumulusError> for BackendError {
     fn from(error: CumulusError) -> Self {
+        if error.is_credential_blocked() {
+            return BackendError::credential_blocked(error.to_string());
+        }
         let retryable = error.is_retryable();
         BackendError::new(error.to_string(), retryable)
     }
@@ -43,8 +46,8 @@ impl CloudBackend for CumulusBackend {
         endpoint_scope(&self.settings.server_url)
     }
 
-    fn principal_scope(&self) -> Result<String, BackendError> {
-        crate::principal_scope(&self.settings).map_err(BackendError::from)
+    fn principal_scope(&self, client_id: Option<u64>) -> Result<String, BackendError> {
+        crate::principal_scope(&self.settings, client_id).map_err(BackendError::from)
     }
 
     fn credential_fingerprint(&self) -> String {
@@ -61,9 +64,10 @@ impl CloudBackend for CumulusBackend {
 
     fn upload_achievement_schema(
         &self,
+        client_id: u64,
         schema: &AchievementSchema,
     ) -> Result<SchemaUploadOutcome, BackendError> {
-        achievement::upload_schema(&self.settings, schema)
+        achievement::upload_schema(&self.settings, client_id, schema)
             .map(|outcome| match outcome {
                 achievement::SchemaUploadOutcome::Uploaded => SchemaUploadOutcome::Accepted,
                 achievement::SchemaUploadOutcome::Disabled => SchemaUploadOutcome::Declined,
@@ -194,7 +198,7 @@ mod tests {
         let (server_url, request) = one_response_server(r#"{"principal_id":"user:42"}"#);
         let backend = CumulusBackend::new(settings(&server_url, "token-a"));
         assert_eq!(
-            backend.principal_scope().unwrap(),
+            backend.principal_scope(Some(77)).unwrap(),
             vapor_forge_cloud_core::principal_scope(&server_url, "user:42")
         );
 
@@ -202,9 +206,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         assert!(request.starts_with("GET /api/v1/device/principal HTTP/1.1"));
-        assert!(request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer token-a"));
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer token-a"));
+        assert!(lower.contains("x-cumulus-steam-client-id: 77"));
     }
 
     #[test]
@@ -214,6 +218,15 @@ mod tests {
 
         let permanent: BackendError = CumulusError::HttpStatus(400).into();
         assert!(!permanent.is_retryable());
+        assert!(!permanent.is_credential_blocked());
+
+        let blocked: BackendError = CumulusError::from_status_body(
+            403,
+            r#"{"error":{"code":"device_revoked","message":"revoked"}}"#,
+        )
+        .into();
+        assert!(!blocked.is_retryable());
+        assert!(blocked.is_credential_blocked());
     }
 
     #[test]

@@ -145,6 +145,7 @@ impl Default for StreamCancellation {
 pub struct BackendError {
     message: String,
     retryable: bool,
+    credential_blocked: bool,
 }
 
 impl BackendError {
@@ -152,12 +153,31 @@ impl BackendError {
         Self {
             message: message.into(),
             retryable,
+            credential_blocked: false,
+        }
+    }
+
+    /// The configured credential or device identity was refused for good.
+    ///
+    /// Retrying cannot succeed until the configuration changes, but the
+    /// payload itself was never judged, so callers keep queued data and pause
+    /// instead of discarding it.
+    pub fn credential_blocked(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            credential_blocked: true,
         }
     }
 
     /// Whether the journal should schedule another attempt instead of giving up.
     pub fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    /// Whether the failure concerns the credential rather than the payload.
+    pub fn is_credential_blocked(&self) -> bool {
+        self.credential_blocked
     }
 }
 
@@ -187,8 +207,9 @@ pub trait CloudBackend: Send + Sync {
     /// Used where data belongs to the authenticated principal. Token rotation
     /// for the same principal must not orphan pending rows, while switching to
     /// another principal must isolate state. Backends may need to authenticate
-    /// to discover their stable principal id.
-    fn principal_scope(&self) -> Result<String, BackendError>;
+    /// to discover their stable principal id. `client_id` identifies this
+    /// device to backends that scope credentials per device.
+    fn principal_scope(&self, client_id: Option<u64>) -> Result<String, BackendError>;
 
     /// Runtime-only fingerprint of the configured destination and credential.
     ///
@@ -205,6 +226,7 @@ pub trait CloudBackend: Send + Sync {
 
     fn upload_achievement_schema(
         &self,
+        client_id: u64,
         schema: &AchievementSchema,
     ) -> Result<SchemaUploadOutcome, BackendError>;
 
@@ -263,6 +285,11 @@ mod tests {
 
         let permanent = BackendError::new("malformed payload", false);
         assert!(!permanent.is_retryable());
+        assert!(!permanent.is_credential_blocked());
+
+        let blocked = BackendError::credential_blocked("device revoked");
+        assert!(!blocked.is_retryable());
+        assert!(blocked.is_credential_blocked());
     }
 
     #[test]

@@ -14,6 +14,23 @@ pub struct ConflictResolutionEvent {
     pub machine_name: Option<String>,
 }
 
+/// Local stats state a backend refused because its baseline was outdated.
+///
+/// It has to be merged into the backend's authoritative state before the
+/// refused commit is rebuilt and uploaded again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingStatsMerge {
+    pub owner_scope: String,
+    pub owner_steam_id64: String,
+    pub app_id: u32,
+    pub commit_id: String,
+    /// Wire stat ids Steam reported as changed by the refused commit. Empty
+    /// when the commit did not say which stats it changed.
+    pub dirty_stat_ids: Vec<u32>,
+    pub achievements: Vec<vapor_forge_cloud_core::OfficialAchievementState>,
+    pub stats: Vec<vapor_forge_cloud_core::OfficialStatState>,
+}
+
 pub fn new_conflict_event_id() -> String {
     new_event_id()
 }

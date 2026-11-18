@@ -8,7 +8,9 @@ mod retry;
 mod store;
 
 pub use handle::shared;
-pub use model::{new_conflict_event_id, ConflictResolutionEvent, SyncJournalError};
+pub use model::{
+    new_conflict_event_id, ConflictResolutionEvent, PendingStatsMerge, SyncJournalError,
+};
 pub use paths::default_sync_journal_path;
 pub use store::{values, Journaled, Queued, SyncJournal};
 #[cfg(test)]

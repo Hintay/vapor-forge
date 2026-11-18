@@ -283,6 +283,123 @@ fn refused_stats_snapshot_is_immediately_recoverable_after_restart() {
     );
 }
 
+fn refuse_first_snapshot(journal: &SyncJournal, refused_crc: Option<u32>) {
+    journal
+        .enqueue_stats_commit(&stats_commit("commit-1", 100))
+        .unwrap();
+    assert!(journal
+        .complete_stats_snapshot(&steam_snapshot("commit-1", 101))
+        .unwrap());
+    let queued = journal
+        .pending_stats_snapshots(SCOPE, STEAM_ID, 101)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(journal
+        .reopen_stats_commit(&queued, refused_crc, 102)
+        .unwrap());
+}
+
+#[test]
+fn refused_stats_wait_for_the_authoritative_merge_before_resubmitting() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sync-journal.stry");
+    let journal = SyncJournal::open(&path).unwrap();
+    refuse_first_snapshot(&journal, Some(7));
+
+    let merge = journal
+        .pending_stats_merge(SCOPE, STEAM_ID, 620)
+        .unwrap()
+        .expect("refused values are kept for the merge");
+    assert_eq!(merge.commit_id, "commit-1");
+    assert_eq!(merge.dirty_stat_ids, vec![11, 12]);
+    assert_eq!(merge.achievements[0].key, "ACH_WIN");
+    assert_eq!(merge.stats[0].value, "42");
+
+    // A snapshot read before the merge describes the stale cache and must not
+    // become an upload, even across a restart.
+    drop(journal);
+    let journal = SyncJournal::open(&path).unwrap();
+    assert!(!journal
+        .complete_stats_snapshot(&steam_snapshot("commit-1", 103))
+        .unwrap());
+    assert!(journal
+        .pending_stats_snapshots(SCOPE, STEAM_ID, i64::MAX)
+        .unwrap()
+        .is_empty());
+
+    // The fetched state names the baseline the resubmission is built on.
+    assert!(!journal
+        .settle_stats_merge(SCOPE, STEAM_ID, 620, "other-commit", Some(9))
+        .unwrap());
+    assert!(journal
+        .settle_stats_merge(SCOPE, STEAM_ID, 620, "commit-1", Some(9))
+        .unwrap());
+    assert!(journal
+        .pending_stats_merge(SCOPE, STEAM_ID, 620)
+        .unwrap()
+        .is_none());
+    assert!(journal
+        .complete_stats_snapshot(&steam_snapshot("commit-1", 104))
+        .unwrap());
+    let resubmitted = journal
+        .pending_stats_snapshots(SCOPE, STEAM_ID, i64::MAX)
+        .unwrap();
+    assert_eq!(resubmitted.len(), 1);
+    assert_eq!(resubmitted[0].value.base_crc_stats, Some(9));
+}
+
+#[test]
+fn a_newer_commit_supersedes_a_pending_stats_merge() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal = journal(&directory);
+    refuse_first_snapshot(&journal, None);
+
+    journal
+        .enqueue_stats_commit(&stats_commit("commit-2", 110))
+        .unwrap();
+    assert!(journal
+        .pending_stats_merge(SCOPE, STEAM_ID, 620)
+        .unwrap()
+        .is_none());
+    assert!(journal
+        .complete_stats_snapshot(&steam_snapshot("commit-2", 111))
+        .unwrap());
+}
+
+#[test]
+fn unsettled_stats_merges_are_retried_with_backoff() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal = journal(&directory);
+    refuse_first_snapshot(&journal, Some(7));
+
+    let first_due = journal
+        .next_stats_merge_attempt_at(SCOPE, STEAM_ID)
+        .unwrap()
+        .unwrap();
+    assert!(first_due > 102);
+    assert!(journal
+        .take_due_stats_merges(SCOPE, STEAM_ID, first_due - 1)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        journal
+            .take_due_stats_merges(SCOPE, STEAM_ID, first_due)
+            .unwrap(),
+        vec![620]
+    );
+    let second_due = journal
+        .next_stats_merge_attempt_at(SCOPE, STEAM_ID)
+        .unwrap()
+        .unwrap();
+    assert!(second_due > first_due);
+    assert!(journal
+        .take_due_stats_merges(SCOPE, STEAM_ID, first_due)
+        .unwrap()
+        .is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn journal_and_parent_directory_use_private_modes() {

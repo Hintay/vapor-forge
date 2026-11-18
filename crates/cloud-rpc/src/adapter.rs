@@ -205,7 +205,7 @@ pub(super) fn execute_rpc(
     match method {
         GET_CHANGELIST => handle_changelist(state, &client, body),
         BEGIN_BATCH => {
-            let conflict_scope = backend.principal_scope()?;
+            let conflict_scope = backend.principal_scope(settings.steam_client_id)?;
             state.principal_scope = Some(conflict_scope.clone());
             if let Some(journal) = state.journal.as_deref() {
                 journal.attribute_pending_conflicts(
@@ -228,7 +228,9 @@ pub(super) fn execute_rpc(
         SUSPEND_SESSION => handle_suspend(&client, body),
         RESUME_SESSION => handle_resume(&client, body),
         EXIT_SYNC_DONE => handle_exit(&client, body),
-        CONFLICT_RESOLUTION => handle_conflict_resolution(state, &backend, &client, body),
+        CONFLICT_RESOLUTION => {
+            handle_conflict_resolution(state, &backend, settings.steam_client_id, &client, body)
+        }
         CDN_REPORT => handle_cdn_report(&client, body),
         EXTERNAL_TRANSFER_REPORT => handle_external_transfer_report(&client, body),
         _ => Err(AdapterError::Protocol("unsupported cloud method".into())),
@@ -750,6 +752,7 @@ pub(super) fn handle_exit(client: &CumulusClient, body: &[u8]) -> Result<RpcRepl
 pub(super) fn handle_conflict_resolution(
     state: &mut AdapterState,
     backend: &impl CloudBackend,
+    steam_client_id: Option<u64>,
     client: &CumulusClient,
     body: &[u8],
 ) -> Result<RpcReply, AdapterError> {
@@ -788,7 +791,7 @@ pub(super) fn handle_conflict_resolution(
         .ok_or_else(|| AdapterError::Protocol("conflict journal is unavailable".into()))?;
     journal.enqueue_conflict(&resolution, unix_now())?;
 
-    let conflict_scope = match backend.principal_scope() {
+    let conflict_scope = match backend.principal_scope(steam_client_id) {
         Ok(scope) => scope,
         Err(error) => {
             warn!(app_id, %error, "cloud-rpc: conflict persisted pending principal lookup");
@@ -810,6 +813,13 @@ pub(super) fn handle_conflict_resolution(
     Ok(RpcReply::ok(Vec::new()))
 }
 
+/// Report every ready kept-cloud resolution.
+///
+/// One failing event does not hold back the others. A payload the server
+/// refuses for good is dropped, a transient failure is retried later, and a
+/// refused credential keeps the event queued and ends the round because every
+/// further request would be refused the same way. Returns the first failure
+/// that left an event queued.
 pub(super) fn deliver_ready_conflicts(
     state: &AdapterState,
     client: &CumulusClient,
@@ -819,25 +829,69 @@ pub(super) fn deliver_ready_conflicts(
         return Ok(());
     };
     let now = unix_now();
+    let mut first_failure = None;
     for queued in journal.pending_cloud_conflicts(now, conflict_scope)? {
         let resolution = &queued.value;
         let result = client.post_json_unit(
             &format!("/api/v1/apps/{}/conflicts/kept-cloud", resolution.app_id),
-            &json!({
-                "event_id": resolution.event_id,
-                "base_change_number": signed_bits(resolution.base_change_number),
-                "machine_name": resolution.machine_name,
-            }),
+            &kept_cloud_report(resolution),
         );
-        match result {
-            Ok(()) => journal.acknowledge(&queued)?,
-            Err(error) => {
+        let error = match result {
+            Ok(()) => {
+                journal.acknowledge(&queued)?;
+                continue;
+            }
+            Err(error) => error,
+        };
+        match conflict_report_failure(&error) {
+            ConflictReportFailure::Rejected => {
+                warn!(
+                    app_id = resolution.app_id,
+                    event_id = %resolution.event_id,
+                    %error,
+                    "cloud-rpc: server rejected kept-cloud report; dropping it"
+                );
+                journal.acknowledge(&queued)?;
+            }
+            ConflictReportFailure::Transient => {
                 journal.defer(&queued, now)?;
-                return Err(error);
+                first_failure.get_or_insert(error);
+            }
+            ConflictReportFailure::CredentialBlocked => {
+                journal.defer(&queued, now)?;
+                return Err(first_failure.unwrap_or(error));
             }
         }
     }
-    Ok(())
+    first_failure.map_or(Ok(()), Err)
+}
+
+fn kept_cloud_report(resolution: &ConflictResolutionEvent) -> serde_json::Value {
+    json!({
+        "event_id": resolution.event_id,
+        "base_change_number": signed_bits(resolution.base_change_number),
+        "remote_change_number": signed_bits(resolution.remote_change_number),
+        "machine_name": resolution.machine_name,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ConflictReportFailure {
+    /// The server judged the report itself and will never accept it.
+    Rejected,
+    Transient,
+    /// The credential or device was refused; the report is still valid.
+    CredentialBlocked,
+}
+
+pub(super) fn conflict_report_failure(error: &AdapterError) -> ConflictReportFailure {
+    match error {
+        AdapterError::Client(error) if error.is_credential_blocked() => {
+            ConflictReportFailure::CredentialBlocked
+        }
+        AdapterError::Client(error) if !error.is_retryable() => ConflictReportFailure::Rejected,
+        _ => ConflictReportFailure::Transient,
+    }
 }
 
 /// Open the shared journal handle for `path`.

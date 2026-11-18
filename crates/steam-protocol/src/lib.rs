@@ -1225,16 +1225,20 @@ pub enum AchievementSchemaError {
 const ACHIEVEMENT_SCHEMA_MAX_DEPTH: usize = 32;
 const ACHIEVEMENT_SCHEMA_MAX_ENTRIES: usize = 100_000;
 
+/// The entries of a KeyValues object in document order. Duplicate keys are
+/// kept because Steam keeps them and resolves lookups to the first one.
+type AchievementSchemaObject = Vec<(String, AchievementSchemaValue)>;
+
 #[derive(Clone, Debug)]
 enum AchievementSchemaValue {
-    Object(std::collections::HashMap<String, AchievementSchemaValue>),
+    Object(AchievementSchemaObject),
     String(String),
     Int(i64),
     Other,
 }
 
 impl AchievementSchemaValue {
-    fn object(&self) -> Option<&std::collections::HashMap<String, AchievementSchemaValue>> {
+    fn object(&self) -> Option<&[(String, AchievementSchemaValue)]> {
         match self {
             Self::Object(value) => Some(value),
             _ => None,
@@ -1248,12 +1252,26 @@ impl AchievementSchemaValue {
         }
     }
 
-    fn int(&self) -> Option<i64> {
+    /// The value as KeyValues::GetInt reads it: strings go through Steam's
+    /// V_atoi, values that carry no integer read as 0.
+    fn steam_int(&self) -> i64 {
         match self {
-            Self::Int(value) => Some(*value),
-            _ => None,
+            Self::Int(value) => *value,
+            Self::String(text) => steam_atoi(text),
+            _ => 0,
         }
     }
+}
+
+/// KeyValues::FindKey: the first entry whose key matches, ignoring ASCII case.
+fn schema_find<'a>(
+    object: &'a [(String, AchievementSchemaValue)],
+    key: &str,
+) -> Option<&'a AchievementSchemaValue> {
+    object
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value)
 }
 
 struct AchievementSchemaParser<'a> {
@@ -1302,22 +1320,19 @@ impl<'a> AchievementSchemaParser<'a> {
             .iter()
             .position(|byte| *byte == 0)
             .ok_or(AchievementSchemaError::Truncated)?;
-        let value = std::str::from_utf8(&rest[..length])
-            .map_err(|_| AchievementSchemaError::InvalidUtf8)?
-            .to_owned();
+        // Steam treats KeyValues strings as bytes. Localized display text in
+        // real schemas is not always UTF-8 (for example Latin-1 French), and
+        // one such string must not make the whole schema unreadable.
+        let value = String::from_utf8_lossy(&rest[..length]).into_owned();
         self.position += length + 1;
         Ok(value)
     }
 
-    fn object(
-        &mut self,
-        depth: usize,
-    ) -> Result<std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError>
-    {
+    fn object(&mut self, depth: usize) -> Result<AchievementSchemaObject, AchievementSchemaError> {
         if depth > ACHIEVEMENT_SCHEMA_MAX_DEPTH {
             return Err(AchievementSchemaError::LimitExceeded);
         }
-        let mut result = std::collections::HashMap::new();
+        let mut result = Vec::new();
         loop {
             let kind = self.byte()?;
             if kind == 8 {
@@ -1352,7 +1367,7 @@ impl<'a> AchievementSchemaParser<'a> {
                 ) as i64),
                 other => return Err(AchievementSchemaError::UnsupportedType(other)),
             };
-            result.insert(key, value);
+            result.push((key, value));
         }
         Ok(result)
     }
@@ -1360,37 +1375,41 @@ impl<'a> AchievementSchemaParser<'a> {
 
 /// Parse the binary KeyValues stats schema returned by Steam and return the
 /// achievement bit identifiers used by stats sync packets.
+///
+/// Achievements are registered the way Steam's schema loader registers them:
+/// only under accepted stats of type ACHIEVEMENTS, with the bit read by atoi
+/// from the key and limited to 0..=31. Achievements with a blank name are
+/// skipped because a blank key cannot be matched to a stored achievement.
 pub fn parse_achievement_bit_mappings(
     bytes: &[u8],
 ) -> Result<Vec<AchievementBitMapping>, AchievementSchemaError> {
     let root = parse_achievement_schema_root(bytes)?;
-    let stats = schema_stats(&root)?;
     let mut mappings = Vec::new();
-    for (stat_key, stat) in stats {
-        let Ok(stat_id) = stat_key.parse::<u32>() else {
+    for stat in accepted_stats(schema_stats(&root)?) {
+        if stat.kind != STAT_TYPE_ACHIEVEMENTS {
             continue;
-        };
-        let Some(bits) = stat
-            .object()
-            .and_then(|stat| stat.get("bits"))
-            .and_then(AchievementSchemaValue::object)
+        }
+        let Some(bits) = schema_find(stat.entries, "bits").and_then(AchievementSchemaValue::object)
         else {
             continue;
         };
         for (bit_key, achievement) in bits {
-            let Ok(achievement_bit) = bit_key.parse::<u32>() else {
+            let Ok(achievement_bit) = u32::try_from(c_atoi(bit_key)) else {
                 continue;
             };
+            if achievement_bit > MAX_ACHIEVEMENT_BIT {
+                continue;
+            }
             let Some(key) = achievement
                 .object()
-                .and_then(|achievement| achievement.get("name"))
+                .and_then(|achievement| schema_find(achievement, "name"))
                 .and_then(AchievementSchemaValue::string)
                 .filter(|key| !key.trim().is_empty())
             else {
                 continue;
             };
             mappings.push(AchievementBitMapping {
-                stat_id,
+                stat_id: stat.id,
                 achievement_bit,
                 key: key.to_owned(),
             });
@@ -1401,44 +1420,114 @@ pub fn parse_achievement_bit_mappings(
 }
 
 /// Parse the binary KeyValues stats schema returned by Steam and return the
-/// ordinary stat identifiers used by stats sync packets.
+/// ordinary stat identifiers used by stats sync packets: accepted stats of
+/// types 1..=3 that carry a usable name.
 pub fn parse_stat_mappings(bytes: &[u8]) -> Result<Vec<StatMapping>, AchievementSchemaError> {
     let root = parse_achievement_schema_root(bytes)?;
-    let stats = schema_stats(&root)?;
     let mut mappings = Vec::new();
-    for (stat_key, stat) in stats {
-        let Ok(stat_id) = stat_key.parse::<u32>() else {
-            continue;
-        };
-        let Some(stat) = stat.object() else {
-            continue;
-        };
-        if stat.get("bits").is_some() {
+    for stat in accepted_stats(schema_stats(&root)?) {
+        if stat.kind == STAT_TYPE_ACHIEVEMENTS {
             continue;
         }
-        let Some(key) = stat
-            .get("name")
+        let Some(key) = schema_find(stat.entries, "name")
             .and_then(AchievementSchemaValue::string)
             .filter(|key| !key.trim().is_empty())
         else {
             continue;
         };
         mappings.push(StatMapping {
-            stat_id,
+            stat_id: stat.id,
             key: key.to_owned(),
-            value_type: stat
-                .get("type")
-                .and_then(AchievementSchemaValue::int)
-                .or_else(|| stat.get("display").and_then(AchievementSchemaValue::int)),
+            value_type: Some(stat.kind),
         });
     }
     mappings.sort_by_key(|mapping| mapping.stat_id);
     Ok(mappings)
 }
 
+const STAT_TYPE_ACHIEVEMENTS: i64 = 4;
+const MAX_ACHIEVEMENT_BIT: u32 = 31;
+
+/// A stat entry Steam's schema loader accepts.
+struct AcceptedStat<'a> {
+    id: u32,
+    kind: i64,
+    entries: &'a [(String, AchievementSchemaValue)],
+}
+
+/// The stats Steam accepts, in document order. The id is the key read with
+/// V_atoi and must fit in 16 bits; the type must resolve to 1..=4. Steam
+/// rejects every other stat together with any achievements under it.
+fn accepted_stats(
+    stats: &[(String, AchievementSchemaValue)],
+) -> impl Iterator<Item = AcceptedStat<'_>> {
+    stats.iter().filter_map(|(key, stat)| {
+        let entries = stat.object()?;
+        let id = u16::try_from(steam_atoi(key)).ok()?;
+        let kind = schema_find(entries, "type").map_or(0, schema_stat_type);
+        (1..=STAT_TYPE_ACHIEVEMENTS)
+            .contains(&kind)
+            .then_some(AcceptedStat {
+                id: u32::from(id),
+                kind,
+                entries,
+            })
+    })
+}
+
+/// Resolve a stat's declared type the way Steam's schema loader does: a type
+/// name compared case-insensitively, otherwise the value read with GetInt.
+/// Anything Steam cannot resolve reads as 0, which it rejects.
+fn schema_stat_type(value: &AchievementSchemaValue) -> i64 {
+    const TYPE_NAMES: [(&str, i64); 4] = [
+        ("INT", 1),
+        ("FLOAT", 2),
+        ("AVGRATE", 3),
+        ("ACHIEVEMENTS", 4),
+    ];
+    if let Some(text) = value.string() {
+        if let Some((_, kind)) = TYPE_NAMES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(text))
+        {
+            return *kind;
+        }
+    }
+    value.steam_int()
+}
+
+/// Steam's V_atoi: an optional sign and the decimal digits that follow it.
+/// Leading whitespace is not skipped, and text without digits reads as 0.
+fn steam_atoi(text: &str) -> i64 {
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let value = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0_i64, |value, digit| {
+            value
+                .saturating_mul(10)
+                .saturating_add(i64::from(digit - b'0'))
+        });
+    if negative {
+        -value
+    } else {
+        value
+    }
+}
+
+/// The C library atoi Steam applies to achievement bit keys: as V_atoi, but
+/// leading whitespace is skipped first.
+fn c_atoi(text: &str) -> i64 {
+    steam_atoi(text.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b'))
+}
+
 fn parse_achievement_schema_root(
     bytes: &[u8],
-) -> Result<std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError> {
+) -> Result<AchievementSchemaObject, AchievementSchemaError> {
     let mut parser = AchievementSchemaParser::new(bytes);
     if parser.byte()? != 0 {
         return Err(AchievementSchemaError::MissingRoot);
@@ -1448,9 +1537,9 @@ fn parse_achievement_schema_root(
 }
 
 fn schema_stats(
-    root: &std::collections::HashMap<String, AchievementSchemaValue>,
-) -> Result<&std::collections::HashMap<String, AchievementSchemaValue>, AchievementSchemaError> {
-    root.get("stats")
+    root: &[(String, AchievementSchemaValue)],
+) -> Result<&[(String, AchievementSchemaValue)], AchievementSchemaError> {
+    schema_find(root, "stats")
         .and_then(AchievementSchemaValue::object)
         .ok_or(AchievementSchemaError::MissingRoot)
 }
@@ -2291,6 +2380,7 @@ mod tests {
         kv_object(&mut schema, "620", |root| {
             kv_object(root, "stats", |stats| {
                 kv_object(stats, "11", |stat| {
+                    kv_int(stat, "type", 4);
                     kv_object(stat, "bits", |bits| {
                         kv_object(bits, "0", |achievement| {
                             kv_string(achievement, "name", "ACH_FIRST");
@@ -2301,6 +2391,7 @@ mod tests {
                     });
                 });
                 kv_object(stats, "12", |stat| {
+                    kv_int(stat, "type", 4);
                     kv_object(stat, "bits", |bits| {
                         kv_object(bits, "1", |achievement| {
                             kv_string(achievement, "name", "ACH_OTHER");
@@ -2355,6 +2446,169 @@ mod tests {
             parse_stat_mappings(&schema).unwrap(),
             vec![StatMapping {
                 stat_id: 11,
+                key: "STAT_SCORE".into(),
+                value_type: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolves_stat_types_written_as_strings() {
+        let mut schema = Vec::new();
+        kv_object(&mut schema, "620", |root| {
+            kv_object(root, "stats", |stats| {
+                for (id, name, value) in [
+                    ("1", "STAT_DIGIT", "1"),
+                    ("2", "STAT_FLOAT", "FLOAT"),
+                    ("3", "STAT_RATE", "avgrate"),
+                    ("4", "STAT_UNKNOWN", "SOMETHING"),
+                ] {
+                    kv_object(stats, id, |stat| {
+                        kv_string(stat, "name", name);
+                        kv_string(stat, "type", value);
+                    });
+                }
+            });
+        });
+
+        // Steam rejects a stat whose type does not resolve to 1..=4.
+        let types = parse_stat_mappings(&schema)
+            .unwrap()
+            .into_iter()
+            .map(|mapping| (mapping.key, mapping.value_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                ("STAT_DIGIT".to_owned(), Some(1)),
+                ("STAT_FLOAT".to_owned(), Some(2)),
+                ("STAT_RATE".to_owned(), Some(3)),
+            ]
+        );
+    }
+
+    /// The rules below were observed by running the same schemas through
+    /// Steam's own schema loader.
+    #[test]
+    fn registers_stats_and_achievements_as_steam_does() {
+        let mut schema = Vec::new();
+        kv_object(&mut schema, "620", |root| {
+            kv_object(root, "stats", |stats| {
+                // Bits under an ordinary stat are ignored; the stat is kept.
+                kv_object(stats, "1", |stat| {
+                    kv_string(stat, "type", "int");
+                    kv_string(stat, "name", "kills");
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "0", |a| kv_string(a, "name", "IGNORED"));
+                    });
+                });
+                // Achievement stats never become ordinary stats.
+                kv_object(stats, "2", |stat| {
+                    kv_int(stat, "type", 4);
+                    kv_string(stat, "name", "bitfield");
+                });
+                // Keys and type names are matched without regard to case;
+                // bit keys are read by atoi, and only bits 0..=31 exist.
+                kv_object(stats, "+3", |stat| {
+                    kv_string(stat, "TYPE", "+4");
+                    kv_object(stat, "Bits", |bits| {
+                        kv_object(bits, " 1", |a| kv_string(a, "NAME", "SPACED"));
+                        kv_object(bits, "31", |a| kv_string(a, "name", "LAST"));
+                        kv_object(bits, "32", |a| kv_string(a, "name", "TOO_HIGH"));
+                    });
+                });
+                // Ids must fit in 16 bits, and a type must resolve to 1..=4.
+                for (id, kind) in [("65536", "4"), ("-1", "4"), ("4", " 4"), ("5", "int ")] {
+                    kv_object(stats, id, |stat| {
+                        kv_string(stat, "type", kind);
+                        kv_string(stat, "name", "rejected");
+                        kv_object(stat, "bits", |bits| {
+                            kv_object(bits, "0", |a| kv_string(a, "name", "REJECTED"));
+                        });
+                    });
+                }
+                kv_object(stats, "6", |stat| {
+                    kv_string(stat, "name", "untyped");
+                });
+                // Steam resolves a duplicated key to its first entry.
+                kv_object(stats, "7", |stat| {
+                    kv_int(stat, "type", 4);
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "0", |a| {
+                            kv_string(a, "name", "FIRST");
+                            kv_string(a, "name", "SECOND");
+                        });
+                    });
+                });
+            });
+        });
+
+        let stats = parse_stat_mappings(&schema)
+            .unwrap()
+            .into_iter()
+            .map(|stat| (stat.stat_id, stat.key, stat.value_type))
+            .collect::<Vec<_>>();
+        assert_eq!(stats, vec![(1, "kills".to_owned(), Some(1))]);
+        let achievements = parse_achievement_bit_mappings(&schema)
+            .unwrap()
+            .into_iter()
+            .map(|achievement| {
+                (
+                    achievement.stat_id,
+                    achievement.achievement_bit,
+                    achievement.key,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            achievements,
+            vec![
+                (3, 1, "SPACED".to_owned()),
+                (3, 31, "LAST".to_owned()),
+                (7, 0, "FIRST".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_utf8_display_text_does_not_hide_mappings() {
+        let mut schema = Vec::new();
+        kv_object(&mut schema, "620", |root| {
+            kv_object(root, "stats", |stats| {
+                kv_object(stats, "11", |stat| {
+                    kv_string(stat, "type", "4");
+                    kv_object(stat, "bits", |bits| {
+                        kv_object(bits, "0", |achievement| {
+                            kv_string(achievement, "name", "ACH_FIRST");
+                            kv_object(achievement, "display", |display| {
+                                kv_object(display, "name", |name| {
+                                    // "Réussite" in Latin-1.
+                                    name.push(1);
+                                    name.extend_from_slice(b"french\0R\xe9ussite\0");
+                                });
+                            });
+                        });
+                    });
+                });
+                kv_object(stats, "12", |stat| {
+                    kv_string(stat, "name", "STAT_SCORE");
+                    kv_string(stat, "type", "INT");
+                });
+            });
+        });
+
+        assert_eq!(
+            parse_achievement_bit_mappings(&schema).unwrap(),
+            vec![AchievementBitMapping {
+                stat_id: 11,
+                achievement_bit: 0,
+                key: "ACH_FIRST".into(),
+            }]
+        );
+        assert_eq!(
+            parse_stat_mappings(&schema).unwrap(),
+            vec![StatMapping {
+                stat_id: 12,
                 key: "STAT_SCORE".into(),
                 value_type: Some(1),
             }]

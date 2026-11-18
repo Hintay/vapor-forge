@@ -277,6 +277,52 @@ pub(crate) fn has_pending_stats(owner_scope: &str, steam_id64: &str, app_id: u32
     })
 }
 
+/// Refused local stats still waiting to be merged with the backend's state.
+pub(crate) fn pending_stats_merge(
+    owner_scope: &str,
+    steam_id64: &str,
+    app_id: u32,
+) -> Option<vapor_forge_sync_journal::PendingStatsMerge> {
+    let worker = worker()?;
+    match worker
+        .journal
+        .pending_stats_merge(owner_scope, steam_id64, app_id)
+    {
+        Ok(merge) => merge,
+        Err(error) => {
+            warn!(%error, app_id, "achievement-sync: failed to read pending stats merge");
+            None
+        }
+    }
+}
+
+/// Record that the backend's state was merged with the refused values. The
+/// rebuilt commit uses `base_crc_stats` as its baseline.
+pub(crate) fn settle_stats_merge(
+    owner_scope: &str,
+    steam_id64: &str,
+    app_id: u32,
+    commit_id: &str,
+    base_crc_stats: Option<u32>,
+) -> bool {
+    let Some(worker) = worker() else {
+        return false;
+    };
+    match worker.journal.settle_stats_merge(
+        owner_scope,
+        steam_id64,
+        app_id,
+        commit_id,
+        base_crc_stats,
+    ) {
+        Ok(settled) => settled,
+        Err(error) => {
+            warn!(%error, app_id, "achievement-sync: failed to settle stats merge");
+            false
+        }
+    }
+}
+
 pub fn queue_schema(app_id: u32, schema_version: Option<String>, content: Vec<u8>) {
     if content.is_empty() {
         return;
@@ -392,14 +438,21 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                     break;
                 }
             };
+            let mut credential_blocked = false;
             for queued in &schemas {
                 let schema = &queued.value;
                 attempted = true;
-                match backend.upload_achievement_schema(schema) {
+                match backend.upload_achievement_schema(descriptor.client_id, schema) {
                     Ok(SchemaUploadOutcome::Accepted | SchemaUploadOutcome::Declined) => {
                         if let Err(error) = journal.acknowledge(queued) {
                             warn!(%error, app_id = schema.app_id, "achievement-sync: failed to acknowledge schema upload");
                         }
+                    }
+                    Err(error) if error.is_credential_blocked() => {
+                        warn!(%error, app_id = schema.app_id, "achievement-sync: uploads paused until the cloud configuration changes");
+                        device_binding.record_failure(binding_generation, false);
+                        credential_blocked = true;
+                        break;
                     }
                     Err(error) if error.is_retryable() => {
                         warn!(%error, app_id = schema.app_id, "achievement-sync: schema upload deferred");
@@ -414,6 +467,10 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                         }
                     }
                 }
+            }
+
+            if credential_blocked {
+                break;
             }
 
             let Some(identity) = upload_identity() else {
@@ -444,7 +501,8 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                     // A stats_out_of_date verdict means the backend did not
                     // store this snapshot as given. Settling it here would drop
                     // state Steam already considers committed, so the commit is
-                    // kept and rebuilt from the refreshed cache instead.
+                    // kept and rebuilt once the backend's state is merged into
+                    // Steam's cache.
                     Ok(result) => match refused_app_result(snapshot, &result) {
                         Some(refused) => {
                             match journal.reopen_stats_commit(queued, refused.crc_stats, unix_now())
@@ -459,9 +517,16 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                         None => {
                             if let Err(error) = journal.acknowledge(queued) {
                                 warn!(%error, app_id = snapshot.app_id, "achievement-sync: failed to acknowledge official snapshot");
+                            } else if issued_new_baseline(snapshot, &result) {
+                                queue_baseline_refresh_after_upload(snapshot);
                             }
                         }
                     },
+                    Err(error) if error.is_credential_blocked() => {
+                        warn!(%error, app_id = snapshot.app_id, "achievement-sync: uploads paused until the cloud configuration changes");
+                        device_binding.record_failure(binding_generation, false);
+                        break;
+                    }
                     Err(error) if error.is_retryable() => {
                         warn!(%error, app_id = snapshot.app_id, "achievement-sync: official snapshot deferred");
                         if let Err(mark_error) = journal.defer(queued, unix_now()) {
@@ -477,6 +542,10 @@ fn upload_loop(journal: Arc<SyncJournal>, wake: mpsc::Receiver<()>) {
                     }
                 }
             }
+            if !device_binding.allows(binding_generation) {
+                break;
+            }
+            retry_due_stats_merges(&journal, &stats_scope, &identity.steam_id64);
             if !attempted {
                 break;
             }
@@ -525,18 +594,87 @@ fn next_achievement_attempt_at(journal: &SyncJournal) -> Option<i64> {
         return schema;
     };
     let stats = match crate::sync_journal::cached_principal_scope(backend.as_ref()) {
-        Some(scope) => match journal.next_stats_snapshot_attempt_at(&scope, &identity.steam_id64) {
-            Ok(next) => next,
-            Err(error) => {
-                warn!(%error, "achievement-sync: failed to schedule stats journal");
-                None
-            }
-        },
+        Some(scope) => {
+            let snapshots = journal
+                .next_stats_snapshot_attempt_at(&scope, &identity.steam_id64)
+                .unwrap_or_else(|error| {
+                    warn!(%error, "achievement-sync: failed to schedule stats journal");
+                    None
+                });
+            let merges = journal
+                .next_stats_merge_attempt_at(&scope, &identity.steam_id64)
+                .unwrap_or_else(|error| {
+                    warn!(%error, "achievement-sync: failed to schedule stats merges");
+                    None
+                });
+            earliest(snapshots, merges)
+        }
         None => None,
     };
     match (schema, stats) {
         (Some(left), Some(right)) => Some(left.min(right)),
         (some, None) | (None, some) => some,
+    }
+}
+
+fn earliest(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+/// Ask Steam again for every refused commit whose merge has not settled yet,
+/// for example because the backend was unreachable at the first attempt.
+fn retry_due_stats_merges(journal: &SyncJournal, owner_scope: &str, steam_id64: &str) {
+    let app_ids = match journal.take_due_stats_merges(owner_scope, steam_id64, unix_now()) {
+        Ok(app_ids) => app_ids,
+        Err(error) => {
+            warn!(%error, "achievement-sync: failed to read pending stats merges");
+            return;
+        }
+    };
+    for app_id in app_ids {
+        let marker = match journal.pending_stats_commit(owner_scope, steam_id64, app_id) {
+            Ok(Some(marker)) => marker,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(%error, app_id, "achievement-sync: failed to read refused stats commit");
+                continue;
+            }
+        };
+        queue_refresh_then_read(marker);
+    }
+}
+
+/// Whether an accepted upload left the backend holding a baseline that Steam
+/// has not seen yet.
+fn issued_new_baseline(snapshot: &SteamAppSnapshot, result: &SteamStateUploadResult) -> bool {
+    result.stats_apps.iter().any(|app| {
+        app.app_id == snapshot.app_id
+            && app.crc_stats.is_some()
+            && app.crc_stats != snapshot.base_crc_stats
+    })
+}
+
+/// Hand the baseline issued for this device's own upload to Steam, so its next
+/// commit is built on it. Wakeups caused by this device are not relied on.
+fn queue_baseline_refresh_after_upload(snapshot: &SteamAppSnapshot) {
+    let runtime_generation = crate::client::install::runtime_generation();
+    let Some(owner) = crate::client::user_stats::capture_stats_snapshot_owner(runtime_generation)
+    else {
+        return;
+    };
+    if owner.principal_scope != snapshot.owner_scope
+        || owner.guard.steam_id64.to_string() != snapshot.owner_steam_id64
+    {
+        return;
+    }
+    if !crate::client::user_stats::queue_backend_stats_refresh(snapshot.app_id, owner.guard) {
+        warn!(
+            app_id = snapshot.app_id,
+            "achievement-sync: user-stats refresh worker unavailable after upload"
+        );
     }
 }
 
@@ -552,37 +690,43 @@ fn refused_app_result<'a>(
 }
 
 fn queue_native_refresh_after_upload(snapshot: &SteamAppSnapshot) {
-    let runtime_generation = crate::client::install::runtime_generation();
-    let Some(owner) = crate::client::user_stats::capture_stats_snapshot_owner(runtime_generation)
-    else {
-        warn!(
-            app_id = snapshot.app_id,
-            "achievement-sync: cannot queue stats_out_of_date refresh without current runtime guard"
-        );
-        return;
-    };
-    if owner.principal_scope != snapshot.owner_scope
-        || owner.guard.steam_id64.to_string() != snapshot.owner_steam_id64
-    {
-        return;
-    }
     let Some(worker) = worker() else {
         return;
     };
-    let marker = match worker.journal.pending_stats_commit(
+    match worker.journal.pending_stats_commit(
         &snapshot.owner_scope,
         &snapshot.owner_steam_id64,
         snapshot.app_id,
     ) {
-        Ok(Some(marker)) if marker.commit_id == snapshot.commit_id => marker,
-        _ => return,
+        Ok(Some(marker)) if marker.commit_id == snapshot.commit_id => {
+            queue_refresh_then_read(marker);
+        }
+        _ => {}
+    }
+}
+
+/// Have Steam request the app's stats again, which merges the backend's state
+/// for a refused commit, then read the refreshed cache to rebuild the commit.
+fn queue_refresh_then_read(marker: StatsCommit) {
+    let app_id = marker.app_id;
+    let runtime_generation = crate::client::install::runtime_generation();
+    let Some(owner) = crate::client::user_stats::capture_stats_snapshot_owner(runtime_generation)
+    else {
+        warn!(
+            app_id,
+            "achievement-sync: cannot queue stats_out_of_date refresh without current runtime guard"
+        );
+        return;
     };
+    if !crate::client::install::config().is_controlled_app(vapor_forge_config::AppId(app_id)) {
+        return;
+    }
     let Some(intent) = crate::client::user_stats::StatsSnapshotIntent::new(marker, &owner) else {
         return;
     };
     if !crate::client::user_stats::queue_snapshot_refresh_then_read(intent) {
         warn!(
-            app_id = snapshot.app_id,
+            app_id,
             "achievement-sync: user-stats refresh worker unavailable after stats_out_of_date"
         );
     }

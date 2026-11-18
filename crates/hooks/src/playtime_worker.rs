@@ -532,6 +532,10 @@ fn flush(journal: &SyncJournal) -> FlushOutcome {
                     }
                     debug!(count = entries.len(), %steam_id64, "playtime-sync: snapshot uploaded");
                 }
+                Err(error) if error.is_credential_blocked() => {
+                    warn!(%error, "playtime-sync: uploads paused until the cloud configuration changes");
+                    return FlushOutcome::DeviceBindingFailed { retryable: false };
+                }
                 Err(error) if error.is_retryable() => {
                     warn!(%error, %steam_id64, "playtime-sync: upload deferred");
                     if let Err(mark_error) = journal.defer_all(&entries, unix_now()) {

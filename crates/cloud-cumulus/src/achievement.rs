@@ -74,17 +74,19 @@ pub enum SchemaUploadOutcome {
 
 pub fn upload_schema(
     settings: &CumulusSettings,
+    client_id: u64,
     schema: &AchievementSchema,
 ) -> Result<SchemaUploadOutcome, CumulusError> {
-    let response: SchemaUploadResponse = CumulusClient::new(settings, None).post_json_response(
-        "/api/v1/device/achievement-schema",
-        &SchemaUploadRequest {
-            app_id: schema.app_id,
-            language: &schema.language,
-            schema_version: schema.schema_version.as_deref(),
-            content_base64: STANDARD.encode(&schema.content),
-        },
-    )?;
+    let response: SchemaUploadResponse = CumulusClient::new(settings, Some(client_id))
+        .post_json_response(
+            "/api/v1/device/achievement-schema",
+            &SchemaUploadRequest {
+                app_id: schema.app_id,
+                language: &schema.language,
+                schema_version: schema.schema_version.as_deref(),
+                content_base64: STANDARD.encode(&schema.content),
+            },
+        )?;
     Ok(if response.accepted {
         SchemaUploadOutcome::Uploaded
     } else {
@@ -229,14 +231,14 @@ mod tests {
             content: b"binary-schema".to_vec(),
         };
         assert_eq!(
-            upload_schema(&settings(url), &schema).unwrap(),
+            upload_schema(&settings(url), 91, &schema).unwrap(),
             SchemaUploadOutcome::Uploaded
         );
         let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(request.starts_with("POST /api/v1/device/achievement-schema HTTP/1.1"));
-        assert!(!request
+        assert!(request
             .to_ascii_lowercase()
-            .contains("x-cumulus-steam-client-id:"));
+            .contains("x-cumulus-steam-client-id: 91"));
         let body: serde_json::Value =
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["app_id"], 620);

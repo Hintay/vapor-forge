@@ -13,7 +13,7 @@ use vapor_forge_cloud_core::{
     PlaytimeEntry, StatsCommit, SteamAppSnapshot,
 };
 
-use crate::ConflictResolutionEvent;
+use crate::{ConflictResolutionEvent, PendingStatsMerge};
 
 /// Resolution value meaning the cloud copy won, which is the only outcome the
 /// backend needs to be told about.
@@ -117,6 +117,34 @@ pub(crate) trait StatsQueries {
     fn owned_by(self, owner_scope: String, owner_steam_id64: String) -> Self;
     fn identified(self, owner_scope: String, owner_steam_id64: String, app_id: u32) -> Self;
     fn ready<R: RangeBounds<i64>>(self, next_attempt_at: R) -> Self;
+}
+
+/// Local stats state the backend refused because it was built on an outdated
+/// baseline. While this exists for an app, the matching commit may not be
+/// completed: Steam's cache has to take the backend's state, merged with these
+/// values, before the next upload is built from it.
+#[derive(Persistent)]
+pub(crate) struct StatsMergeRecord {
+    #[index(mode = "cluster")]
+    pub(crate) owner_scope: String,
+    #[index(mode = "cluster")]
+    pub(crate) owner_steam_id64: String,
+    #[index(mode = "cluster")]
+    pub(crate) app_id: u32,
+    pub(crate) commit_id: String,
+    pub(crate) dirty_stat_ids: Vec<u32>,
+    pub(crate) achievements: Vec<AchievementStateRecord>,
+    pub(crate) stats: Vec<StatStateRecord>,
+    pub(crate) attempts: i64,
+    #[index(mode = "cluster")]
+    pub(crate) next_attempt_at: i64,
+    pub(crate) created_at: i64,
+}
+
+#[queries(StatsMergeRecord)]
+pub(crate) trait StatsMergeQueries {
+    fn owned_by(self, owner_scope: String, owner_steam_id64: String) -> Self;
+    fn identified(self, owner_scope: String, owner_steam_id64: String, app_id: u32) -> Self;
 }
 
 #[derive(Persistent)]
@@ -365,6 +393,67 @@ impl StatsRecord {
                 .collect(),
             observed_at: self.snapshot_observed_at?,
         })
+    }
+}
+
+impl StatsMergeRecord {
+    pub(crate) fn new(snapshot: &SteamAppSnapshot, next_attempt_at: i64, now: i64) -> Self {
+        Self {
+            owner_scope: snapshot.owner_scope.clone(),
+            owner_steam_id64: snapshot.owner_steam_id64.clone(),
+            app_id: snapshot.app_id,
+            commit_id: snapshot.commit_id.clone(),
+            dirty_stat_ids: snapshot.dirty_stat_ids.clone(),
+            achievements: snapshot
+                .achievements
+                .iter()
+                .map(|achievement| AchievementStateRecord {
+                    key: achievement.key.clone(),
+                    unlocked: achievement.unlocked,
+                    unlocked_at: achievement.unlocked_at,
+                })
+                .collect(),
+            stats: snapshot
+                .stats
+                .iter()
+                .map(|stat| StatStateRecord {
+                    key: stat.key.clone(),
+                    value_type: stat.value_type.clone(),
+                    value: stat.value.clone(),
+                })
+                .collect(),
+            attempts: 0,
+            next_attempt_at,
+            created_at: now,
+        }
+    }
+
+    pub(crate) fn value(&self) -> PendingStatsMerge {
+        PendingStatsMerge {
+            owner_scope: self.owner_scope.clone(),
+            owner_steam_id64: self.owner_steam_id64.clone(),
+            app_id: self.app_id,
+            commit_id: self.commit_id.clone(),
+            dirty_stat_ids: self.dirty_stat_ids.clone(),
+            achievements: self
+                .achievements
+                .iter()
+                .map(|achievement| OfficialAchievementState {
+                    key: achievement.key.clone(),
+                    unlocked: achievement.unlocked,
+                    unlocked_at: achievement.unlocked_at,
+                })
+                .collect(),
+            stats: self
+                .stats
+                .iter()
+                .map(|stat| OfficialStatState {
+                    key: stat.key.clone(),
+                    value_type: stat.value_type.clone(),
+                    value: stat.value.clone(),
+                })
+                .collect(),
+        }
     }
 }
 

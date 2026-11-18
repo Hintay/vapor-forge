@@ -12,12 +12,15 @@ use vapor_forge_cloud_core::{
 
 use crate::record::*;
 use crate::retry::retry_delay;
-use crate::{ConflictResolutionEvent, SyncJournalError};
+use crate::{ConflictResolutionEvent, PendingStatsMerge, SyncJournalError};
 
 const PLAYTIME_BATCH_LIMIT: usize = 500;
 const SCHEMA_BATCH_LIMIT: usize = 10;
 const STATS_BATCH_LIMIT: usize = 100;
 const CONFLICT_BATCH_LIMIT: usize = 100;
+/// Seconds before a refused commit asks again for the backend's state when the
+/// first request did not settle the merge.
+const STATS_MERGE_RETRY_SECS: i64 = 30;
 
 /// A record handed out for upload, carrying the identity needed to settle it.
 ///
@@ -156,6 +159,7 @@ impl SyncJournal {
         database.define::<ConflictRecord>()?;
         database.define::<DeviceRecord>()?;
         database.define::<BackendPrincipalRecord>()?;
+        database.define::<StatsMergeRecord>()?;
         Ok(Self {
             database,
             writer: Mutex::new(()),
@@ -391,6 +395,15 @@ impl SyncJournal {
                     tx.insert(&record)?;
                 }
             }
+            // The new commit carries Steam's current cache, which still holds
+            // the refused values. If it is refused in turn it records its own
+            // merge, so the older one is no longer needed.
+            Self::delete_stats_merge(
+                tx,
+                &commit.owner_scope,
+                &commit.owner_steam_id64,
+                commit.app_id,
+            )?;
             Ok(())
         })
     }
@@ -436,6 +449,18 @@ impl SyncJournal {
                 return Ok(false);
             };
             if record.has_snapshot() || record.commit_id != snapshot.commit_id {
+                return Ok(false);
+            }
+            if Self::stats_merge_for(
+                tx,
+                &snapshot.owner_scope,
+                &snapshot.owner_steam_id64,
+                snapshot.app_id,
+            )
+            .is_some()
+            {
+                // Steam's cache still predates the backend's state, so a
+                // snapshot read from it would overwrite other devices' values.
                 return Ok(false);
             }
             record.complete(snapshot);
@@ -502,7 +527,10 @@ impl SyncJournal {
     }
 
     /// Put a refused upload back into the awaiting-snapshot state and adopt the
-    /// baseline the backend reported. Returns `false` when the record has since
+    /// baseline the backend reported. The refused values are kept as a pending
+    /// merge, which blocks completion of the commit until
+    /// [`Self::settle_stats_merge`] records that the backend's state was
+    /// merged into Steam's cache. Returns `false` when the record has since
     /// been replaced by a newer commit, which already supersedes this one.
     pub fn reopen_stats_commit(
         &self,
@@ -520,8 +548,110 @@ impl SyncJournal {
             }
             stored.reopen(base_crc_stats, now);
             tx.update(&id, &stored)?;
+            let snapshot = &item.value;
+            Self::delete_stats_merge(
+                tx,
+                &snapshot.owner_scope,
+                &snapshot.owner_steam_id64,
+                snapshot.app_id,
+            )?;
+            tx.insert(&StatsMergeRecord::new(
+                snapshot,
+                now.saturating_add(STATS_MERGE_RETRY_SECS),
+                now,
+            ))?;
             Ok(true)
         })
+    }
+
+    /// The refused values still waiting to be merged with the backend's state.
+    pub fn pending_stats_merge(
+        &self,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+        app_id: u32,
+    ) -> Result<Option<PendingStatsMerge>, SyncJournalError> {
+        Ok(self
+            .fetch(Filter::<StatsMergeRecord>::new().identified(
+                owner_scope.to_owned(),
+                owner_steam_id64.to_owned(),
+                app_id,
+            ))
+            .next()
+            .map(|(_, record)| record.value()))
+    }
+
+    /// Record that Steam's cache now holds the backend's state merged with the
+    /// refused values, and adopt the backend's baseline for the rebuilt
+    /// upload. Returns `false` when the merge no longer belongs to `commit_id`.
+    pub fn settle_stats_merge(
+        &self,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+        app_id: u32,
+        commit_id: &str,
+        base_crc_stats: Option<u32>,
+    ) -> Result<bool, SyncJournalError> {
+        self.write(|tx| {
+            let Some((merge_id, merge)) =
+                Self::stats_merge_for(tx, owner_scope, owner_steam_id64, app_id)
+            else {
+                return Ok(false);
+            };
+            if merge.commit_id != commit_id {
+                return Ok(false);
+            }
+            tx.delete(&merge_id)?;
+            if let Some((id, mut record)) =
+                Self::stats_for(tx, owner_scope, owner_steam_id64, app_id)
+            {
+                if record.commit_id == commit_id && !record.has_snapshot() {
+                    record.base_crc_stats = base_crc_stats;
+                    record.revision = record.revision.wrapping_add(1);
+                    tx.update(&id, &record)?;
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// Apps whose merge is due for another attempt, rescheduling each one.
+    pub fn take_due_stats_merges(
+        &self,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+        now: i64,
+    ) -> Result<Vec<u32>, SyncJournalError> {
+        self.write(|tx| {
+            let due = Filter::<StatsMergeRecord>::new()
+                .owned_by(owner_scope.to_owned(), owner_steam_id64.to_owned())
+                .fetch_tx(tx)
+                .filter(|(_, record)| record.next_attempt_at <= now)
+                .collect::<Vec<_>>();
+            let mut app_ids = Vec::with_capacity(due.len());
+            for (id, mut record) in due {
+                record.attempts = record.attempts.saturating_add(1);
+                record.next_attempt_at =
+                    now.saturating_add(retry_delay(record.attempts).max(STATS_MERGE_RETRY_SECS));
+                tx.update(&id, &record)?;
+                app_ids.push(record.app_id);
+            }
+            Ok(app_ids)
+        })
+    }
+
+    pub fn next_stats_merge_attempt_at(
+        &self,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+    ) -> Result<Option<i64>, SyncJournalError> {
+        Ok(self
+            .fetch(
+                Filter::<StatsMergeRecord>::new()
+                    .owned_by(owner_scope.to_owned(), owner_steam_id64.to_owned()),
+            )
+            .map(|(_, record)| record.next_attempt_at)
+            .min())
     }
 
     // -----------------------------------------------------------------------
@@ -779,6 +909,35 @@ impl SyncJournal {
             app_id,
         ))
         .next()
+    }
+
+    fn stats_merge_for(
+        tx: &mut structsy::OwnedSytx,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+        app_id: u32,
+    ) -> Option<(Ref<StatsMergeRecord>, StatsMergeRecord)> {
+        Filter::<StatsMergeRecord>::new()
+            .identified(owner_scope.to_owned(), owner_steam_id64.to_owned(), app_id)
+            .fetch_tx(tx)
+            .next()
+    }
+
+    fn delete_stats_merge(
+        tx: &mut structsy::OwnedSytx,
+        owner_scope: &str,
+        owner_steam_id64: &str,
+        app_id: u32,
+    ) -> Result<(), SyncJournalError> {
+        let stale = Filter::<StatsMergeRecord>::new()
+            .identified(owner_scope.to_owned(), owner_steam_id64.to_owned(), app_id)
+            .fetch_tx(tx)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        for id in stale {
+            tx.delete(&id)?;
+        }
+        Ok(())
     }
 
     fn stats_for(

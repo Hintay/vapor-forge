@@ -278,7 +278,7 @@ impl CloudBackend for LocalBackend {
         self.scope.clone()
     }
 
-    fn principal_scope(&self) -> Result<String, BackendError> {
+    fn principal_scope(&self, _client_id: Option<u64>) -> Result<String, BackendError> {
         Ok(self.scope.clone())
     }
 
@@ -300,6 +300,7 @@ impl CloudBackend for LocalBackend {
 
     fn upload_achievement_schema(
         &self,
+        _client_id: u64,
         _schema: &AchievementSchema,
     ) -> Result<SchemaUploadOutcome, BackendError> {
         Ok(SchemaUploadOutcome::Declined)
@@ -820,7 +821,7 @@ mod tests {
         };
 
         assert_eq!(
-            backend.upload_achievement_schema(&schema).unwrap(),
+            backend.upload_achievement_schema(7, &schema).unwrap(),
             SchemaUploadOutcome::Declined
         );
         assert!(!backend.accepts_achievement_schemas());

@@ -620,6 +620,136 @@ fn replacing_an_upload_batch_aborts_the_previous_server_batch() {
 }
 
 #[test]
+fn kept_cloud_delivery_drops_rejected_reports_and_continues_the_round() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal =
+        vapor_forge_sync_journal::shared(&directory.path().join("kept-cloud.redb")).unwrap();
+    for (offset, app_id) in [480_u32, 620, 730].into_iter().enumerate() {
+        journal
+            .enqueue_conflict(
+                &vapor_forge_sync_journal::ConflictResolutionEvent {
+                    owner_scope: "principal".into(),
+                    event_id: format!("event-{app_id}"),
+                    app_id,
+                    base_change_number: 4,
+                    remote_change_number: 6,
+                    resolution: "kept_cloud".into(),
+                    machine_name: Some("deck".into()),
+                },
+                offset as i64,
+            )
+            .unwrap();
+    }
+    let (server_url, captured) = scripted_server(&[
+        (
+            422,
+            r#"{"error":{"code":"bad_request","message":"remote_change_number is out of range"}}"#,
+        ),
+        (503, ""),
+        (204, ""),
+    ]);
+    let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
+        local_path: String::new(),
+        syncthing: None,
+        server_url,
+        token: "conflict-token".into(),
+        steam_client_id: Some(91),
+        steam_machine_name: None,
+        steam_id64: Some(76_561_198_000_000_001),
+        bind_device: false,
+        timeout_connect_ms: 1000,
+        timeout_ms: 2000,
+    };
+    let state = AdapterState {
+        journal: Some(Arc::clone(&journal)),
+        ..Default::default()
+    };
+    let client = CumulusClient::new(&settings).unwrap();
+
+    let error = deliver_ready_conflicts(&state, &client, "principal").unwrap_err();
+    assert_eq!(
+        conflict_report_failure(&error),
+        ConflictReportFailure::Transient
+    );
+
+    let requests = (0..3)
+        .map(|_| captured.recv_timeout(Duration::from_secs(1)).unwrap())
+        .collect::<Vec<_>>();
+    assert!(requests[0].starts_with("POST /api/v1/apps/480/conflicts/kept-cloud HTTP/1.1"));
+    assert!(requests[1].starts_with("POST /api/v1/apps/620/conflicts/kept-cloud HTTP/1.1"));
+    assert!(requests[2].starts_with("POST /api/v1/apps/730/conflicts/kept-cloud HTTP/1.1"));
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["event_id"], "event-480");
+    assert_eq!(body["base_change_number"], 4);
+    assert_eq!(body["remote_change_number"], 6);
+    assert_eq!(body["machine_name"], "deck");
+
+    // Only the transient failure stays queued; it waits for its retry time.
+    assert_eq!(journal.conflict_len().unwrap(), 1);
+    assert!(journal
+        .pending_cloud_conflicts(i64::MAX, "principal")
+        .unwrap()
+        .iter()
+        .all(|queued| queued.value.app_id == 620));
+}
+
+#[test]
+fn credential_refusal_keeps_kept_cloud_reports_queued() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal =
+        vapor_forge_sync_journal::shared(&directory.path().join("kept-cloud.redb")).unwrap();
+    for app_id in [480_u32, 620] {
+        journal
+            .enqueue_conflict(
+                &vapor_forge_sync_journal::ConflictResolutionEvent {
+                    owner_scope: "principal".into(),
+                    event_id: format!("event-{app_id}"),
+                    app_id,
+                    base_change_number: 4,
+                    remote_change_number: 6,
+                    resolution: "kept_cloud".into(),
+                    machine_name: None,
+                },
+                0,
+            )
+            .unwrap();
+    }
+    let (server_url, captured) = scripted_server(&[(
+        403,
+        r#"{"error":{"code":"device_revoked","message":"device has been revoked"}}"#,
+    )]);
+    let settings = CloudSettings {
+        backend: CloudBackendMode::Cumulus,
+        local_path: String::new(),
+        syncthing: None,
+        server_url,
+        token: "conflict-token".into(),
+        steam_client_id: Some(91),
+        steam_machine_name: None,
+        steam_id64: Some(76_561_198_000_000_001),
+        bind_device: false,
+        timeout_connect_ms: 1000,
+        timeout_ms: 2000,
+    };
+    let state = AdapterState {
+        journal: Some(Arc::clone(&journal)),
+        ..Default::default()
+    };
+    let client = CumulusClient::new(&settings).unwrap();
+
+    let error = deliver_ready_conflicts(&state, &client, "principal").unwrap_err();
+    assert_eq!(
+        conflict_report_failure(&error),
+        ConflictReportFailure::CredentialBlocked
+    );
+    captured.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(captured.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(journal.conflict_len().unwrap(), 2);
+}
+
+#[test]
 fn conflict_results_are_reported_or_bound_to_the_next_batch() {
     let directory = tempfile::tempdir().unwrap();
     let journal =
@@ -685,6 +815,7 @@ fn conflict_results_are_reported_or_bound_to_the_next_batch() {
     let report = captured.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(report.starts_with("POST /api/v1/apps/480/conflicts/kept-cloud HTTP/1.1"));
     assert!(report.contains(r#""base_change_number":1"#));
+    assert!(report.contains(r#""remote_change_number":2"#));
     let report_body: serde_json::Value =
         serde_json::from_str(report.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let event_id = report_body["event_id"].as_str().unwrap();

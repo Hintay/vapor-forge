@@ -1593,6 +1593,7 @@ mod tests {
                     kv_int(stat, "type", 3);
                 });
                 kv_object(stats, "13", |stat| {
+                    kv_int(stat, "type", 4);
                     kv_object(stat, "bits", |bits| {
                         kv_object(bits, "2", |achievement| {
                             kv_string(achievement, "name", "ACH_WIN");
