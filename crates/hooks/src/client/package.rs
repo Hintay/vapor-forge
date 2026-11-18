@@ -1,6 +1,6 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -59,9 +59,18 @@ static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// App-info cache lookup decoded from the license cache rebuild.
 static APPINFO_LOOKUP: OnceLock<AppInfoLookup> = OnceLock::new();
-/// Injected IDs moved from pkg0's app list to its depot list. Kept across
-/// account resets: pkg0 keeps these entries, and every use re-checks the list.
-static MOVED_TO_DEPOTS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+/// Injected IDs moved from a pkg0's app list to its depot list, keyed by that
+/// pkg0's address. An account reset may keep the same pkg0 and its entries;
+/// entries for any other pkg0 are dropped when a new one is captured. Unloading
+/// an app removes the depot entry only when it was appended here.
+static MOVED_TO_DEPOTS: Mutex<BTreeMap<(usize, u32), DepotOrigin>> = Mutex::new(BTreeMap::new());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DepotOrigin {
+    Native,
+    Appended,
+}
+
 /// A pass moving unknown app IDs is queued on the engine thread.
 static RECLASSIFY_POSTED: AtomicBool = AtomicBool::new(false);
 /// Upper bound on red-black tree descent; the cache holds far fewer than 2^32 apps.
@@ -219,8 +228,10 @@ impl SteamPackageAccess {
             if unsafe { self.app_ids().contains(&raw_id) } {
                 continue;
             }
-            // SAFETY: as above, for the depot vector.
-            if is_moved_to_depots(raw_id) && unsafe { self.depot_ids().contains(&raw_id) } {
+            if moved_to_depots().contains_key(&(self.pkg0.as_ptr() as usize, raw_id))
+                // SAFETY: as above, for the depot vector.
+                && unsafe { self.depot_ids().contains(&raw_id) }
+            {
                 crate::ui::install::forget_removal(app_id);
                 adopted.push(app_id);
                 continue;
@@ -289,15 +300,18 @@ impl SteamPackageAccess {
             }
             // SAFETY: the capability guarantees a live writable pkg0 vector.
             if unsafe { self.app_ids().find_and_fast_remove(&id) } {
+                let key = (self.pkg0.as_ptr() as usize, id);
+                if listed {
+                    moved_to_depots().entry(key).or_insert(DepotOrigin::Native);
+                } else {
+                    moved_to_depots().insert(key, DepotOrigin::Appended);
+                }
                 moved.push(id);
             }
         }
         if moved.is_empty() {
             return;
         }
-        moved_to_depots()
-            .get_or_insert_with(HashSet::new)
-            .extend(moved.iter().copied());
         self.publish_package_change();
         info!(
             moved = moved.len(),
@@ -315,12 +329,13 @@ impl SteamPackageAccess {
         for &app_id in &diff.removals {
             let raw_id = app_id.0;
             // SAFETY: the capability guarantees live writable pkg0 vectors.
-            let removed = unsafe { self.app_ids().find_and_fast_remove(&raw_id) }
-                || (is_moved_to_depots(raw_id)
-                    // SAFETY: as above.
-                    && unsafe { self.depot_ids().find_and_fast_remove(&raw_id) });
-            if removed {
-                forget_moved_to_depots(raw_id);
+            let removed = unsafe { self.app_ids().find_and_fast_remove(&raw_id) };
+            let origin = moved_to_depots().remove(&(self.pkg0.as_ptr() as usize, raw_id));
+            if origin == Some(DepotOrigin::Appended) {
+                // SAFETY: the capability guarantees a live writable pkg0 vector.
+                unsafe { self.depot_ids().find_and_fast_remove(&raw_id) };
+            }
+            if removed || origin.is_some() {
                 debug!(app_id = raw_id, "package: removed from pkg0");
                 crate::ui::install::queue_removal(app_id);
                 applied.removals.push(app_id);
@@ -331,7 +346,7 @@ impl SteamPackageAccess {
             let raw_id = app_id.0;
             // SAFETY: the capability guarantees live readable pkg0 vectors.
             let present = unsafe { self.app_ids().contains(&raw_id) }
-                || (is_moved_to_depots(raw_id)
+                || (moved_to_depots().contains_key(&(self.pkg0.as_ptr() as usize, raw_id))
                     // SAFETY: as above.
                     && unsafe { self.depot_ids().contains(&raw_id) });
             if present {
@@ -379,22 +394,10 @@ fn append_grown(
     }
 }
 
-fn moved_to_depots() -> std::sync::MutexGuard<'static, Option<HashSet<u32>>> {
+fn moved_to_depots() -> std::sync::MutexGuard<'static, BTreeMap<(usize, u32), DepotOrigin>> {
     MOVED_TO_DEPOTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn is_moved_to_depots(app_id: u32) -> bool {
-    moved_to_depots()
-        .as_ref()
-        .is_some_and(|moved| moved.contains(&app_id))
-}
-
-fn forget_moved_to_depots(app_id: u32) {
-    if let Some(moved) = moved_to_depots().as_mut() {
-        moved.remove(&app_id);
-    }
 }
 
 /// Steam's app-info cache in the current engine object.
@@ -1372,6 +1375,7 @@ pub(crate) unsafe fn capture_validated_pkg0(pkg_ptr: *mut u8) {
         return;
     }
 
+    moved_to_depots().retain(|&(pkg0, _), _| pkg0 == pkg_ptr as usize);
     PKG0_PTR.store(pkg_ptr as usize, Ordering::Release);
     info!("package: captured pkg0 at 0x{:x}", pkg_ptr as usize);
     queue_initial_injection();
