@@ -590,7 +590,8 @@ fn is_repeated_field_u32_add_abi(code: &CodeRegion, addr: usize) -> bool {
 pub fn get_steamui_code() -> Option<CodeRegion> {
     use vapor_forge_memory::find_proc_self_maps_targets;
 
-    let entries = find_proc_self_maps_targets(64).ok()?;
+    // steamclient's patched pages precede steamui in the address space.
+    let entries = find_proc_self_maps_targets(crate::client::install::MAX_TARGET_MAPPINGS).ok()?;
     let exec_entry = entries
         .iter()
         .find(|e| e.permissions.starts_with("r-xp") && e.path.ends_with("/steamui.so"))?;

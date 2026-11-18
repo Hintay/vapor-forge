@@ -300,9 +300,14 @@ fn validate_live_hotfix(
     Ok(())
 }
 
+/// Upper bound on Steam module mappings read from /proc/self/maps. Every page
+/// a detour patches becomes a mapping of its own, so a hooked module spans
+/// dozens of them.
+pub(crate) const MAX_TARGET_MAPPINGS: usize = 4096;
+
 fn current_pattern_target(module: &str, code: &CodeRegion) -> Option<PatternTarget> {
     let architecture = PatternArchitecture::current()?;
-    let entries = find_proc_self_maps_targets(64).ok()?;
+    let entries = find_proc_self_maps_targets(MAX_TARGET_MAPPINGS).ok()?;
     let binary_family = binary_family_for_code_region(&entries, module, code)?;
     Some(PatternTarget {
         architecture,
@@ -310,6 +315,8 @@ fn current_pattern_target(module: &str, code: &CodeRegion) -> Option<PatternTarg
     })
 }
 
+/// The family of the module file whose executable mappings cover `code`. The
+/// mappings are adjacent and of one file; patched pages split them.
 fn binary_family_for_code_region(
     entries: &[ProcMapsEntry],
     module: &str,
@@ -318,13 +325,23 @@ fn binary_family_for_code_region(
     let file_name = format!("{module}.so");
     let suffix = format!("/{file_name}");
     let code_end = code.base.checked_add(code.bytes.len())?;
-    let mapping = entries.iter().find(|entry| {
+    let first = entries.iter().find(|entry| {
         entry.permissions.contains('x')
             && entry.range.base.0 <= code.base
-            && entry.range.end.0 >= code_end
+            && entry.range.end.0 > code.base
             && (entry.path.ends_with(&suffix) || entry.path == file_name.as_str())
     })?;
-    steam_binary_family_from_path(std::path::Path::new(&mapping.path))
+    let mut covered = first.range.end.0;
+    while covered < code_end {
+        let next = entries.iter().find(|entry| {
+            entry.permissions.contains('x')
+                && entry.range.base.0 == covered
+                && entry.range.end.0 > covered
+                && entry.path == first.path
+        })?;
+        covered = next.range.end.0;
+    }
+    steam_binary_family_from_path(std::path::Path::new(&first.path))
 }
 
 fn steam_binary_family_from_path(path: &std::path::Path) -> Option<SteamBinaryFamily> {
@@ -1435,7 +1452,8 @@ fn do_install() {
     // Background fetch of online pattern updates
     let cfg = config();
     if !cfg.runtime.patterns_url.is_empty() {
-        if let Some(target) = current_pattern_target("steamclient", &code) {
+        // The target was resolved before any page was patched.
+        if let Some(target) = registry.target() {
             vapor_forge_features::online_patterns::spawn_fetch(
                 cfg.runtime.patterns_url.clone(),
                 target,
@@ -1566,6 +1584,38 @@ mod pattern_target_tests {
         assert_eq!(
             binary_family_for_code_region(&entries, "steamclient", &code),
             Some(SteamBinaryFamily::SteamRt)
+        );
+    }
+
+    #[test]
+    fn target_family_follows_mappings_split_by_patched_pages() {
+        let path = "/home/user/.steam/steamrt64/steamclient.so";
+        let code = CodeRegion {
+            base: 0x3000,
+            bytes: &CODE_BYTES,
+        };
+        let split = [
+            mapping(0x3000, 0x3040, path),
+            mapping(0x3040, 0x3041, path),
+            mapping(0x3041, 0x3100, path),
+        ];
+        assert_eq!(
+            binary_family_for_code_region(&split, "steamclient", &code),
+            Some(SteamBinaryFamily::SteamRt)
+        );
+
+        let gap = [mapping(0x3000, 0x3040, path), mapping(0x3041, 0x3100, path)];
+        assert_eq!(
+            binary_family_for_code_region(&gap, "steamclient", &code),
+            None
+        );
+        let other_file = [
+            mapping(0x3000, 0x3040, path),
+            mapping(0x3040, 0x3100, "/home/user/.steam/linux64/steamclient.so"),
+        ];
+        assert_eq!(
+            binary_family_for_code_region(&other_file, "steamclient", &code),
+            None
         );
     }
 

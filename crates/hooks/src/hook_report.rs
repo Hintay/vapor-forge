@@ -72,7 +72,9 @@ pub(crate) fn clear_stored_results() {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn log_drift_summary(module_name: &str, hook_results: &[HookResult]) {
-    let entries = match vapor_forge_memory::find_proc_self_maps_targets(16) {
+    let entries = match vapor_forge_memory::find_proc_self_maps_targets(
+        crate::client::install::MAX_TARGET_MAPPINGS,
+    ) {
         Ok(e) => e,
         Err(_) => return,
     };

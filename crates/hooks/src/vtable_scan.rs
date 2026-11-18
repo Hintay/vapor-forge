@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Once, OnceLock};
 
 use tracing::{debug, info, warn};
-use vapor_forge_memory::find_proc_self_maps_targets;
 use vapor_forge_patterns::vtable_scan::DEFAULT_INTERFACES;
 
 static SCAN_ONCE: Once = Once::new();
@@ -350,8 +349,7 @@ fn do_scan() {
 }
 
 fn build_segments() -> Option<SegmentRanges> {
-    let _entries = find_proc_self_maps_targets(64).ok()?;
-    // Also read ALL /proc/self/maps to get full steamclient.so segments
+    // Read all of /proc/self/maps to get the full steamclient.so segments.
     let all_maps = std::fs::read_to_string("/proc/self/maps").ok()?;
 
     let mut text = Vec::new();

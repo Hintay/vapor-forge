@@ -183,6 +183,11 @@ impl PatternRegistry {
         self.hotfix_revision
     }
 
+    /// The runtime target this registry was loaded for.
+    pub fn target(&self) -> Option<PatternTarget> {
+        self.target
+    }
+
     /// Look up a pattern by function name. Runtime override wins over embedded.
     pub fn get(&self, name: &str) -> Option<PatternLookup<'_>> {
         if let Some(rt) = self.overrides.get(name) {
