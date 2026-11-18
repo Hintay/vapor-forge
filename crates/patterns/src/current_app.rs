@@ -146,6 +146,56 @@ fn writes_register(instruction: &Instruction, register: Register) -> bool {
 fn sites32(code: &[u8], text_vaddr: u64, instructions: &[Instruction]) -> Vec<(u64, u64)> {
     let mut got = None;
     let mut sites = Vec::new();
+    let stack = stack_offsets32(instructions);
+    let mut spilled_got = Vec::new();
+    for (index, instruction) in instructions.iter().enumerate() {
+        let Some(thunk) = near_call_target(instruction) else {
+            continue;
+        };
+        let Some(thunk_offset) = thunk
+            .checked_sub(text_vaddr)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            continue;
+        };
+        if code.get(thunk_offset..thunk_offset.saturating_add(4))
+            != Some(&[0x8b, 0x04, 0x24, 0xc3][..])
+        {
+            continue;
+        }
+        let Some(add) = instructions.get(index + 1) else {
+            continue;
+        };
+        if add.mnemonic() != Mnemonic::Add
+            || add.op0_register() != Register::EAX
+            || add.op1_kind() != OpKind::Immediate32
+        {
+            continue;
+        }
+        let base = (add.ip() as u32).wrapping_add(add.immediate32());
+        for store_index in index + 2..instructions.len().min(index + 20) {
+            let store = &instructions[store_index];
+            if store.mnemonic() == Mnemonic::Mov
+                && store.op0_kind() == OpKind::Memory
+                && store.memory_base() == Register::ESP
+                && store.memory_index() == Register::None
+                && store.memory_size() == MemorySize::UInt32
+                && store.op1_register() == Register::EAX
+            {
+                if let Some(sp) = stack[store_index] {
+                    spilled_got.push((
+                        store_index,
+                        sp + i64::from(store.memory_displacement32() as i32),
+                        base,
+                    ));
+                }
+                break;
+            }
+            if store.flow_control() != FlowControl::Next || writes_register(store, Register::EAX) {
+                break;
+            }
+        }
+    }
     for (index, instruction) in instructions.iter().enumerate() {
         if let Some(thunk) = near_call_target(instruction) {
             if loads_return_address_into_ebx(code, text_vaddr, thunk) {
@@ -159,7 +209,51 @@ fn sites32(code: &[u8], text_vaddr: u64, instructions: &[Instruction]) -> Vec<(u
                 continue;
             }
         }
-        let Some(got) = got else {
+        // A compiler may spill the EAX PIC base and reload it into EBX on a
+        // cold branch. Stack depths are computed along control-flow edges so
+        // an earlier return's epilogue cannot change that slot's identity.
+        let reloaded_got = index.checked_sub(1).and_then(|load_index| {
+            let load = &instructions[load_index];
+            if load.mnemonic() != Mnemonic::Mov
+                || load.op0_register() != Register::EBX
+                || load.op1_kind() != OpKind::Memory
+                || load.memory_base() != Register::ESP
+                || load.memory_index() != Register::None
+                || load.memory_size() != MemorySize::UInt32
+            {
+                return None;
+            }
+            let slot = stack[load_index]? + i64::from(load.memory_displacement32() as i32);
+            spilled_got
+                .iter()
+                .find_map(|&(store_index, stored_slot, base)| {
+                    if store_index >= load_index || slot != stored_slot {
+                        return None;
+                    }
+                    let overwritten = instructions
+                        .iter()
+                        .enumerate()
+                        .take(load_index)
+                        .skip(store_index + 1)
+                        .any(|(index, write)| {
+                            write.op0_kind() == OpKind::Memory
+                                && write.memory_base() == Register::ESP
+                                && write.memory_index() == Register::None
+                                && stack[index].is_some_and(|sp| {
+                                    let start =
+                                        sp + i64::from(write.memory_displacement32() as i32);
+                                    start < slot + 4
+                                        && start + write.memory_size().size() as i64 > slot
+                                })
+                                && !matches!(
+                                    write.mnemonic(),
+                                    Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Push
+                                )
+                        });
+                    (!overwritten).then_some(u64::from(base))
+                })
+        });
+        let Some(got) = reloaded_got.or(got) else {
             continue;
         };
         let is_slot_address = instruction.mnemonic() == Mnemonic::Lea
@@ -197,6 +291,106 @@ fn sites32(code: &[u8], text_vaddr: u64, instructions: &[Instruction]) -> Vec<(u
     sites
 }
 
+/// Stack depth at each reachable instruction. Conflicting paths discard the
+/// affected value, and returns do not fall through into cold blocks.
+fn stack_offsets32(instructions: &[Instruction]) -> Vec<Option<i64>> {
+    use std::collections::{HashMap, VecDeque};
+    type Stack = (Option<i64>, Option<i64>);
+    let indices: HashMap<_, _> = instructions
+        .iter()
+        .enumerate()
+        .map(|(i, instruction)| (instruction.ip(), i))
+        .collect();
+    let mut states: Vec<Option<Stack>> = vec![None; instructions.len()];
+    let mut pending = VecDeque::new();
+    if !instructions.is_empty() {
+        states[0] = Some((Some(0), None));
+        pending.push_back(0);
+    }
+    while let Some(index) = pending.pop_front() {
+        let instruction = &instructions[index];
+        let (mut sp, mut fp) = states[index].unwrap();
+        let flow = instruction.flow_control();
+        match instruction.mnemonic() {
+            Mnemonic::Push | Mnemonic::Pop => {
+                sp = sp.map(|sp| sp + i64::from(instruction.stack_pointer_increment()));
+            }
+            Mnemonic::Add | Mnemonic::Sub if instruction.op0_register() == Register::ESP => {
+                let delta = instruction
+                    .try_immediate(1)
+                    .ok()
+                    .map(|value| i64::from(value as i32));
+                sp = sp.zip(delta).map(|(sp, delta)| {
+                    if instruction.mnemonic() == Mnemonic::Add {
+                        sp + delta
+                    } else {
+                        sp - delta
+                    }
+                });
+            }
+            Mnemonic::Mov if instruction.op0_register() == Register::EBP => {
+                fp = (instruction.op1_register() == Register::ESP)
+                    .then_some(sp)
+                    .flatten();
+            }
+            Mnemonic::Mov if instruction.op0_register() == Register::ESP => {
+                sp = (instruction.op1_register() == Register::EBP)
+                    .then_some(fp)
+                    .flatten();
+            }
+            Mnemonic::Lea if instruction.op0_register() == Register::ESP => {
+                sp = if instruction.memory_base() == Register::EBP
+                    && instruction.memory_index() == Register::None
+                {
+                    fp.map(|fp| fp + i64::from(instruction.memory_displacement32() as i32))
+                } else {
+                    None
+                };
+            }
+            Mnemonic::Leave => {
+                sp = fp.map(|fp| fp + 4);
+                fp = None;
+            }
+            _ => {}
+        }
+        let mut next = Vec::new();
+        if matches!(
+            flow,
+            FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+        ) {
+            if let Some(&target) = indices.get(&instruction.near_branch_target()) {
+                next.push(target);
+            }
+        }
+        if matches!(
+            flow,
+            FlowControl::Next
+                | FlowControl::Call
+                | FlowControl::IndirectCall
+                | FlowControl::ConditionalBranch
+        ) && index + 1 < instructions.len()
+        {
+            next.push(index + 1);
+        }
+        for target in next {
+            let merged = states[target].map_or((sp, fp), |old| {
+                (
+                    (old.0 == sp).then_some(sp).flatten(),
+                    (old.1 == fp).then_some(fp).flatten(),
+                )
+            });
+            if states[target] != Some(merged) {
+                states[target] = Some(merged);
+                pending.push_back(target);
+            }
+        }
+    }
+    states
+        .into_iter()
+        .map(|state| state.and_then(|state| state.0))
+        .collect()
+}
+
 /// `mov ebx, [esp]; ret`
 fn loads_return_address_into_ebx(code: &[u8], text_vaddr: u64, target: u64) -> bool {
     let Some(offset) = target
@@ -216,9 +410,25 @@ pub fn validate_helper(code: &[u8], text_vaddr: u64, offset: usize, bitness: u32
         return false;
     };
     let mut body = instructions.iter().peekable();
+    let mut saved = Vec::new();
     let mut engine = match bitness {
         64 => Some(Register::RDI),
         32 => {
+            while body
+                .peek()
+                .is_some_and(|instruction| instruction.mnemonic() == Mnemonic::Push)
+            {
+                let push = body.next().unwrap();
+                if push.op0_kind() != OpKind::Register
+                    || !matches!(
+                        push.op0_register(),
+                        Register::EBX | Register::ESI | Register::EDI | Register::EBP
+                    )
+                {
+                    return false;
+                }
+                saved.push(push.op0_register());
+            }
             let Some(load) = body.next() else {
                 return false;
             };
@@ -226,7 +436,7 @@ pub fn validate_helper(code: &[u8], text_vaddr: u64, offset: usize, bitness: u32
                 && load.op0_kind() == OpKind::Register
                 && load.op1_kind() == OpKind::Memory
                 && load.memory_base() == Register::ESP
-                && load.memory_displacement32() == 4;
+                && load.memory_displacement32() == 4 + 4 * saved.len() as u32;
             if !loads_this {
                 return false;
             }
@@ -273,14 +483,21 @@ pub fn validate_helper(code: &[u8], text_vaddr: u64, offset: usize, bitness: u32
         {
             compares_key = true;
         }
+        let mut tail = body.clone();
+        let restores_registers = saved.iter().rev().all(|&register| {
+            tail.next().is_some_and(|instruction| {
+                instruction.mnemonic() == Mnemonic::Pop && instruction.op0_register() == register
+            })
+        });
         let returns_value = instruction.mnemonic() == Mnemonic::Mov
             && instruction.op0_kind() == OpKind::Register
             && instruction.op0_register() == Register::EAX
             && instruction.op1_kind() == OpKind::Memory
             && instruction.memory_size() == MemorySize::UInt32
             && instruction.memory_displacement64() == NODE_VALUE
-            && body
-                .peek()
+            && restores_registers
+            && tail
+                .next()
                 .is_some_and(|next| next.mnemonic() == Mnemonic::Ret && next.op_count() == 0);
         if returns_value {
             return member_loads >= 3 && compares_key;
@@ -542,6 +759,64 @@ mod tests {
     }
 
     #[test]
+    fn resolves_spilled_x86_pic_base_on_a_cold_branch() {
+        for overwrite in [false, true] {
+            let image = image(
+                32,
+                |a, helper| {
+                    let mut thunk = a.create_label();
+                    let mut cold = a.create_label();
+                    a.call(thunk)?;
+                    a.add(eax, GOT32 as i32)?;
+                    a.push(ebp)?;
+                    a.push(edi)?;
+                    a.push(esi)?;
+                    a.push(ebx)?;
+                    a.sub(esp, 0x2c)?;
+                    a.mov(dword_ptr(esp + 4), eax)?;
+                    if overwrite {
+                        a.mov(dword_ptr(esp + 4), 0)?;
+                    }
+                    a.test(ecx, ecx)?;
+                    a.je(cold)?;
+                    a.add(esp, 0x2c)?;
+                    a.pop(ebx)?;
+                    a.pop(esi)?;
+                    a.pop(edi)?;
+                    a.pop(ebp)?;
+                    a.ret()?;
+                    a.set_label(&mut cold)?;
+                    a.sub(esp, 0xc)?;
+                    a.mov(ebx, dword_ptr(esp + 0x10))?;
+                    a.lea(eax, dword_ptr(ebx + ENGINE_SLOT_FROM_GOT32))?;
+                    a.push(dword_ptr(eax))?;
+                    a.call(helper)?;
+                    a.add(esp, 0x3c)?;
+                    a.pop(ebx)?;
+                    a.pop(esi)?;
+                    a.pop(edi)?;
+                    a.pop(ebp)?;
+                    a.ret()?;
+                    a.set_label(&mut thunk)?;
+                    a.mov(eax, dword_ptr(esp))?;
+                    a.ret()
+                },
+                helper32,
+            );
+            let expected = (TEXT_VADDR as u32 + 5)
+                .wrapping_add(GOT32)
+                .wrapping_add(ENGINE_SLOT_FROM_GOT32 as u32);
+            assert_eq!(
+                resolve(&image.code, TEXT_VADDR, 0, 32),
+                (!overwrite).then_some(CurrentAppSite {
+                    engine_slot: u64::from(expected),
+                    helper: image.helper,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn helper_must_compare_the_loaded_pipe() {
         // The key compare uses a register that never held an engine member.
         let helper = image(
@@ -569,6 +844,31 @@ mod tests {
         ));
         let valid = image(64, |a, _| a.nop(), helper64);
         assert!(validate_helper(&valid.code, TEXT_VADDR, valid.helper, 64));
+    }
+
+    #[test]
+    fn x86_helper_accounts_for_saved_registers_and_requires_their_restore() {
+        for wrong_restore in [false, true] {
+            let image = image(32, adapter32, |a| {
+                a.push(ebx)?;
+                a.mov(edx, dword_ptr(esp + 8))?;
+                a.mov(eax, dword_ptr(edx + 0xe00))?;
+                a.mov(ebx, dword_ptr(edx + 0x9c))?;
+                a.mov(ecx, dword_ptr(edx + 0xe14))?;
+                a.cmp(dword_ptr(ecx + 0x10), ebx)?;
+                a.mov(eax, dword_ptr(ecx + 0x14))?;
+                if wrong_restore {
+                    a.pop(esi)?;
+                } else {
+                    a.pop(ebx)?;
+                }
+                a.ret()
+            });
+            assert_eq!(
+                validate_helper(&image.code, TEXT_VADDR, image.helper, 32),
+                !wrong_restore
+            );
+        }
     }
 
     #[test]

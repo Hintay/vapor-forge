@@ -1619,12 +1619,13 @@ fn discover_app_overview_change64_layout(
     build_complete_offset: usize,
 ) -> Option<AppOverviewChangeLayout> {
     let bytes = bounded_tail(code, build_complete_offset, 0x200)?;
-    if !bytes.windows(4).any(|w| w == [0x48, 0x8d, 0x7b, 0x18]) {
-        return None;
-    }
-    if !bytes.windows(4).any(|w| w == [0xc6, 0x43, 0x40, 0x01])
-        || !bytes.windows(4).any(|w| w == [0x83, 0x4b, 0x10, 0x01])
-    {
+    // Both register allocations operate on the same change argument. Keep the
+    // repeated field and both flags tied to that register.
+    if ![rbx, rbp].into_iter().any(|change| {
+        has_asm64(bytes, |a| a.lea(rdi, qword_ptr(change + 0x18)))
+            && has_asm64(bytes, |a| a.mov(byte_ptr(change + 0x40), 1))
+            && has_asm64(bytes, |a| a.or(dword_ptr(change + 0x10), 1))
+    }) {
         return None;
     }
     // app_overview is a 24-byte RepeatedPtrField; removed_appid follows it
@@ -1637,13 +1638,111 @@ fn discover_app_overview_change64_layout(
 
 /// The app map's offset inside `CSteamUIAppController`, which differs between
 /// builds.
-const APP_MAP_OFFSETS32: [i32; 2] = [0x9E0, 0xC38];
 const APP_MAP_OFFSETS64: [i32; 2] = [0xB58, 0xF80];
 
-fn has_app_map_load32(bytes: &[u8]) -> bool {
-    APP_MAP_OFFSETS32
-        .iter()
-        .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset))))
+fn decode_x86(bytes: &[u8]) -> Vec<iced_x86::Instruction> {
+    let mut decoder = iced_x86::Decoder::new(32, bytes, iced_x86::DecoderOptions::NONE);
+    let mut instructions = Vec::new();
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() {
+            break;
+        }
+        instructions.push(instruction);
+    }
+    instructions
+}
+
+/// A PIC/GOT load followed by dereferencing and testing the diagnostic flag.
+/// The GOT slot is a linker detail, not an offset in the app map.
+fn has_x86_diagnostic_flag_read(bytes: &[u8]) -> bool {
+    use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
+
+    let instructions = decode_x86(bytes);
+    instructions.iter().enumerate().any(|(index, load)| {
+        if load.mnemonic() != Mnemonic::Mov
+            || load.op0_register() != Register::EAX
+            || load.op1_kind() != OpKind::Memory
+            || load.memory_base() != Register::EAX
+            || load.memory_index() != Register::None
+            || !(0x100..0x8000).contains(&load.memory_displacement64())
+            || load.memory_displacement64() % 4 != 0
+        {
+            return false;
+        }
+        let mut dereferenced = false;
+        for instruction in instructions.iter().skip(index + 1).take(12) {
+            if instruction.mnemonic() == Mnemonic::Mov
+                && instruction.op0_register() == Register::EAX
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.memory_base() == Register::EAX
+                && instruction.memory_index() == Register::None
+                && instruction.memory_displacement64() == 0
+            {
+                dereferenced = true;
+            } else if instruction.mnemonic() == Mnemonic::Test
+                && instruction.op0_register() == Register::EAX
+                && instruction.op1_register() == Register::EAX
+            {
+                return dereferenced;
+            } else if instruction.flow_control() != FlowControl::Next
+                || (instruction.op0_kind() == OpKind::Register
+                    && instruction.op0_register() == Register::EAX)
+            {
+                return false;
+            }
+        }
+        false
+    })
+}
+
+/// Read a tree's root, check its -1 sentinel, then read its node vector from
+/// the same object. The root and vector are always 0x14 bytes apart.
+fn has_x86_package_tree_lookup(bytes: &[u8]) -> bool {
+    use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
+
+    decode_x86(bytes).windows(4).any(|window| {
+        let [root, sentinel, branch, nodes] = window else {
+            return false;
+        };
+        root.mnemonic() == Mnemonic::Mov
+            && root.op0_register().is_gpr32()
+            && root.op1_kind() == OpKind::Memory
+            && root.memory_base().is_gpr32()
+            && root.memory_index() == Register::None
+            && (0x400..0x8000).contains(&root.memory_displacement64())
+            && sentinel.mnemonic() == Mnemonic::Cmp
+            && sentinel.op0_register() == root.op0_register()
+            && sentinel
+                .try_immediate(1)
+                .is_ok_and(|value| value as u32 == u32::MAX)
+            && branch.flow_control() == FlowControl::ConditionalBranch
+            && nodes.mnemonic() == Mnemonic::Mov
+            && nodes.op0_register().is_gpr32()
+            && nodes.op1_kind() == OpKind::Memory
+            && nodes.memory_base() == root.memory_base()
+            && nodes.memory_index() == Register::None
+            && nodes.memory_displacement64() == root.memory_displacement64() + 0x14
+    })
+}
+
+fn has_x86_subobject_call(bytes: &[u8]) -> bool {
+    use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
+
+    decode_x86(bytes).windows(3).any(|window| {
+        let [add, push, call] = window else {
+            return false;
+        };
+        add.mnemonic() == Mnemonic::Add
+            && add.op0_kind() == OpKind::Register
+            && add.op0_register() == Register::EDI
+            && add
+                .try_immediate(1)
+                .is_ok_and(|field| (0x400..0x8000).contains(&field))
+            && push.mnemonic() == Mnemonic::Push
+            && push.op0_register() == add.op0_register()
+            && call.flow_control() == FlowControl::Call
+    })
 }
 
 fn has_app_map_load64(bytes: &[u8]) -> bool {
@@ -1859,13 +1958,6 @@ fn has_x86_test_ebp_disp8_imm8(bytes: &[u8], disp: u8, imm: u8) -> bool {
     has_seq(bytes, &[0xf6, 0x45, disp, imm])
 }
 
-fn has_x86_rm32_disp32_load(bytes: &[u8], disp: u32) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(6)
-        .any(|w| w[0] == 0x8b && matches!(w[1], 0x80..=0xbf) && w[2..6] == disp)
-}
-
 fn has_x86_ebp_store_i32(bytes: &[u8], value: i32) -> bool {
     let value = value.to_le_bytes();
     bytes.windows(7).any(|w| {
@@ -1930,13 +2022,6 @@ fn has_x64_stack_spill_r32(bytes: &[u8], reg: u8) -> bool {
     bytes
         .windows(4)
         .any(|w| w[0] == 0x89 && w[1] == modrm && w[2] == 0x24)
-}
-
-fn has_x64_movsd_rbp_disp32_from_xmm0(bytes: &[u8], disp: i32) -> bool {
-    let disp = disp.to_le_bytes();
-    bytes
-        .windows(8)
-        .any(|w| w[0] == 0xf2 && w[1] == 0x0f && w[2] == 0x11 && w[3] == 0x85 && w[4..8] == disp)
 }
 
 fn has_x64_push_rbp_negative_local_before_call(bytes: &[u8]) -> bool {
@@ -2868,6 +2953,25 @@ fn validate_get_subscribed_apps32(code: &[u8], offset: usize) -> Option<&'static
 
 fn get_subscribed_apps32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x100)?;
+    // A license entry occupies 9 * 8 bytes; the vector base and count are 0xc
+    // apart even when CUser's surrounding fields move.
+    let license_iteration = decode_x86(bytes).windows(2).any(|window| {
+        use iced_x86::{Mnemonic, Register};
+        let [index, entry] = window else {
+            return false;
+        };
+        index.mnemonic() == Mnemonic::Lea
+            && index.memory_base() == index.memory_index()
+            && index.memory_base().is_gpr32()
+            && index.memory_index_scale() == 8
+            && index.memory_displacement64() == 0
+            && entry.mnemonic() == Mnemonic::Lea
+            && entry.memory_base().is_gpr32()
+            && entry.memory_index() == index.op0_register()
+            && entry.memory_index() != Register::None
+            && entry.memory_index_scale() == 8
+            && entry.memory_displacement64() == 0
+    }) && find_field_group(32, bytes, &[0xc]).is_some();
     Some(Evidence::required([
         (
             "subscription flag argument",
@@ -2878,7 +2982,7 @@ fn get_subscribed_apps32_evidence(code: &[u8], offset: usize) -> Option<Evidence
             has_asm32(bytes, |a| {
                 a.push(0)?;
                 a.push(0)
-            }) || has_asm32(bytes, |a| a.mov(edx, dword_ptr(ecx + 0x1BD0))),
+            }) || license_iteration,
         ),
     ]))
 }
@@ -2915,13 +3019,30 @@ fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence
         ("known license entry layout", has_license_entry),
         (
             "package lookup state",
-            // The lookup sub-object's own offset in CUser differs between
-            // builds together with the surrounding fields; nothing else in
-            // this body pins it.
-            (has_asm64(bytes, |a| a.add(rdi, 0x1018)) || has_asm64(bytes, |a| a.add(rdi, 0x1440)))
+            // The lookup sub-object's own offset in CUser moves between
+            // builds (0x1018, 0x1440, 0x1490 so far) together with the
+            // surrounding fields, so only `add rdi, <sub-object>` and the
+            // package state read are pinned.
+            has_x64_add_rdi_field(bytes, 0x800..0x4000)
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
         ),
     ]))
+}
+
+/// `add rdi, imm32` with the immediate in `range`, forming a sub-object
+/// pointer as the first argument.
+fn has_x64_add_rdi_field(bytes: &[u8], range: std::ops::Range<u32>) -> bool {
+    has_x64_add_imm32_field(bytes, &[0x48, 0x81, 0xC7], range)
+}
+
+/// `add r64, imm32` encoded as `opcode` with the immediate in `range`.
+fn has_x64_add_imm32_field(bytes: &[u8], opcode: &[u8; 3], range: std::ops::Range<u32>) -> bool {
+    bytes.windows(7).any(|window| {
+        window[..3] == opcode[..]
+            && range.contains(&u32::from_le_bytes([
+                window[3], window[4], window[5], window[6],
+            ]))
+    })
 }
 
 fn set_stat_adapter32_evidence(
@@ -3361,20 +3482,16 @@ fn validate_build_depot_dependency32(code: &[u8], offset: usize) -> Option<&'sta
 
 fn build_depot_dependency32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
-    let old_large_arg_form = has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x08)))
-        && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
+    // All builds spill the eight stack arguments under a 0x22C frame; steamrt
+    // keeps the third one in ESI instead of going through EAX.
+    let large_arg_form = has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x08)))
+        && (has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
+            || has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x10))))
         && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x14)))
         && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x24)))
         && has_asm32(bytes, |a| a.sub(esp, 0x22Cu32));
-    let steamrt_arg_form = has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x08)))
-        && has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x10)))
-        && has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x0C)))
-        && has_asm32(bytes, |a| a.sub(esp, 0x6Cu32));
     Some(Evidence::required([
-        (
-            "known depot dependency arg form",
-            old_large_arg_form || steamrt_arg_form,
-        ),
+        ("known depot dependency arg form", large_arg_form),
         (
             "ownership result init",
             has_asm32(bytes, |a| a.mov(ecx, 0x0D)) && has_x86_ebp_store_i32(bytes, -1),
@@ -3385,9 +3502,8 @@ fn build_depot_dependency32_evidence(code: &[u8], offset: usize) -> Option<Evide
         ),
         (
             "dependency state/result path",
-            // The depot state sub-object's offset in CUser differs between builds.
-            has_asm32(bytes, |a| a.add(edi, 0xB88u32))
-                || has_asm32(bytes, |a| a.add(edi, 0xEC0u32))
+            // Form and pass the depot-state sub-object, wherever CUser stores it.
+            has_x86_subobject_call(bytes)
                 || has_asm32(bytes, |a| a.mov(dword_ptr(ebx + 0x14), eax)),
         ),
     ]))
@@ -3402,11 +3518,10 @@ fn validate_build_depot_dependency64(code: &[u8], offset: usize) -> Option<&'sta
 
 fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
-    // Only the app-state sub-object's offset in CUser differs between builds;
-    // the rest of this body is identical.
-    let app_state_base = [0xF20i32, 0x1348].iter().any(|&app_state| {
-        has_asm64(bytes, |a| a.add(rbp, app_state)) || has_asm64(bytes, |a| a.add(r12, app_state))
-    });
+    // Only the app-state sub-object's offset in CUser differs between builds
+    // (0xF20, 0x1348, 0x13D8 so far); the rest of this body is identical.
+    let app_state_base = has_x64_add_imm32_field(bytes, &[0x48, 0x81, 0xC5], 0xC00..0x3000)
+        || has_x64_add_imm32_field(bytes, &[0x49, 0x81, 0xC4], 0xC00..0x3000);
     let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1))
         && has_asm64(bytes, |a| a.mov(rdi, qword_ptr(r14 + 0xF8)))
@@ -3581,7 +3696,10 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
 /// `CNetPacket::Alloc`: CCMConnection splits a multi-message into sub-packets
 /// with Alloc, Init, a receiver dispatch and Release. That loop keeps its shape
 /// while the CNetPacket bodies and layout change, so Alloc, Init and Release
-/// are followed from its calls and the field offsets are read from Init.
+/// are followed from its calls and the field offsets are read from Init. Recent
+/// x86_64 steamrt builds allocate registers differently in the loop; their
+/// variants follow Alloc from a single-packet receive path with the same call
+/// sequence.
 fn validate_cnet_packet_alloc32(code: &[u8], offset: usize) -> Option<&'static str> {
     validate_cnet_packet_alloc(32, code, offset)
 }
@@ -3811,16 +3929,17 @@ fn validate_http_request_job_start32(code: &[u8], offset: usize) -> Option<&'sta
 
 fn http_request_job_start32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x180)?;
-    let classic_args = has_asm32(bytes, |a| a.mov(edi, dword_ptr(ebp + 0x08)))
-        && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x0C)))
-        && has_asm32(bytes, |a| a.mov(edx, dword_ptr(ebp + 0x10)))
-        && has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x14)));
+    let classic_args = [0x08, 0x0c, 0x10, 0x14]
+        .into_iter()
+        .all(|slot| has_x86_ebp_arg_load(bytes, slot));
     let steamrt_args = has_asm32(bytes, |a| a.mov(edi, dword_ptr(ebp + 0x08)))
         && has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x0C)))
         && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x10)))
         && has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x14)));
-    let classic_counter = has_asm32(bytes, |a| a.add(dword_ptr(edi + 0x38), 1))
-        && has_asm32(bytes, |a| a.adc(dword_ptr(edi + 0x3C), 0));
+    let classic_counter = [edi, eax].into_iter().any(|manager| {
+        has_asm32(bytes, |a| a.add(dword_ptr(manager + 0x38), 1))
+            && has_asm32(bytes, |a| a.adc(dword_ptr(manager + 0x3C), 0))
+    });
     let steamrt_counter = has_asm32(bytes, |a| a.movq(xmm0, qword_ptr(edi + 0x38)))
         && has_seq(bytes, &[0x66, 0x0F, 0x6F, 0x8E])
         && has_asm32(bytes, |a| a.paddq(xmm0, xmm1))
@@ -3933,11 +4052,7 @@ fn mark_license_changed32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         ),
         (
             "package app-state lookup",
-            // A separate sub-object whose offset differs between builds by its
-            // own amount; no neighbouring read in this body pins it relatively.
-            (has_x86_rm32_disp32_load(bytes, 0x0c58) && has_x86_rm32_disp32_load(bytes, 0x0c6c))
-                || (has_x86_rm32_disp32_load(bytes, 0x0f90)
-                    && has_x86_rm32_disp32_load(bytes, 0x0fa4)),
+            has_x86_package_tree_lookup(bytes),
         ),
     ]))
 }
@@ -4087,6 +4202,47 @@ fn remove_site_licenses64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
             vapor_forge_patterns::appinfo_cache::decode(64, 0, code, offset).is_ok(),
         ),
     ]))
+}
+
+/// `mov [rbp - disp], source`: a 64-bit register spilled to a frame local.
+fn has_x64_rbp_local_store(bytes: &[u8], source: iced_x86::Register) -> bool {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    decode_x64(bytes).any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_base() == Register::RBP
+            && (instruction.memory_displacement64() as i64) < 0
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op1_register() == source
+    })
+}
+
+/// `mov dword [gpr + displacement], -1`.
+fn has_x64_field_store_minus_one32(bytes: &[u8], displacement: u64) -> bool {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    decode_x64(bytes).any(|instruction| {
+        instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Memory
+            && instruction.memory_size() == iced_x86::MemorySize::UInt32
+            && instruction.memory_base().is_gpr64()
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64() == displacement
+            && instruction.op1_kind() == OpKind::Immediate32
+            && instruction.immediate32() == u32::MAX
+    })
+}
+
+/// A 32-bit read of the stack argument at `[rbp + displacement]`, into a
+/// general or an XMM register.
+fn has_x64_rbp_arg_load32(bytes: &[u8], displacement: u64) -> bool {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    decode_x64(bytes).any(|instruction| {
+        matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Movd)
+            && instruction.op1_kind() == OpKind::Memory
+            && instruction.memory_size() == iced_x86::MemorySize::UInt32
+            && instruction.memory_base() == Register::RBP
+            && instruction.memory_displacement64() == displacement
+    })
 }
 
 fn decode_x64(bytes: &[u8]) -> impl Iterator<Item = iced_x86::Instruction> + '_ {
@@ -4276,14 +4432,28 @@ fn validate_spawn_process32(code: &[u8], offset: usize) -> Option<&'static str> 
 
 fn spawn_process32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x220)?;
+    // Some builds construct additional launch data before calling the builder.
+    // Validate the callee itself instead of pinning the caller's stack spills.
+    let builder_call = {
+        let window = bounded_tail(code, offset, 0x700)?;
+        let mut decoder =
+            iced_x86::Decoder::with_ip(32, window, offset as u64, iced_x86::DecoderOptions::NONE);
+        std::iter::from_fn(|| decoder.can_decode().then(|| decoder.decode())).any(|instruction| {
+            instruction.flow_control() == iced_x86::FlowControl::Call
+                && validate_build_spawn_env_block32(code, instruction.near_branch_target() as usize)
+                    .is_some()
+        })
+    };
     Some(Evidence::required([
         (
             "spawn launch-info argument",
-            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x18))),
+            has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x18)))
+                || has_asm32(bytes, |a| a.mov(edi, dword_ptr(ebp + 0x18))),
         ),
         (
             "game id discriminator",
-            has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x03), 2))
+            (has_asm32(bytes, |a| a.cmp(byte_ptr(esi + 0x03), 2))
+                || has_asm32(bytes, |a| a.cmp(byte_ptr(edi + 0x03), 2)))
                 && has_asm32(bytes, |a| a.and(eax, 0x00FF_FFFF))
                 && has_asm32(bytes, |a| a.cmp(eax, 0x31673)),
         ),
@@ -4293,15 +4463,16 @@ fn spawn_process32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
             // a pair.
             "launch context allocation",
             [0x94i32, 0x4C].iter().any(|&size| {
-                has_asm32_call_after(bytes, |a| a.push(size), 0x20)
+                has_asm32_call_after(bytes, |a| a.push(size), 0x80)
                     && has_asm32(bytes, |a| a.mov(dword_ptr(edx + (size - 4)), -1))
             }) || has_asm32(bytes, |a| a.mov(dword_ptr(edx + 0xC0), -1)),
         ),
         (
             "environment block builder call",
-            has_asm32(bytes, |a| a.push(dword_ptr(ebp + 0x24)))
-                && has_asm32(bytes, |a| a.push(1))
-                && has_asm32_call_after(bytes, |a| a.push(dword_ptr(ebp + 0x24)), 0x80),
+            builder_call
+                || (has_asm32(bytes, |a| a.push(dword_ptr(ebp + 0x24)))
+                    && has_asm32(bytes, |a| a.push(1))
+                    && has_asm32_call_after(bytes, |a| a.push(dword_ptr(ebp + 0x24)), 0x80)),
         ),
     ]))
 }
@@ -4318,8 +4489,15 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let current_shape = has_asm64(bytes, |a| a.mov(r14, rdi))
         && has_asm64(bytes, |a| a.mov(rbx, r8))
         && has_asm64(bytes, |a| a.mov(r8, r15));
+    // Builds that keep `this` in a frame slot instead of a register.
+    let spilled_this_shape = has_asm64(bytes, |a| a.mov(r14, rsi))
+        && has_asm64(bytes, |a| a.mov(rbx, r8))
+        && has_x64_rbp_local_store(bytes, iced_x86::Register::RDI);
     Some(Evidence::required([
-        ("known spawn argument layout", old_shape || current_shape),
+        (
+            "known spawn argument layout",
+            old_shape || current_shape || spilled_this_shape,
+        ),
         (
             "game id discriminator",
             has_asm64(bytes, |a| a.cmp(byte_ptr(r8 + 0x03), 2))
@@ -4332,15 +4510,17 @@ fn spawn_process64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
             "launch context allocation",
             [0xC8i32, 0x68].iter().any(|&size| {
                 has_asm64(bytes, |a| a.mov(edi, size))
-                    && (has_asm64(bytes, |a| a.mov(dword_ptr(rdx + (size - 8)), -1))
-                        || has_asm64(bytes, |a| a.mov(dword_ptr(r12 + (size - 8)), -1)))
+                    && has_x64_field_store_minus_one32(bytes, (size - 8) as u64)
             }),
         ),
         (
-            "environment block builder call",
-            has_asm64(bytes, |a| a.push(1))
+            // The seventh and eighth arguments are passed on the stack and
+            // forwarded to the environment block builder.
+            "environment block builder arguments",
+            (has_asm64(bytes, |a| a.push(1))
                 && has_asm64(bytes, |a| a.mov(r9d, dword_ptr(rbp + 0x18)))
-                && has_x64_push_rbp_negative_local_before_call(bytes),
+                && has_x64_push_rbp_negative_local_before_call(bytes))
+                || (has_x64_rbp_arg_load32(bytes, 0x10) && has_x64_rbp_arg_load32(bytes, 0x18)),
         ),
     ]))
 }
@@ -4357,10 +4537,7 @@ fn build_spawn_env_block32_evidence(code: &[u8], offset: usize) -> Option<Eviden
     Some(Evidence::required([
         (
             "env output arguments",
-            (has_asm32(bytes, |a| a.mov(eax, dword_ptr(ebp + 0x20)))
-                || has_asm32(bytes, |a| a.mov(ebx, dword_ptr(ebp + 0x20))))
-                && (has_asm32(bytes, |a| a.mov(ecx, dword_ptr(ebp + 0x24)))
-                    || has_asm32(bytes, |a| a.mov(edx, dword_ptr(ebp + 0x24)))),
+            has_x86_ebp_arg_load(bytes, 0x20) && has_x86_ebp_arg_load(bytes, 0x24),
         ),
         (
             "env source flags",
@@ -4383,8 +4560,13 @@ fn build_spawn_env_block32_evidence(code: &[u8], offset: usize) -> Option<Eviden
                 && has_asm32(bytes, |a| a.push(0x7FFF_FFFF)),
         ),
         (
-            "fixed env block reservation",
-            has_asm32_call_after(bytes, |a| a.push(0x5D), 0x30),
+            "runtime launcher prefix construction",
+            has_asm32_call_after(bytes, |a| a.push(0x5D), 0x30)
+                || has_asm32(bytes, |a| {
+                    a.mov(dword_ptr(edi), 0x61657473)?;
+                    a.mov(dword_ptr(edi + 4), 0x75722d6d)?;
+                    a.mov(dword_ptr(edi + 8), 0x6d69746e)
+                }),
         ),
     ]))
 }
@@ -4455,8 +4637,10 @@ fn set_env_string32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let key_value_insert = has_asm32(bytes, |a| a.push(0x417)) && has_asm32(bytes, |a| a.push(1));
     // `(envMap, key, value, flag, separator)`, which builds the entry on its own
     // stack and walks the map here instead of in a helper.
-    let separator_map = has_asm32(bytes, |a| a.mov(eax, dword_ptr(edi + 0x0C)))
-        && has_asm32(bytes, |a| a.mov(edx, dword_ptr(edi + 0x30)));
+    let separator_map = [edi, esi].into_iter().any(|map| {
+        has_asm32(bytes, |a| a.mov(eax, dword_ptr(map + 0x0C)))
+            && has_asm32(bytes, |a| a.mov(edx, dword_ptr(map + 0x30)))
+    });
     let separator_insert = has_asm32(bytes, |a| a.cmp(dword_ptr(ebp + 0x14), 1));
 
     Some(Evidence::required([
@@ -4520,14 +4704,30 @@ fn validate_steamui_run_frame32(code: &[u8], offset: usize) -> Option<&'static s
 
 fn steamui_run_frame32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x160)?;
+    let controller_count = decode_x86(bytes).windows(4).any(|window| {
+        use iced_x86::{Mnemonic, OpKind, Register};
+        let [argument, field, test, branch] = window else {
+            return false;
+        };
+        argument.mnemonic() == Mnemonic::Mov
+            && argument.op0_register() == Register::EAX
+            && argument.op1_kind() == OpKind::Memory
+            && argument.memory_base() == Register::ESP
+            && argument.memory_displacement64() == 0x90
+            && field.mnemonic() == Mnemonic::Mov
+            && field.op0_register() == Register::EAX
+            && field.op1_kind() == OpKind::Memory
+            && field.memory_base() == Register::EAX
+            && field.memory_index() == Register::None
+            && (0x400..0x8000).contains(&field.memory_displacement64())
+            && test.mnemonic() == Mnemonic::Test
+            && test.op0_register() == Register::EAX
+            && test.op1_register() == Register::EAX
+            && branch.mnemonic() == Mnemonic::Jle
+    });
     Some(Evidence::required([
         ("frame time store", has_x86_fstp_esp_disp8(bytes, 0x0C)),
-        (
-            "app controller state load",
-            [0xB30i32, 0xB3C, 0xB70]
-                .iter()
-                .any(|&offset| has_asm32(bytes, |a| a.mov(eax, dword_ptr(eax + offset)))),
-        ),
+        ("app controller state load", controller_count),
     ]))
 }
 
@@ -4536,25 +4736,29 @@ fn validate_steamui_run_frame64(code: &[u8], offset: usize) -> Option<&'static s
 }
 
 fn steamui_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
-    let bytes = bounded_tail(code, offset, 0x160)?;
+    let bytes = bounded_tail(code, offset, 0x100)?;
+    // The controller tick narrows the current time to float and compares it
+    // with timestamps kept on the controller (`this` in RBX), each plus a
+    // constant interval. The timestamp offsets differ between builds.
+    let timestamps = decode_x64(bytes)
+        .filter(|i| {
+            i.mnemonic() == iced_x86::Mnemonic::Cvtss2sd
+                && i.op0_register() == iced_x86::Register::XMM1
+                && i.op1_kind() == iced_x86::OpKind::Memory
+                && i.memory_base() == iced_x86::Register::RBX
+                && i.memory_index() == iced_x86::Register::None
+        })
+        .count();
     Some(Evidence::required([
+        ("controller receiver", has_asm64(bytes, |a| a.mov(rbx, rdi))),
         (
-            "frame time virtual call",
-            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x28)))
-                && has_x64_movsd_rbp_disp32_from_xmm0(bytes, -0x1240),
+            "frame time narrowed to float",
+            has_asm64(bytes, |a| a.cvtsd2ss(xmm0, xmm0))
+                && has_asm64(bytes, |a| a.cvtss2sd(xmm2, xmm0)),
         ),
         (
-            "app controller update calls",
-            has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x58)))
-                && has_asm64(bytes, |a| a.call(qword_ptr(rax + 0x150))),
-        ),
-        (
-            "frame-time comparison",
-            has_asm64(bytes, |a| a.comisd(xmm0, qword_ptr(rbp - 0x1240))),
-        ),
-        (
-            "controller active flag",
-            has_asm64(bytes, |a| a.cmp(byte_ptr(rbx + 0x20), 0)),
+            "throttled task timestamps",
+            timestamps >= 2 && has_asm64(bytes, |a| a.comisd(xmm2, xmm1)),
         ),
     ]))
 }
@@ -4737,7 +4941,10 @@ fn get_app_by_id32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
             "receiver argument load",
             has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
         ),
-        ("app map load", has_app_map_load32(bytes)),
+        (
+            "diagnostic flag global load",
+            has_x86_diagnostic_flag_read(bytes),
+        ),
     ]))
 }
 
@@ -4770,7 +4977,10 @@ fn validate_mark_app_change32(code: &[u8], offset: usize) -> Option<&'static str
 fn mark_app_change32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x120)?;
     Some(Evidence::required([
-        ("library app map load", has_app_map_load32(bytes)),
+        (
+            "diagnostic flag global load",
+            has_x86_diagnostic_flag_read(bytes),
+        ),
         (
             "change flag materialization",
             has_asm32(bytes, |a| a.sete(cl)),

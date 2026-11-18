@@ -64,7 +64,7 @@ follow = "none"
 pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 2C 02 00 00 8B 45 08 89 85 ? ? FF FF 8B 45 10 89 85 ? ? FF FF"
 
 [[steamclient."BuildDepotDependency".variants]]
-pattern = "E8 ? ? ? ? 81 C2 ? ? ? ? 55 89 E5 57 56 53 83 EC 6C 8B 45 08 8B 5D 10 89 55 A0 8B 75 0C 89 45 9C 89 5D A4"
+pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC 2C 02 00 00 8B 45 08 8B 75 10 89 85 ? ? FF FF 8B 45 14"
 
 [steamclient."CShaderCacheManager::GetShaderCacheDepot"]
 follow = "none"
@@ -92,16 +92,17 @@ pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 6A 01 FF 75 0C 89
 pattern = "55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 34 8B 45 08 89 45 D4 8B 45 0C 89 FB 89 45 D0 89 C1 65 A1 14 00 00 00"
 
 [steamclient."CNetPacket::Alloc"]
-follow = "relative"
-pattern = "E8 ? ? ? ? 83 EC 08 6A 01 89 C7 6A 00 55 56 01 EE FF 74 24 ? 50 E8 ? ? ? ? 8B 44 24 ? 83 C4 18 8B 00 57 FF 74 24 ? FF 50 0C 89 3C 24 E8"
+follow = "upward"
+prologue = "53 56"
+pattern = "8B 10 6A 01 6A 00 68 ? ? ? ? 51 6A ? 50 FF 52 14 83 C4 14 50 89 C6 E8 ? ? ? ? 83 C4 14 89 F0 5B 5E C3"
 
 [steamclient."CNetPacket::Init"]
-follow = "relative"
-pattern = "E8 ? ? ? ? 8B 44 24 ? 83 C4 18 8B 00 57 FF 74 24 ? FF 50 0C 89 3C 24 E8"
+follow = "call"
+pattern = "55 6A 00 56 E8 ? ? ? ? 83 C4 2C 89 F0 5B 5E 5F 5D C3"
 
 [steamclient."CNetPacket::Release"]
-follow = "relative"
-pattern = "E8 ? ? ? ? 8B 4C 24 ? 83 C4 10 29 E9 75 ? 83 C4 1C 5B 5E 5F 5D"
+follow = "none"
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC ? 8B 7C 24 ? 83 6F ? 01 74 0C 83 C4 ? 5B 5E 5F 5D C3 8D 74 26 00 8D 83 ? ? ? ? 8B B3"
 
 [steamclient."CWorkThreadPool::AddWorkItem"]
 follow = "none"
@@ -127,10 +128,10 @@ pattern = "F3 0F 7E 47 38 66 0F 6F 8E ? ? ? ? 89 5D ? 8B 57 04 89 45 ? 66 0F D4 
 
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"
-pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"
+pattern = "55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? ? 00 00 88 44 24 1C 8D 86 ? ? 00 00"
 
 [[steamclient."CUser::MarkLicenseAsChanged".variants]]
-pattern = "E8 ? ? ? ? 81 C1 ? ? ? ? 55 57 56 53 83 EC 2C 8B 74 24 40 8B 44 24 48 89 4C 24 08 8B 5C 24 44 8B BE ? 1B 00 00 88 44 24 1C 8D 86 ? 1A 00 00"
+pattern = "E8 ? ? ? ? 81 C1 ? ? ? ? 55 57 56 53 83 EC 2C 8B 74 24 40 8B 44 24 48 89 4C 24 08 8B 5C 24 44 8B BE ? ? 00 00 88 44 24 1C 8D 86 ? ? 00 00"
 
 [steamclient."CUser::RemoveSiteLicenses"]
 follow = "none"
@@ -145,7 +146,7 @@ pattern = "E8 ? ? ? ? 8B 85 04 FF FF FF 83 C4 10 8B 40 54 89 85 FC FE FF FF"
 
 [[steamclient."CUtlMemory::Grow".variants]]
 follow = "relative"
-pattern = "E8 ? ? ? ? 8B 85 ? ? ? ? 83 C4 10 8B 40 58 89 85 ? ? ? ? 83 C0 01"
+pattern = "E8 ? ? ? ? 8B 85 ? ? FF FF 83 C4 10 8B 40 ? 89 85 ? ? FF FF 83 C0 01 E9 ? ? ? ? 8D 76 00 83 EC 04 89 F3 FF B5"
 
 [steamclient."CPackageInfo::GetPackageInfo"]
 follow = "none"
@@ -164,8 +165,9 @@ pattern = "65 8B 0D 14 00 00 00 89 8C 24 DC 00 00 00 31 C9 8B B4 24 14 01 00 00"
 pattern = "65 8B 35 14 00 00 00 89 B4 24 DC 00 00 00 8B B4 24 14 01 00 00 8B 94 24 00 01 00 00 8B 84 24 0C 01 00 00"
 
 [steamclient."CUser::SpawnProcess"]
-follow = "none"
-pattern = "55 89 E5 57 56 53 81 EC ? 10 00 00 8B 75 18 89 85 ? ? FF FF 8B 45 08 89 85 ? ? FF FF"
+follow = "upward"
+prologue = "53 56 57 E5 89 55"
+pattern = "80 ? 03 02 C7 85 ? ? FF FF 00 00 00 00 C7 85 ? ? FF FF 00 00 00 00 0F 84"
 pic_entry = true
 
 [steamclient."CUser::BuildSpawnEnvBlock"]
@@ -174,7 +176,7 @@ pattern = "55 89 E5 57 56 53 81 EC ? 31 00 00 8B 4D 24"
 pic_entry = true
 
 [[steamclient."CUser::BuildSpawnEnvBlock".variants]]
-pattern = "55 89 E5 57 56 53 81 EC 6C 31 00 00 8B 5D 20 8B 55 24 89 85 D4 CE FF FF 8B 45 0C 8B 7D 08"
+pattern = "55 89 E5 57 56 53 81 EC ? 31 00 00 8B ? 20 8B ? 24 89 85 ? ? FF FF 8B 45 0C 8B 7D 08"
 
 [steamclient."SetEnvString"]
 follow = "upward"
@@ -184,6 +186,11 @@ pic_entry = true
 
 [[steamclient."SetEnvString".variants]]
 pattern = "8B 45 D4 8B 40 78 85 C0 0F 84 ? ? ? ? 83 EC 0C FF 75 0C 8B 7D D0 89 FB E8 ? ? ? ? 83 C4 10 6A 01 68 17 04 00 00 50 FF 75 0C E8"
+
+[[steamclient."SetEnvString".variants]]
+follow = "none"
+pic_entry = false
+pattern = "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC ? 8B ? 0C 8B ? 08 89 45 ? 8B 45 18"
 
 [[steamclient."SetEnvString".variants]]
 steamrt = false

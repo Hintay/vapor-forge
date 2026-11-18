@@ -160,6 +160,7 @@ fn validate_get_steam_id64(decoder: &mut Decoder<'_>) -> bool {
 fn validate_get_steam_id32(decoder: &mut Decoder<'_>) -> bool {
     let mut loads = Vec::new();
     let mut stores = Vec::new();
+    let mut wide_load = None;
     while decoder.can_decode() {
         let instruction = decoder.decode();
         if instruction.is_invalid() {
@@ -174,6 +175,51 @@ fn validate_get_steam_id32(decoder: &mut Decoder<'_>) -> bool {
             }
             FlowControl::Next => {}
             _ => return false,
+        }
+        if instruction.mnemonic() == Mnemonic::Movq {
+            if instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register().is_xmm()
+                && instruction.op1_kind() == OpKind::Memory
+                && instruction.memory_size() == MemorySize::UInt64
+                && instruction.memory_base().is_gpr32()
+                && instruction.memory_base() != Register::ESP
+                && instruction.memory_index() == Register::None
+            {
+                wide_load = Some((
+                    instruction.op0_register(),
+                    instruction.memory_base(),
+                    instruction.memory_displacement32(),
+                ));
+                continue;
+            }
+            if let Some((register, base, member)) = wide_load {
+                if instruction.op0_kind() == OpKind::Memory
+                    && instruction.memory_size() == MemorySize::UInt64
+                    && instruction.memory_base().is_gpr32()
+                    && instruction.memory_base() != Register::ESP
+                    && instruction.memory_index() == Register::None
+                    && instruction.op1_kind() == OpKind::Register
+                    && instruction.op1_register() == register
+                {
+                    loads.extend([(base, member), (base, member.wrapping_add(4))]);
+                    stores.extend([
+                        (
+                            instruction.memory_base(),
+                            instruction.memory_displacement32(),
+                        ),
+                        (
+                            instruction.memory_base(),
+                            instruction.memory_displacement32().wrapping_add(4),
+                        ),
+                    ]);
+                    wide_load = None;
+                    continue;
+                }
+            }
+            return false;
+        }
+        if wide_load.is_some_and(|(register, _, _)| instruction.op0_register() == register) {
+            return false;
         }
         if instruction.mnemonic() != Mnemonic::Mov {
             continue;
@@ -380,6 +426,30 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn get_steam_id_accepts_an_sse_copy_and_rejects_a_clobbered_value() {
+        for (clobber, stack_write) in [(false, false), (true, false), (false, true)] {
+            let code = assemble(32, |a| {
+                a.mov(edx, dword_ptr(esp + 8))?;
+                a.mov(eax, dword_ptr(esp + 4))?;
+                a.movq(xmm0, qword_ptr(edx - 0x1756))?;
+                if clobber {
+                    a.pxor(xmm0, xmm0)?;
+                }
+                if stack_write {
+                    a.movq(qword_ptr(esp), xmm0)?;
+                } else {
+                    a.movq(qword_ptr(eax), xmm0)?;
+                }
+                a.ret_1(4)
+            });
+            assert_eq!(
+                resolve_get_steam_id_implementation(&code, TEXT_VADDR, 0, 32),
+                (!clobber && !stack_write).then_some(0)
+            );
+        }
     }
 
     #[test]

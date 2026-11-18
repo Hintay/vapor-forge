@@ -47,8 +47,9 @@ fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<SetApiCa
         result_record_stride: (has_seq(bytes, &[0x8d, 0x0c, 0x7f])
             && has_seq(bytes, &[0xc1, 0xe1, 0x04]))
             || (has_seq(bytes, &[0x8d, 0x34, 0x40]) && has_seq(bytes, &[0xc1, 0xe6, 0x04])),
-        target_pipe_argument: has_seq(bytes, &[0x8b, 0x55, 0x18])
-            || has_seq(bytes, &[0x8b, 0x7d, 0x18])
+        target_pipe_argument: bytes
+            .windows(3)
+            .any(|window| window[0] == 0x8b && window[1] & 0xc7 == 0x45 && window[2] == 0x18)
             || has_seq(bytes, &[0x83, 0x7d, 0x18, 0x00])
             || has_seq(bytes, &[0x8b, 0x54, 0x24, 0x60]),
         payload_arguments: (has_seq(bytes, &[0x8b, 0x45, 0x1c])
@@ -63,21 +64,12 @@ fn set_api_call_result32_evidence(code: &[u8], offset: usize) -> Option<SetApiCa
 
 fn set_api_call_result64_evidence(code: &[u8], offset: usize) -> Option<SetApiCallResultEvidence> {
     let bytes = bounded_tail(code, offset, 0x780)?;
-    let ordinary_current = has_seq(bytes, &[0x48, 0x81, 0xc7, 0xa8, 0x19, 0x00, 0x00])
-        && has_seq(bytes, &[0x4d, 0x03, 0xbe, 0xd8, 0x19, 0x00, 0x00]);
-    let ordinary_older = has_x64_rm32_disp32_load(bytes, 0x19c0)
-        && has_seq(bytes, &[0x48, 0x8b, 0x8f, 0xd8, 0x19, 0x00, 0x00]);
-    let steamrt = has_x64_rm32_disp32_load(bytes, 0x19a8)
-        && has_seq(bytes, &[0x4d, 0x8b, 0x8d, 0xd8, 0x19, 0x00, 0x00]);
-    // Builds that place the map block 0x428 further into CSteamEngine.
-    let steamrt_moved = has_seq(bytes, &[0x49, 0x8d, 0xbd, 0xd0, 0x1d, 0x00, 0x00])
-        && has_seq(bytes, &[0x4d, 0x8b, 0x8d, 0x00, 0x1e, 0x00, 0x00]);
 
     Some(SetApiCallResultEvidence {
         api_call_argument: has_seq(bytes, &[0x48, 0x89, 0xd5])
             || has_seq(bytes, &[0x49, 0x89, 0xd4])
             || has_seq(bytes, &[0x49, 0x89, 0xd5]),
-        api_result_map: ordinary_current || ordinary_older || steamrt || steamrt_moved,
+        api_result_map: has_x64_api_result_map(bytes),
         result_record_stride: has_seq(bytes, &[0x48, 0x6b, 0xdb, 0x38])
             || has_seq(bytes, &[0x4d, 0x6b, 0xc0, 0x38])
             || has_seq(bytes, &[0x4d, 0x6b, 0xed, 0x38])
@@ -124,6 +116,45 @@ fn has_x86_api_result_map(bytes: &[u8]) -> bool {
     })
 }
 
+/// The x86_64 CSteamEngine API-result map block: its record vector is read at
+/// `base + 0x30`, and the base itself appears as a `lea`/`add` forming
+/// `this->map` or as the root-index read at `base + 0x18`. Builds move the
+/// whole block (0x19a8, 0x1dd0, 0x1dd8 so far) but keep these distances.
+fn has_x64_api_result_map(bytes: &[u8]) -> bool {
+    const ROOT: u32 = 0x18;
+    const RECORDS: u32 = 0x30;
+
+    let operands = x64_disp32_operands(bytes);
+    operands.iter().any(|&records| {
+        let Some(base) = records.checked_sub(RECORDS) else {
+            return false;
+        };
+        (0x1000..0x8000).contains(&base)
+            && (operands.contains(&base) || operands.contains(&(base + ROOT)))
+    })
+}
+
+/// Displacements of `mov`/`lea`/`add r, [reg + disp32]` and immediates of
+/// `add r64, imm32`, with or without a REX prefix.
+fn x64_disp32_operands(bytes: &[u8]) -> Vec<u32> {
+    let plain = bytes
+        .windows(6)
+        .filter(|window| {
+            matches!(window[0], 0x03 | 0x8b | 0x8d) && matches!(window[1], 0x80..=0xbf)
+        })
+        .map(|window| u32::from_le_bytes([window[2], window[3], window[4], window[5]]));
+    let rex = bytes
+        .windows(7)
+        .filter(|window| {
+            let memory =
+                matches!(window[1], 0x03 | 0x8b | 0x8d) && matches!(window[2], 0x80..=0xbf);
+            let add_imm = window[1] == 0x81 && matches!(window[2], 0xc0..=0xc7);
+            (0x40..=0x4f).contains(&window[0]) && (memory || add_imm)
+        })
+        .map(|window| u32::from_le_bytes([window[3], window[4], window[5], window[6]]));
+    plain.chain(rex).collect()
+}
+
 /// Displacements of `add`/`mov`/`lea r32, [reg + disp32]` operands.
 fn x86_rm32_disp32_operands(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -140,18 +171,6 @@ fn has_x86_add_eax_imm32(bytes: &[u8], value: u32) -> bool {
     bytes
         .windows(5)
         .any(|window| window[0] == 0x05 && window[1..5] == value)
-}
-
-fn has_x64_rm32_disp32_load(bytes: &[u8], displacement: u32) -> bool {
-    let displacement = displacement.to_le_bytes();
-    bytes.windows(6).any(|window| {
-        window[0] == 0x8b && matches!(window[1], 0x80..=0xbf) && window[2..6] == displacement
-    }) || bytes.windows(7).any(|window| {
-        window[0] == 0x44
-            && window[1] == 0x8b
-            && matches!(window[2], 0x80..=0xbf)
-            && window[3..7] == displacement
-    })
 }
 
 fn has_x86_push_imm32(bytes: &[u8], value: u32) -> bool {
@@ -222,6 +241,38 @@ mod tests {
         code.extend_from_slice(&[0x8b, 0x91]);
         code.extend_from_slice(&0x17fcu32.to_le_bytes());
         assert!(has_x86_api_result_map(&code));
+    }
+
+    /// `mov r12d, [rdi + base + 0x18]; mov rcx, [rdi + base + 0x30]`.
+    fn x64_result_map_root_reads(base: u32) -> Vec<u8> {
+        let mut code = vec![0x44, 0x8b, 0xa7];
+        code.extend_from_slice(&(base + 0x18).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x8f]);
+        code.extend_from_slice(&(base + 0x30).to_le_bytes());
+        code
+    }
+
+    #[test]
+    fn x64_result_map_follows_the_block() {
+        for base in [0x19a8, 0x1dd0, 0x1dd8] {
+            assert!(has_x64_api_result_map(&x64_result_map_root_reads(base)));
+        }
+        // add rdi, 0x19a8; add r15, [r14 + 0x19d8]
+        let mut code = vec![0x48, 0x81, 0xc7];
+        code.extend_from_slice(&0x19a8u32.to_le_bytes());
+        code.extend_from_slice(&[0x4d, 0x03, 0xbe]);
+        code.extend_from_slice(&0x19d8u32.to_le_bytes());
+        assert!(has_x64_api_result_map(&code));
+    }
+
+    #[test]
+    fn x64_result_map_rejects_other_distances() {
+        let mut code = vec![0x44, 0x8b, 0xa7];
+        code.extend_from_slice(&0x1df0u32.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x8f]);
+        code.extend_from_slice(&0x1e10u32.to_le_bytes());
+        assert!(!has_x64_api_result_map(&code));
+        assert!(!has_x64_api_result_map(&x64_result_map_root_reads(0x40)));
     }
 
     #[test]
