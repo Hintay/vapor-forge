@@ -12,6 +12,7 @@ use vapor_forge_hook_engine::detour::Detour;
 use super::callback_dispatch::{
     self, AppMinutesPlayedDataNotice, CallbackEvent, APP_MINUTES_PLAYED_DATA_NOTICE,
 };
+use super::cxx_rtti::{CxxVtable, TypeInfo};
 
 const MAX_OBSERVED_USERS: usize = 16;
 const EVENT_CAPACITY: usize = 256;
@@ -41,10 +42,15 @@ struct InternalCallbackVTable {
     validate: unsafe extern "C" fn(*mut InternalCallback, *mut c_void, *mut c_void),
 }
 
-static INTERNAL_CALLBACK_VTABLE: InternalCallbackVTable = InternalCallbackVTable {
-    run: run_internal_callback,
-    validate: validate_internal_callback,
-};
+static INTERNAL_CALLBACK_TYPE: TypeInfo = TypeInfo::new(c"N10VaporForge16InternalCallbackE");
+
+static INTERNAL_CALLBACK_VTABLE: CxxVtable<InternalCallbackVTable> = CxxVtable::new(
+    &INTERNAL_CALLBACK_TYPE,
+    InternalCallbackVTable {
+        run: run_internal_callback,
+        validate: validate_internal_callback,
+    },
+);
 
 #[repr(C)]
 pub(crate) struct InternalCallback {
@@ -65,7 +71,7 @@ unsafe impl Send for InternalCallback {}
 impl InternalCallback {
     fn new(steam_user: i32, callback: i32) -> Self {
         Self {
-            vtable: &INTERNAL_CALLBACK_VTABLE,
+            vtable: INTERNAL_CALLBACK_VTABLE.address_point(),
             steam_user,
             #[cfg(target_pointer_width = "64")]
             _user_padding: 0,

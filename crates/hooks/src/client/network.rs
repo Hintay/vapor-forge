@@ -10,6 +10,7 @@ use vapor_forge_patterns::registry::PatternRegistry;
 use vapor_forge_patterns::work_item_site::WorkItemSite;
 use vapor_forge_steam_native_abi::cnet_packet;
 
+use super::cxx_rtti::{CxxVtable, TypeInfo};
 use crate::netpacket::SendFrameDecision;
 use crate::pattern_resolver::CodeRegion;
 use vapor_forge_hook_engine::original::detour_or_return;
@@ -1047,17 +1048,22 @@ fn schedule_injection_drain() {
     }
 }
 
-static NATIVE_INJECT_VTABLE: NativeProbeWorkItemVtable = NativeProbeWorkItemVtable {
-    destroy: native_inject_noop,
-    deleting_destroy: native_inject_deleting_destroy,
-    pre_destroy: native_inject_true,
-    work_item_name: native_inject_work_item_name,
-    thread_process_name: native_inject_thread_process_name,
-    aux: native_inject_true,
-    execute: native_inject_execute,
-    slot_7: native_inject_noop,
-    slot_8: native_inject_true,
-};
+static NATIVE_INJECT_TYPE: TypeInfo = TypeInfo::new(c"N10VaporForge23NativeInjectionWorkItemE");
+
+static NATIVE_INJECT_VTABLE: CxxVtable<NativeProbeWorkItemVtable> = CxxVtable::new(
+    &NATIVE_INJECT_TYPE,
+    NativeProbeWorkItemVtable {
+        destroy: native_inject_noop,
+        deleting_destroy: native_inject_deleting_destroy,
+        pre_destroy: native_inject_true,
+        work_item_name: native_inject_work_item_name,
+        thread_process_name: native_inject_thread_process_name,
+        aux: native_inject_true,
+        execute: native_inject_execute,
+        slot_7: native_inject_noop,
+        slot_8: native_inject_true,
+    },
+);
 
 static NATIVE_INJECT_WORK_ITEM_NAME: &[u8] = b"VaporNativeInjectionWorkItem\0";
 static NATIVE_INJECT_THREAD_PROCESS_NAME: &[u8] = b"VaporNativeInjectionWorkItem::ThreadProcess\0";
@@ -1090,7 +1096,7 @@ impl NativeWorkItem {
         // was checked against item_size when the site decoded.
         unsafe {
             base.cast::<usize>()
-                .write_unaligned(&NATIVE_INJECT_VTABLE as *const _ as usize);
+                .write_unaligned(NATIVE_INJECT_VTABLE.address_point() as usize);
             base.add(site.refcount_offset)
                 .cast::<u32>()
                 .write_unaligned(1);

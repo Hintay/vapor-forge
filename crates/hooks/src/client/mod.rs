@@ -8,6 +8,7 @@ pub(crate) mod client_id;
 pub(crate) mod cloud;
 pub(crate) mod cloud_http;
 pub(crate) mod current_app;
+pub(crate) mod cxx_rtti;
 pub(crate) mod depot;
 pub(crate) mod dlc;
 pub(crate) mod env;
