@@ -232,17 +232,22 @@ fn decode_lookup(
 }
 
 /// The cache operand: the last `lea reg, [reg + offset]` or `add reg, offset`
-/// in the engine-member range before the lookup call.
+/// in the engine-member range before the lookup call. Frame and stack
+/// arithmetic is not an engine member.
 fn cache_offset(lookback: &[Instruction]) -> Option<usize> {
     lookback.iter().rev().find_map(|instruction| {
         let offset = match instruction.mnemonic() {
             Mnemonic::Lea
                 if instruction.memory_index() == Register::None
-                    && instruction.memory_base().is_gpr() =>
+                    && instruction.memory_base().is_gpr()
+                    && !is_stack(instruction.memory_base().full_register()) =>
             {
                 usize::try_from(instruction.memory_displacement64()).ok()?
             }
-            Mnemonic::Add if instruction.op0_kind() == OpKind::Register => {
+            Mnemonic::Add
+                if instruction.op0_kind() == OpKind::Register
+                    && !is_stack(instruction.op0_register().full_register()) =>
+            {
                 match instruction.op1_kind() {
                     OpKind::Immediate32 | OpKind::Immediate8to32 | OpKind::Immediate32to64 => {
                         usize::try_from(instruction.immediate(1)).ok()?
@@ -620,6 +625,19 @@ mod tests {
             }
         );
         assert_eq!(lookup.unknown_flag, 0x10);
+    }
+
+    #[test]
+    fn ignores_stack_arithmetic_next_to_the_cache_operand() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.lea(rbx, qword_ptr(rax + 0x13d8)).unwrap();
+        a.lea(rsi, qword_ptr(rsp + 0x120)).unwrap();
+        a.add(rsp, 0x200).unwrap();
+        let code = a.assemble(BASE).unwrap();
+        let lookback: Vec<_> = Decoder::with_ip(64, &code, BASE, DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        assert_eq!(cache_offset(&lookback), Some(0x13d8));
     }
 
     #[test]

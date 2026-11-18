@@ -59,7 +59,8 @@ static PKG0_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// App-info cache lookup decoded from the license cache rebuild.
 static APPINFO_LOOKUP: OnceLock<AppInfoLookup> = OnceLock::new();
-/// Injected IDs moved from pkg0's app list to its depot list.
+/// Injected IDs moved from pkg0's app list to its depot list. Kept across
+/// account resets: pkg0 keeps these entries, and every use re-checks the list.
 static MOVED_TO_DEPOTS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 /// A pass moving unknown app IDs is queued on the engine thread.
 static RECLASSIFY_POSTED: AtomicBool = AtomicBool::new(false);
@@ -138,6 +139,8 @@ static UPDATE_DISPATCH: Mutex<UpdateDispatch> = Mutex::new(UpdateDispatch {
 
 struct InjectionResult {
     appended: Vec<AppId>,
+    /// IDs an earlier pass of this process already moved to pkg0's depots.
+    adopted: Vec<AppId>,
     complete: bool,
 }
 
@@ -202,11 +205,13 @@ impl SteamPackageAccess {
             debug!("package: no apps to inject");
             return InjectionResult {
                 appended: Vec::new(),
+                adopted: Vec::new(),
                 complete: true,
             };
         }
 
         let mut appended = Vec::new();
+        let mut adopted = Vec::new();
         let mut complete = true;
         for &app_id in app_ids {
             let raw_id = app_id.0;
@@ -214,7 +219,14 @@ impl SteamPackageAccess {
             if unsafe { self.app_ids().contains(&raw_id) } {
                 continue;
             }
+            // SAFETY: as above, for the depot vector.
+            if is_moved_to_depots(raw_id) && unsafe { self.depot_ids().contains(&raw_id) } {
+                crate::ui::install::forget_removal(app_id);
+                adopted.push(app_id);
+                continue;
+            }
             if self.append(raw_id) {
+                crate::ui::install::forget_removal(app_id);
                 appended.push(app_id);
             } else {
                 complete = false;
@@ -230,7 +242,11 @@ impl SteamPackageAccess {
                 "package: app IDs appended to pkg0"
             );
         }
-        InjectionResult { appended, complete }
+        InjectionResult {
+            appended,
+            adopted,
+            complete,
+        }
     }
 
     fn depot_ids(&mut self) -> &mut vapor_forge_steam_native_abi::CUtlVector<u32> {
@@ -265,7 +281,9 @@ impl SteamPackageAccess {
         };
         let mut moved = Vec::new();
         for id in candidates {
-            if !self.append_depot(id) {
+            // SAFETY: the capability guarantees a live readable pkg0 vector.
+            let listed = unsafe { self.depot_ids().contains(&id) };
+            if !listed && !self.append_depot(id) {
                 error!(app_id = id, "package: failed to append to pkg0 depots");
                 continue;
             }
@@ -384,6 +402,10 @@ struct AppInfoCache {
     base: *const u8,
     tree: TreeLayout,
     unknown_flag: usize,
+    nodes: *const u8,
+    /// Node indices below this stay inside the readable memory of the node
+    /// array, whatever the tree links say.
+    node_limit: usize,
 }
 
 impl AppInfoCache {
@@ -397,11 +419,23 @@ impl AppInfoCache {
         if engine.is_null() {
             return None;
         }
+        // SAFETY: the rebuild addresses the cache at this engine offset.
+        let base = unsafe { engine.add(lookup.cache_offset) };
+        let tree = lookup.tree;
+        // SAFETY: the decoded node array pointer belongs to the live cache.
+        let nodes = unsafe { base.add(tree.nodes).cast::<*const u8>().read_unaligned() };
+        if nodes.is_null() || tree.stride == 0 {
+            return None;
+        }
+        let readable_end = vapor_forge_memory::current_process_readable_end(nodes as usize)
+            .ok()
+            .flatten()?;
         let cache = Self {
-            // SAFETY: the rebuild addresses the cache at this engine offset.
-            base: unsafe { engine.add(lookup.cache_offset) },
-            tree: lookup.tree,
+            base,
+            tree,
             unknown_flag: lookup.unknown_flag,
+            nodes,
+            node_limit: (readable_end - nodes as usize) / tree.stride,
         };
         // SAFETY: read on the engine thread that owns the cache.
         unsafe { cache.record(STEAM_CLIENT_APP) }.map(|_| cache)
@@ -413,23 +447,15 @@ impl AppInfoCache {
     /// Must run on the engine thread, with `self` from [`Self::current`].
     unsafe fn record(&self, app_id: u32) -> Option<*const u8> {
         let tree = self.tree;
-        // SAFETY: the decoded fields belong to the live cache.
-        let (mut index, nodes) = unsafe {
-            (
-                self.base.add(tree.root).cast::<i32>().read_unaligned(),
-                self.base
-                    .add(tree.nodes)
-                    .cast::<*const u8>()
-                    .read_unaligned(),
-            )
-        };
-        if nodes.is_null() {
-            return None;
-        }
+        // SAFETY: the decoded root field belongs to the live cache.
+        let mut index = unsafe { self.base.add(tree.root).cast::<i32>().read_unaligned() };
         for _ in 0..MAX_TREE_DEPTH {
-            let index_value = usize::try_from(index).ok()?;
-            // SAFETY: Steam's tree links address nodes of the decoded size.
-            let node = unsafe { nodes.add(index_value * tree.stride) };
+            let index_value = usize::try_from(index)
+                .ok()
+                .filter(|&value| value < self.node_limit)?;
+            // SAFETY: the index is below node_limit, so the node lies inside
+            // the node array's readable memory.
+            let node = unsafe { self.nodes.add(index_value * tree.stride) };
             // SAFETY: the decoded key field lies inside the node.
             let key = unsafe { node.add(tree.key).cast::<u32>().read_unaligned() };
             let child = if app_id < key {
@@ -724,7 +750,6 @@ pub(crate) fn reset_account_state() {
     }
     CPKG_INFO_PTR.store(0, Ordering::Release);
     PKG0_PTR.store(0, Ordering::Release);
-    *moved_to_depots() = None;
     RECLASSIFY_POSTED.store(false, Ordering::Release);
     let mut dispatch = UPDATE_DISPATCH
         .lock()
@@ -1045,6 +1070,7 @@ fn run_update_work_item(generation: u64) {
             let plan = package_state.compute_injection(&without_family_shared(&controlled));
             let injection = access.inject(&plan.app_ids);
             package_state.record_injected(&injection.appended);
+            package_state.record_injected(&injection.adopted);
             if !injection.complete {
                 return false;
             }

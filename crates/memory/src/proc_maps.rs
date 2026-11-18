@@ -94,6 +94,31 @@ pub fn current_process_range_has_permissions(
     }))
 }
 
+/// End of the readable memory around `address`: the end of the readable
+/// mapping that contains it, extended over adjacent readable mappings.
+pub fn current_process_readable_end(address: usize) -> Result<Option<usize>> {
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    Ok(readable_end_in_text(&maps, address))
+}
+
+pub(crate) fn readable_end_in_text(maps: &str, address: usize) -> Option<usize> {
+    let mut end: Option<usize> = None;
+    for entry in maps.lines().filter_map(parse_proc_maps_entry) {
+        let readable = entry.permissions.as_bytes().first() == Some(&b'r');
+        match end {
+            None if readable && entry.range.base.0 <= address && address < entry.range.end.0 => {
+                end = Some(entry.range.end.0);
+            }
+            Some(current) if readable && entry.range.base.0 == current => {
+                end = Some(entry.range.end.0);
+            }
+            Some(_) => break,
+            None => {}
+        }
+    }
+    end
+}
+
 /// Whether one current-process range is file-backed, readable module data and
 /// cannot be modified or executed.
 pub fn current_process_range_is_readonly_data(address: usize, len: usize) -> Result<bool> {

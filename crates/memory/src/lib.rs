@@ -22,9 +22,9 @@ pub use elf::{
 pub use proc_maps::{
     current_process_context, current_process_range_has_permissions,
     current_process_range_is_readonly_data, current_process_ranges_match,
-    find_proc_self_maps_targets, find_proc_self_module_data, summarize_proc_maps_targets,
-    summarize_proc_self_maps_targets, ModuleRange, ProcMapsEntry, ProcMapsModuleInventory,
-    ProcessContext, ProcessRangeQuery,
+    current_process_readable_end, find_proc_self_maps_targets, find_proc_self_module_data,
+    summarize_proc_maps_targets, summarize_proc_self_maps_targets, ModuleRange, ProcMapsEntry,
+    ProcMapsModuleInventory, ProcessContext, ProcessRangeQuery,
 };
 pub use sampling::{
     sample_mapped_target_module_bytes, MappedByteSample, MappedByteSampleSkip,
@@ -35,7 +35,8 @@ pub use targets::is_steam_target_name;
 #[cfg(test)]
 pub(crate) use proc_maps::{
     find_proc_maps_targets_in_text, module_data_ranges_in_text, parse_parent_pid_from_stat,
-    parse_proc_maps_entry, range_is_contained_in_entry, summarize_proc_maps_targets_in_text,
+    parse_proc_maps_entry, range_is_contained_in_entry, readable_end_in_text,
+    summarize_proc_maps_targets_in_text,
 };
 #[cfg(test)]
 pub(crate) use util::{bytes_to_hex, fnv1a64_digest, truncate_str};
@@ -65,9 +66,9 @@ mod tests {
         analyze_public_dynamic_symbol_questions, bytes_to_hex, find_proc_maps_targets_in_text,
         fnv1a64_digest, is_steam_target_name, module_data_ranges_in_text,
         parse_parent_pid_from_stat, parse_proc_maps_entry, range_is_contained_in_entry,
-        sample_mapped_target_module_bytes, summarize_elf_file, summarize_proc_maps_targets_in_text,
-        truncate_str, ElfMetadataLimits, ElfMetadataSummary, MappedByteSamplingLimits, MemoryError,
-        ModuleRange,
+        readable_end_in_text, sample_mapped_target_module_bytes, summarize_elf_file,
+        summarize_proc_maps_targets_in_text, truncate_str, ElfMetadataLimits, ElfMetadataSummary,
+        MappedByteSamplingLimits, MemoryError, ModuleRange,
     };
 
     #[test]
@@ -77,6 +78,22 @@ mod tests {
             "/home/user/.steam/steam/ubuntu12_32/steamui.so"
         ));
         assert!(!is_steam_target_name("libc.so.6"));
+    }
+
+    #[test]
+    fn readable_end_follows_adjacent_readable_mappings() {
+        let maps = "\
+1000-2000 r-xp 00000000 00:00 0 /lib/a.so
+2000-3000 rw-p 00000000 00:00 0
+3000-4000 rw-p 00000000 00:00 0 [heap]
+5000-6000 rw-p 00000000 00:00 0
+6000-7000 ---p 00000000 00:00 0
+7000-8000 rw-p 00000000 00:00 0
+";
+        assert_eq!(readable_end_in_text(maps, 0x2800), Some(0x4000));
+        assert_eq!(readable_end_in_text(maps, 0x5000), Some(0x6000));
+        assert_eq!(readable_end_in_text(maps, 0x4800), None);
+        assert_eq!(readable_end_in_text(maps, 0x6800), None);
     }
 
     #[test]
