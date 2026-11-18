@@ -13,6 +13,8 @@ pub(crate) mod client;
 pub(crate) mod cloud_backend;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod context_signal;
+#[cfg(test)]
+mod cumulus_sim;
 #[cfg(any(
     all(target_os = "linux", debug_assertions),
     all(test, target_family = "unix")

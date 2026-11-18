@@ -52,4 +52,6 @@ const RPC_QUEUE_CAPACITY: usize = 64;
 const RPC_CHANNEL_CAPACITY: usize = RPC_QUEUE_CAPACITY * 2;
 
 #[cfg(test)]
+mod cumulus_sim;
+#[cfg(test)]
 mod tests;

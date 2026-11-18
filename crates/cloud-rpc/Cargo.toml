@@ -23,4 +23,5 @@ vapor-forge-steam-protocol = { path = "../steam-protocol" }
 vapor-forge-sync-journal = { path = "../sync-journal" }
 
 [dev-dependencies]
+sha1.workspace = true
 tempfile = "3"

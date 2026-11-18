@@ -13,3 +13,6 @@ thiserror.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 vapor-forge-cloud-core = { path = "../cloud-core" }
+
+[dev-dependencies]
+sha2.workspace = true

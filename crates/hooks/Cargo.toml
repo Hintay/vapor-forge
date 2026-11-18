@@ -17,11 +17,15 @@ vapor-forge-packet-capture = { path = "../packet-capture", features = ["json"] }
 iced-x86.workspace = true
 prost.workspace = true
 serde_json.workspace = true
+tempfile = "3"
 tracing.workspace = true
+ureq.workspace = true
 vapor-forge-cloud-core = { path = "../cloud-core" }
+vapor-forge-cloud-cumulus = { path = "../cloud-cumulus" }
 vapor-forge-config = { path = "../config" }
 vapor-forge-diagnostics = { path = "../diagnostics" }
 vapor-forge-steam-protocol = { path = "../steam-protocol" }
+vapor-forge-sync-journal = { path = "../sync-journal" }
 
 [target.'cfg(target_family = "unix")'.dev-dependencies]
 vapor-forge-features = { path = "../features" }
