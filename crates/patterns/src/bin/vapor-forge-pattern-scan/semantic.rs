@@ -1615,9 +1615,11 @@ fn discover_app_overview_change64_layout(
     {
         return None;
     }
+    // app_overview is a 24-byte RepeatedPtrField; removed_appid follows it
+    // and ends at the first flag.
     Some(AppOverviewChangeLayout {
         app_overview_off: 0x18,
-        removed_appid_off: 0x28,
+        removed_appid_off: 0x30,
     })
 }
 
@@ -1688,9 +1690,11 @@ fn discover_app_overview_change32_layout(
     {
         return None;
     }
+    // app_overview is a 16-byte RepeatedPtrField; removed_appid follows it
+    // and ends at the first flag.
     Some(AppOverviewChangeLayout {
         app_overview_off: 0x10,
-        removed_appid_off: 0x1c,
+        removed_appid_off: 0x20,
     })
 }
 
@@ -4842,8 +4846,8 @@ fn build_complete_app_overview_change32_evidence(code: &[u8], offset: usize) -> 
     if let Some(layout) = layout {
         evidence.require("app_overview offset 0x10", layout.app_overview_off == 0x10);
         evidence.require(
-            "removed_appid offset 0x1c",
-            layout.removed_appid_off == 0x1c,
+            "removed_appid offset 0x20",
+            layout.removed_appid_off == 0x20,
         );
     }
     Some(evidence)
@@ -4866,8 +4870,8 @@ fn build_complete_app_overview_change64_evidence(code: &[u8], offset: usize) -> 
     if let Some(layout) = layout {
         evidence.require("app_overview offset 0x18", layout.app_overview_off == 0x18);
         evidence.require(
-            "removed_appid offset 0x28",
-            layout.removed_appid_off == 0x28,
+            "removed_appid offset 0x30",
+            layout.removed_appid_off == 0x30,
         );
     }
     Some(evidence)

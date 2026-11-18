@@ -1215,7 +1215,7 @@ mod tests {
             layout,
             AppOverviewChangeLayout {
                 app_overview_off: 0x10,
-                removed_appid_off: 0x1c,
+                removed_appid_off: 0x20,
             }
         );
     }
@@ -1235,7 +1235,7 @@ mod tests {
             layout,
             AppOverviewChangeLayout {
                 app_overview_off: 0x18,
-                removed_appid_off: 0x28,
+                removed_appid_off: 0x30,
             }
         );
     }
