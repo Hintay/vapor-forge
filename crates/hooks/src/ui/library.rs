@@ -80,6 +80,17 @@ pub(crate) fn append_removed_appids(
     );
 }
 
+/// Forget every removal; the hidden apps belonged to the previous account.
+pub(crate) fn reset_account_state() {
+    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
+        pending.clear();
+    }
+    if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
+        removed.clear();
+    }
+    HAS_REMOVED.store(false, Ordering::Release);
+}
+
 /// Stop hiding an app that is controlled again.
 pub fn forget_removal(app_id: AppId) {
     if let Ok(mut pending) = PENDING_REMOVALS.lock() {

@@ -37,6 +37,7 @@ pub(crate) fn reset_account_state() {
     steam_context::invalidate_identity();
     package::reset_account_state();
     install::reset_account_state();
+    crate::ui::install::reset_account_state();
     vapor_forge_features::apps::reset_account_state();
     playtime_downlink::reset_account_state();
     vapor_forge_features::rich_presence::reset_account_state();

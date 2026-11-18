@@ -20,6 +20,7 @@ use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTarg
 use vapor_forge_patterns::Pattern;
 
 pub(crate) use super::library::queue_metadata_refreshes;
+pub(crate) use super::library::reset_account_state;
 pub use super::library::{forget_removal, queue_removal};
 use super::state::{
     GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, RepeatedFieldReserveFn, APP_CHANGE_SOURCE,
