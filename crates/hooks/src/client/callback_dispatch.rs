@@ -9,6 +9,8 @@ pub(super) const MAX_INTERNAL_CALLBACK_PAYLOAD: usize = 32;
 pub(super) const USER_STATS_RECEIVED: i32 = 1101;
 /// `AppMinutesPlayedDataNotice_t`.
 pub(super) const APP_MINUTES_PLAYED_DATA_NOTICE: i32 = 0x000f_908e;
+/// `AppInfoUpdateComplete_t`, posted when an app-info update job finishes.
+pub(super) const APP_INFO_UPDATE_COMPLETE: i32 = 1_270_003;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CallbackRegistration {
@@ -18,11 +20,18 @@ pub(super) struct CallbackRegistration {
 }
 
 /// Internal callbacks with an in-process consumer.
-pub(super) const REGISTRATIONS: &[CallbackRegistration] = &[CallbackRegistration {
-    id: APP_MINUTES_PLAYED_DATA_NOTICE,
-    name: "AppMinutesPlayedDataNotice_t",
-    payload_size: 4,
-}];
+pub(super) const REGISTRATIONS: &[CallbackRegistration] = &[
+    CallbackRegistration {
+        id: APP_MINUTES_PLAYED_DATA_NOTICE,
+        name: "AppMinutesPlayedDataNotice_t",
+        payload_size: 4,
+    },
+    CallbackRegistration {
+        id: APP_INFO_UPDATE_COMPLETE,
+        name: "AppInfoUpdateComplete_t",
+        payload_size: 12,
+    },
+];
 
 /// API-call results accepted from registered handles.
 pub(super) const API_RESULT_REGISTRATIONS: &[CallbackRegistration] = &[CallbackRegistration {

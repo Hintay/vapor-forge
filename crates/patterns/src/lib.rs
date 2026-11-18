@@ -6,6 +6,8 @@ extern crate self as vapor_forge_patterns;
 use thiserror::Error;
 
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod appinfo_cache;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod arg_flow;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
 pub mod cnet_packet;

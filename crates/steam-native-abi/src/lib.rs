@@ -154,6 +154,14 @@ pub mod package_info {
         // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
         unsafe { core::ptr::addr_of_mut!((*pkg).app_id_vec) }
     }
+
+    /// # Safety
+    /// pkg must point to a valid PackageInfo struct in Steam memory.
+    pub unsafe fn depot_id_vec(pkg: *mut u8) -> *mut CUtlVector<u32> {
+        let pkg = pkg.cast::<PackageInfoPrefix>();
+        // SAFETY: caller guarantees pkg points to a valid PackageInfo struct.
+        unsafe { core::ptr::addr_of_mut!((*pkg).depot_id_vec) }
+    }
 }
 
 pub mod cnet_packet {

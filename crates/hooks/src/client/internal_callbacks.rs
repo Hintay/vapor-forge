@@ -428,6 +428,10 @@ unsafe extern "C" fn run_internal_callback(handler: *mut InternalCallback, paylo
     let Some(registration) = callback_dispatch::registration(handler.callback) else {
         return;
     };
+    if handler.callback == callback_dispatch::APP_INFO_UPDATE_COMPLETE {
+        super::package::note_app_info_update();
+        return;
+    }
     let Some((identity_generation, steam_id64)) =
         super::steam_context::callback_identity(handler.steam_user)
     else {

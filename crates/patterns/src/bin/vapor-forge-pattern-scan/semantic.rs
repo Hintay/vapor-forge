@@ -4186,7 +4186,10 @@ fn remove_site_licenses32_evidence(code: &[u8], offset: usize) -> Option<Evidenc
             "removed entry compaction",
             has_x86_sub_eax_imm8(bytes, 1) && has_x86_push_edx_call_after(bytes, 0x20),
         ),
-
+        (
+            "rebuild app-info lookup",
+            vapor_forge_patterns::appinfo_cache::decode(32, 0, code, offset).is_ok(),
+        ),
     ]))
 }
 
@@ -4242,6 +4245,10 @@ fn remove_site_licenses64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
                 && has_asm64(bytes, |a| a.xor(edx, edx)),
         ),
         ("rebuild and notify", rebuild_and_notify),
+        (
+            "rebuild app-info lookup",
+            vapor_forge_patterns::appinfo_cache::decode(64, 0, code, offset).is_ok(),
+        ),
     ]))
 }
 
