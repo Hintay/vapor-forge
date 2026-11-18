@@ -773,6 +773,7 @@ mod tests {
         code[offset..offset + bytes.len()].copy_from_slice(&bytes);
     }
 
+    /// The i686 header and body streaming consumers for one handler slot.
     fn place_http_download_consumer32(code: &mut [u8], offset: usize) {
         place_asm32(code, offset, |a| {
             a.mov(eax, dword_ptr(edx + 0x50))?;
@@ -783,19 +784,56 @@ mod tests {
             a.push(dword_ptr(ebx + 0x38))?;
             a.push(edx)?;
             a.push(eax)?;
-            a.call(dword_ptr(ecx + 0x18))
+            a.call(dword_ptr(ecx + 0x18))?;
+            a.ret()?;
+            a.mov(eax, dword_ptr(edx + 0x50))?;
+            a.mov(eax, dword_ptr(eax + 0x94))?;
+            a.test(eax, eax)?;
+            a.mov(ecx, dword_ptr(eax))?;
+            a.push(dword_ptr(ebp - 0x4c))?;
+            a.push(edx)?;
+            a.push(eax)?;
+            a.call(dword_ptr(ecx + 0x1c))?;
+            a.ret()
         });
     }
 
+    /// The x86_64 header and body streaming consumers and the request
+    /// constructor that clears the matching tail, as `http::decode_request64`
+    /// requires them.
     fn place_http_download_consumer64(code: &mut [u8], offset: usize) {
         place_asm64(code, offset, |a| {
+            let mut buffer_ctor = a.create_label();
+            let mut string_ctor = a.create_label();
             a.mov(rax, qword_ptr(rsi + 0x68))?;
             a.mov(rdi, qword_ptr(rax + 0xe0))?;
             a.test(rdi, rdi)?;
             a.mov(rax, qword_ptr(rsi + 0x70))?;
             a.mov(rdx, qword_ptr(rax + 0x50))?;
             a.mov(rax, qword_ptr(rdi))?;
-            a.call(qword_ptr(rax + 0x30))
+            a.call(qword_ptr(rax + 0x30))?;
+            a.ret()?;
+            a.mov(rax, qword_ptr(rsi + 0x68))?;
+            a.mov(rdi, qword_ptr(rax + 0xe0))?;
+            a.test(rdi, rdi)?;
+            a.mov(rax, qword_ptr(rdi))?;
+            a.mov(rdx, rbx)?;
+            a.call(qword_ptr(rax + 0x38))?;
+            a.ret()?;
+            a.lea(r13, ptr(rbx + 0x98))?;
+            a.pxor(xmm0, xmm0)?;
+            a.mov(rdi, r13)?;
+            a.movups(xmmword_ptr(rbx + 0x80), xmm0)?;
+            a.call(buffer_ctor)?;
+            a.lea(rdi, ptr(rbx + 0x88))?;
+            a.call(string_ctor)?;
+            a.ret()?;
+            a.set_label(&mut buffer_ctor)?;
+            a.mov(qword_ptr(rdi), 0)?;
+            a.movups(xmmword_ptr(rdi + 8), xmm0)?;
+            a.ret()?;
+            a.set_label(&mut string_ctor)?;
+            a.ret()
         });
     }
 
@@ -927,6 +965,39 @@ mod tests {
 
         assert!(http_request_job_start32_evidence(&code, start)
             .is_some_and(|evidence| evidence.is_complete()));
+    }
+
+    #[test]
+    fn http_consumer32_accepts_inline_headers_but_requires_the_same_handle() {
+        let consumers = |response_handle| {
+            let mut code = vec![0x90; 0x100];
+            place_asm32(&mut code, 0, |a| {
+                a.mov(eax, dword_ptr(edx + 0x50))?;
+                a.mov(eax, dword_ptr(eax + 0xa0))?;
+                a.mov(edi, dword_ptr(response_handle + 0x54))?;
+                a.mov(ebx, dword_ptr(eax))?;
+                a.lea(ecx, dword_ptr(edi + 0x38))?;
+                a.push(ecx)?;
+                a.push(edx)?;
+                a.push(eax)?;
+                a.call(dword_ptr(ebx + 0x18))?;
+                a.ret()?;
+                a.mov(eax, dword_ptr(edx + 0x50))?;
+                a.mov(eax, dword_ptr(eax + 0xa0))?;
+                a.mov(ecx, dword_ptr(eax))?;
+                a.push(dword_ptr(ebp - 0x4c))?;
+                a.push(edx)?;
+                a.push(eax)?;
+                a.call(dword_ptr(ecx + 0x1c))
+            });
+            code
+        };
+        assert_eq!(
+            vapor_forge_patterns::http::decode_request32(&consumers(edx))
+                .map(|layout| layout.download_handler),
+            Ok(0xa0)
+        );
+        assert!(vapor_forge_patterns::http::decode_request32(&consumers(esi)).is_err());
     }
 
     #[test]

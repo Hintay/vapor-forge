@@ -1,10 +1,9 @@
 //! Detour on `CHTTPRequestJob::Start` that short-circuits cloud transfers whose
 //! target is the process-local sentinel authority.
 //!
-//! Field offsets are architecture-specific candidates recovered from Steam's
-//! request constructor, body setter, yielding wait path, and download callback.
-//! A candidate is admitted only when every field agrees with an unconsumed local
-//! transfer contract; every other request is forwarded unchanged.
+//! The request tail is decoded from Steam's streaming consumers (and, on
+//! x86_64, its constructor). A local transfer is admitted only when its live
+//! fields agree with an unconsumed transfer contract.
 //!
 //! Start's second argument is a `CHTTPRequestHandle` (typeinfo confirmed), and
 //! the handle owns both the request and a `CHTTPResponse`. On i686 the request
@@ -44,35 +43,58 @@ struct HttpLayout {
     download_body_vtable: usize,
 }
 
+static HTTP_LAYOUT: std::sync::OnceLock<HttpLayout> = std::sync::OnceLock::new();
+
 #[cfg(target_pointer_width = "64")]
-const HTTP_LAYOUTS: &[HttpLayout] = &[HttpLayout {
-    request_host: 0x80,
-    request_path: 0x88,
-    request_body_data: 0x98,
-    request_body_size: 0xac,
-    request_download_handler: 0xe0,
-    job_complete: 0x22,
-    job_success: 0x23,
-    job_request: 0x68,
-    job_response: 0x70,
-    response_status: 0x0c,
-    download_body_vtable: 0x38,
-}];
+fn decode_layout(code: &[u8]) -> Result<HttpLayout, &'static str> {
+    let request = vapor_forge_patterns::http::decode_request64(code)?;
+    info!(?request, "cloud-http: decoded request layout");
+    Ok(HttpLayout {
+        request_host: request.host,
+        request_path: request.path,
+        request_body_data: request.body_data,
+        request_body_size: request.body_size,
+        request_download_handler: request.download_handler,
+        job_complete: 0x22,
+        job_success: 0x23,
+        job_request: 0x68,
+        job_response: 0x70,
+        response_status: 0x0c,
+        download_body_vtable: 0x38,
+    })
+}
 
 #[cfg(target_pointer_width = "32")]
-const HTTP_LAYOUTS: &[HttpLayout] = &[HttpLayout {
-    request_host: 0x58,
-    request_path: 0x5c,
-    request_body_data: 0x64,
-    request_body_size: 0x74,
-    request_download_handler: 0x94,
-    job_complete: 0x16,
-    job_success: 0x17,
-    job_request: 0x50,
-    job_response: 0x54,
-    response_status: 0x08,
-    download_body_vtable: 0x1c,
-}];
+fn decode_layout(code: &[u8]) -> Result<HttpLayout, &'static str> {
+    let request = vapor_forge_patterns::http::decode_request32(code)?;
+    info!(?request, "cloud-http: decoded request layout");
+    Ok(HttpLayout {
+        request_host: request.host,
+        request_path: request.path,
+        request_body_data: request.body_data,
+        request_body_size: request.body_size,
+        request_download_handler: request.download_handler,
+        job_complete: 0x16,
+        job_success: 0x17,
+        job_request: 0x50,
+        job_response: 0x54,
+        response_status: 0x08,
+        download_body_vtable: 0x1c,
+    })
+}
+
+pub(crate) fn resolve_layout(code: &crate::pattern_resolver::CodeRegion) {
+    match decode_layout(code.bytes) {
+        Ok(layout) => {
+            let _ = HTTP_LAYOUT.set(layout);
+        }
+        Err(reason) => warn!(reason, "cloud-http: could not decode request layout"),
+    }
+}
+
+fn active_layout() -> Option<&'static HttpLayout> {
+    HTTP_LAYOUT.get()
+}
 
 pub(crate) unsafe extern "C" fn hk_http_job_start(
     manager: *mut c_void,
@@ -86,9 +108,9 @@ pub(crate) unsafe extern "C" fn hk_http_job_start(
         unsafe { original(manager, job, request, flag) };
         return;
     }
-    // Only a target issued by the local adapter can admit a candidate layout.
+    // Only a target issued by the local adapter can admit a transfer.
     // All reads use process_vm_readv, so layout drift is a clean miss.
-    let Some(admitted) = HTTP_LAYOUTS.iter().find_map(|layout| {
+    let Some(admitted) = active_layout().and_then(|layout| {
         // SAFETY: `request` is Steam's live hook argument; probing uses
         // process_vm_readv so an invalid candidate is reported as a miss.
         let identity = unsafe { probe_request_identity(request, layout) }?;

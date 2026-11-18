@@ -116,11 +116,14 @@ follow = "none"
 pattern = "83 7E ? 02 75 ? 80 BE ? ? 00 00 00"
 
 [steamclient."CHTTPRequestJob::Start"]
-follow = "none"
-pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 6C 8B 5D 14 8B 45 0C 8B 55 10 8B 7D 08 89 5D ? 89 45 ? 89 55 ? 65 8B 1D 14 00 00 00"
+follow = "call"
+pattern = "6A 00 57 56 FF 75 08 E8 ? ? ? ? 83 C4 10 89 F0 8D 65 F4 5B 5E 5F 5D C3"
+callee_pattern = "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC ? 8B ? 14"
 
 [[steamclient."CHTTPRequestJob::Start".variants]]
-pattern = "55 89 E5 57 56 8D 4D B4 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 6C 8B 45 10 8B 7D 08 8B 5D 0C 89 45 ? 8B 45 14 F3 0F 7E 47 38 66 0F 6F 8E ? ? ? ? 89 5D ? 8B 57 04 89 45 ? 66 0F D4 C1"
+follow = "upward"
+prologue = "E5 89 55"
+pattern = "F3 0F 7E 47 38 66 0F 6F 8E ? ? ? ? 89 5D ? 8B 57 04 89 45 ? 66 0F D4 C1"
 
 [steamclient."CUser::MarkLicenseAsChanged"]
 follow = "none"

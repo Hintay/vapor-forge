@@ -885,6 +885,7 @@ fn do_install() {
     vapor_forge_features::inject_wake::set_injection_router(Box::new(|source| {
         crate::netpacket::wake_source(source)
     }));
+    super::cloud_http::resolve_layout(&code);
     let d_http_job_start = resolve_from_registry(
         &registry,
         &code,

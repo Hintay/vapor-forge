@@ -24,6 +24,8 @@ pub mod engine_work_item_site;
 pub mod env_writer;
 #[cfg(feature = "runtime-semantic")]
 pub mod full_semantic;
+#[cfg(any(feature = "runtime-semantic", feature = "tools"))]
+pub mod http;
 pub mod semantic;
 pub mod vtable_scan;
 #[cfg(any(feature = "runtime-semantic", feature = "tools"))]
