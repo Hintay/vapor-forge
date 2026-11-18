@@ -1,5 +1,5 @@
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use tracing::{debug, error, info};
@@ -14,18 +14,44 @@ use super::state::{
     MARK_APP_CHANGE_DETOUR,
 };
 
-// Pending removals queued from the FileWatcher thread, drained on the
-// UI thread inside hk_run_frame.
-static PENDING_REMOVALS: Mutex<Vec<AppId>> = Mutex::new(Vec::new());
+struct Removals {
+    generation: u64,
+    pending: Vec<AppId>,
+    removed: Vec<u32>,
+}
+
+impl Removals {
+    fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending.clear();
+        self.removed.clear();
+    }
+
+    fn apply(
+        &mut self,
+        generation: u64,
+        app_id: AppId,
+        clear_ownership: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        if clear_ownership() {
+            self.removed.push(app_id.0);
+        }
+        true
+    }
+}
+
+static REMOVALS: Mutex<Removals> = Mutex::new(Removals {
+    generation: 0,
+    pending: Vec::new(),
+    removed: Vec::new(),
+});
 
 // App metadata changes queued outside the SteamUI thread.
 static PENDING_METADATA_REFRESHES: Mutex<Vec<AppId>> = Mutex::new(Vec::new());
 const MAX_METADATA_REFRESHES_PER_DRAIN: usize = 64;
-
-// Apps confirmed removed. Appended to CAppOverview_Change.removed_appid
-// during full rebuilds to prevent removed apps from reappearing.
-static REMOVED_APP_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-static HAS_REMOVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn append_removed_appids(
     change: *mut c_void,
@@ -34,21 +60,21 @@ pub(crate) fn append_removed_appids(
 ) {
     if !crate::capability::is_ready(crate::capability::Capability::LibrarySnapshot)
         || change.is_null()
-        || !HAS_REMOVED.load(Ordering::Acquire)
     {
+        return;
+    }
+    let Ok(state) = REMOVALS.lock() else {
+        error!("steamui: removal state lock poisoned");
+        return;
+    };
+    let removed = &state.removed;
+    if removed.is_empty() {
         return;
     }
     let Some(add_fn) = add_fn else {
         error!("steamui: RepeatedField<uint32>::Add unavailable");
         return;
     };
-    let Ok(removed) = REMOVED_APP_IDS.lock() else {
-        error!("steamui: removed app set lock poisoned");
-        return;
-    };
-    if removed.is_empty() {
-        return;
-    }
 
     // Append removed app IDs to CAppOverview_Change.removed_appid so
     // full rebuilds don't restore apps we've hidden.
@@ -82,26 +108,17 @@ pub(crate) fn append_removed_appids(
 
 /// Forget every removal; the hidden apps belonged to the previous account.
 pub(crate) fn reset_account_state() {
-    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
-        pending.clear();
+    if let Ok(mut state) = REMOVALS.lock() {
+        state.reset();
     }
-    if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
-        removed.clear();
-    }
-    HAS_REMOVED.store(false, Ordering::Release);
 }
 
 /// Stop hiding an app that is controlled again.
 pub fn forget_removal(app_id: AppId) {
-    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
-        pending.retain(|&pending| pending != app_id);
+    if let Ok(mut state) = REMOVALS.lock() {
+        state.pending.retain(|&pending| pending != app_id);
+        state.removed.retain(|&removed| removed != app_id.0);
     }
-    let Ok(mut removed) = REMOVED_APP_IDS.lock() else {
-        error!("steamui: removed app set lock poisoned");
-        return;
-    };
-    removed.retain(|&removed| removed != app_id.0);
-    HAS_REMOVED.store(!removed.is_empty(), Ordering::Release);
 }
 
 /// Queue an app for removal from the library UI.
@@ -111,12 +128,12 @@ pub fn queue_removal(app_id: AppId) {
     if !crate::capability::is_ready(crate::capability::Capability::LibraryUi) {
         return;
     }
-    let Ok(mut pending) = PENDING_REMOVALS.lock() else {
+    let Ok(mut state) = REMOVALS.lock() else {
         error!("steamui: pending removal lock poisoned");
         return;
     };
-    pending.push(app_id);
-    drop(pending);
+    state.pending.push(app_id);
+    drop(state);
     vapor_forge_features::toast::request_ui_work();
     debug!(app = app_id.0, "steamui: removal queued");
 }
@@ -203,24 +220,24 @@ pub(crate) fn drain_pending_removals(controller: *mut c_void) {
         return;
     }
 
-    let draining: Vec<AppId> = {
-        let Ok(mut pending) = PENDING_REMOVALS.lock() else {
+    let (generation, draining) = {
+        let Ok(mut state) = REMOVALS.lock() else {
             error!("steamui: pending removal lock poisoned");
             return;
         };
-        let v = std::mem::take(&mut *pending);
+        let v = std::mem::take(&mut state.pending);
         if v.is_empty() {
             return;
         }
-        v
+        (state.generation, v)
     };
 
     for app_id in draining {
-        do_remove_app(controller, src, app_id);
+        do_remove_app(controller, src, app_id, generation);
     }
 }
 
-fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId) {
+fn do_remove_app(controller: *mut c_void, src: usize, app_id: AppId, generation: u64) {
     // Skip if the app was re-added to config (hot-reload: unload then load).
     let cfg = crate::client::install::config();
     if cfg.is_controlled_app(app_id) {
@@ -237,20 +254,20 @@ unsafe { get_app_by_id(controller, app_id.0, false) };
         return;
     }
 
-    // SAFETY: app_ptr is a CSteamApp* returned by GetAppByID.
-    unsafe {
-        let app = app_ptr.cast::<CSteamApp>();
-        (*app).ownership_flags = EAPP_OWNERSHIP_FLAGS_NONE;
-
-        // Only track in removed set if already uninstalled.
-        let state = (*app).app_state_flags;
-        if state == EAPP_STATE_UNINSTALLED {
-            if let Ok(mut removed) = REMOVED_APP_IDS.lock() {
-                removed.push(app_id.0);
-                HAS_REMOVED.store(true, Ordering::Release);
-            } else {
-                error!("steamui: removed app set lock poisoned");
+    {
+        let Ok(mut state) = REMOVALS.lock() else {
+            error!("steamui: removal state lock poisoned");
+            return;
+        };
+        if !state.apply(generation, app_id, || {
+            // SAFETY: GetAppByID returned the live UI-thread app.
+            unsafe {
+                let app = app_ptr.cast::<CSteamApp>();
+                (*app).ownership_flags = EAPP_OWNERSHIP_FLAGS_NONE;
+                (*app).app_state_flags == EAPP_STATE_UNINSTALLED
             }
+        }) {
+            return;
         }
     }
 
@@ -261,4 +278,26 @@ unsafe { get_app_by_id(controller, app_id.0, false) };
     /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
     unsafe { mark_app_change(src as *mut c_void, app_id.0, EAPPCHANGE_ADDED_OR_CREATED) };
     info!(app = app_id.0, "steamui: app removed from library");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_invalidates_a_drained_removal_before_touching_the_app() {
+        let mut state = Removals {
+            generation: 0,
+            pending: Vec::new(),
+            removed: Vec::new(),
+        };
+        state.pending.push(AppId(42));
+        let generation = state.generation;
+        let app = state.pending.pop().unwrap();
+        state.reset();
+        assert!(!state.apply(generation, app, || panic!("stale app write")));
+        assert!(state.removed.is_empty());
+        assert!(state.apply(state.generation, app, || true));
+        assert_eq!(state.removed, [42]);
+    }
 }
