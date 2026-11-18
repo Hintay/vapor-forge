@@ -9,8 +9,9 @@ use vapor_forge_steam_native_abi::steamui::{CAppOverviewChange, CSteamApp};
 use vapor_forge_hook_engine::original::detour_or_return;
 
 use super::state::{
-    RepeatedFieldAddFn, APP_CHANGE_SOURCE, EAPPCHANGE_ADDED_OR_CREATED, EAPP_OWNERSHIP_FLAGS_NONE,
-    EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR, MARK_APP_CHANGE_DETOUR,
+    RepeatedFieldAddFn, RepeatedFieldReserveFn, APP_CHANGE_SOURCE, EAPPCHANGE_ADDED_OR_CREATED,
+    EAPP_OWNERSHIP_FLAGS_NONE, EAPP_STATE_UNINSTALLED, GET_APP_BY_ID_DETOUR,
+    MARK_APP_CHANGE_DETOUR,
 };
 
 // Pending removals queued from the FileWatcher thread, drained on the
@@ -26,7 +27,11 @@ const MAX_METADATA_REFRESHES_PER_DRAIN: usize = 64;
 static REMOVED_APP_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static HAS_REMOVED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<RepeatedFieldAddFn>) {
+pub(crate) fn append_removed_appids(
+    change: *mut c_void,
+    add_fn: Option<RepeatedFieldAddFn>,
+    reserve_fn: Option<RepeatedFieldReserveFn>,
+) {
     if !crate::capability::is_ready(crate::capability::Capability::LibrarySnapshot)
         || change.is_null()
         || !HAS_REMOVED.load(Ordering::Acquire)
@@ -49,6 +54,22 @@ pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<Repeated
     // full rebuilds don't restore apps we've hidden.
     // SAFETY: change is a valid CAppOverview_Change* from SteamUI.
     let field = unsafe { CAppOverviewChange::mutable_removed_appid(change) };
+    let Some(reserve_fn) = reserve_fn else {
+        error!("steamui: RepeatedField<uint32>::Reserve unavailable");
+        return;
+    };
+    // The x86_64 Add only appends into reserved capacity, so the capacity
+    // for every removed ID is reserved first.
+    // SAFETY: the field's first member is its current size.
+    let size = unsafe { field.cast::<i32>().read() };
+    let Some(needed) = i32::try_from(removed.len())
+        .ok()
+        .and_then(|count| size.checked_add(count))
+    else {
+        return;
+    };
+    // SAFETY: Steam's RepeatedField<uint32> and its matching Reserve.
+    unsafe { reserve_fn(field, needed) };
     for &app_id in removed.iter() {
         /* SAFETY: the typed Steam function and arguments satisfy the active FFI callback contract. */
         unsafe { add_fn(field, &app_id) };
@@ -57,6 +78,19 @@ pub(crate) fn append_removed_appids(change: *mut c_void, add_fn: Option<Repeated
         count = removed.len(),
         "steamui: BuildComplete appended removed_appid entries"
     );
+}
+
+/// Stop hiding an app that is controlled again.
+pub fn forget_removal(app_id: AppId) {
+    if let Ok(mut pending) = PENDING_REMOVALS.lock() {
+        pending.retain(|&pending| pending != app_id);
+    }
+    let Ok(mut removed) = REMOVED_APP_IDS.lock() else {
+        error!("steamui: removed app set lock poisoned");
+        return;
+    };
+    removed.retain(|&removed| removed != app_id.0);
+    HAS_REMOVED.store(!removed.is_empty(), Ordering::Release);
 }
 
 /// Queue an app for removal from the library UI.

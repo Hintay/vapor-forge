@@ -1,10 +1,6 @@
 # Pattern definitions for 64-bit Linux steamclient.so and steamui.so, baseline Steam public manifest 1782866176.
 #
-# The default runtime.patterns_url serves this file as the online hotfix. The
-# [hotfix] block names the architecture it is for and declares no binary family:
-# ordinary and steamrt shapes both live here as variants. It carries no
-# revision: a client compares the commit it was built from with the
-# repository's, and takes this file only when the repository is ahead.
+# Served as the online hotfix by the default runtime.patterns_url.
 [hotfix]
 format = 1
 architecture = "x86_64"
@@ -17,29 +13,20 @@ pattern = "41 57 41 56 ? ? ? ? 55 ? ? ? ? 48 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ?
 follow = "none"
 pattern = "41 57 41 56 41 55 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 24 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 00 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? F6 43 18 01 75 ? ? 8B ? 24 ? ? ? ? ? ?"
 
-# API-call result storage. Ordinary builds share the helper-call implementation.
-# The API result map's offset in CSteamEngine is a wildcard: it differs between
-# builds while the surrounding entry sequence is identical.
 [steamclient."CSteamEngine::SetAPICallResult"]
 follow = "none"
 pattern = "41 57 41 56 49 ? ? 48 81 C7 ? ? 00 00 41 55 49 ? ? 41 54 4D ? ? 55 ? ? 53 44 ? ? 48 83 EC ? 48 89 ? 24 ? 48 ? ? E8 ? ? ? ? 4C 63 ? 4D 6B ? 38 4D 03 ? ? ? 00 00"
 
-# steamrt keeps the API result map index in a different register layout.
 [[steamclient."CSteamEngine::SetAPICallResult".variants]]
 pattern = "41 57 41 ? ? 41 56 4D ? ? 41 55 49 ? ? 41 54 55 48 ? ? 53 48 83 EC ? 44 8B ? ? ? 00 00 48 89 ? 24 64 4C 8B ? 25 28 00 00 00 4C 89 ? 24 ? 45 89 ?"
 
-# One-argument global internal-callback registration wrapper. Ordinary builds
-# share this wildcard shape across versions.
 [steamclient."CSteamEngine::RegisterInternalCallback"]
 follow = "none"
 pattern = "55 53 48 89 FB 48 83 EC 18 0F B6 05 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 85 DB 48 89 5C 24 08 0F 84 ? ? ? ? 48 83 7B 10 00"
 
-# steamrt adds a stack canary before the same handler checks.
 [[steamclient."CSteamEngine::RegisterInternalCallback".variants]]
 pattern = "41 54 55 53 48 83 EC 10 64 48 8B 1C 25 28 00 00 00 48 89 5C 24 08 48 89 FB 0F B6 05 ? ? ? ? 84 C0 0F 84 ? ? ? ? 48 85 DB 48 89 1C 24"
 
-# Owns the global-user IClient map wrappers. Ordinary builds use this wildcard
-# entry across versions; steamrt uses the SSE argument-store variant.
 [steamclient."CUserInterface::Init"]
 follow = "none"
 pattern = "41 54 41 89 F4 55 89 D5 53 48 89 FB 89 77 04 89 57 08 48 C7 47 10 00 00 00 00"
@@ -47,7 +34,6 @@ pattern = "41 54 41 89 F4 55 89 D5 53 48 89 FB 89 77 04 89 57 08 48 C7 47 10 00 
 [[steamclient."CUserInterface::Init".variants]]
 pattern = "66 0F 6E C6 66 0F 6E CA 41 54 41 89 F4 55 66 0F 62 C1 89 D5 53 48 89 FB 66 0F D6 47 04 48 C7 47 10 00 00 00 00"
 
-# Invalidates the owner before its interface wrappers are released.
 [steamclient."CUserInterface::~CUserInterface"]
 follow = "none"
 pattern = "53 8B 07 48 89 FB 85 C0 0F 85 ? ? ? ? 48 8B BB ? ? ? ? 48 85 FF"
@@ -60,18 +46,14 @@ pattern = "41 ? 48 89 D7 ? ? ? ? ? ? ? 00 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ?"
 follow = "none"
 pattern = "41 57 ? 89 ? 41 56 ? ? ? ? ? 41 54 55 53 48 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 4C ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 00 ? ? ? ? ?"
 
-# Reads game/shadercachedepot from the local app-info cache.
 [steamclient."CShaderCacheManager::GetShaderCacheDepot"]
 follow = "none"
 pattern = "48 8B 05 ? ? ? ? 8B 40 7C 85 C0 75 ? 31 C0 C3 ? ? ? ? ? ? ? 41 54"
 
-# Returns the account that holds the family library lock on an app, or 0 when
-# the app is free, a lender is available, or the lock is held by this account.
 [steamclient."CFamilySharing::GetLockingAccount"]
 follow = "none"
 pattern = "48 63 87 ? ? ? ? 83 F8 FF 74 ? 48 8B 97 ? ? ? ? EB ? ? ? ? 48 63 00 83 F8 FF 74 ? 48 6B C0 38 48 01 D0 39 70 10 77 ? 73 ? 48 63 40 04 83 F8 FF 75 ? 45 31 C0"
 
-# steamrt holds the node array in RCX and the result in ESI.
 [[steamclient."CFamilySharing::GetLockingAccount".variants]]
 pattern = "48 63 87 ? ? ? ? 83 F8 FF 74 ? 48 8B 8F ? ? ? ? EB ? ? ? ? ? ? ? ? ? ? ? ? 48 63 00 83 F8 FF 74 ? 48 6B C0 38 48 01 C8 8B 50 10 39 D6 72 ? 39 F2 73 ? 48 63 40 04 83 F8 FF 75 ? 31 F6"
 
@@ -83,10 +65,6 @@ pattern = "41 57 41 56 41 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 
 follow = "none"
 pattern = "41 ? 49 89 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 48 89 ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 00 00 ? ? ? ? ? ? ? ? ? ? 8B ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 8B ? 08 83 E8 01 3D FE FF FF 00 ? ? ? ? ?"
 
-# CCMConnection splits a multi-message into sub-packets with Alloc, Init, a
-# receiver dispatch and Release. That loop keeps its shape across builds whose
-# CNetPacket bodies and layout differ, so all three are followed from its
-# calls, and the field offsets are read from Init itself.
 [steamclient."CNetPacket::Alloc"]
 follow = "relative"
 pattern = "E8 ? ? ? ? 8B 74 24 ? 45 31 C0 44 89 E9 41 B9 01 00 00 00 48 89 EA 48 89 C7 49 89 C6 E8 ? ? ? ? 49 8B 04 24 4C 89 F6 4C 89 E7 FF 50 18 4C 89 F7 E8"
@@ -99,36 +77,26 @@ pattern = "E8 ? ? ? ? 49 8B 04 24 4C 89 F6 4C 89 E7 FF 50 18 4C 89 F7 E8"
 follow = "relative"
 pattern = "E8 ? ? ? ? 4A 8D 7C 3D 00 4C 29 FB 74 ? 44 8B 2F 48 8D 6F 04 48 83 EB 04 45 85 ED 79"
 
-# The pool-state byte and the frame size are wildcards: the pool object's layout
-# differs between builds while this entry sequence is identical.
 [steamclient."CWorkThreadPool::AddWorkItem"]
 follow = "none"
 pattern = "41 56 41 55 41 54 55 48 89 F5 53 48 83 EC ? 44 0F B6 A7 ? ? 00 00 45 84 E4 0F 85"
 
-# steamrt stack-canary implementation shape. Matched from the frame setup, past
-# the register saves, because builds differ in how many registers they save;
-# `entry` then walks back over those pushes to the real entry.
 [[steamclient."CWorkThreadPool::AddWorkItem".variants]]
 follow = "entry"
 pattern = "48 83 EC ? 64 48 8B 2C 25 28 00 00 00 48 89 6C 24 18 48 89 F5 0F B6 87 ? ? 00 00 84 C0 0F 85"
 
-# Read, not hooked: source of the CNet pool global and work-item timer vtable.
+# Read, not hooked.
 [steamclient."CWebSocketConnection::PostDelayedCloseWorkItem"]
 follow = "none"
 pattern = "83 7F ? 02 0F 85 ? ? ? ? 80 BF ? ? 00 00 00 0F 85 ? ? ? ? 48 8D 05 ? ? ? ? BF ? ? 00 00"
 
-# steamrt reorders the connection save and pool load around the state gates.
-# The body validator verifies the pool load and complete work-item allocation.
 [[steamclient."CWebSocketConnection::PostDelayedCloseWorkItem".variants]]
 pattern = "83 7F ? 02"
 
-# CHTTPRequestJob start boundary. The local-cloud hook first uses this as an
-# observation point; x64 request layout is validated before transfer bypass.
 [steamclient."CHTTPRequestJob::Start"]
 follow = "none"
 pattern = "41 57 41 56 41 55 41 54 49 89 F4 55 48 89 FD 53 48 83 EC 68 4C 8B 6F 08 48 89 54 24 08 4C 8D 74 24 18 89 4C 24 04 64 48 8B 04 25 28 00 00 00 48 89 44 24 58 31 C0 48 8D 05 ? ? ? ? 48 83 47 40 01 4D 85 ED"
 
-# steamrt stores the request arguments after loading the response vtable.
 [[steamclient."CHTTPRequestJob::Start".variants]]
 pattern = "41 57 48 8D 05 ? ? ? ? 41 56 41 55 41 54 55 48 89 F5 53 48 89 FB 48 83 EC 68 48 89 14 24 4C 8D 74 24 18 64 4C 8B 24 25 28 00 00 00 4C 89 64 24 58 41 89 CC 48 8B 4F 08 48 83 47 40 01 4C 8B BE 88 00 00 00"
 
@@ -136,7 +104,6 @@ pattern = "41 57 48 8D 05 ? ? ? ? 41 56 41 55 41 54 55 48 89 F5 53 48 89 FB 48 8
 follow = "none"
 pattern = "41 57 41 56 41 55 4C 8D ? ? ? 00 00 41 54 55 53 48 83 EC ? 88 54 24 ? 8B 97 ? ? 00 00 89 74 24 ? 85 D2"
 
-# steamrt preserves the package ID before saving the change map base.
 [[steamclient."CUser::MarkLicenseAsChanged".variants]]
 pattern = "41 57 48 8D 87 ? ? 00 00 41 89 F7 41 56 41 55 41 54 55 53 48 83 EC ? 88 54 24 ? 8B 97 ? ? 00 00 89 74 24 ? 48 89 44 24 ? 85 D2"
 
@@ -146,10 +113,8 @@ pattern = "41 54 49 89 FC 55 53 8B 9F ? ? 00 00 83 EB 01 78 ? 48 63 C3 48 8D 2C 
 
 [steamclient."CUtlMemory::Grow"]
 follow = "relative"
-# Follow the pkg0 CUtlVector<u32> append helper callsite to CUtlMemory<u32>::Grow(int).
 pattern = "E8 ? ? ? ? 8B ? 10 8D 70 01 EB ? 66 0F 1F 44 00 00 29 C6 48 89 ? E8 ? ? ? ? 8B ? 10 8D 70 01 E9 ? FF FF FF 0F 1F 00 48 8D 15 ? ?"
 
-# Package lookup by package ID and access token.
 [steamclient."CPackageInfo::GetPackageInfo"]
 follow = "none"
 pattern = "41 ? 41 ? 41 ? 41 ? 49 89 ? 55 48 89 ? 53 89 ? 48 83 EC ? 48 63 47 ? 83 F8 FF 74 ? 48 8B ? ? EB ?"
@@ -166,11 +131,9 @@ pattern = "55 48 89 E5 41 57 ? ? ? ? ? 41 55 41 54 ? ? ? ? 48 ? ? ? ? ? ? ? ? ? 
 follow = "none"
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
 
-# Some steamrt builds use the same frame-pointer entry.
 [[steamclient."CUser::BuildSpawnEnvBlock".variants]]
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? 31 00 00 48 8B 45 ? 48 89 B5 ? CE FF FF ?"
 
-# steamrt addresses saved arguments and local buffers through RSP.
 [[steamclient."CUser::BuildSpawnEnvBlock".variants]]
 pattern = "41 57 41 56 41 55 41 54 55 53 48 81 EC ? 31 00 00 48 8B 84 24 ? 32 00 00 48 89 74 24 ? 48 89 4C 24"
 
@@ -181,8 +144,6 @@ pattern = "41 57 41 56 41 55 41 54 ? ? ? 55 ? ? ? 53 48 83 EC ? 48 85 F6 48 89 5
 [[steamclient."SetEnvString".variants]]
 pattern = "41 57 49 89 FF 41 56 41 55 41 54 55 53 48 89 F3 48 83 EC ? 48 85 F6 64 4C 8B 2C 25 28 00 00 00 ? ? ? ? ? 49 89 D5 0F 84 ? ? ? ? 4D 85 ED 0F 84 ? ? ? ? 41 8B 87 A4 00 00 00"
 
-# The writer that also takes a mode flag and a separator. A real calling
-# convention change, so this shape has to sit alongside the one above.
 [[steamclient."SetEnvString".variants]]
 pattern = "41 57 49 89 FF 41 56 41 55 41 54 41 89 CC 55 48 89 D5 53 48 89 F3 48 83 EC ? 48 85 F6 64 4C 8B 2C 25 28 00 00 00 4C 89 6C 24 ? 45 89 C5 0F 84 ? ? ? ? 48 85 ED 75 ? 41 83 FC 01"
 
@@ -192,8 +153,6 @@ pattern = "41 57 49 89 FF 41 56 41 55 41 54 41 89 CC 55 48 89 D5 53 48 89 F3 48 
 follow = "none"
 pattern = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 64 48 8B 1C 25 28 00 00 00 48 89 5D ? 48 89 FB E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? 48 C7 85 ? ? ? ? 00 00 00 00 48 C7 85 ? ? ? ? 00 00 00 00"
 
-# The vtable slot, the app map offset and the overview flag byte differ between
-# builds while the sequence around them is identical, so each is a wildcard.
 [steamui."CSteamUIAppController::FillInAppOverview"]
 follow = "upward"
 prologue = "53 55 54 41 55 41 56 41 57 41"
@@ -210,6 +169,10 @@ pattern = "41 57 41 56 41 55 41 54 55 48 89 FD 53 48 89 F3 48 81 EC ? ? ? ? 48 8
 [steamui."google::protobuf::RepeatedField<uint32>::Add"]
 follow = "none"
 pattern = "41 54 55 48 89 FD 53 48 89 F3 48 83 EC 30 8B 47 04 39 07 7C ? 4C 8D 64 24 10 B9 F7 04 00 00 BE 03 00 00 00 48 8D 15 ? ? ? ? 4C 89 E7 E8 ? ? ? ? 48 8D 35 ? ? ? ? 4C 89 E7 E8 ? ? ? ? 48 89 C6 48 8D 7C 24 0F E8 ? ? ? ? 4C 89 E7 E8 ? ? ? ? 48 89 EF E8 ? ? ? ? 49 89 C0 48 63 45 00 8D 50 01 89 55 00 8B 13 41 89 14 80"
+
+[steamui."google::protobuf::RepeatedField<uint32>::Reserve"]
+follow = "none"
+pattern = "8B 47 04 39 F0 0F 8D ? ? ? ? 41 57 41 56 41 55 45 31 ED 41 54 41 89 F4 55 48 89 FD 53 48 83 EC 48 85 C0 7E ? E8 ? ? ? ? 49 89 C5 48 89 EF E8 ? ? ? ? 8B 7D 04 44 89 E6 48 89 C3 E8 ? ? ? ? 4C 63 F8 48 B8 FD FF FF FF FF FF FF 3F"
 
 [steamui."CSteamUIAppController::GetAppByID"]
 follow = "none"

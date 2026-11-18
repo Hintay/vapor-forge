@@ -11,6 +11,8 @@ pub(crate) const EAPPCHANGE_ADDED_OR_CREATED: u32 = 1;
 pub(crate) type GetAppByIdFn = unsafe extern "C" fn(*mut c_void, u32, bool) -> *mut c_void;
 pub(crate) type MarkAppChangeFn = unsafe extern "C" fn(*mut c_void, u32, u32);
 pub(crate) type RepeatedFieldAddFn = unsafe extern "C" fn(*mut c_void, *const u32);
+/// `RepeatedField<T>::Reserve(int new_size)` for a 4-byte `T`.
+pub(crate) type RepeatedFieldReserveFn = unsafe extern "C" fn(*mut c_void, i32);
 
 pub(crate) static mut GET_APP_BY_ID_DETOUR: Option<Detour<GetAppByIdFn>> = None;
 pub(crate) static mut MARK_APP_CHANGE_DETOUR: Option<Detour<MarkAppChangeFn>> = None;

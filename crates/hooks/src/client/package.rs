@@ -321,6 +321,7 @@ impl SteamPackageAccess {
                 continue;
             }
             if self.append(raw_id) {
+                crate::ui::install::forget_removal(app_id);
                 debug!(app_id = raw_id, "package: added to pkg0");
                 applied.additions.push(app_id);
             } else {

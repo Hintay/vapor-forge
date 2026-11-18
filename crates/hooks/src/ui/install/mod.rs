@@ -8,9 +8,7 @@
 use core::ffi::c_void;
 use std::sync::atomic::Ordering;
 
-#[cfg(target_pointer_width = "64")]
-use tracing::error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use vapor_forge_config::AppId;
 use vapor_forge_hook_engine::detour::Detour;
 use vapor_forge_steam_native_abi::steamui::CSteamApp;
@@ -19,24 +17,24 @@ use crate::hook_report::{log_drift_summary, log_hook_details, store_results, Hoo
 use crate::pattern_resolver::{resolve_pattern_entry, CodeRegion};
 use vapor_forge_hook_engine::original::detour_or_return;
 use vapor_forge_hook_engine::plan::{validate_hook_target, AddressRange, HookTargetInput};
-#[cfg(target_pointer_width = "64")]
 use vapor_forge_patterns::Pattern;
 
 pub(crate) use super::library::queue_metadata_refreshes;
-pub use super::library::queue_removal;
+pub use super::library::{forget_removal, queue_removal};
 use super::state::{
-    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, APP_CHANGE_SOURCE, GET_APP_BY_ID_DETOUR,
-    MARK_APP_CHANGE_DETOUR,
+    GetAppByIdFn, MarkAppChangeFn, RepeatedFieldAddFn, RepeatedFieldReserveFn, APP_CHANGE_SOURCE,
+    GET_APP_BY_ID_DETOUR, MARK_APP_CHANGE_DETOUR,
 };
 
 type RunFrameFn = unsafe extern "C" fn(*mut c_void);
 type FillInAppOverviewFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 type IsVisibleInGamesListFn = unsafe extern "C" fn(*mut c_void) -> bool;
 type BuildCompleteChangeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
-#[cfg(target_pointer_width = "64")]
 const MAX_REPEATED_FIELD_CANDIDATES: usize = 256;
 
 static mut REPEATED_FIELD_ADD: Option<RepeatedFieldAddFn> = None;
+/// Capacity growth before the removed IDs are appended.
+static mut REPEATED_FIELD_RESERVE: Option<RepeatedFieldReserveFn> = None;
 static mut RUN_FRAME_DETOUR: Option<Detour<RunFrameFn>> = None;
 static mut FILL_IN_OVERVIEW_DETOUR: Option<Detour<FillInAppOverviewFn>> = None;
 static mut IS_VISIBLE_IN_GAMES_LIST_DETOUR: Option<Detour<IsVisibleInGamesListFn>> = None;
@@ -161,9 +159,14 @@ unsafe extern "C" fn hk_build_complete_change(
     unsafe { original(controller, change, callback_slot) };
 
     if crate::capability::is_ready(crate::capability::Capability::LibrarySnapshot) {
-        // SAFETY: REPEATED_FIELD_ADD resolved once at install time.
-        let add_fn = unsafe { *std::ptr::addr_of!(REPEATED_FIELD_ADD) };
-        super::library::append_removed_appids(change, add_fn);
+        // SAFETY: both slots are resolved once at install time.
+        let (add_fn, reserve_fn) = unsafe {
+            (
+                *std::ptr::addr_of!(REPEATED_FIELD_ADD),
+                *std::ptr::addr_of!(REPEATED_FIELD_RESERVE),
+            )
+        };
+        super::library::append_removed_appids(change, add_fn, reserve_fn);
     }
 }
 
@@ -434,6 +437,17 @@ fn resolve_repeated_field_add(
     registry: &vapor_forge_patterns::registry::PatternRegistry,
 ) -> Option<usize> {
     let addr = resolve_repeated_field_add_address(steamui_code, registry)?;
+    {
+        let reserve = resolve_repeated_field_reserve_address(steamui_code, registry)?;
+        // SAFETY: reserve passed the live semantic validator for this ABI.
+        let f: RepeatedFieldReserveFn = unsafe { std::mem::transmute(reserve) };
+        // SAFETY: single-threaded init writes the resolver slot once.
+        unsafe { std::ptr::addr_of_mut!(REPEATED_FIELD_RESERVE).write(Some(f)) };
+        info!(
+            addr = format_args!("{:#x}", reserve),
+            "steamui: RepeatedField<uint32>::Reserve resolved"
+        );
+    }
 
     // SAFETY: addr passed the live semantic validator for this concrete ABI.
     let f: RepeatedFieldAddFn = unsafe { std::mem::transmute(addr) };
@@ -511,6 +525,52 @@ pub(crate) fn resolve_repeated_field_add_address(
     }
 
     Some(addr)
+}
+
+/// Every 4-byte RepeatedField instantiation shares the Reserve body, so the
+/// first candidate that passes semantic validation is used.
+fn resolve_repeated_field_reserve_address(
+    steamui_code: &CodeRegion,
+    registry: &vapor_forge_patterns::registry::PatternRegistry,
+) -> Option<usize> {
+    const NAME: &str = "google::protobuf::RepeatedField<uint32>::Reserve";
+    let Some(entry) = registry.get(NAME) else {
+        error!("steamui: RepeatedField<uint32>::Reserve pattern not in registry");
+        return None;
+    };
+    for variant in entry.variants() {
+        let pattern = match Pattern::parse(variant.pattern()) {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                error!(%error, "steamui: invalid RepeatedField<uint32>::Reserve pattern");
+                return None;
+            }
+        };
+        let matches =
+            match pattern.find_all_bounded(steamui_code.bytes, MAX_REPEATED_FIELD_CANDIDATES) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    error!(%error, "steamui: RepeatedField<uint32>::Reserve pattern is too broad");
+                    return None;
+                }
+            };
+        let valid = matches
+            .into_iter()
+            .map(|offset| steamui_code.base + offset)
+            .find(|&addr| {
+                crate::pattern_resolver::validate_resolved_pattern(
+                    "steamui",
+                    steamui_code,
+                    NAME,
+                    addr,
+                )
+            });
+        if valid.is_some() {
+            return valid;
+        }
+    }
+    error!("steamui: no valid RepeatedField<uint32>::Reserve candidate");
+    None
 }
 
 #[cfg(target_pointer_width = "64")]

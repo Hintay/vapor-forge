@@ -352,6 +352,11 @@ const STEAMUI32_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         label: "google::protobuf::RepeatedField<uint32>::Add body",
         validate: validate_repeated_field_add32,
     },
+    SemanticCheck {
+        name: "google::protobuf::RepeatedField<uint32>::Reserve",
+        label: "google::protobuf::RepeatedField<uint32>::Reserve body",
+        validate: validate_repeated_field_reserve32,
+    },
 ];
 
 const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
@@ -390,6 +395,11 @@ const STEAMUI64_SEMANTIC_CHECKS: &[SemanticCheck] = &[
         label: "google::protobuf::RepeatedField<uint32>::Add body",
         validate: validate_repeated_field_add64,
     },
+    SemanticCheck {
+        name: "google::protobuf::RepeatedField<uint32>::Reserve",
+        label: "google::protobuf::RepeatedField<uint32>::Reserve body",
+        validate: validate_repeated_field_reserve64,
+    },
 ];
 
 const STEAMCLIENT_SPECIAL_SEMANTIC_CHECKS: &[&str] = &["CPackageInfo::GetPackageInfo"];
@@ -405,11 +415,7 @@ fn semantic_check_table(module: &str, arch: SemanticArch) -> &'static [SemanticC
 }
 
 /// The body validator registered for one pattern entry, if any.
-fn semantic_validator(
-    module: &str,
-    arch: SemanticArch,
-    name: &str,
-) -> Option<SemanticValidator> {
+fn semantic_validator(module: &str, arch: SemanticArch, name: &str) -> Option<SemanticValidator> {
     semantic_check_table(module, arch)
         .iter()
         .find(|check| check.name == name)
@@ -881,7 +887,10 @@ fn scan_current_app_resolver(
             false
         }
         None => {
-            println!("  FAIL {:<58} required (no unique validated helper site)", name);
+            println!(
+                "  FAIL {:<58} required (no unique validated helper site)",
+                name
+            );
             true
         }
     }
@@ -1002,10 +1011,13 @@ fn scan_cuser_adapters(
                     // convention, and the IsUserSubscribedAppInTicket wrapper
                     // has a different ABI from the implementation it calls, so
                     // an unvalidated entry is not a match for either.
-                    if implementation.is_none() { eprintln!("PROBE unvalidated {name} 0x{:x}", method.func_va); }
+                    if implementation.is_none() {
+                        eprintln!("PROBE unvalidated {name} 0x{:x}", method.func_va);
+                    }
                     let implementation = match kind {
-                        CUserAdapterKind::GetSteamId
-                        | CUserAdapterKind::IsSubscribedInTicket => implementation?,
+                        CUserAdapterKind::GetSteamId | CUserAdapterKind::IsSubscribedInTicket => {
+                            implementation?
+                        }
                         _ => implementation.unwrap_or(offset),
                     };
                     Some((
@@ -1786,7 +1798,6 @@ fn has_x86_mov_from_any_disp8(bytes: &[u8], disp: u8) -> bool {
         .any(|w| w[0] == 0x8b && (0x40..=0x7f).contains(&w[1]) && w[2] == disp)
 }
 
-
 fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool {
     bytes.windows(6).any(|w| {
         if w[0] != 0x8d || w[1] != 0x86 {
@@ -1796,7 +1807,6 @@ fn has_x86_lea_eax_from_esi_disp32(bytes: &[u8], accepted_disps: &[u32]) -> bool
         accepted_disps.is_empty() || accepted_disps.contains(&disp)
     })
 }
-
 
 /// `lea eax, [esi + base]` on the license block found by `find_field_group`,
 /// so the check follows the block wherever a build places it in `CUser`.
@@ -1945,7 +1955,6 @@ fn has_x64_push_rbp_negative_local_before_call(bytes: &[u8]) -> bool {
         after_lea[push_rax_at + 1..].contains(&0xe8)
     })
 }
-
 
 fn has_x64_rip_lea(bytes: &[u8], modrm: u8) -> bool {
     bytes
@@ -2158,6 +2167,12 @@ fn semantic_failure_evidence(
         (SemanticArch::X86_64, "google::protobuf::RepeatedField<uint32>::Add") => {
             repeated_field_add64_evidence(code, offset)
         }
+        (SemanticArch::X86, "google::protobuf::RepeatedField<uint32>::Reserve") => {
+            repeated_field_reserve32_evidence(code, offset)
+        }
+        (SemanticArch::X86_64, "google::protobuf::RepeatedField<uint32>::Reserve") => {
+            repeated_field_reserve64_evidence(code, offset)
+        }
         _ => None,
     }
 }
@@ -2168,6 +2183,8 @@ fn validate_check_app_ownership32(code: &[u8], offset: usize) -> Option<&'static
         .then_some("ownership result + license state")
 }
 
+/// `CSteamEngine::RegisterInternalCallback`: the one-argument global wrapper.
+/// steamrt adds a stack canary and keeps the handler in a local slot.
 fn validate_register_internal_callback32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         register_internal_callback32_evidence(code, offset),
@@ -2354,7 +2371,11 @@ fn has_work_item_size(bitness: u32, bytes: &[u8]) -> bool {
         }
         let sets_size = matches!(instruction.mnemonic(), Mnemonic::Mov | Mnemonic::Push)
             && instruction
-                .try_immediate(if instruction.mnemonic() == Mnemonic::Push { 0 } else { 1 })
+                .try_immediate(if instruction.mnemonic() == Mnemonic::Push {
+                    0
+                } else {
+                    1
+                })
                 .is_ok_and(|size| (0x40..=0x1000).contains(&size));
         if sets_size {
             return true;
@@ -2409,12 +2430,7 @@ fn has_cmp_field_imm(bitness: u32, bytes: &[u8], base: iced_x86::Register, imm: 
 }
 
 /// `cmp byte ptr [base + any displacement], imm`.
-fn has_cmp_byte_field_imm(
-    bitness: u32,
-    bytes: &[u8],
-    base: iced_x86::Register,
-    imm: u64,
-) -> bool {
+fn has_cmp_byte_field_imm(bitness: u32, bytes: &[u8], base: iced_x86::Register, imm: u64) -> bool {
     has_cmp_field_imm_sized(bitness, bytes, base, 1, imm)
 }
 
@@ -2496,6 +2512,8 @@ fn has_x64_nonstack_qword_store_disp8(bytes: &[u8], displacement: u8) -> bool {
     })
 }
 
+/// `CUserInterface::Init`: owns the global-user IClient map wrappers. steamrt
+/// stores its arguments through SSE registers and has its own variant.
 fn validate_user_interface_init32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         user_interface_init32_evidence(code, offset),
@@ -2572,6 +2590,8 @@ fn user_interface_init64_evidence(code: &[u8], offset: usize) -> Option<Evidence
     ]))
 }
 
+/// `CUserInterface::~CUserInterface`: invalidates the owner before its
+/// interface wrappers are released.
 fn validate_user_interface_destructor32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         user_interface_destructor32_evidence(code, offset),
@@ -2701,6 +2721,9 @@ fn second_operand_is_zero_immediate(instruction: &iced_x86::Instruction) -> bool
     }
 }
 
+/// `CSteamEngine::SetAPICallResult`: API-call result storage, where registered
+/// vapor handles complete. The result map's offset in the engine differs
+/// between builds and is a wildcard in the pattern.
 fn validate_set_api_call_result32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         set_api_call_result32_evidence(code, offset),
@@ -2895,8 +2918,7 @@ fn get_subscribed_apps64_evidence(code: &[u8], offset: usize) -> Option<Evidence
             // The lookup sub-object's own offset in CUser differs between
             // builds together with the surrounding fields; nothing else in
             // this body pins it.
-            (has_asm64(bytes, |a| a.add(rdi, 0x1018))
-                || has_asm64(bytes, |a| a.add(rdi, 0x1440)))
+            (has_asm64(bytes, |a| a.add(rdi, 0x1018)) || has_asm64(bytes, |a| a.add(rdi, 0x1440)))
                 && has_asm64(bytes, |a| a.cmp(dword_ptr(rax + 0x18), 3)),
         ),
     ]))
@@ -3203,6 +3225,8 @@ fn load_depot_key64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     ]))
 }
 
+/// `CShaderCacheManager::GetShaderCacheDepot`: reads game/shadercachedepot
+/// from the local app-info cache.
 fn validate_get_shader_cache_depot32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         get_shader_cache_depot32_evidence(code, offset),
@@ -3250,8 +3274,7 @@ fn get_shader_cache_depot64_evidence(code: &[u8], offset: usize) -> Option<Evide
         ("app-info AppID", app_id),
         (
             "game type lookup",
-            has_seq(bytes, &[0xBA, 0x02, 0x00, 0x00, 0x00])
-                && has_seq(bytes, &[0x83, 0xF8, 0x01]),
+            has_seq(bytes, &[0xBA, 0x02, 0x00, 0x00, 0x00]) && has_seq(bytes, &[0x83, 0xF8, 0x01]),
         ),
         (
             "shader depot lookup",
@@ -3260,6 +3283,9 @@ fn get_shader_cache_depot64_evidence(code: &[u8], offset: usize) -> Option<Evide
     ]))
 }
 
+/// `CFamilySharing::GetLockingAccount`: the account holding the family library
+/// lock on an app, or 0 when the app is free, a lender is available, or this
+/// account holds the lock.
 fn validate_get_locking_account32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         get_locking_account_evidence(32, code, offset),
@@ -3310,7 +3336,9 @@ fn get_locking_account_evidence(bitness: u32, code: &[u8], offset: usize) -> Opt
         }
         if instruction.mnemonic() == Mnemonic::Add
             && register_operand(0)
-            && instruction.try_immediate(1).is_ok_and(|value| value == 0x10)
+            && instruction
+                .try_immediate(1)
+                .is_ok_and(|value| value == 0x10)
         {
             player_step = true;
         }
@@ -3340,6 +3368,10 @@ fn get_locking_account_evidence(bitness: u32, code: &[u8], offset: usize) -> Opt
     ]))
 }
 
+/// `BuildDepotDependency`: the argument spills sit at build-specific frame
+/// offsets, so the patterns pin only the frame size and the spill shape. A
+/// three-argument `CUserAppManager` virtual with a 0x6c frame looks similar on
+/// i686 steamrt but is not this function.
 fn validate_build_depot_dependency32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         build_depot_dependency32_evidence(code, offset),
@@ -3393,8 +3425,7 @@ fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evide
     // Only the app-state sub-object's offset in CUser differs between builds;
     // the rest of this body is identical.
     let app_state_base = [0xF20i32, 0x1348].iter().any(|&app_state| {
-        has_asm64(bytes, |a| a.add(rbp, app_state))
-            || has_asm64(bytes, |a| a.add(r12, app_state))
+        has_asm64(bytes, |a| a.add(rbp, app_state)) || has_asm64(bytes, |a| a.add(r12, app_state))
     });
     let old_shape = has_asm64(bytes, |a| a.mov(rax, qword_ptr(rsp + 0x2C8)))
         && has_asm64(bytes, |a| a.mov(dword_ptr(rsp + 0x130), -1))
@@ -3417,6 +3448,11 @@ fn build_depot_dependency64_evidence(code: &[u8], offset: usize) -> Option<Evide
     ]))
 }
 
+/// `CWebSocketConnection::BBuildAndAsyncSendFrame`: the pattern reaches past
+/// the frame setup to the two argument spills, because another function shares
+/// the prologue and the 0xac frame and differs only in which register takes the
+/// connection. The spill displacements depend on the build's frame and are
+/// wildcards.
 fn validate_websocket_send_frame32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         websocket_send_frame32_evidence(code, offset),
@@ -3562,6 +3598,10 @@ fn ccm_recv_pkt64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     ]))
 }
 
+/// `CNetPacket::Alloc`: CCMConnection splits a multi-message into sub-packets
+/// with Alloc, Init, a receiver dispatch and Release. That loop keeps its shape
+/// while the CNetPacket bodies and layout change, so Alloc, Init and Release
+/// are followed from its calls and the field offsets are read from Init.
 fn validate_cnet_packet_alloc32(code: &[u8], offset: usize) -> Option<&'static str> {
     validate_cnet_packet_alloc(32, code, offset)
 }
@@ -3582,6 +3622,8 @@ fn cnet_packet_alloc_evidence(bitness: u32, code: &[u8], offset: usize) -> Optio
     ))
 }
 
+/// `CNetPacket::Init`: the owned-data Init call followed by a fixed-argument
+/// call keeps one shape in every sampled build and family.
 fn validate_cnet_packet_init32(code: &[u8], offset: usize) -> Option<&'static str> {
     validate_cnet_packet_init(32, code, offset)
 }
@@ -3602,6 +3644,8 @@ fn cnet_packet_init_evidence(bitness: u32, code: &[u8], offset: usize) -> Option
     ))
 }
 
+/// `CNetPacket::Release`: the refcount offset differs between builds and is a
+/// wildcard.
 fn validate_cnet_packet_release32(code: &[u8], offset: usize) -> Option<&'static str> {
     validate_cnet_packet_release(32, code, offset)
 }
@@ -3631,6 +3675,11 @@ fn decoded_evidence<T>(result: Result<T, &'static str>) -> Evidence {
     evidence
 }
 
+/// `CWorkThreadPool::AddWorkItem`: builds differ in whether the pool-state byte
+/// is spilled before the test, in that byte's offset and in the frame size, so
+/// the patterns stop at the pool-state read and wildcard both. The x86_64
+/// steamrt shape starts past the register saves, whose count differs between
+/// builds, and `entry` walks back to the real entry.
 fn validate_work_thread_pool_add_work_item32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         work_thread_pool_add_work_item32_evidence(code, offset),
@@ -3711,6 +3760,8 @@ fn work_thread_pool_add_work_item64_evidence(code: &[u8], offset: usize) -> Opti
     ]))
 }
 
+/// `CWebSocketConnection::PostDelayedCloseWorkItem`: read, not hooked; the
+/// source of the CNet pool global and the work-item timer vtable.
 fn validate_websocket_delayed_close32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         websocket_delayed_close32_evidence(code, offset),
@@ -3767,6 +3818,10 @@ fn websocket_delayed_close64_evidence(code: &[u8], offset: usize) -> Option<Evid
     ]))
 }
 
+/// `CHTTPRequestJob::Start`: the boundary used by the local-cloud transfer
+/// hook. On x86_64 the request layout is validated before a transfer is
+/// bypassed; steamrt stores the request arguments after loading the response
+/// vtable, with build-specific frame size and stack slots.
 fn validate_http_request_job_start32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         http_request_job_start32_evidence(code, offset),
@@ -4127,16 +4182,12 @@ fn mark_license_changed64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         (
             "changed-license count load",
             bytes.windows(6).any(|window| {
-                window[0] == 0x8b
-                    && window[1] == 0x97
-                    && window[4] == 0
-                    && window[5] == 0
+                window[0] == 0x8b && window[1] == 0x97 && window[4] == 0 && window[5] == 0
             }),
         ),
         (
             "license ID hash",
-            has_seq(bytes, &[0x6b, 0xca, 0xeb, 0x85])
-                && has_seq(bytes, &[0x35, 0xae, 0xb2, 0xc2]),
+            has_seq(bytes, &[0x6b, 0xca, 0xeb, 0x85]) && has_seq(bytes, &[0x35, 0xae, 0xb2, 0xc2]),
         ),
         (
             "existing added-state lookup",
@@ -4145,10 +4196,7 @@ fn mark_license_changed64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
         (
             "added-state promotion",
             bytes.windows(5).any(|window| {
-                window[0] == 0xc6
-                    && window[1] == 0x44
-                    && window[2] == 0x24
-                    && window[4] == 1
+                window[0] == 0xc6 && window[1] == 0x44 && window[2] == 0x24 && window[4] == 1
             }),
         ),
     ]))
@@ -4433,6 +4481,10 @@ fn write_vdf_file64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     ]))
 }
 
+/// `CUser::SpawnProcess`: the entry saves its arguments in a build-specific
+/// order, so the patterns start at the game-id discriminator check and its
+/// zeroed local and walk up to the frame setup, independent of the argument
+/// spills and SSE register packing.
 fn validate_spawn_process32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(spawn_process32_evidence(code, offset), "spawn process args")
 }
@@ -4592,6 +4644,10 @@ fn build_spawn_env_block64_evidence(code: &[u8], offset: usize) -> Option<Eviden
     ]))
 }
 
+/// `SetEnvString`: an older three-argument writer and a five-argument writer
+/// that also takes a mode flag and a separator. The calling convention really
+/// changed, so both shapes are kept; `vapor_forge_patterns::env_writer`
+/// tells them apart.
 fn validate_set_env_string32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(set_env_string32_evidence(code, offset), "env map insertion")
 }
@@ -4669,6 +4725,10 @@ fn set_env_string64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     ]))
 }
 
+/// `CSteamUIAppController::RunFrame`: vtable slot 3 of the controller.
+/// `CVGUIApplicationSteamUI::RunFrame` has the same name but another receiver.
+/// The entry compares the frame time with per-task timestamps whose offsets
+/// differ between builds.
 fn validate_steamui_run_frame32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(steamui_run_frame32_evidence(code, offset), "ui frame tick")
 }
@@ -4714,6 +4774,8 @@ fn steamui_run_frame64_evidence(code: &[u8], offset: usize) -> Option<Evidence> 
     ]))
 }
 
+/// `CSteamUIAppController::FillInAppOverview`: the vtable slot, the app map
+/// offset and the overview flag byte differ between builds and are wildcards.
 fn validate_fill_in_app_overview32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         fill_in_app_overview32_evidence(code, offset),
@@ -4758,10 +4820,7 @@ fn fill_in_app_overview64_evidence(code: &[u8], offset: usize) -> Option<Evidenc
     Some(evidence)
 }
 
-fn validate_is_visible_in_games_list32(
-    code: &[u8],
-    offset: usize,
-) -> Option<&'static str> {
+fn validate_is_visible_in_games_list32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         is_visible_in_games_list32_evidence(code, offset),
         "Steam library visibility predicate",
@@ -4795,10 +4854,7 @@ fn is_visible_in_games_list32_evidence(code: &[u8], offset: usize) -> Option<Evi
     ]))
 }
 
-fn validate_is_visible_in_games_list64(
-    code: &[u8],
-    offset: usize,
-) -> Option<&'static str> {
+fn validate_is_visible_in_games_list64(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(
         is_visible_in_games_list64_evidence(code, offset),
         "Steam library visibility predicate",
@@ -4829,6 +4885,8 @@ fn is_visible_in_games_list64_evidence(code: &[u8], offset: usize) -> Option<Evi
     ]))
 }
 
+/// `CSteamUIAppController::BuildCompleteAppOverviewChange`: newer steamrt
+/// builds keep the controller and the change in exchanged registers.
 fn validate_build_complete_app_overview_change32(
     code: &[u8],
     offset: usize,
@@ -4877,6 +4935,8 @@ fn build_complete_app_overview_change64_evidence(code: &[u8], offset: usize) -> 
     Some(evidence)
 }
 
+/// `CSteamUIAppController::GetAppByID`: the app map's offset in the controller
+/// differs between builds; it is a wildcard here and in `MarkAppChange`.
 fn validate_get_app_by_id32(code: &[u8], offset: usize) -> Option<&'static str> {
     evidence_result(get_app_by_id32_evidence(code, offset), "app lookup")
 }
@@ -4892,10 +4952,7 @@ fn get_app_by_id32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
             "receiver argument load",
             has_asm32(bytes, |a| a.mov(esi, dword_ptr(ebp + 0x08))),
         ),
-        (
-            "app map load",
-            has_app_map_load32(bytes),
-        ),
+        ("app map load", has_app_map_load32(bytes)),
     ]))
 }
 
@@ -4928,10 +4985,7 @@ fn validate_mark_app_change32(code: &[u8], offset: usize) -> Option<&'static str
 fn mark_app_change32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x120)?;
     Some(Evidence::required([
-        (
-            "library app map load",
-            has_app_map_load32(bytes),
-        ),
+        ("library app map load", has_app_map_load32(bytes)),
         (
             "change flag materialization",
             has_asm32(bytes, |a| a.sete(cl)),
@@ -4950,10 +5004,7 @@ fn mark_app_change64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
     let bytes = bounded_tail(code, offset, 0x160)?;
     Some(Evidence::required([
         ("change kind filter", has_asm64(bytes, |a| a.cmp(edi, 7))),
-        (
-            "library app map load",
-            has_app_map_load64(bytes),
-        ),
+        ("library app map load", has_app_map_load64(bytes)),
         ("app object save", has_asm64(bytes, |a| a.mov(r12, rax))),
     ]))
 }
@@ -5014,6 +5065,72 @@ fn repeated_field_add64_evidence(code: &[u8], offset: usize) -> Option<Evidence>
     ]))
 }
 
+/// `RepeatedField<T>::Reserve(int)` for a 4-byte `T`. The x86_64 Add only
+/// appends into reserved capacity. Every 4-byte instantiation shares this body,
+/// so any candidate that passes is usable.
+fn validate_repeated_field_reserve32(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        repeated_field_reserve32_evidence(code, offset),
+        "repeated-field reserve",
+    )
+}
+
+fn repeated_field_reserve32_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    let bytes = bounded_tail(code, offset, 0x100)?;
+    Some(Evidence::required([
+        (
+            "capacity check",
+            has_asm32(bytes, |a| {
+                a.mov(eax, dword_ptr(esi + 0x04))?;
+                a.cmp(eax, ebx)
+            }),
+        ),
+        (
+            "four-byte element size limit",
+            has_asm32(bytes, |a| a.cmp(eax, 0x3fff_fffe)),
+        ),
+    ]))
+}
+
+fn validate_repeated_field_reserve64(code: &[u8], offset: usize) -> Option<&'static str> {
+    evidence_result(
+        repeated_field_reserve64_evidence(code, offset),
+        "repeated-field reserve",
+    )
+}
+
+fn repeated_field_reserve64_evidence(code: &[u8], offset: usize) -> Option<Evidence> {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    let bytes = bounded_tail(code, offset, 0x100)?;
+    let instructions: Vec<_> = decode_x64(bytes).collect();
+    Some(Evidence::required([
+        (
+            "capacity check",
+            has_asm64(bytes, |a| {
+                a.mov(eax, dword_ptr(rdi + 0x04))?;
+                a.cmp(eax, esi)
+            }),
+        ),
+        (
+            "four-byte element size limit",
+            instructions.iter().any(|instruction| {
+                instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op1_kind() == OpKind::Immediate64
+                    && instruction.immediate64() == 0x3fff_ffff_ffff_fffd
+            }),
+        ),
+        (
+            "rep header allocation size",
+            instructions.iter().any(|instruction| {
+                instruction.mnemonic() == Mnemonic::Lea
+                    && instruction.memory_base() == Register::None
+                    && instruction.memory_index_scale() == 4
+                    && instruction.memory_displacement64() == 8
+            }),
+        ),
+    ]))
+}
+
 fn find_x64_rbp_dword_or_qword_load(bytes: &[u8], expected_disp: u8) -> Option<usize> {
     let has_mov_eax = bytes
         .windows(3)
@@ -5067,11 +5184,12 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     failed |= scan_env_writer_abi(code, vaddr, resolved, 64);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
-        let ownership_calls_lookup = resolved
-            .get("CUser::CheckAppOwnership")
-            .is_some_and(|&ownership_offset| {
-                has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
-            });
+        let ownership_calls_lookup =
+            resolved
+                .get("CUser::CheckAppOwnership")
+                .is_some_and(|&ownership_offset| {
+                    has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
+                });
         match discover_package_info64_layout(code, get_package_info_offset) {
             Some(layout) if ownership_calls_lookup => {
                 println!(
@@ -5085,11 +5203,8 @@ fn scan_steamclient64_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
                 );
             }
             _ => {
-                let evidence = package_info64_evidence(
-                    code,
-                    get_package_info_offset,
-                    ownership_calls_lookup,
-                );
+                let evidence =
+                    package_info64_evidence(code, get_package_info_offset, ownership_calls_lookup);
                 print_evidence_failure(
                     "CPackageInfo::GetPackageInfo package map",
                     vaddr + get_package_info_offset as u64,
@@ -5118,11 +5233,12 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
     failed |= scan_env_writer_abi(code, vaddr, resolved, 32);
 
     if let Some(&get_package_info_offset) = resolved.get("CPackageInfo::GetPackageInfo") {
-        let ownership_calls_lookup = resolved
-            .get("CUser::CheckAppOwnership")
-            .is_some_and(|&ownership_offset| {
-                has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
-            });
+        let ownership_calls_lookup =
+            resolved
+                .get("CUser::CheckAppOwnership")
+                .is_some_and(|&ownership_offset| {
+                    has_relative_call_to(code, ownership_offset, 0x1400, get_package_info_offset)
+                });
         match discover_package_info32_layout(code, get_package_info_offset) {
             Some(layout) if ownership_calls_lookup => {
                 println!(
@@ -5136,11 +5252,8 @@ fn scan_steamclient32_layouts(code: &[u8], vaddr: u64, resolved: &HashMap<&str, 
                 );
             }
             _ => {
-                let evidence = package_info32_evidence(
-                    code,
-                    get_package_info_offset,
-                    ownership_calls_lookup,
-                );
+                let evidence =
+                    package_info32_evidence(code, get_package_info_offset, ownership_calls_lookup);
                 print_evidence_failure(
                     "CPackageInfo::GetPackageInfo package map",
                     vaddr + get_package_info_offset as u64,
@@ -5355,9 +5468,10 @@ fn update_ticket32_evidence(
 /// through the unadjusted pointer.
 fn update_ticket32_has_valid_receiver(bytes: &[u8], this_adjust: u64) -> bool {
     let receiver_adjust_window = &bytes[..bytes.len().min(0x100)];
-    let adjusts_this =
-        find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| u64::from(imm) == this_adjust)
-            .is_some();
+    let adjusts_this = find_x86_sub_eax_imm32_matching(receiver_adjust_window, |imm| {
+        u64::from(imm) == this_adjust
+    })
+    .is_some();
     if adjusts_this && has_x86_cmp_cuser_field_imm8(bytes, this_adjust as u32, 0x04) {
         return true;
     }
@@ -5555,8 +5669,13 @@ fn package_info32_evidence(
     evidence.require("package map value offset", node_value_off.is_some());
     evidence.require(
         "expected package map layout",
-        (root_off, elements_off, node_size, node_key_off, node_value_off)
-            == (Some(0x18), Some(0x2c), Some(0x18), Some(0x10), Some(0x14)),
+        (
+            root_off,
+            elements_off,
+            node_size,
+            node_key_off,
+            node_value_off,
+        ) == (Some(0x18), Some(0x2c), Some(0x18), Some(0x10), Some(0x14)),
     );
     Some(evidence)
 }
@@ -5618,8 +5737,13 @@ fn package_info64_evidence(
     evidence.require("package map value offset", node_value_off.is_some());
     evidence.require(
         "expected package map layout",
-        (root_off, elements_off, node_size, node_key_off, node_value_off)
-            == (Some(0x20), Some(0x38), Some(0x20), Some(0x10), Some(0x18)),
+        (
+            root_off,
+            elements_off,
+            node_size,
+            node_key_off,
+            node_value_off,
+        ) == (Some(0x20), Some(0x38), Some(0x20), Some(0x10), Some(0x18)),
     );
     Some(evidence)
 }
@@ -5656,13 +5780,13 @@ fn has_x86_package_info_allocation(bytes: &[u8]) -> bool {
 
 fn find_x64_get_package_info_args(bytes: &[u8]) -> bool {
     let args = bytes.get(..bytes.len().min(0x40)).unwrap_or(bytes);
-    let saves_access_token = args.windows(3).any(|w| {
-        matches!(w[0], 0x48 | 0x49) && w[1] == 0x89 && w[2] & 0xf8 == 0xd0
-    });
+    let saves_access_token = args
+        .windows(3)
+        .any(|w| matches!(w[0], 0x48 | 0x49) && w[1] == 0x89 && w[2] & 0xf8 == 0xd0);
     let saves_package_id = args.windows(2).any(|w| w[0] == 0x89 && w[1] & 0xf8 == 0xf0)
-        || args.windows(3).any(|w| {
-            w[0] == 0x41 && w[1] == 0x89 && w[2] & 0xf8 == 0xf0
-        });
+        || args
+            .windows(3)
+            .any(|w| w[0] == 0x41 && w[1] == 0x89 && w[2] & 0xf8 == 0xf0);
     let compares_access_token = bytes.windows(4).any(|w| {
         matches!(w[0], 0x48 | 0x49 | 0x4c | 0x4d)
             && matches!(w[1], 0x39 | 0x3b)
@@ -5755,8 +5879,7 @@ fn find_x64_package_root_off(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(4)
         .find_map(|w| {
-            ((w[0] & 0xfb) == 0x48 && w[1] == 0x63 && w[2] & 0xc7 == 0x47)
-                .then_some(w[3] as usize)
+            ((w[0] & 0xfb) == 0x48 && w[1] == 0x63 && w[2] & 0xc7 == 0x47).then_some(w[3] as usize)
         })
         .or_else(|| {
             bytes.windows(7).enumerate().find_map(|(idx, w)| {
@@ -5771,8 +5894,7 @@ fn find_x64_elements_load_from_rdi(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(4)
         .find_map(|w| {
-            ((w[0] & 0xfb) == 0x48 && w[1] == 0x8b && w[2] & 0xc7 == 0x47)
-                .then_some(w[3] as usize)
+            ((w[0] & 0xfb) == 0x48 && w[1] == 0x8b && w[2] & 0xc7 == 0x47).then_some(w[3] as usize)
         })
         .or_else(|| {
             bytes.windows(7).enumerate().find_map(|(idx, w)| {
@@ -5822,9 +5944,9 @@ fn find_x64_pointer_return_off(bytes: &[u8]) -> Option<usize> {
         .windows(5)
         .find_map(|w| (w[0..4] == [0x48, 0x8b, 0x44, 0x07]).then_some(w[4] as usize))
         .or_else(|| {
-            bytes.windows(5).find_map(|w| {
-                (w[0..4] == [0x4c, 0x8b, 0x6c, 0x06]).then_some(w[4] as usize)
-            })
+            bytes
+                .windows(5)
+                .find_map(|w| (w[0..4] == [0x4c, 0x8b, 0x6c, 0x06]).then_some(w[4] as usize))
         })
         .or_else(|| {
             // `mov r13, [base + disp8]`, the same load without a scaled index.
