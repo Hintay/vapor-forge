@@ -2,7 +2,7 @@ use core::ffi::c_void;
 
 use std::sync::OnceLock;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use vapor_forge_config::DepotId;
 use vapor_forge_features::depot_key::DEPOT_KEY_SIZE;
 use vapor_forge_hook_engine::detour::Detour;
@@ -70,6 +70,8 @@ unsafe { original(
         p_build_id,
         pb_beta_fallback,
     ) };
+    // SAFETY: p_depot_info is the vector Steam just filled for this call.
+    unsafe { note_depot_selection(app_id, result, p_depot_info) };
 
     if !crate::capability::is_ready(crate::capability::Capability::DepotInjection) {
         return result;
@@ -119,6 +121,64 @@ unsafe { original(
     }
 
     result
+}
+
+/// Record what Steam selected for a controlled app. An empty selection makes
+/// Steam finish an install with no depots (0 B), so it is reported with the
+/// ownership state that feeds the selection, once per app and outcome; other
+/// selections only at debug level.
+///
+/// # Safety
+/// `p_depot_info` must be null or the `CUtlVector<DepotEntry>` Steam filled
+/// for this `BuildDepotDependency` call.
+unsafe fn note_depot_selection(app_id: u32, result: bool, p_depot_info: *mut c_void) {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use vapor_forge_config::AppId;
+
+    let app = AppId(app_id);
+    if !super::install::config().is_controlled_app(app) {
+        return;
+    }
+    let depots = (!p_depot_info.is_null())
+        .then(|| {
+            let vec = p_depot_info
+                as *const vapor_forge_steam_native_abi::CUtlVector<
+                    vapor_forge_steam_native_abi::DepotEntry,
+                >;
+            // SAFETY: the caller passes the vector Steam just filled.
+            let (len, capacity) = unsafe { ((*vec).len(), (*vec).capacity()) };
+            (len <= capacity).then_some(len)
+        })
+        .flatten();
+    if result && depots.is_some_and(|count| count > 0) {
+        debug!(app_id, depots = ?depots, "depot: selection");
+        return;
+    }
+
+    /// (app id, BuildDepotDependency result, selected depot count).
+    type Outcome = (u32, bool, Option<usize>);
+    static REPORTED: Mutex<Option<HashSet<Outcome>>> = Mutex::new(None);
+    let first = REPORTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert((app_id, result, depots));
+    if !first {
+        return;
+    }
+    warn!(
+        app_id,
+        result,
+        depots = ?depots,
+        license_sync_complete = vapor_forge_features::apps::license_sync_complete(),
+        actual_ownership = ?vapor_forge_features::apps::actual_ownership(app),
+        pkg0_injected = super::install::PKG0_INJECTED.load(Ordering::Acquire),
+        depot_injection_ready =
+            crate::capability::is_ready(crate::capability::Capability::DepotInjection),
+        "depot: controlled app has no depots selected"
+    );
 }
 
 // ---------------------------------------------------------------------------
