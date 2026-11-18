@@ -117,15 +117,26 @@ mod linux_audit {
         }
         let steamclient_seen = STEAM_MODULES.steamclient_seen();
         let steamui_seen = STEAM_MODULES.steamui_seen();
+        if !steamclient_seen && !steamui_seen {
+            return;
+        }
+        // steamwebhelper and other children inherit LD_AUDIT and load a
+        // steamclient.so of their own to talk to the client; only the client
+        // process carries the hook targets.
+        if !is_steam_client_process() {
+            static SKIPPED: AtomicBool = AtomicBool::new(false);
+            if !SKIPPED.swap(true, Ordering::AcqRel) {
+                log_early("la_activity: not the Steam client process; hooks skipped");
+            }
+            return;
+        }
 
         use vapor_forge_hooks::{
             ensure_runtime_initialized, install_hook_batch, is_hook_batch_finished, HookBatch,
         };
 
-        if steamclient_seen || steamui_seen {
-            clear_audit_env_for_steam();
-        }
-        if (steamclient_seen || steamui_seen) && !ensure_runtime_initialized() {
+        clear_audit_env_for_steam();
+        if !ensure_runtime_initialized() {
             log_early("la_activity: runtime initialization rejected; hooks disabled");
             return;
         }
@@ -139,7 +150,7 @@ mod linux_audit {
         let steamclient_finished =
             !steamclient_seen || is_hook_batch_finished(HookBatch::SteamClient);
         let steamui_finished = !steamui_seen || is_hook_batch_finished(HookBatch::SteamUi);
-        if (steamclient_seen || steamui_seen) && steamclient_finished && steamui_finished {
+        if steamclient_finished && steamui_finished {
             vapor_forge_hooks::restore_trampoline_pages_rx();
         }
     }
@@ -150,17 +161,9 @@ mod linux_audit {
             return;
         }
 
-        // Only the process that loads Steam's client modules clears the
-        // variable. The steamrt64 bootstrap is also a `steam` binary and
-        // re-executes the client, which must still inherit it. Launcher
-        // scripts are named `steam` too; their executed image is the
-        // interpreter, so /proc/self/exe excludes them.
-        let Ok(executable) = std::fs::read_link("/proc/self/exe") else {
-            return;
-        };
-        if !executable.to_str().is_some_and(is_steam_executable_path) {
-            return;
-        }
+        // Only the client process, once it loads Steam's client modules,
+        // clears the variable. The steamrt64 bootstrap is also a `steam`
+        // binary and re-executes the client, which must still inherit it.
 
         // SAFETY: The audit module is already loaded in this process, so
         // removing the variable only stops child processes from inheriting it.
@@ -170,6 +173,19 @@ mod linux_audit {
         } else {
             log_early("la_activity: failed to clear inherited LD_AUDIT");
         }
+    }
+
+    /// Whether this process runs the Steam client executable. Launcher scripts
+    /// are named `steam` too; their executed image is the interpreter, so
+    /// /proc/self/exe excludes them.
+    fn is_steam_client_process() -> bool {
+        static CLIENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CLIENT.get_or_init(|| {
+            std::fs::read_link("/proc/self/exe")
+                .ok()
+                .and_then(|executable| executable.to_str().map(is_steam_executable_path))
+                .unwrap_or(false)
+        })
     }
 
     fn is_steam_executable_path(path: &str) -> bool {
@@ -216,6 +232,9 @@ mod linux_audit {
             assert!(is_steam_executable_path("steam"));
             assert!(!is_steam_executable_path("/usr/bin/steam.sh"));
             assert!(!is_steam_executable_path("/usr/bin/steamwebhelper"));
+            assert!(!is_steam_executable_path(
+                "/home/deck/.local/share/Steam/steamrt64/steamwebhelper"
+            ));
         }
     }
 }
