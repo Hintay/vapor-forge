@@ -30,7 +30,7 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all(&args.out_dir)
         .map_err(|error| format!("create {} failed: {error}", args.out_dir.display()))?;
 
-    let manifest_url = args.channel.manifest_url();
+    let manifest_url = args.channel.manifest_url(args.platform);
     args.text_print(format_args!("manifest_url={manifest_url}"));
     let manifest_text = http_get_string(manifest_url, MAX_MANIFEST_BYTES)?;
     let manifest = Manifest::parse(&manifest_text)?;
@@ -103,12 +103,36 @@ impl Channel {
         }
     }
 
-    fn manifest_url(self) -> &'static str {
-        match self {
-            Self::Public => "https://client-update.akamai.steamstatic.com/steam_client_ubuntu12",
-            Self::PublicBeta => {
+    fn manifest_url(self, platform: Platform) -> &'static str {
+        match (self, platform) {
+            (Self::Public, Platform::SteamRt64) => {
+                "https://client-update.akamai.steamstatic.com/steam_client_steamrt64"
+            }
+            (Self::PublicBeta, Platform::SteamRt64) => {
+                "https://client-update.akamai.steamstatic.com/steam_client_publicbeta_steamrt64"
+            }
+            (Self::Public, Platform::Ubuntu12) => {
+                "https://client-update.akamai.steamstatic.com/steam_client_ubuntu12"
+            }
+            (Self::PublicBeta, Platform::Ubuntu12) => {
                 "https://client-update.akamai.steamstatic.com/steam_client_publicbeta_ubuntu12"
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Platform {
+    SteamRt64,
+    Ubuntu12,
+}
+
+impl Platform {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "steamrt64" => Ok(Self::SteamRt64),
+            "ubuntu12" => Ok(Self::Ubuntu12),
+            other => Err(format!("unsupported platform {other:?}")),
         }
     }
 }
@@ -138,10 +162,12 @@ enum PackageKind {
 }
 
 impl PackageKind {
-    fn manifest_key(self) -> &'static str {
-        match self {
-            Self::Ubuntu12 => "bins_ubuntu12",
-            Self::SteamRt => "bins_steamrt_ubuntu12",
+    fn manifest_key(self, platform: Platform) -> &'static str {
+        match (self, platform) {
+            (Self::Ubuntu12, Platform::Ubuntu12) => "bins_ubuntu12",
+            (Self::SteamRt, Platform::Ubuntu12) => "bins_steamrt_ubuntu12",
+            (Self::Ubuntu12, Platform::SteamRt64) => "bins_steamrt64",
+            (Self::SteamRt, Platform::SteamRt64) => "bins_steamrt_steamrt64",
         }
     }
 
@@ -165,6 +191,7 @@ const ROOTS_STEAMRT_BOTH: &[&str] = &["steamrt32", "steamrt64"];
 
 struct Args {
     channel: Channel,
+    platform: Platform,
     arch: Option<Arch>,
     version: Option<String>,
     out_dir: PathBuf,
@@ -182,6 +209,7 @@ enum OutputFormat {
 impl Args {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut channel = Channel::Public;
+        let mut platform = Platform::SteamRt64;
         let mut arch = None;
         let mut version = None;
         let mut out_dir = std::env::temp_dir().join("vapor-steam-cdn");
@@ -193,6 +221,7 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--channel" => channel = Channel::parse(&next_value(&mut args, "--channel")?)?,
+                "--platform" => platform = Platform::parse(&next_value(&mut args, "--platform")?)?,
                 "--arch" => arch = Some(Arch::parse(&next_value(&mut args, "--arch")?)?),
                 "--version" => version = Some(next_value(&mut args, "--version")?),
                 "--out" => out_dir = PathBuf::from(next_value(&mut args, "--out")?),
@@ -213,6 +242,7 @@ impl Args {
 
         Ok(Self {
             channel,
+            platform,
             arch,
             version,
             out_dir,
@@ -229,9 +259,14 @@ impl Args {
         };
 
         match self.arch {
-            None => match self.channel {
-                Channel::Public => vec![request(PackageKind::Ubuntu12, ROOTS_UBUNTU12_32)],
-                Channel::PublicBeta => vec![request(PackageKind::SteamRt, ROOTS_STEAMRT_BOTH)],
+            None => match (self.platform, self.channel) {
+                (Platform::SteamRt64, _) => vec![request(PackageKind::SteamRt, ROOTS_STEAMRT64)],
+                (Platform::Ubuntu12, Channel::Public) => {
+                    vec![request(PackageKind::Ubuntu12, ROOTS_UBUNTU12_32)]
+                }
+                (Platform::Ubuntu12, Channel::PublicBeta) => {
+                    vec![request(PackageKind::SteamRt, ROOTS_STEAMRT_BOTH)]
+                }
             },
             Some(Arch::X86) => vec![request(PackageKind::Ubuntu12, ROOTS_UBUNTU12_32)],
             Some(Arch::X64) => vec![request(PackageKind::SteamRt, ROOTS_STEAMRT64)],
@@ -258,10 +293,12 @@ fn usage() -> String {
     concat!(
         "usage: vapor-forge-steam-cdn-fetch ",
         "[--channel public|publicbeta] [--arch x86|x64|both] ",
+        "[--platform steamrt64|ubuntu12] ",
         "[--version MANIFEST_VERSION] [--out DIR] [--no-keep-zip] ",
         "[--scan] [--format text|json]\n",
         "\n",
-        "Defaults: --channel public uses x86; --channel publicbeta uses steamrt32+steamrt64; ",
+        "Defaults: --platform steamrt64 uses the current 64-bit client; ",
+        "--platform ubuntu12 selects the legacy client (public: x86; publicbeta: steamrt32+steamrt64); ",
         "--out $TMPDIR/vapor-steam-cdn"
     )
     .to_owned()
@@ -464,13 +501,13 @@ fn fetch_package(
     request: PackageRequest,
 ) -> Result<JsonPackage, String> {
     let kind = request.kind;
-    let key = kind.manifest_key();
+    let key = kind.manifest_key(args.platform);
     let package = manifest
         .packages
         .get(key)
         .ok_or_else(|| format!("manifest missing package {key:?}"))?;
     let url = format!("{CDN_BASE}/{}", package.file);
-    let zip_name = format!("{}_{}.zip", kind.manifest_key(), args.channel.name());
+    let zip_name = format!("{}_{}.zip", key, args.channel.name());
     let zip_path = args.out_dir.join(zip_name);
     args.text_print(format_args!("package={key}"));
     args.text_print(format_args!("package_url={url}"));
@@ -904,13 +941,84 @@ mod tests {
     }
 
     #[test]
-    fn publicbeta_defaults_to_both_steamrt_roots() {
-        let args = Args::parse(["--channel".to_owned(), "publicbeta".to_owned()]).unwrap();
+    fn current_channels_use_the_steamrt64_manifest_and_package() {
+        for (channel, manifest) in [
+            ("public", "steam_client_steamrt64"),
+            ("publicbeta", "steam_client_publicbeta_steamrt64"),
+        ] {
+            let args = Args::parse(["--channel".to_owned(), channel.to_owned()]).unwrap();
+            assert!(args.channel.manifest_url(args.platform).ends_with(manifest));
+            let requests = args.package_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].kind.manifest_key(args.platform),
+                "bins_steamrt_steamrt64"
+            );
+            assert_eq!(requests[0].library_roots, ROOTS_STEAMRT64);
+        }
+    }
+
+    #[test]
+    fn current_manifest_selects_the_32_bit_companion_package() {
+        let args = Args::parse(["--arch".to_owned(), "both".to_owned()]).unwrap();
+        let requests = args.package_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].kind.manifest_key(args.platform),
+            "bins_steamrt64"
+        );
+        assert_eq!(requests[0].library_roots, ROOTS_UBUNTU12_32);
+        assert_eq!(
+            requests[1].kind.manifest_key(args.platform),
+            "bins_steamrt_steamrt64"
+        );
+        assert_eq!(requests[1].library_roots, ROOTS_STEAMRT64);
+    }
+
+    #[test]
+    fn legacy_publicbeta_defaults_to_both_steamrt_roots() {
+        let args = Args::parse([
+            "--channel".to_owned(),
+            "publicbeta".to_owned(),
+            "--platform".to_owned(),
+            "ubuntu12".to_owned(),
+        ])
+        .unwrap();
+        assert!(args
+            .channel
+            .manifest_url(args.platform)
+            .ends_with("steam_client_publicbeta_ubuntu12"));
         let requests = args.package_requests();
 
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].kind.manifest_key(), "bins_steamrt_ubuntu12");
+        assert_eq!(
+            requests[0].kind.manifest_key(args.platform),
+            "bins_steamrt_ubuntu12"
+        );
         assert_eq!(requests[0].library_roots, ROOTS_STEAMRT_BOTH);
+    }
+
+    #[test]
+    fn legacy_both_architectures_select_both_packages() {
+        let args = Args::parse([
+            "--platform".to_owned(),
+            "ubuntu12".to_owned(),
+            "--arch".to_owned(),
+            "both".to_owned(),
+        ])
+        .unwrap();
+        let requests = args.package_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].kind.manifest_key(args.platform),
+            "bins_ubuntu12"
+        );
+        assert_eq!(requests[0].library_roots, ROOTS_UBUNTU12_32);
+        assert_eq!(
+            requests[1].kind.manifest_key(args.platform),
+            "bins_steamrt_ubuntu12"
+        );
+        assert_eq!(requests[1].library_roots, ROOTS_STEAMRT64);
     }
 
     #[test]
