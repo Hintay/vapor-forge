@@ -154,6 +154,9 @@ unsafe extern "win64" fn hook_nt_suspend_thread(handle: Handle, previous: *mut u
                 // SAFETY: previous is the caller's optional out pointer.
                 unsafe { *previous = count };
             }
+            // SAFETY: the hook runs on the Wine PE thread that called
+            // NtSuspendThread.
+            let _scope = unsafe { crate::pe_context::UnixScope::enter() };
             if retries == MAX_RETRIES {
                 log_args(format_args!(
                     "suspend guard: suspended thread {thread_id:#x} still holding an ntdll lock after {retries} retries"

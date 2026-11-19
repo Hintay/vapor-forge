@@ -25,6 +25,8 @@ mod nt_types;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod pe;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod pe_context;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod suspend_guard;
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod trigger;
@@ -60,6 +62,8 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
         return;
     }
 
+    pe_context::resolve();
+
     // Do not perform socket I/O in the audit callback. The loader detour queues
     // reports, and the game-bridge worker connects asynchronously on demand.
     // Per-launch tokens may authenticate multiple Wine child processes.
@@ -80,9 +84,11 @@ pub extern "C" fn la_preinit(_cookie: *mut usize) {
 /// Called by glibc with a live loader-owned link_map pointer.
 pub unsafe extern "C" fn la_objopen(
     map: *mut c_void,
-    _lmid: libc::c_long,
+    lmid: libc::c_long,
     _cookie: *mut usize,
 ) -> c_uint {
+    // SAFETY: glibc supplies a valid link_map for this callback.
+    unsafe { pe_context::record_object(map, lmid) };
     // SAFETY: glibc supplies a valid link_map for this callback.
     unsafe { mapping_event::object_flags(map) }
 }

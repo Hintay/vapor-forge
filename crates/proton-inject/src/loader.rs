@@ -7,6 +7,7 @@ use crate::detour::PreparedDetour;
 use crate::maps;
 use crate::nt_types::{LdrLoadDllFn, UnicodeString, STATUS_SUCCESS};
 use crate::pe;
+use crate::pe_context::UnixScope;
 use crate::trigger;
 
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
@@ -72,6 +73,10 @@ pub fn install_trigger() -> bool {
 
     log("LdrLoadDll detour installed");
 
+    // Start the bridge worker from Unix context, before Wine enables syscall
+    // user dispatch on its threads.
+    crate::ipc::try_connect();
+
     if crate::loader_fix::enabled() {
         crate::suspend_guard::install(pe_base, &pe_bytes);
     }
@@ -88,9 +93,9 @@ pub fn mark_pending() {
     PENDING.store(true, Ordering::Release);
 }
 
-/// Called from the LdrLoadDll hook. Reports module observations and activates
-/// injection when a Steam trigger module appears.
-pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
+/// Called from the LdrLoadDll hook inside a Unix scope. Reports module
+/// observations and activates injection when a Steam trigger module appears.
+pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void, scope: &mut UnixScope) {
     let dll_name = dll_name_to_string(name);
     if !dll_name.is_empty() {
         crate::ipc::send_dll_loaded(&dll_name);
@@ -116,7 +121,7 @@ pub fn on_ldr_load_dll(name: &[u16], base_address: *mut core::ffi::c_void) {
     if trigger_seen || pending_pickup {
         // Ensure the asynchronous bridge transport exists before loading the DLL.
         crate::ipc::try_connect();
-        load_helper_now();
+        load_helper_now(scope);
     }
 }
 
@@ -149,7 +154,7 @@ fn scan_loaded_pe(base: *mut core::ffi::c_void) {
     }
 }
 
-fn load_helper_now() {
+fn load_helper_now(scope: &mut UnixScope) {
     if HELPER_LOADING.swap(true, Ordering::AcqRel) {
         return; // already loading/loaded
     }
@@ -184,14 +189,14 @@ fn load_helper_now() {
 
     // SAFETY: orig is the relocated LdrLoadDll trampoline and all pointers live
     // through the call.
-    let status = unsafe {
+    let status = scope.call_pe(|| unsafe {
         orig(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut us,
             &mut base,
         )
-    };
+    });
     if status == STATUS_SUCCESS {
         log("DLL loaded successfully");
         crate::ipc::send_dll_inject_result(true);
@@ -235,11 +240,13 @@ unsafe extern "win64" fn hook_ldr_load_dll(
             // when the caller supplied a non-null out pointer.
             unsafe { *base_address }
         };
+        // SAFETY: the detour runs on the Wine PE thread that called LdrLoadDll.
+        let mut scope = unsafe { UnixScope::enter() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: dll_name is checked for null above. Wine provides a
             // valid UNICODE_STRING for the duration of the callback.
             let name = unsafe { (*dll_name).as_slice() };
-            on_ldr_load_dll(name, base);
+            on_ldr_load_dll(name, base, &mut scope);
         }));
     }
 

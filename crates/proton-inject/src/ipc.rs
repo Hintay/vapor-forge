@@ -194,6 +194,7 @@ fn outbound() -> Option<&'static mpsc::SyncSender<Message>> {
 }
 
 fn outbound_loop(receiver: mpsc::Receiver<Message>, session: LaunchSession) {
+    block_all_signals();
     let mut stream = None;
     let mut retry_delay = INITIAL_RETRY_DELAY;
     while let Ok(message) = receiver.recv() {
@@ -260,6 +261,18 @@ fn app_id_from_steam_game_id(value: &str) -> Option<u32> {
     let game_id = value.parse::<u64>().ok()?;
     let app_id = game_id as u32 & 0x00ff_ffff;
     (app_id != 0).then_some(app_id)
+}
+
+/// The worker runs no Wine code and has no TEB, so Wine's signal handlers must
+/// never run on it.
+fn block_all_signals() {
+    // SAFETY: the set is initialized by sigfillset before pthread_sigmask reads
+    // it; a null old-set pointer is allowed.
+    unsafe {
+        let mut set = core::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigfillset(set.as_mut_ptr());
+        libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), core::ptr::null_mut());
+    }
 }
 
 #[cfg(test)]
